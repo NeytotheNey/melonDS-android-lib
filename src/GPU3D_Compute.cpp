@@ -274,53 +274,61 @@ ComputeRenderer::~ComputeRenderer()
     glDeleteBuffers(1, &YSpanIndicesTextureMemory);
     glDeleteTextures(1, &YSpanIndicesTexture);
     glDeleteTextures(1, &Framebuffer);
+    glDeleteTextures(1, &LowResFramebuffer);
     glDeleteBuffers(1, &MetaUniformMemory);
 
     glDeleteSamplers(9, Samplers);
     glDeleteBuffers(1, &PixelBuffer);
     glDeleteBuffers(1, &CaptureFrameBuffer);
+
+    DeleteShaders();
 }
 
 void ComputeRenderer::DeleteShaders()
 {
-    std::initializer_list<GLuint> allPrograms =
+    std::initializer_list<GLuint*> allPrograms =
     {
-        ShaderInterpXSpans[0],
-        ShaderInterpXSpans[1],
-        ShaderBinCombined,
-        ShaderDepthBlend[0],
-        ShaderDepthBlend[1],
-        ShaderRasteriseNoTexture[0],
-        ShaderRasteriseNoTexture[1],
-        ShaderRasteriseNoTextureToon[0],
-        ShaderRasteriseNoTextureToon[1],
-        ShaderRasteriseNoTextureHighlight[0],
-        ShaderRasteriseNoTextureHighlight[1],
-        ShaderRasteriseUseTextureDecal[0],
-        ShaderRasteriseUseTextureDecal[1],
-        ShaderRasteriseUseTextureModulate[0],
-        ShaderRasteriseUseTextureModulate[1],
-        ShaderRasteriseUseTextureToon[0],
-        ShaderRasteriseUseTextureToon[1],
-        ShaderRasteriseUseTextureHighlight[0],
-        ShaderRasteriseUseTextureHighlight[1],
-        ShaderRasteriseShadowMask[0],
-        ShaderRasteriseShadowMask[1],
-        ShaderClearCoarseBinMask,
-        ShaderClearIndirectWorkCount,
-        ShaderCalculateWorkListOffset,
-        ShaderSortWork,
-        ShaderFinalPass[0],
-        ShaderFinalPass[1],
-        ShaderFinalPass[2],
-        ShaderFinalPass[3],
-        ShaderFinalPass[4],
-        ShaderFinalPass[5],
-        ShaderFinalPass[6],
-        ShaderFinalPass[7],
+        &ShaderInterpXSpans[0],
+        &ShaderInterpXSpans[1],
+        &ShaderBinCombined,
+        &ShaderDepthBlend[0],
+        &ShaderDepthBlend[1],
+        &ShaderRasteriseNoTexture[0],
+        &ShaderRasteriseNoTexture[1],
+        &ShaderRasteriseNoTextureToon[0],
+        &ShaderRasteriseNoTextureToon[1],
+        &ShaderRasteriseNoTextureHighlight[0],
+        &ShaderRasteriseNoTextureHighlight[1],
+        &ShaderRasteriseUseTextureDecal[0],
+        &ShaderRasteriseUseTextureDecal[1],
+        &ShaderRasteriseUseTextureModulate[0],
+        &ShaderRasteriseUseTextureModulate[1],
+        &ShaderRasteriseUseTextureToon[0],
+        &ShaderRasteriseUseTextureToon[1],
+        &ShaderRasteriseUseTextureHighlight[0],
+        &ShaderRasteriseUseTextureHighlight[1],
+        &ShaderRasteriseShadowMask[0],
+        &ShaderRasteriseShadowMask[1],
+        &ShaderClearCoarseBinMask,
+        &ShaderClearIndirectWorkCount,
+        &ShaderCalculateWorkListOffset,
+        &ShaderSortWork,
+        &ShaderFinalPass[0],
+        &ShaderFinalPass[1],
+        &ShaderFinalPass[2],
+        &ShaderFinalPass[3],
+        &ShaderFinalPass[4],
+        &ShaderFinalPass[5],
+        &ShaderFinalPass[6],
+        &ShaderFinalPass[7],
     };
-    for (GLuint program : allPrograms)
-        glDeleteProgram(program);
+    // Program names are shared with the frontend's contexts, so clear them after deleting. Deleting a stale name again (in the destructor, or
+    // when the settings change before the shaders are compiled again) could free a program that reused it
+    for (GLuint* program : allPrograms)
+    {
+        glDeleteProgram(*program);
+        *program = 0;
+    }
 }
 
 void ComputeRenderer::Reset(GPU& gpu)

@@ -298,6 +298,8 @@ error:
     if (!linkingSucess)
     {
         glDeleteProgram(result);
+        // Program names are shared with other contexts, so don't leave a deleted name behind for the caller to delete again
+        result = 0;
     }
     /*else
     {
@@ -354,7 +356,11 @@ error:
     glDeleteShader(shaders[0]);
 
     if (!linkingSucess)
+    {
         glDeleteProgram(result);
+        // Program names are shared with other contexts, so don't leave a deleted name behind for the caller to delete again
+        result = 0;
+    }
 
     return linkingSucess;
 }

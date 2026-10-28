@@ -296,9 +296,11 @@ GLRenderer::~GLRenderer()
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
     glDeleteTextures(1, &DownScaleBufferTex);
+    glDeleteBuffers(1, &PixelbufferID);
 
     glDeleteVertexArrays(1, &VertexArrayID);
     glDeleteBuffers(1, &VertexBufferID);
+    glDeleteBuffers(1, &IndexBufferID);
     glDeleteVertexArrays(1, &ClearVertexArrayID);
     glDeleteBuffers(1, &ClearVertexBufferID);
 
@@ -309,6 +311,9 @@ GLRenderer::~GLRenderer()
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
     }
+    glDeleteProgram(ClearShaderPlain);
+    glDeleteProgram(FinalPassEdgeShader);
+    glDeleteProgram(FinalPassFogShader);
 }
 
 void GLRenderer::Reset(GPU& gpu)

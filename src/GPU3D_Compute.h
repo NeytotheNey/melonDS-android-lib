@@ -65,22 +65,22 @@ public:
 private:
     ComputeRenderer(GLCompositor&& compositor);
 
-    GLuint ShaderInterpXSpans[2];
-    GLuint ShaderBinCombined;
-    GLuint ShaderDepthBlend[2];
-    GLuint ShaderRasteriseNoTexture[2];
-    GLuint ShaderRasteriseNoTextureToon[2];
-    GLuint ShaderRasteriseNoTextureHighlight[2];
-    GLuint ShaderRasteriseUseTextureDecal[2];
-    GLuint ShaderRasteriseUseTextureModulate[2];
-    GLuint ShaderRasteriseUseTextureToon[2];
-    GLuint ShaderRasteriseUseTextureHighlight[2];
-    GLuint ShaderRasteriseShadowMask[2];
-    GLuint ShaderClearCoarseBinMask;
-    GLuint ShaderClearIndirectWorkCount;
-    GLuint ShaderCalculateWorkListOffset;
-    GLuint ShaderSortWork;
-    GLuint ShaderFinalPass[8];
+    GLuint ShaderInterpXSpans[2] {};
+    GLuint ShaderBinCombined {};
+    GLuint ShaderDepthBlend[2] {};
+    GLuint ShaderRasteriseNoTexture[2] {};
+    GLuint ShaderRasteriseNoTextureToon[2] {};
+    GLuint ShaderRasteriseNoTextureHighlight[2] {};
+    GLuint ShaderRasteriseUseTextureDecal[2] {};
+    GLuint ShaderRasteriseUseTextureModulate[2] {};
+    GLuint ShaderRasteriseUseTextureToon[2] {};
+    GLuint ShaderRasteriseUseTextureHighlight[2] {};
+    GLuint ShaderRasteriseShadowMask[2] {};
+    GLuint ShaderClearCoarseBinMask {};
+    GLuint ShaderClearIndirectWorkCount {};
+    GLuint ShaderCalculateWorkListOffset {};
+    GLuint ShaderSortWork {};
+    GLuint ShaderFinalPass[8] {};
 
     GLuint YSpanIndicesTextureMemory;
     GLuint YSpanIndicesTexture;
