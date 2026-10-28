@@ -506,16 +506,7 @@ int CartRetail::ROMCommandStart(NDS& nds, NDSCart::NDSCartSlot& cartslot, const 
     case 0xB7:
         {
             u32 addr = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
-            memset(data, 0, len);
-
-            if (((addr + len - 1) >> 12) != (addr >> 12))
-            {
-                u32 len1 = 0x1000 - (addr & 0xFFF);
-                ReadROM_B7(addr, len1, data, 0);
-                ReadROM_B7(addr+len1, len-len1, data, len1);
-            }
-            else
-                ReadROM_B7(addr, len, data, 0);
+            ReadROM_B7(addr, len, data, 0);
         }
         return 0;
 
@@ -574,7 +565,14 @@ void CartRetail::ReadROM_B7(u32 addr, u32 len, u8* data, u32 offset) const
             addr = 0x8000 + (addr & 0x1FF);
     }
 
-    memcpy(data+offset, ROM.get()+addr, len);
+    while (len)
+    {
+        u32 chunk = std::min(len, 0x1000 - (addr & 0xFFF));
+        memcpy(data + offset, ROM.get() + addr, chunk);
+        offset += chunk;
+        len -= chunk;
+        addr &= ~0xFFF;
+    }
 }
 
 u8 CartRetail::SRAMWrite_EEPROMTiny(u8 val, u32 pos, bool last)
@@ -1506,6 +1504,11 @@ void NDSCartSlot::DoSavestate(Savestate* file) noexcept
     }
     else
     {
+        // fallback for states without NDCF, set before the early returns below
+        ROMDataNext = 0;
+        ROMDataCount = (!(ROMCnt & (1<<30)) && (ROMCnt & (1<<23))) ? 1 : 0;
+        ROMReadStalled = ROMDataCount != 0;
+
         u32 savetype;
         file->Var32(&savetype);
         if (savetype != carttype) return;
@@ -1516,6 +1519,16 @@ void NDSCartSlot::DoSavestate(Savestate* file) noexcept
     }
 
     if (Cart) Cart->DoSavestate(file);
+
+    if (file->Saving || file->HasSection("NDCF"))
+    {
+        file->Section("NDCF");
+        file->Var32(&ROMDataNext);
+        file->Var32(&ROMDataCount);
+        file->Bool32(&ROMReadStalled);
+        if (ROMDataCount > 2)
+            file->Error = true;
+    }
 }
 
 
@@ -1789,6 +1802,9 @@ void NDSCartSlot::ResetCart() noexcept
 
     memset(ROMCommand.data(), 0, sizeof(ROMCommand));
     ROMData = 0;
+    ROMDataNext = 0;
+    ROMDataCount = 0;
+    ROMReadStalled = false;
 
     Key2_X = 0;
     Key2_Y = 0;
@@ -1819,17 +1835,45 @@ void NDSCartSlot::ROMPrepareData(u32 param) noexcept
 {
     if (TransferDir == 0)
     {
+        u32 data;
         if (TransferPos >= TransferLen)
-            ROMData = 0;
+            data = 0;
         else
-            ROMData = *(u32*)&TransferData[TransferPos];
+            data = *(u32*)&TransferData[TransferPos];
+
+        if (!(ROMCnt & (1<<30)) && ROMDataCount)
+            ROMDataNext = data;
+        else
+            ROMData = data;
 
         TransferPos += 4;
     }
 
-    ROMCnt |= (1<<23);
+    if (!(ROMCnt & (1<<30)))
+        ROMDataCount++;
 
-    if (NDS.ExMemCnt[0] & (1<<11))
+    RaiseDRQ();
+
+    if (!(ROMCnt & (1<<30)))
+    {
+        ROMReadStalled = ROMDataCount == 2;
+        if (!ROMReadStalled)
+            AdvanceROMTransfer(true);
+    }
+}
+
+void NDSCartSlot::RaiseDRQ() noexcept
+{
+    ROMCnt |= (1<<23);
+    CheckDMA((NDS.ExMemCnt[0]>>11)&1);
+}
+
+void NDSCartSlot::CheckDMA(u32 cpu) noexcept
+{
+    if (!(ROMCnt & (1<<23)) || cpu != ((NDS.ExMemCnt[0]>>11)&1))
+        return;
+
+    if (cpu)
         NDS.CheckDMAs(1, 0x12);
     else
         NDS.CheckDMAs(0, 0x05);
@@ -1876,6 +1920,8 @@ void NDSCartSlot::WriteROMCnt(u32 val) noexcept
 
     TransferPos = 0;
     TransferLen = datasize;
+    ROMDataCount = 0;
+    ROMReadStalled = false;
 
     *(u32*)&TransferCmd[0] = *(u32*)&ROMCommand[0];
     *(u32*)&TransferCmd[4] = *(u32*)&ROMCommand[4];
@@ -1924,10 +1970,8 @@ void NDSCartSlot::WriteROMCnt(u32 val) noexcept
         NDS.ScheduleEvent(Event_ROMTransfer, false, xfercycle*(cmddelay+4), ROMTransfer_PrepareData, 0);
 }
 
-void NDSCartSlot::AdvanceROMTransfer() noexcept
+void NDSCartSlot::AdvanceROMTransfer(bool fromTransferEvent) noexcept
 {
-    ROMCnt &= ~(1<<23);
-
     if (TransferPos < TransferLen)
     {
         u32 xfercycle = (ROMCnt & (1<<27)) ? 8 : 5;
@@ -1938,9 +1982,9 @@ void NDSCartSlot::AdvanceROMTransfer() noexcept
                 delay += ((ROMCnt >> 16) & 0x3F);
         }
 
-        NDS.ScheduleEvent(Event_ROMTransfer, false, xfercycle*delay, ROMTransfer_PrepareData, 0);
+        NDS.ScheduleEvent(Event_ROMTransfer, fromTransferEvent, xfercycle*delay, ROMTransfer_PrepareData, 0);
     }
-    else
+    else if (ROMCnt & (1<<30))
         ROMEndTransfer(0);
 }
 
@@ -1948,12 +1992,30 @@ u32 NDSCartSlot::ReadROMData() noexcept
 {
     if (ROMCnt & (1<<30)) return 0;
 
+    u32 ret = ROMData;
     if (ROMCnt & (1<<23))
     {
-        AdvanceROMTransfer();
+        ROMCnt &= ~(1<<23);
+        if (ROMDataCount)
+            ROMDataCount--;
+        if (ROMDataCount)
+            ROMData = ROMDataNext;
+
+        if (TransferPos < TransferLen)
+        {
+            if (ROMReadStalled)
+            {
+                ROMReadStalled = false;
+                AdvanceROMTransfer();
+            }
+        }
+        else if (!ROMDataCount)
+            ROMEndTransfer(0);
+        else
+            RaiseDRQ();
     }
 
-    return ROMData;
+    return ret;
 }
 
 void NDSCartSlot::WriteROMData(u32 val) noexcept
@@ -1964,6 +2026,7 @@ void NDSCartSlot::WriteROMData(u32 val) noexcept
 
     if (ROMCnt & (1<<23))
     {
+        ROMCnt &= ~(1<<23);
         if (TransferDir == 1)
         {
             if (TransferPos < TransferLen)

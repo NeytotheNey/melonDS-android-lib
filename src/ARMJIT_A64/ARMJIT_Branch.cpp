@@ -172,6 +172,7 @@ void* Compiler::Gen_JumpTo9(int kind)
     void* res = GetRXPtr();
 
     LSR(W1, W0, 12);
+    LSL(W1, W1, 2); // MemTimings is u8[][4], so the row offset is (addr >> 12) * 4
     ADDI2R(W1, W1, offsetof(ARMv5, MemTimings), W2);
     LDRB(W1, RCPU, W1);
 

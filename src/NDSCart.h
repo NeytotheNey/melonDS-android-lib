@@ -417,6 +417,7 @@ public:
     [[nodiscard]] u32 GetROMCnt() const noexcept { return ROMCnt; }
     [[nodiscard]] u16 GetSPICnt() const noexcept { return SPICnt; }
     void SetSPICnt(u16 val) noexcept { SPICnt = val; }
+    void CheckDMA(u32 cpu) noexcept;
 private:
     friend class CartCommon;
     melonDS::NDS& NDS;
@@ -428,8 +429,11 @@ private:
     bool SPIHold = false;
 
     u32 ROMData = 0;
+    u32 ROMDataNext = 0;
+    u32 ROMDataCount = 0;
+    bool ROMReadStalled = false;
 
-    std::array<u8, 0x4000> TransferData {};
+    alignas(u32) std::array<u8, 0x4000> TransferData {};
     u32 TransferPos = 0;
     u32 TransferLen = 0;
     u32 TransferDir = 0;
@@ -450,7 +454,8 @@ private:
     void Key2_Encrypt(const u8* data, u32 len) noexcept;
     void ROMEndTransfer(u32 param) noexcept;
     void ROMPrepareData(u32 param) noexcept;
-    void AdvanceROMTransfer() noexcept;
+    void RaiseDRQ() noexcept;
+    void AdvanceROMTransfer(bool fromTransferEvent = false) noexcept;
     void SPITransferDone(u32 param) noexcept;
 };
 
