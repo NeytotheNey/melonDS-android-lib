@@ -141,7 +141,8 @@ private:
 
 // one HBlank's worth of 2D drawing: the BG/OBJ pass of the current line and the sprites of the
 // next one, for both Units. GPU::StartHBlank builds it on the emulator thread, and the renderer
-// draws only from it plus VRAM (and its flat copies), palette and OAM
+// draws only from it plus VRAM (and its flat copies), palette and OAM.
+// with threaded 2D, jobs wait in a ring until the 2D thread draws them (see GPU::Begin2DJob)
 struct LineJob
 {
     bool DrawBG;            // DrawScanline(Line) for both Units
@@ -160,6 +161,10 @@ struct LineJob
     UnitState OBJ[2];       // after PostDrawScanline (line 0: after ResetOBJMosaicCounters)
 
     u16 DispFIFOBuffer[256]; // unit A's, only copied when it uses the display FIFO
+
+    // queued jobs keep their own copy of the 3D line (Line3D points here), since the 3D renderer
+    // reuses its line buffer before the 2D thread gets to the job
+    u32 Line3DBuffer[256];
 };
 
 class Renderer2D

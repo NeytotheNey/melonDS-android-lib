@@ -250,7 +250,11 @@ enum LogLevel
 void Log(LogLevel level, const char* fmt, ...);
 
 struct Thread;
-Thread* Thread_Create(std::function<void()> func);
+/// Starts a thread that runs func.
+/// @param name A short name for the thread (up to 15 characters), shown in debuggers and profilers.
+/// Frontends that can't name threads ignore it.
+/// @return The thread, or null if it couldn't be started. Thread_Wait and Thread_Free accept null.
+Thread* Thread_Create(std::function<void()> func, const char* name = nullptr);
 void Thread_Free(Thread* thread);
 void Thread_Wait(Thread* thread);
 

@@ -55,6 +55,10 @@ void SoftRenderer::SetupRenderThread(GPU& gpu)
             RenderThread = Platform::Thread_Create([this, &gpu]() {
                 RenderThreadFunc(gpu);
             });
+
+            // no thread: render on the emulator thread instead
+            if (!RenderThread)
+                RenderThreadRunning = false;
         }
 
         // "Be on standby, but don't start rendering until I tell you to!"

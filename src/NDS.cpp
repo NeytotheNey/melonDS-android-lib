@@ -1056,6 +1056,10 @@ u32 NDS::RunFrame()
         break;
     }
 
+    // The frontend reads the framebuffers and saves states between frames, so the 2D thread must be done.
+    // GPU::FinishFrame already synced it, unless the frame stopped early (sleep mode or a stop)
+    GPU.Sync2D();
+
     // Ensure the last audio samples produced for this frame are available to the frontend immediately
     SPU.BufferAudio();
 

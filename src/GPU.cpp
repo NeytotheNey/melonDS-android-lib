@@ -17,6 +17,9 @@
 */
 
 #include <string.h>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include "NDS.h"
 #include "GPU.h"
 
@@ -39,6 +42,36 @@ enum
     LCD_StartHBlank = 0,
     LCD_StartScanline,
     LCD_FinishFrame,
+};
+
+// threaded 2D (how it works is explained above GPU::SetThreaded2D)
+
+// a frame queues 193 jobs at most (line 262's sprites, then lines 0-191) before the barrier at
+// VCount 192, so the ring is only full if a game rewrites VCount to stay in the visible lines
+static constexpr u32 Ring2DSize = 256;
+
+// how long each side spins before it sleeps. while a frame is drawn, lines arrive every few dozen
+// microseconds, so the 2D thread spins through the gaps (waking it costs the emulator thread a
+// syscall per line). after line 191 it has nothing to do until line 262, and after line 262's
+// job nothing until the next frame starts, so it sleeps soon.
+// the barrier waits for lines that are being drawn, usually only one or two
+static constexpr u32 Spin2DWorkFrameUs = 100;
+static constexpr u32 Spin2DWorkVBlankUs = 10;
+static constexpr u32 Spin2DSyncUs = 50;
+
+// only exists while threaded 2D is on
+struct GPU::Threaded2DState
+{
+    std::unique_ptr<GPU2D::LineJob[]> Jobs = std::make_unique<GPU2D::LineJob[]>(Ring2DSize);
+    Platform::Thread* Thread = nullptr;
+
+    std::mutex Mutex;
+    std::condition_variable WorkWake;   // a job was queued, or the thread should stop
+    std::condition_variable SyncWake;   // a job was drawn
+    std::atomic<bool> WorkSleeping {false};
+    // a count, in case a barrier on another thread (a savestate) ever waits at the same time
+    std::atomic<int> SyncSleepers {0};
+    std::atomic<bool> Stopping {false};
 };
 
 
@@ -83,7 +116,8 @@ GPU::GPU(melonDS::NDS& nds, std::unique_ptr<Renderer3D>&& renderer3d, std::uniqu
 
 GPU::~GPU() noexcept
 {
-    // All unique_ptr fields are automatically cleaned up
+    // All unique_ptr fields are automatically cleaned up, but the 2D thread must stop first
+    Stop2DThread();
 
     NDS.UnregisterEventFuncs(Event_LCD);
     NDS.UnregisterEventFuncs(Event_DisplayFIFO);
@@ -119,6 +153,8 @@ void GPU::ResetVRAMCache() noexcept
 
 void GPU::Reset() noexcept
 {
+    Sync2D();
+
     VCount = 0;
     NextVCount = -1;
     TotalScanlines = 0;
@@ -201,6 +237,8 @@ void GPU::Reset() noexcept
 
 void GPU::Stop() noexcept
 {
+    Sync2D();
+
     int fbsize;
     if (GPU3D.IsRendererAccelerated())
         fbsize = (256*3 + 1) * 192;
@@ -217,6 +255,8 @@ void GPU::Stop() noexcept
 
 void GPU::DoSavestate(Savestate* file) noexcept
 {
+    Sync2D();
+
     file->Section("GPUG");
 
     file->Var16(&VCount);
@@ -297,6 +337,8 @@ void GPU::AssignFramebuffers() noexcept
 
 void GPU::SetRenderer3D(std::unique_ptr<Renderer3D>&& renderer) noexcept
 {
+    Sync2D();
+
     if (renderer == nullptr)
         GPU3D.SetCurrentRenderer(std::make_unique<SoftRenderer>());
     else
@@ -307,6 +349,9 @@ void GPU::SetRenderer3D(std::unique_ptr<Renderer3D>&& renderer) noexcept
 
 void GPU::InitFramebuffers() noexcept
 {
+    // queued jobs point into the old framebuffers
+    Sync2D();
+
     int fbsize;
     if (GPU3D.IsRendererAccelerated())
         fbsize = (256*3 + 1) * 192;
@@ -371,6 +416,8 @@ const u8* GPU::GetUniqueBankPtr(u32 mask, u32 offset) const noexcept
     return &VRAM[num][offset & VRAMMask[num]];
 }
 
+// a mapping change syncs the 2D thread first: queued lines may still read a bank that was in LCDC
+// mode when they were built, and the flat copies are rebuilt from the new mappings
 #define MAP_RANGE(map, base, n)    for (int i = 0; i < n; i++) VRAMMap_##map[(base)+i] |= bankmask;
 #define UNMAP_RANGE(map, base, n)  for (int i = 0; i < n; i++) VRAMMap_##map[(base)+i] &= ~bankmask;
 
@@ -387,6 +434,7 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    Sync2D();
 
     u8 oldofs = (oldcnt >> 3) & 0x3;
     u8 ofs = (cnt >> 3) & 0x3;
@@ -449,6 +497,7 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
     VRAMSTAT &= ~(1 << (bank-2));
 
     if (oldcnt == cnt) return;
+    Sync2D();
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -534,6 +583,7 @@ void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    Sync2D();
 
     u32 bankmask = 1 << bank;
 
@@ -598,6 +648,7 @@ void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    Sync2D();
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -698,6 +749,7 @@ void GPU::MapVRAM_H(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    Sync2D();
 
     u32 bankmask = 1 << bank;
 
@@ -760,6 +812,7 @@ void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    Sync2D();
 
     u32 bankmask = 1 << bank;
 
@@ -835,6 +888,8 @@ void GPU::SetPowerCnt(u32 val) noexcept
 
     if (!(val & (1<<0))) Log(LogLevel::Warn, "!!! CLEARING POWCNT BIT0. DANGER\n");
 
+    Sync2D();
+
     GPU2D_A.SetEnabled(val & (1<<1));
     GPU2D_B.SetEnabled(val & (1<<9));
     GPU3D.SetEnabled(val & (1<<3), val & (1<<2));
@@ -889,12 +944,12 @@ void GPU::StartHBlank(u32 line) noexcept
         if (line < 192)
         {
             // the renderer draws from the job alone. the Units' per-line updates happen around
-            // taking their snapshots: the BG pass sees PreDrawScanline, the sprites see PostDrawScanline
-            GPU2D::LineJob& job = Job2D;
-            Start2DJob(job);
-
+            // taking their snapshots: the BG pass sees PreDrawScanline, the sprites see PostDrawScanline.
+            // the job starts after PreDrawScanline, which arms display capture (that decides where it's drawn)
             GPU2D_A.PreDrawScanline(VCount);
             GPU2D_B.PreDrawScanline(VCount);
+
+            GPU2D::LineJob& job = Begin2DJob();
             Snapshot2DScanline(job, line);
             GPU2D_A.PostDrawScanline(VCount);
             GPU2D_B.PostDrawScanline(VCount);
@@ -903,7 +958,7 @@ void GPU::StartHBlank(u32 line) noexcept
             if (line < 191)
                 Snapshot2DSprites(job, line+1);
 
-            GPU2D_Renderer->RunJob(job);
+            End2DJob(job);
         }
 
         NDS.CheckDMAs(0, 0x02);
@@ -917,10 +972,9 @@ void GPU::StartHBlank(u32 line) noexcept
         GPU2D_A.ResetOBJMosaicCounters();
         GPU2D_B.ResetOBJMosaicCounters();
 
-        GPU2D::LineJob& job = Job2D;
-        Start2DJob(job);
+        GPU2D::LineJob& job = Begin2DJob();
         Snapshot2DSprites(job, 0);
-        GPU2D_Renderer->RunJob(job);
+        End2DJob(job);
     }
 
     if (DispStat[0] & (1<<4)) NDS.SetIRQ(0, IRQ_HBlank);
@@ -964,6 +1018,18 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
     else if (GPU2D_A.CaptureLatch && (((GPU2D_A.CaptureCnt >> 29) & 0x3) != 1))
         job.Line3D = GPU3D.GetLine(line);
 
+    // the 3D renderer reuses its line buffer, so a queued job keeps a copy
+    if (job.Line3D && Is2DJobQueued(job))
+    {
+        memcpy(job.Line3DBuffer, job.Line3D, sizeof(job.Line3DBuffer));
+        job.Line3D = job.Line3DBuffer;
+    }
+
+    // VRAM display (display mode 2, unit A only: unit B's mode is masked to 0-1) reads LCDC banks
+    // when the 2D thread draws the line, so writes to them must wait for it (see Sync2DForLCDC)
+    if (Is2DJobQueued(job) && ((job.BG[0].DispCnt >> 16) & 0x3) == 2)
+        Queued2DReadsLCDC = true;
+
     // display mode 3 and capture source B can read the display FIFO
     if (GPU2D_A.UsesFIFO())
         memcpy(job.DispFIFOBuffer, GPU2D_A.DispFIFOBuffer, sizeof(job.DispFIFOBuffer));
@@ -984,34 +1050,260 @@ void GPU::Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept
 // bits, so it happens here before the job is built, not in the renderer.
 // these used to run between the draw calls of an HBlank and now all run before them. the only
 // VRAM the draw calls write is display capture's, to an LCDC bank, which no BG/OBJ mapping
-// includes, so the copies come out the same
+// includes, so the copies come out the same.
+// the copies only change here, which is why CPU writes to BG/OBJ VRAM don't need the 2D barrier.
+// the dirty sets are all worked out first (that only touches emulator-thread state), and the
+// barrier only runs when a copy is about to change under lines the 2D thread hasn't drawn yet
 void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
 {
     auto bgDirtyA = VRAMDirty_ABG.DeriveState(VRAMMap_ABG, *this);
-    MakeVRAMFlat_ABGCoherent(bgDirtyA);
     auto bgExtPalDirtyA = VRAMDirty_ABGExtPal.DeriveState(VRAMMap_ABGExtPal, *this);
-    MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirtyA);
     auto objExtPalDirtyA = VRAMDirty_AOBJExtPal.DeriveState(&VRAMMap_AOBJExtPal, *this);
-    MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirtyA);
-
     auto bgDirtyB = VRAMDirty_BBG.DeriveState(VRAMMap_BBG, *this);
-    MakeVRAMFlat_BBGCoherent(bgDirtyB);
     auto bgExtPalDirtyB = VRAMDirty_BBGExtPal.DeriveState(VRAMMap_BBGExtPal, *this);
-    MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirtyB);
     auto objExtPalDirtyB = VRAMDirty_BOBJExtPal.DeriveState(&VRAMMap_BOBJExtPal, *this);
+
+    if (Is2DThreadBusy() && (bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA || bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB))
+        Sync2D();
+
+    MakeVRAMFlat_ABGCoherent(bgDirtyA);
+    MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirtyA);
+    MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirtyA);
+    MakeVRAMFlat_BBGCoherent(bgDirtyB);
+    MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirtyB);
     MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirtyB);
 }
 
 void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 {
     auto objDirtyA = VRAMDirty_AOBJ.DeriveState(VRAMMap_AOBJ, *this);
-    MakeVRAMFlat_AOBJCoherent(objDirtyA);
     auto objDirtyB = VRAMDirty_BOBJ.DeriveState(VRAMMap_BOBJ, *this);
+
+    if (Is2DThreadBusy() && (objDirtyA || objDirtyB))
+        Sync2D();
+
+    MakeVRAMFlat_AOBJCoherent(objDirtyA);
     MakeVRAMFlat_BOBJCoherent(objDirtyB);
+}
+
+// threaded 2D
+//
+// when it's on, StartHBlank queues each line's job in a ring and the 2D thread draws them in order.
+// the emulator thread still does everything that changes state, so a queued job only needs the
+// memory it reads to stay as it was: whatever writes palette, OAM, LCDC banks, VRAM mappings, the
+// flat copies, the framebuffers or the renderer runs Sync2D first. the frame's lines are all drawn
+// by StartScanline(192), and the thread is idle between frames (FinishFrame and NDS::RunFrame sync),
+// so the frontend can read the framebuffers and save states as before.
+// while display capture is armed, lines are drawn on the emulator thread instead, after a Sync2D:
+// DoCapture writes VRAM and VRAMDirty, and the GL renderers' GetLine needs the GL context. capture
+// is armed at line 0 and stays on until VBlank, so a frame that captures goes back to drawing here
+// from its first captured line on, and the next frame starts on the thread again.
+// the 3D line is copied into queued jobs (see Snapshot2DScanline), so software 3D works threaded too
+
+static inline void CPURelax() noexcept
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield");
+#endif
+}
+
+// spins until done() is true or the time is up, reading the clock every few rounds
+template <typename F>
+static bool SpinUntil(F done, u32 limitUs) noexcept
+{
+    auto start = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        for (int i = 0; i < 64; i++)
+        {
+            if (done()) return true;
+            CPURelax();
+        }
+
+        if (std::chrono::steady_clock::now() - start >= std::chrono::microseconds(limitUs))
+            return false;
+    }
+}
+
+void GPU::SetThreaded2D(bool threaded) noexcept
+{
+    if (threaded == IsThreaded2D())
+        return;
+
+    if (threaded)
+        Start2DThread();
+    else
+        Stop2DThread();
+}
+
+Platform::Thread* GPU::Get2DThread() const noexcept
+{
+    return Threaded2D ? Threaded2D->Thread : nullptr;
+}
+
+void GPU::Start2DThread() noexcept
+{
+    // the counts are equal here (nothing is queued while threaded 2D is off), so the thread starts idle
+    Threaded2D = std::make_unique<Threaded2DState>();
+    Threaded2D->Thread = Platform::Thread_Create([this]() { Run2DThread(); }, "GPU2DThread");
+    if (!Threaded2D->Thread)
+    {
+        // nothing would ever draw the queued lines, so stay with drawing them at HBlank
+        Threaded2D.reset();
+        Log(LogLevel::Error, "GPU2D: couldn't start the 2D thread, threaded 2D rendering stays off\n");
+        return;
+    }
+
+    Log(LogLevel::Info, "GPU2D: threaded 2D rendering on\n");
+}
+
+void GPU::Stop2DThread() noexcept
+{
+    if (!Threaded2D)
+        return;
+
+    // the thread only ever waits for work, so it can always be woken to stop
+    Sync2D();
+    {
+        std::lock_guard lock(Threaded2D->Mutex);
+        Threaded2D->Stopping.store(true, std::memory_order_relaxed);
+    }
+    Threaded2D->WorkWake.notify_one();
+
+    Platform::Thread_Wait(Threaded2D->Thread);
+    Platform::Thread_Free(Threaded2D->Thread);
+    Threaded2D.reset();
+
+    Log(LogLevel::Info, "GPU2D: threaded 2D rendering off\n");
+}
+
+void GPU::Run2DThread() noexcept
+{
+    Threaded2DState& state = *Threaded2D;
+    u32 done = Jobs2DDone.load(std::memory_order_relaxed);
+    bool frameDone = true;
+
+    while (Wait2DWork(done, frameDone ? Spin2DWorkVBlankUs : Spin2DWorkFrameUs))
+    {
+        // acquire: the jobs counted so far are fully written
+        u32 queued = Jobs2DQueued.load(std::memory_order_acquire);
+        while (done != queued)
+        {
+            const GPU2D::LineJob& job = state.Jobs[done % Ring2DSize];
+            GPU2D_Renderer->RunJob(job);
+            // after line 191 the next job is line 262's (sprites only), and after that one the
+            // next frame's line 0, with the frontend's frame gap in between
+            frameDone = !job.DrawBG || job.Line == 191;
+            done++;
+
+            // a release for the barrier (the line is drawn and its memory read), and seq_cst so
+            // that it pairs with SyncSleepers: a barrier going to sleep either sees this count or
+            // gets woken
+            Jobs2DDone.store(done, std::memory_order_seq_cst);
+            if (state.SyncSleepers.load(std::memory_order_seq_cst) > 0)
+            {
+                std::lock_guard lock(state.Mutex);
+                state.SyncWake.notify_all();
+            }
+        }
+    }
+}
+
+// on the 2D thread: waits until more than `done` jobs are queued, spinning for up to `spinUs` before
+// it sleeps. false when the thread should stop
+bool GPU::Wait2DWork(u32 done, u32 spinUs) noexcept
+{
+    Threaded2DState& state = *Threaded2D;
+    auto ready = [&]()
+    {
+        return Jobs2DQueued.load(std::memory_order_acquire) != done || state.Stopping.load(std::memory_order_relaxed);
+    };
+
+    if (!SpinUntil(ready, spinUs))
+    {
+        // seq_cst pairs with End2DJob: either it sees WorkSleeping and wakes us, or we see its job
+        std::unique_lock lock(state.Mutex);
+        state.WorkSleeping.store(true, std::memory_order_seq_cst);
+        while (Jobs2DQueued.load(std::memory_order_seq_cst) == done && !state.Stopping.load(std::memory_order_relaxed))
+            state.WorkWake.wait(lock);
+        state.WorkSleeping.store(false, std::memory_order_relaxed);
+    }
+
+    return !state.Stopping.load(std::memory_order_relaxed);
+}
+
+// waits until the 2D thread has drawn `count` jobs. Sync2D waits for all the queued ones
+void GPU::Wait2DJobs(u32 count) noexcept
+{
+    if (!Threaded2D)
+        return;
+
+    Threaded2DState& state = *Threaded2D;
+    // the counts wrap, so this compares the distance
+    auto reached = [&]() { return (s32)(Jobs2DDone.load(std::memory_order_acquire) - count) >= 0; };
+
+    if (SpinUntil(reached, Spin2DSyncUs))
+        return;
+
+    // seq_cst pairs with Run2DThread, see there
+    std::unique_lock lock(state.Mutex);
+    state.SyncSleepers.fetch_add(1, std::memory_order_seq_cst);
+    while ((s32)(Jobs2DDone.load(std::memory_order_seq_cst) - count) < 0)
+        state.SyncWake.wait(lock);
+    state.SyncSleepers.fetch_sub(1, std::memory_order_relaxed);
+}
+
+GPU2D::LineJob& GPU::Begin2DJob() noexcept
+{
+    GPU2D::LineJob* job = &Job2D;
+
+    if (Threaded2D)
+    {
+        if (!GPU2D_A.CaptureLatch)
+        {
+            // the next ring slot, once the thread is done with the job that used it last
+            u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
+            if (queued - Jobs2DDone.load(std::memory_order_acquire) >= Ring2DSize)
+                Wait2DJobs(queued - Ring2DSize + 1);
+
+            job = &Threaded2D->Jobs[queued % Ring2DSize];
+        }
+        else
+        {
+            // display capture: drawn here, after the lines queued before it
+            Sync2D();
+        }
+    }
+
+    Start2DJob(*job);
+    return *job;
+}
+
+void GPU::End2DJob(GPU2D::LineJob& job) noexcept
+{
+    if (!Is2DJobQueued(job))
+    {
+        GPU2D_Renderer->RunJob(job);
+        return;
+    }
+
+    // a release (the job is written before the count says so), and seq_cst so that it pairs with
+    // WorkSleeping: a thread going to sleep either sees this job or gets woken
+    Jobs2DQueued.store(Jobs2DQueued.load(std::memory_order_relaxed) + 1, std::memory_order_seq_cst);
+    if (Threaded2D->WorkSleeping.load(std::memory_order_seq_cst))
+    {
+        std::lock_guard lock(Threaded2D->Mutex);
+        Threaded2D->WorkWake.notify_one();
+    }
 }
 
 void GPU::FinishFrame(u32 lines) noexcept
 {
+    // line 262 queued the next frame's first sprites. after this the 2D thread is idle until the next frame
+    Sync2D();
+
     if (Hash2DLogging)
         LogHash2D();
 
@@ -1070,6 +1362,8 @@ void GPU::LogHash2D() noexcept
 
 void GPU::BlankFrame() noexcept
 {
+    Sync2D();
+
     int backbuf = FrontBuffer ? 0 : 1;
     int fbsize;
     if (GPU3D.IsRendererAccelerated())
@@ -1150,6 +1444,10 @@ void GPU::StartScanline(u32 line) noexcept
     {
         if (VCount == 192)
         {
+            // the frame's 2D lines must all be drawn before the GL renderers composite them, and
+            // before VBlank DMAs and the CPU start changing VRAM, palette and OAM for the next frame
+            Sync2D();
+
             // in reality rendering already finishes at line 144
             // and games might already start to modify texture memory.
             // That doesn't matter for us because we cache the entire

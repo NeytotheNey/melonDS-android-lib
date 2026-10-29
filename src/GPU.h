@@ -19,6 +19,7 @@
 #ifndef GPU_H
 #define GPU_H
 
+#include <atomic>
 #include <memory>
 
 #include "GPU2D.h"
@@ -29,6 +30,7 @@ namespace melonDS
 {
 class GPU3D;
 class ARMJIT;
+namespace Platform { struct Thread; }
 
 static constexpr u32 VRAMDirtyGranularity = 512;
 class GPU;
@@ -72,9 +74,37 @@ public:
     u8* GetUniqueBankPtr(u32 mask, u32 offset) noexcept;
     const u8* GetUniqueBankPtr(u32 mask, u32 offset) const noexcept;
 
-    void SetRenderer2D(std::unique_ptr<GPU2D::Renderer2D>&& renderer) noexcept { GPU2D_Renderer = std::move(renderer); }
+    void SetRenderer2D(std::unique_ptr<GPU2D::Renderer2D>&& renderer) noexcept { Sync2D(); GPU2D_Renderer = std::move(renderer); }
     [[nodiscard]] const GPU2D::Renderer2D& GetRenderer2D() const noexcept { return *GPU2D_Renderer; }
     [[nodiscard]] GPU2D::Renderer2D& GetRenderer2D() noexcept { return *GPU2D_Renderer; }
+
+    /// Draws the 2D layers on a thread of their own ("GPU2DThread") when true. Call it between frames.
+    /// It's off by default, and then no thread exists and each line is drawn at its HBlank.
+    void SetThreaded2D(bool threaded) noexcept;
+    [[nodiscard]] bool IsThreaded2D() const noexcept { return Threaded2D != nullptr; }
+    /// The 2D thread while threaded 2D is on, otherwise null (so the frontend can find it, e.g. for CPU hints)
+    [[nodiscard]] Platform::Thread* Get2DThread() const noexcept;
+
+    /// The 2D barrier: waits until the 2D thread has drawn every line it was given. Call it before
+    /// changing anything a queued line reads: palette, OAM, LCDC VRAM banks, VRAM mappings, the
+    /// flat VRAM copies, the framebuffers or the 2D renderer. It's only a check while the thread is
+    /// idle, or when threaded 2D is off
+    void Sync2D() noexcept
+    {
+        if (Is2DThreadBusy())
+            Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+    }
+
+    /// The barrier for writes to LCDC banks. A queued line only reads them in VRAM display mode
+    /// (display capture is never queued), so it only syncs while such a line may still be queued
+    void Sync2DForLCDC() noexcept
+    {
+        if (Queued2DReadsLCDC)
+        {
+            Sync2D();
+            Queued2DReadsLCDC = false;
+        }
+    }
 
     void MapVRAM_AB(u32 bank, u8 cnt) noexcept;
     void MapVRAM_CD(u32 bank, u8 cnt) noexcept;
@@ -151,6 +181,10 @@ public:
     template<typename T>
     void WriteVRAM_LCDC(u32 addr, T val)
     {
+        // VRAM display reads LCDC banks directly. the BG/OBJ writers below don't need the barrier:
+        // the 2D renderer reads those banks only through the flat copies (see MakeVRAMFlat_2DBGCoherent)
+        Sync2DForLCDC();
+
         int bank;
 
         switch (addr & 0xFF8FC000)
@@ -478,6 +512,7 @@ public:
     template<typename T>
     void WritePalette(u32 addr, T val)
     {
+        Sync2D();
         addr &= 0x7FF;
 
         *(T*)&Palette[addr] = val;
@@ -493,6 +528,7 @@ public:
     template<typename T>
     void WriteOAM(u32 addr, T val)
     {
+        Sync2D();
         addr &= 0x7FF;
 
         *(T*)&OAM[addr] = val;
@@ -631,6 +667,22 @@ private:
     void MakeVRAMFlat_2DBGCoherent() noexcept;
     void MakeVRAMFlat_2DOBJCoherent() noexcept;
 
+    // a job is either queued for the 2D thread (a ring slot) or drawn right away (Job2D)
+    GPU2D::LineJob& Begin2DJob() noexcept;
+    void End2DJob(GPU2D::LineJob& job) noexcept;
+    bool Is2DJobQueued(const GPU2D::LineJob& job) const noexcept { return &job != &Job2D; }
+
+    // threaded 2D, see SetThreaded2D in GPU.cpp
+    bool Is2DThreadBusy() const noexcept
+    {
+        return Jobs2DQueued.load(std::memory_order_relaxed) != Jobs2DDone.load(std::memory_order_acquire);
+    }
+    void Wait2DJobs(u32 count) noexcept;
+    void Start2DThread() noexcept;
+    void Stop2DThread() noexcept;
+    void Run2DThread() noexcept;
+    bool Wait2DWork(u32 done, u32 spinUs) noexcept;
+
     template<typename T>
     T ReadVRAM_ABGExtPal(u32 addr) const noexcept
     {
@@ -716,6 +768,18 @@ private:
 
     // only lives for one HBlank, so it isn't savestated
     GPU2D::LineJob Job2D {};
+
+    // emulator thread only: set when a queued job uses VRAM display, cleared by Sync2DForLCDC once
+    // the ring is drained (a drain elsewhere leaves it set, which only costs one idle check)
+    bool Queued2DReadsLCDC = false;
+
+    // threaded 2D: how many jobs the emulator thread has queued and the 2D thread has drawn (both
+    // wrap around). equal counts mean the thread is idle, which is all the barrier checks. they're
+    // never reset, so they stay equal while threaded 2D is off
+    std::atomic<u32> Jobs2DQueued {0};
+    std::atomic<u32> Jobs2DDone {0};
+    struct Threaded2DState;
+    std::unique_ptr<Threaded2DState> Threaded2D;
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;
