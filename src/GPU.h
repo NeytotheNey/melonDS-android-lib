@@ -584,6 +584,9 @@ public:
     int FrontBuffer = 0;
     std::unique_ptr<u32[]> Framebuffer[2][2] {};
 
+    // debug only: log a checksum of both 2D framebuffers at the end of every frame (see LogHash2D)
+    bool Hash2DLogging = false;
+
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;
     melonDS::GPU3D GPU3D;
@@ -619,6 +622,7 @@ private:
     void ResetVRAMCache() noexcept;
     void AssignFramebuffers() noexcept;
     void InitFramebuffers() noexcept;
+    void LogHash2D() noexcept;
     template<typename T>
     T ReadVRAM_ABGExtPal(u32 addr) const noexcept
     {
@@ -704,6 +708,8 @@ private:
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;
+
+    u32 Hash2DFrame = 0;
 };
 }
 

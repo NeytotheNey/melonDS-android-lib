@@ -195,6 +195,8 @@ void GPU::Reset() noexcept
 
     OAMDirty = 0x3;
     PaletteDirty = 0xF;
+
+    Hash2DFrame = 0;
 }
 
 void GPU::Stop() noexcept
@@ -920,6 +922,9 @@ void GPU::StartHBlank(u32 line) noexcept
 
 void GPU::FinishFrame(u32 lines) noexcept
 {
+    if (Hash2DLogging)
+        LogHash2D();
+
     FrontBuffer = FrontBuffer ? 0 : 1;
     AssignFramebuffers();
 
@@ -930,6 +935,47 @@ void GPU::FinishFrame(u32 lines) noexcept
         GPU3D.RestartFrame(*this);
         GPU3D.AbortFrame = false;
     }
+}
+
+// debug only: logs a checksum (64-bit FNV-1a over 32-bit words) of what the 2D renderer drew
+// into the back buffers this frame, so two builds can be checked for byte-identical output
+// by diffing their logs.
+// with an accelerated 3D renderer, each line is 3x256 words plus a control word. the second and
+// third 256 words are only written on lines in display mode 1 (and the compositor only reads them
+// there); on other lines they hold whatever an older frame left, so they're left out.
+void GPU::LogHash2D() noexcept
+{
+    int backbuf = FrontBuffer ? 0 : 1;
+    bool accel = GPU3D.IsRendererAccelerated();
+    int stride = accel ? (256*3 + 1) : 256;
+
+    u64 hash[2];
+    for (int screen = 0; screen < 2; screen++)
+    {
+        const u32* fb = Framebuffer[backbuf][screen].get();
+        if (!fb) return;
+
+        u64 h = 0xCBF29CE484222325ULL;
+        for (int line = 0; line < 192; line++)
+        {
+            const u32* src = &fb[stride * line];
+            int count = 256;
+            if (accel)
+            {
+                u32 ctrl = src[256*3];
+                h = (h ^ ctrl) * 0x100000001B3ULL;
+                if (((ctrl >> 16) & 0x3) == 1)
+                    count = 256*3;
+            }
+
+            for (int i = 0; i < count; i++)
+                h = (h ^ src[i]) * 0x100000001B3ULL;
+        }
+        hash[screen] = h;
+    }
+
+    Log(LogLevel::Info, "HASH2D frame=%u top=%016llX bottom=%016llX\n",
+        Hash2DFrame++, (unsigned long long)hash[0], (unsigned long long)hash[1]);
 }
 
 void GPU::BlankFrame() noexcept
