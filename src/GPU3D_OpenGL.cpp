@@ -21,9 +21,12 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL_shaders.h"
+#include "Platform.h"
+#include "WideMelon.h"
 
 namespace melonDS
 {
@@ -109,6 +112,12 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_STENCIL_TEST);
+
+    GLint maxTextureSize = 0;
+    GLint maxViewportDims[2] = {};
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewportDims);
+    result->MaxTargetWidth = std::min(maxTextureSize, maxViewportDims[0]);
 
     glDepthRangef(0.0f, 1.0f);
     glClearDepthf(1.0f);
@@ -333,16 +342,61 @@ void GLRenderer::SetScaleFactor(int scale) noexcept
 }
 
 
+bool GLRenderer::TargetFits(int width, int scale) const noexcept
+{
+    return width == WideMelon::NativeWidth || MaxTargetWidth <= 0 || width * scale <= MaxTargetWidth;
+}
+
+int GLRenderer::ResolveViewWidth(int width, int scale) noexcept
+{
+    if (width == WideMelon::NativeWidth)
+        return width;
+
+    if (!TargetFits(width, scale))
+    {
+        Platform::Log(Platform::LogLevel::Warn, "WideMelon: %dx%d does not fit in %d, using native width\n",
+            width, scale, MaxTargetWidth);
+        return WideMelon::NativeWidth;
+    }
+
+    if (!CurGLCompositor.PrepareWide())
+        return WideMelon::NativeWidth;
+
+    return width;
+}
+
+void GLRenderer::SetViewWidth(int width) noexcept
+{
+    RequestedViewWidth = WideMelon::SanitizeWidth(width);
+
+    // the scale decides whether it fits, the first SetRenderSettings resolves it otherwise.
+    // the targets follow in RenderFrame
+    if (ScaleFactor > 0)
+        ViewWidth = ResolveViewWidth(RequestedViewWidth, ScaleFactor);
+}
+
 void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
 {
-    if (betterpolygons == BetterPolygons && scale == ScaleFactor)
+    ViewWidth = ResolveViewWidth(RequestedViewWidth, scale);
+
+    int targetWidth = TargetWidth;
+    if (!TargetFits(targetWidth, scale))
+        targetWidth = ViewWidth;
+
+    ResizeTargets(betterpolygons, scale, targetWidth);
+}
+
+void GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept
+{
+    if (betterpolygons == BetterPolygons && scale == ScaleFactor && targetWidth == TargetWidth)
         return;
 
-    CurGLCompositor.SetScaleFactor(scale);
+    CurGLCompositor.SetRenderSettings(scale, targetWidth);
     ScaleFactor = scale;
+    TargetWidth = targetWidth;
     BetterPolygons = betterpolygons;
 
-    ScreenW = 256 * scale;
+    ScreenW = targetWidth * scale;
     ScreenH = 192 * scale;
 
     glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
@@ -464,6 +518,9 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
         }
     }*/
 
+    if (WideFrame)
+        x = WideVertexX(vtx->HiresPosition[0]);
+
     *vptr++ = x | (y << 16);
     *vptr++ = z | (w << 16);
 
@@ -480,6 +537,12 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
     *vptr++ = (poly->TexParam >> 16 ) | (poly->TexPalette << 16);
 
     return vptr;
+}
+
+// wide views always go through the hi-res position, which GPU3D already placed on the wide target
+u32 GLRenderer::WideVertexX(s32 hiresx) const
+{
+    return (std::max(hiresx + WideXAdjust, 0) * ScaleFactor) >> 4;
 }
 
 void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys)
@@ -631,7 +694,10 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                 cS *= cW;
                 cT *= cW;
 
-                cX = (cX * ScaleFactor) >> 4;
+                if (WideFrame)
+                    cX = WideVertexX((s32)cX);
+                else
+                    cX = (cX * ScaleFactor) >> 4;
                 cY = (cY * ScaleFactor) >> 4;
 
                 u32 w = (u32)cW;
@@ -761,7 +827,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     u32 flags = 0;
     if (gpu3d.RenderPolygonRAM[0]->WBuffer) flags |= RenderFlag_WBuffer;
 
-    if (h != 192) glScissor(0, y<<ScaleFactor, 256<<ScaleFactor, h<<ScaleFactor);
+    if (h != 192) glScissor(0, y<<ScaleFactor, ScreenW, h<<ScaleFactor);
 
     GLboolean fogenable = (gpu3d.RenderDispCnt & (1<<7)) ? GL_TRUE : GL_FALSE;
 
@@ -1127,6 +1193,15 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
 void GLRenderer::RenderFrame(GPU& gpu)
 {
+    // the targets match the polygons drawn here, so after a width change they only shrink once
+    // the game has built geometry at the new width. this runs after the frame's Blit, so the
+    // compositor's width only changes between frames as well
+    int targetWidth = std::max(ViewWidth, gpu.GPU3D.RenderViewWidth);
+    if (!TargetFits(targetWidth, ScaleFactor) ||
+        (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
+        targetWidth = ViewWidth;
+    ResizeTargets(BetterPolygons, ScaleFactor, targetWidth);
+
     CurShaderID = -1;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -1135,6 +1210,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     ShaderConfig.uScreenSize[0] = ScreenW;
     ShaderConfig.uScreenSize[1] = ScreenH;
     ShaderConfig.uDispCnt = gpu.GPU3D.RenderDispCnt;
+
+    WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
+    WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
 
     for (int i = 0; i < 32; i++)
     {
@@ -1326,7 +1404,11 @@ void GLRenderer::PrepareCaptureFrame()
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DownscaleFramebuffer);
     GLenum bufferAttachment = GL_COLOR_ATTACHMENT0;
     glDrawBuffers(1, &bufferAttachment);
-    glBlitFramebuffer(0, 0, ScreenW, ScreenH, 0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    // the game only ever sees the native 256 it asked for, so capture
+    // (and GetLine) read back the centre of a wide target
+    int captureX = ((TargetWidth - WideMelon::NativeWidth) / 2) * ScaleFactor;
+    glBlitFramebuffer(captureX, 0, captureX + WideMelon::NativeWidth * ScaleFactor, ScreenH,
+                      0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, PixelbufferID);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, DownscaleFramebuffer);

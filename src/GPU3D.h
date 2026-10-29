@@ -112,6 +112,11 @@ public:
 
     void SetRenderXPos(u16 xpos) noexcept;
     [[nodiscard]] u16 GetRenderXPos() const noexcept { return RenderXPos; }
+
+    // width of the 3D view in native pixels (256 = stock DS) that geometry is being built for.
+    // it follows the renderer's GetViewWidth(), latched when the polygon RAM is swapped (or at
+    // VBlank while the geometry engine is off)
+    [[nodiscard]] int GetViewWidth() const noexcept { return ViewWidth; }
     u32* GetLine(int line) noexcept;
 
     void WriteToGXFIFO(u32 val) noexcept;
@@ -190,6 +195,7 @@ private:
     std::unique_ptr<Renderer3D> CurrentRenderer = nullptr;
 
     u16 RenderXPos = 0;
+    int ViewWidth = 256;
 
 public:
     FIFO<CmdFIFOEntry, 256> CmdFIFO {};
@@ -272,6 +278,7 @@ public:
     u32 RenderClearAttr2 = 0;
 
     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
+    int RenderViewWidth = 256; // the view width RenderPolygonRAM was built for, not serialized either
 
     bool AbortFrame = false;
 
@@ -355,6 +362,12 @@ public:
     virtual void PrepareCaptureFrame() {}
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
+
+    // WideMelon, in native pixels: the width new geometry should be built for, and the width of
+    // the output right now (it can lag behind for the polygons still being drawn).
+    // only the GL renderer goes wider than 256
+    [[nodiscard]] virtual int GetViewWidth() const noexcept { return 256; }
+    [[nodiscard]] virtual int GetOutputWidth() const noexcept { return 256; }
 
     virtual bool NeedsShaderCompile() { return false; }
     virtual void ShaderCompileStep(int& current, int& count) {}

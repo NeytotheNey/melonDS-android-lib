@@ -42,6 +42,12 @@ public:
     void SetScaleFactor(int scale) noexcept;
     [[nodiscard]] int GetScaleFactor() const noexcept { return Scale; }
 
+    // WideMelon: the output is viewWidth x scale wide, and the wide shader is only built when
+    // PrepareWide() is first called. it returns false if that failed, then only 256 works
+    void SetRenderSettings(int scale, int viewWidth) noexcept;
+    [[nodiscard]] int GetViewWidth() const noexcept { return ViewWidth; }
+    bool PrepareWide() noexcept;
+
     void Stop(const GPU& gpu) noexcept;
     void RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept;
     void SetOutputTexture(int buf, GLuint texture);
@@ -49,10 +55,17 @@ public:
 private:
     GLCompositor(GLuint CompShader) noexcept;
     int Scale = 0;
+    int ViewWidth = 256;
     int ScreenH = 0, ScreenW = 0;
 
     GLuint CompShader {};
     GLuint CompScaleLoc = 0;
+
+    GLuint CompShaderWide {};
+    bool CompShaderWideFailed = false;
+    GLuint CompWideScaleLoc = 0;
+    GLuint CompWideRatioLoc = 0;
+    GLuint CompWideOffsetLoc = 0;
 
     GLuint CompVertexBufferID = 0;
     GLuint CompVertexArrayID = 0;

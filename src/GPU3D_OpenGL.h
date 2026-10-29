@@ -39,6 +39,20 @@ public:
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
 
+    // WideMelon: width of the 3D view in native pixels (even, 256..768, anything else means 256).
+    // * it's kept across SetRenderSettings calls and re-checked when the scale changes: it drops
+    //   back to 256 when width x scale doesn't fit in a texture, or the wide compositor shader
+    //   doesn't build. a new GLRenderer starts at 256, so the frontend has to set it again.
+    // * SetViewWidth and SetRenderSettings can compile that shader and reallocate the targets, so
+    //   call them on the GL (emulator) thread, between RunFrame calls.
+    // * GetViewWidth is the width new geometry is built for. GetOutputWidth is the width of the
+    //   targets and the compositor's output, which follows at RenderFrame (VCount 215) once the
+    //   polygons being drawn match, so it can lag a frame or two, or longer on static 3D.
+    //   the frontend's output texture must be GetOutputWidth() x scale wide, checked every frame
+    void SetViewWidth(int width) noexcept;
+    [[nodiscard]] int GetViewWidth() const noexcept override { return ViewWidth; }
+    [[nodiscard]] int GetOutputWidth() const noexcept override { return TargetWidth; }
+
     void VCount144(GPU& gpu) override {};
     void RenderFrame(GPU& gpu) override;
     void Stop(const GPU& gpu) override;
@@ -81,6 +95,10 @@ private:
     void UseRenderShader(u32 flags);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
+    u32 WideVertexX(s32 hiresx) const;
+    bool TargetFits(int width, int scale) const noexcept;
+    int ResolveViewWidth(int width, int scale) noexcept;
+    void ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
@@ -154,6 +172,16 @@ private:
     int ScaleFactor {};
     bool BetterPolygons {};
     int ScreenW {}, ScreenH {};
+
+    int RequestedViewWidth = 256;
+    int ViewWidth = 256;
+    int TargetWidth = 256;
+    int MaxTargetWidth {};
+
+    // set per frame: the polygons were built for a wide view, or are drawn into one. when the
+    // two widths differ (right after a change), WideXAdjust keeps them centred
+    bool WideFrame {};
+    s32 WideXAdjust {};
 
     GLuint ColorBufferTex {}, DepthBufferTex {}, AttrBufferTex {};
     GLuint DownScaleBufferTex {};

@@ -26,6 +26,10 @@ const char* kCompositorVS = R"(#version 320 es
 in vec2 vPosition;
 in vec2 vTexcoord;
 
+#ifdef WIDE
+uniform float uWideRatio;
+#endif
+
 smooth out vec2 fTexcoord;
 
 void main()
@@ -36,16 +40,29 @@ void main()
     fpos.w = 1.0;
 
     gl_Position = fpos;
+#ifdef WIDE
+    // spread the native 0..256 over the wide output, what ends up below 0 or past 256 is a wing
+    fTexcoord = vec2((vTexcoord.x - 128.0) * uWideRatio + 128.0, vTexcoord.y);
+#else
     fTexcoord = vTexcoord;
+#endif
 }
 )";
 
 const char* kCompositorFS_Nearest = R"(#version 320 es
 
+#ifdef WIDE
+// wide coordinates need more precision than mediump (which can be fp16) has
+precision highp float;
+#else
 precision mediump float;
+#endif
 precision mediump usampler2D;
 
 uniform uint u3DScale;
+#ifdef WIDE
+uniform int uWideOffset;
+#endif
 
 uniform usampler2D ScreenTex;
 uniform sampler2D _3DTex;
@@ -54,8 +71,76 @@ smooth in vec2 fTexcoord;
 
 layout(location = 0) out vec4 oColor;
 
+ivec4 Fetch3D(float xpos, float ypos)
+{
+#ifdef WIDE
+    // xpos is in native pixels, and the 3D target is uWideOffset wider on each side.
+    // past its edges there's no 3D, like with a scrolled native 3D layer
+    ivec2 coord = ivec2(floor(vec2(xpos + float(uWideOffset), ypos) * float(u3DScale)));
+    if (coord.x < 0 || coord.x >= textureSize(_3DTex, 0).x)
+        return ivec4(0);
+    return ivec4(texelFetch(_3DTex, coord, 0).bgra * vec4(63,63,63,31));
+#else
+    return ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos) * float(u3DScale)), 0).bgra
+         * vec4(63,63,63,31));
+#endif
+}
+
+#ifdef WIDE
+// the wide output's extra columns. only the top screen's 3D layer goes there, on the lines
+// where unit A shows it (control word bit 18), and the 2D layers stay native.
+// lines that are all white (bit 21) get white wings
+ivec4 WingPixel()
+{
+    if (fTexcoord.y >= 192.0)
+        return ivec4(0);
+
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+    int dispmode = mbright.b & 0x3;
+
+    ivec4 pixel = ivec4(0);
+    if ((mbright.b & 0x20) != 0)
+    {
+        pixel = ivec4(0x3F);
+    }
+    else if ((mbright.b & 0x4) != 0)
+    {
+        // same X scroll as the middle
+        float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
+        pixel = Fetch3D(fTexcoord.x + _3dxpos, fTexcoord.y);
+
+        // BLDCNT fade, as for 3D on top in the middle (bits 19-20, EVY in bits 8-12)
+        int effect = (mbright.b >> 3) & 0x3;
+        int evy = mbright.g & 0x1F;
+        if      (effect == 2) pixel += (((0x3F - pixel) * evy) + 0x8) >> 4;
+        else if (effect == 3) pixel -= ((pixel * evy) + 0x7) >> 4;
+    }
+
+    if (dispmode != 0)
+    {
+        int brightmode = mbright.g >> 6;
+        int evy = min(mbright.r & 0x1F, 16);
+        if      (brightmode == 1) pixel += ((0x3F - pixel) * evy) >> 4;
+        else if (brightmode == 2) pixel -= ((pixel * evy) + 0xF) >> 4;
+    }
+
+    return pixel;
+}
+#endif
+
 void main()
 {
+#ifdef WIDE
+    if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
+    {
+        ivec4 wing = WingPixel();
+        wing.rgb <<= 2;
+        wing.rgb |= (wing.rgb >> 6);
+        oColor = vec4(vec3(wing.bgr) / 255.0, 1.0);
+        return;
+    }
+#endif
+
     ivec4 pixel = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord), 0));
 
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
@@ -80,8 +165,7 @@ void main()
 
             float xpos = fTexcoord.x + _3dxpos;
             float ypos = mod(fTexcoord.y, 192.0);
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos) * float(u3DScale)), 0).bgra
-                         * vec4(63,63,63,31));
+            ivec4 _3dpix = Fetch3D(xpos, ypos);
 
             if (_3dpix.a > 0)
             {
@@ -100,8 +184,7 @@ void main()
 
             float xpos = fTexcoord.x + _3dxpos;
             float ypos = mod(fTexcoord.y, 192.0);
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*float(u3DScale)), 0).bgra
-                         * vec4(63,63,63,31));
+            ivec4 _3dpix = Fetch3D(xpos, ypos);
 
             if (_3dpix.a > 0)
             {
@@ -120,8 +203,7 @@ void main()
 
             float xpos = fTexcoord.x + _3dxpos;
             float ypos = mod(fTexcoord.y, 192.0);
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*float(u3DScale)), 0).bgra
-                         * vec4(63,63,63,31));
+            ivec4 _3dpix = Fetch3D(xpos, ypos);
 
             if (_3dpix.a > 0)
             {

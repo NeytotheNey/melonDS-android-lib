@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "NDS.h"
 #include "GPU.h"
@@ -131,14 +132,21 @@ GLCompositor::~GLCompositor()
     glDeleteBuffers(1, &CompVertexBufferID);
 
     glDeleteProgram(CompShader);
+    glDeleteProgram(CompShaderWide);
 }
 
 
 GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     Scale(other.Scale),
+    ViewWidth(other.ViewWidth),
     ScreenH(other.ScreenH),
     ScreenW(other.ScreenW),
     CompScaleLoc(other.CompScaleLoc),
+    CompShaderWide(other.CompShaderWide),
+    CompShaderWideFailed(other.CompShaderWideFailed),
+    CompWideScaleLoc(other.CompWideScaleLoc),
+    CompWideRatioLoc(other.CompWideRatioLoc),
+    CompWideOffsetLoc(other.CompWideOffsetLoc),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -153,6 +161,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     other.CompVertexArrayID = {};
     other.CompVertexBufferID = {};
     other.CompShader = {};
+    other.CompShaderWide = {};
 }
 
 GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
@@ -160,14 +169,22 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
     if (this != &other)
     {
         Scale = other.Scale;
+        ViewWidth = other.ViewWidth;
         ScreenH = other.ScreenH;
         ScreenW = other.ScreenW;
         CompScaleLoc = other.CompScaleLoc;
+        CompShaderWideFailed = other.CompShaderWideFailed;
+        CompWideScaleLoc = other.CompWideScaleLoc;
+        CompWideRatioLoc = other.CompWideRatioLoc;
+        CompWideOffsetLoc = other.CompWideOffsetLoc;
         CompVertices = other.CompVertices;
 
         // Clean up these resources before overwriting them
         glDeleteProgram(CompShader);
         CompShader = other.CompShader;
+
+        glDeleteProgram(CompShaderWide);
+        CompShaderWide = other.CompShaderWide;
 
         glDeleteBuffers(1, &CompVertexBufferID);
         CompVertexBufferID = other.CompVertexBufferID;
@@ -190,19 +207,59 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         other.CompVertexArrayID = {};
         other.CompVertexBufferID = {};
         other.CompShader = {};
+        other.CompShaderWide = {};
     }
 
     return *this;
 }
 
+bool GLCompositor::PrepareWide() noexcept
+{
+    if (CompShaderWide || CompShaderWideFailed)
+        return CompShaderWide != 0;
+
+    // the same shaders with WIDE defined, which has to come after the #version line
+    std::string vs = kCompositorVS;
+    std::string fs = kCompositorFS_Nearest;
+    vs.insert(vs.find('\n') + 1, "#define WIDE\n");
+    fs.insert(fs.find('\n') + 1, "#define WIDE\n");
+
+    GLuint shader {};
+    if (!OpenGL::CompileVertexFragmentProgram(shader,
+            vs, fs,
+            "CompositorShaderWide",
+            {{"vPosition", 0}, {"vTexcoord", 1}},
+            {{"oColor", 0}}))
+    {
+        CompShaderWideFailed = true;
+        return false;
+    }
+
+    CompShaderWide = shader;
+    CompWideScaleLoc = glGetUniformLocation(CompShaderWide, "u3DScale");
+    CompWideRatioLoc = glGetUniformLocation(CompShaderWide, "uWideRatio");
+    CompWideOffsetLoc = glGetUniformLocation(CompShaderWide, "uWideOffset");
+
+    glUseProgram(CompShaderWide);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "_3DTex"), 1);
+
+    return true;
+}
 
 void GLCompositor::SetScaleFactor(int scale) noexcept
 {
-    if (scale == Scale)
+    SetRenderSettings(scale, ViewWidth);
+}
+
+void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
+{
+    if (scale == Scale && viewWidth == ViewWidth)
         return;
 
     Scale = scale;
-    ScreenW = 256 * scale;
+    ViewWidth = viewWidth;
+    ScreenW = viewWidth * scale;
     ScreenH = (384+2) * scale;
 
     for (int i = 0; i < 2; i++)
@@ -250,8 +307,18 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     glViewport(0, 0, ScreenW, ScreenH);
 
     // TODO: select more shaders (filtering, etc)
-    glUseProgram(CompShader);
-    glUniform1ui(CompScaleLoc, Scale);
+    if (ViewWidth == 256)
+    {
+        glUseProgram(CompShader);
+        glUniform1ui(CompScaleLoc, Scale);
+    }
+    else
+    {
+        glUseProgram(CompShaderWide);
+        glUniform1ui(CompWideScaleLoc, Scale);
+        glUniform1f(CompWideRatioLoc, ViewWidth / 256.0f);
+        glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
+    }
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, CompScreenInputTex);

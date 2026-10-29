@@ -200,6 +200,10 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
         if (CurJob->Accelerated)
         {
             dst[256*3] = 0;
+
+            // white wings next to the white line (see below)
+            if (CurJob->WideView)
+                dst[256*3] = (1 << 21);
         }
         return;
     }
@@ -295,6 +299,29 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
         dst[256*3] = masterBrightness |
                      (CurUnit->DispCnt & 0x30000) |
                      (xpos << 24) | ((xpos & 0x100) << 15);
+
+        if (CurJob->WideView)
+        {
+            // wide 3D view: bit 18 = this line shows unit A's 3D layer in the wings, bits 19-20 = its
+            // BLDCNT fade (BG0 as 1st target) and bits 8-12 = EVY for it, bit 21 = white wings, for
+            // a white line (screen off or forced blank). the master brightness register doesn't use
+            // bits 5-13
+            dst[256*3] &= ~0x1F00;
+
+            if ((dispmode == 0) || ((dispmode == 1) && (CurUnit->DispCnt & 0x80)))
+            {
+                dst[256*3] |= (1 << 21);
+            }
+            else if ((CurUnit->Num == 0) && CurUnit->Enabled && (dispmode == 1) &&
+                ((CurUnit->DispCnt & 0x188) == 0x108))
+            {
+                u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
+                u32 evy = CurUnit->EVY;
+                if (evy > 16) evy = 16;
+
+                dst[256*3] |= (1 << 18) | (effect << 19) | (evy << 8);
+            }
+        }
         return;
     }
 

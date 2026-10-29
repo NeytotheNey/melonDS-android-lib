@@ -21,6 +21,7 @@
 #include <algorithm>
 #include "NDS.h"
 #include "GPU.h"
+#include "WideMelon.h"
 #include "FIFO.h"
 #include "GPU3D_Soft.h"
 #include "Platform.h"
@@ -164,6 +165,9 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
 {
     CurrentRenderer = std::move(renderer);
     CurrentRenderer->Reset(NDS.GPU);
+
+    // software and compute only do 256, so don't keep squeezing geometry for them
+    ViewWidth = CurrentRenderer->GetViewWidth();
 }
 
 void GPU3D::ResetRenderingState() noexcept
@@ -304,6 +308,9 @@ void GPU3D::Reset() noexcept
     FlushAttributes = 0;
 
     RenderXPos = 0;
+
+    ViewWidth = CurrentRenderer ? CurrentRenderer->GetViewWidth() : WideMelon::NativeWidth;
+    RenderViewWidth = ViewWidth;
 
     if (CurrentRenderer)
         CurrentRenderer->Reset(NDS.GPU);
@@ -1150,6 +1157,19 @@ void GPU3D::SubmitPolygon() noexcept
 
             vtx->HiresPosition[0] = posX & 0x1FFF;
             vtx->HiresPosition[1] = posY & 0xFFF;
+
+            if (ViewWidth != WideMelon::NativeWidth)
+            {
+                // X was squeezed by 256/W around clip X = 0, which is the viewport's centre, so it's
+                // stretched back by W/256 around that same point, on a target (W-256)/2 wider each side
+                s64 centre = ((s64)Viewport[0] << 4) + ((s64)Viewport[4] << 3) + ((ViewWidth - WideMelon::NativeWidth) << 3);
+                s64 num = (s64)vtx->Position[0] * Viewport[4] * ViewWidth;
+                s64 den = (s64)w << 5;
+                s64 wideX = centre + (num >= 0 ? num / den : -((den - 1 - num) / den));
+
+                // the native formula can't go negative, but a wrapped viewport (x1 < x0) can here
+                vtx->HiresPosition[0] = std::clamp<s64>(wideX, 0, 0x3FFF);
+            }
         }
     }
 
@@ -1365,6 +1385,9 @@ void GPU3D::SubmitVertex() noexcept
     vertextrans->Position[1] = (vertex[0]*ClipMatrix[1] + vertex[1]*ClipMatrix[5] + vertex[2]*ClipMatrix[9] + vertex[3]*ClipMatrix[13]) >> 12;
     vertextrans->Position[2] = (vertex[0]*ClipMatrix[2] + vertex[1]*ClipMatrix[6] + vertex[2]*ClipMatrix[10] + vertex[3]*ClipMatrix[14]) >> 12;
     vertextrans->Position[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
+
+    if (ViewWidth != WideMelon::NativeWidth)
+        vertextrans->Position[0] = WideMelon::ProjectX(vertextrans->Position[0], ViewWidth);
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -1587,6 +1610,14 @@ void GPU3D::BoxTest(const u32* params) noexcept
         cube[i].Position[1] = ((s64)x*ClipMatrix[1] + (s64)y*ClipMatrix[5] + (s64)z*ClipMatrix[9] + (s64)0x1000*ClipMatrix[13]) >> 12;
         cube[i].Position[2] = ((s64)x*ClipMatrix[2] + (s64)y*ClipMatrix[6] + (s64)z*ClipMatrix[10] + (s64)0x1000*ClipMatrix[14]) >> 12;
         cube[i].Position[3] = ((s64)x*ClipMatrix[3] + (s64)y*ClipMatrix[7] + (s64)z*ClipMatrix[11] + (s64)0x1000*ClipMatrix[15]) >> 12;
+    }
+
+    // box tests have to agree with the widened frustum, otherwise games that
+    // cull with them drop objects that would be visible at the sides
+    if (ViewWidth != WideMelon::NativeWidth)
+    {
+        for (int i = 0; i < 8; i++)
+            cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], ViewWidth);
     }
 
     // front face (-Z)
@@ -2486,6 +2517,7 @@ void GPU3D::VBlank() noexcept
                 }
 
                 RenderNumPolygons = NumPolygons;
+                RenderViewWidth = ViewWidth;
                 RenderFrameIdentical = false;
             }
             else
@@ -2529,7 +2561,15 @@ void GPU3D::VBlank() noexcept
             NumOpaquePolygons = 0;
 
             FlushRequest = 0;
+
+            // the width only changes between frames of geometry: right after a swap...
+            ViewWidth = CurrentRenderer->GetViewWidth();
         }
+    }
+    else if (NumVertices == 0 && NumPolygons == 0 && VertexNumInPoly == 0)
+    {
+        // ...or while the geometry engine is off with nothing half-built
+        ViewWidth = CurrentRenderer->GetViewWidth();
     }
 }
 

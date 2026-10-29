@@ -153,6 +153,7 @@ struct LineJob
 
     bool Accelerated;       // OpenGL/Compute 3D: the accelerated line format
     u16 RenderXPos;         // 3D layer X position, for the accelerated format's control word
+    bool WideView;          // the 3D output is wider than 256, so the control word carries the wings info
     u32* Framebuffer[2];    // per Unit, as assigned when the job was built (POWCNT can swap them)
     u32* Line3D;            // unit A's 3D line, or null when this line didn't fetch it (the renderer keeps the last one)
     u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks

@@ -1008,6 +1008,7 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     job.VCount = VCount;
     job.Accelerated = GPU3D.IsRendererAccelerated();
     job.RenderXPos = GPU3D.GetRenderXPos();
+    job.WideView = job.Accelerated && GPU3D.GetCurrentRenderer().GetOutputWidth() != 256;
     job.Framebuffer[0] = GPU2D_Renderer->GetFramebuffer(0);
     job.Framebuffer[1] = GPU2D_Renderer->GetFramebuffer(1);
     job.VRAMMap_LCDC = VRAMMap_LCDC;
