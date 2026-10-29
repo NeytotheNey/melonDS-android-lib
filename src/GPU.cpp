@@ -57,21 +57,33 @@ static constexpr u32 Ring2DSize = 256;
 // the barrier waits for lines that are being drawn, usually only one or two
 static constexpr u32 Spin2DWorkFrameUs = 100;
 static constexpr u32 Spin2DWorkVBlankUs = 10;
-static constexpr u32 Spin2DSyncUs = 50;
+// experiment ovh3 (10-29): hardware counters on the Z Fold showed the emulator thread's effective
+// clock dropping from 1.26 GHz to 1.0 GHz with threaded 2D on, because it sleeps on the barrier
+// about two extra times a frame, and a thread that idles in short bursts gets 20-30% less clock
+// than the governor reports. the barrier wait at frame end is only 0.1-0.3 ms, so spinning
+// through it keeps the core awake. the right value is still to be tuned
+static constexpr u32 Spin2DSyncUs = 2000;
 
 // only exists while threaded 2D is on
 struct GPU::Threaded2DState
 {
     std::unique_ptr<GPU2D::LineJob[]> Jobs = std::make_unique<GPU2D::LineJob[]>(Ring2DSize);
     Platform::Thread* Thread = nullptr;
+    std::atomic<bool> Stopping {false};
 
     std::mutex Mutex;
     std::condition_variable WorkWake;   // a job was queued, or the thread should stop
-    std::condition_variable SyncWake;   // a job was drawn
-    std::atomic<bool> WorkSleeping {false};
+    std::condition_variable SyncWake;   // the sleepers' target count of jobs was drawn
+
+    // each thread reads the other's flags after every job, so the 2D thread's flag and the
+    // emulator thread's are on cache lines of their own, away from the mutex and condvars that
+    // both threads write when they sleep or wake (the struct's alignment pads the last line)
+    alignas(64) std::atomic<bool> WorkSleeping {false};
     // a count, in case a barrier on another thread (a savestate) ever waits at the same time
-    std::atomic<int> SyncSleepers {0};
-    std::atomic<bool> Stopping {false};
+    alignas(64) std::atomic<int> SyncSleepers {0};
+    // the job count the sleepers wait for (the lowest one, if there are several). only written
+    // under the mutex, by sleepers; see Wait2DJobs
+    std::atomic<u32> SyncTarget {0};
 };
 
 
@@ -1091,9 +1103,10 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 // when it's on, StartHBlank queues each line's job in a ring and the 2D thread draws them in order.
 // the emulator thread still does everything that changes state, so a queued job only needs the
 // memory it reads to stay as it was: whatever writes palette, OAM, LCDC banks, VRAM mappings, the
-// flat copies, the framebuffers or the renderer runs Sync2D first. the frame's lines are all drawn
-// by StartScanline(192), and the thread is idle between frames (FinishFrame and NDS::RunFrame sync),
-// so the frontend can read the framebuffers and save states as before.
+// flat copies, the framebuffers or the renderer runs Sync2D first. with an accelerated 3D renderer
+// the frame's lines are all drawn by the end of StartScanline(192), where the GL compositor reads
+// them, and the thread is idle between frames (FinishFrame and NDS::RunFrame sync), so the frontend
+// can read the framebuffers and save states as before.
 // while display capture is armed, lines are drawn on the emulator thread instead, after a Sync2D:
 // DoCapture writes VRAM and VRAMDirty, and the GL renderers' GetLine needs the GL context. capture
 // is armed at line 0 and stays on until VBlank, so a frame that captures goes back to drawing here
@@ -1199,10 +1212,14 @@ void GPU::Run2DThread() noexcept
             done++;
 
             // a release for the barrier (the line is drawn and its memory read), and seq_cst so
-            // that it pairs with SyncSleepers: a barrier going to sleep either sees this count or
-            // gets woken
+            // that it pairs with SyncSleepers and SyncTarget: a barrier going to sleep either sees
+            // this count or gets woken. a sleeper stores its target before it adds itself to the
+            // count, and the loads here are in the opposite order, so a sleeper seen here has its
+            // target in place, and it's only woken once that count is reached, not for every line
+            // before it (Wait2DJobs explains the target with several sleepers)
             Jobs2DDone.store(done, std::memory_order_seq_cst);
-            if (state.SyncSleepers.load(std::memory_order_seq_cst) > 0)
+            if (state.SyncSleepers.load(std::memory_order_seq_cst) > 0
+                && (s32)(done - state.SyncTarget.load(std::memory_order_seq_cst)) >= 0)
             {
                 std::lock_guard lock(state.Mutex);
                 state.SyncWake.notify_all();
@@ -1247,11 +1264,39 @@ void GPU::Wait2DJobs(u32 count) noexcept
     if (SpinUntil(reached, Spin2DSyncUs))
         return;
 
-    // seq_cst pairs with Run2DThread, see there
+    // seq_cst pairs with Run2DThread, see there. the 2D thread only notifies once SyncTarget is
+    // reached, so the target is stored before we show up in SyncSleepers, and it must never sit
+    // above the count of a sleeper that still waits. it's the lowest of the pending targets (the
+    // counts not reached yet), kept so, each time a sleeper is about to wait:
+    // - it takes the target over when it's the only sleeper, when its count is lower, or when the
+    //   target was reached (stale: its sleepers have been notified and will leave or re-arm)
+    // - a pending target below its count stays: another sleeper is still owed that wake, and it
+    //   never raises it over them
+    // notify_all wakes every sleeper, and each one re-arms or leaves. until the first of them
+    // re-arms a reached target, the 2D thread's check passes on every job it finishes, each a
+    // cheap notify_all with nobody (or only sleepers that leave) to wake
     std::unique_lock lock(state.Mutex);
+    auto arm = [&]()
+    {
+        u32 target = state.SyncTarget.load(std::memory_order_relaxed);
+        if (state.SyncSleepers.load(std::memory_order_relaxed) == 0
+            || (s32)(count - target) < 0
+            || (s32)(Jobs2DDone.load(std::memory_order_seq_cst) - target) >= 0)
+            state.SyncTarget.store(count, std::memory_order_seq_cst);
+    };
+
+    arm();
     state.SyncSleepers.fetch_add(1, std::memory_order_seq_cst);
-    while ((s32)(Jobs2DDone.load(std::memory_order_seq_cst) - count) < 0)
+    for (;;)
+    {
+        // this load comes after arm()'s store in the seq_cst order, so the 2D thread either sees
+        // the new target, or we see the count it stored before it read the old one
+        if ((s32)(Jobs2DDone.load(std::memory_order_seq_cst) - count) >= 0)
+            break;
+
         state.SyncWake.wait(lock);
+        arm();
+    }
     state.SyncSleepers.fetch_sub(1, std::memory_order_relaxed);
 }
 
@@ -1444,9 +1489,12 @@ void GPU::StartScanline(u32 line) noexcept
     {
         if (VCount == 192)
         {
-            // the frame's 2D lines must all be drawn before the GL renderers composite them, and
-            // before VBlank DMAs and the CPU start changing VRAM, palette and OAM for the next frame
-            Sync2D();
+            // the last lines are usually still being drawn here, and nothing below needs them until
+            // the GL compositor reads the 2D back buffers (the Blit at the end), so the wait is there.
+            // the VBlank DMAs and the CPU only reach what a queued line reads through the write
+            // barriers (palette, OAM, LCDC banks, the mappings and the flat copies), the 3D renderers
+            // don't touch the 2D output, and with software 3D nothing reads it before FinishFrame,
+            // which syncs
 
             // in reality rendering already finishes at line 144
             // and games might already start to modify texture memory.
@@ -1474,7 +1522,11 @@ void GPU::StartScanline(u32 line) noexcept
 
             // Need a better way to identify the openGL renderer in particular
             if (GPU3D.IsRendererAccelerated())
+            {
+                // the compositor uploads this frame's 2D back buffers, so every line must be drawn
+                Sync2D();
                 GPU3D.Blit(*this);
+            }
         }
     }
 

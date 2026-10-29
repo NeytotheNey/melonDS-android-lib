@@ -764,8 +764,6 @@ private:
 
     u16 VMatch[2] {};
 
-    std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = nullptr;
-
     // only lives for one HBlank, so it isn't savestated
     GPU2D::LineJob Job2D {};
 
@@ -773,18 +771,25 @@ private:
     // the ring is drained (a drain elsewhere leaves it set, which only costs one idle check)
     bool Queued2DReadsLCDC = false;
 
-    // threaded 2D: how many jobs the emulator thread has queued and the 2D thread has drawn (both
-    // wrap around). equal counts mean the thread is idle, which is all the barrier checks. they're
-    // never reset, so they stay equal while threaded 2D is off
-    std::atomic<u32> Jobs2DQueued {0};
-    std::atomic<u32> Jobs2DDone {0};
-    struct Threaded2DState;
-    std::unique_ptr<Threaded2DState> Threaded2D;
-
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;
 
     u32 Hash2DFrame = 0;
+
+    // threaded 2D: how many jobs the emulator thread has queued and the 2D thread has drawn (both
+    // wrap around). equal counts mean the thread is idle, which is all the barrier checks. they're
+    // never reset, so they stay equal while threaded 2D is off.
+    // each thread writes one counter and reads the other's after every job, so each one has a
+    // cache line to itself (the alignas on the following member closes Jobs2DDone's line), with
+    // nothing the emulator thread writes per line or per register write on them. none of this is
+    // savestated
+    alignas(64) std::atomic<u32> Jobs2DQueued {0};
+    alignas(64) std::atomic<u32> Jobs2DDone {0};
+    // read by both threads (the 2D thread per job) and only written while the thread is idle, so
+    // they share a line away from the counters and the per-line state above
+    struct Threaded2DState;
+    alignas(64) std::unique_ptr<Threaded2DState> Threaded2D;
+    std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = nullptr;
 };
 }
 
