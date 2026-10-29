@@ -29,7 +29,50 @@ class GPU;
 namespace GPU2D
 {
 
-class Unit
+// the Unit state the renderer reads. Unit is built around it, so a line's snapshot is a plain copy
+// (see LineJob). the registers only the CPU or the per-line updates use stay in Unit
+struct UnitState
+{
+    u32 Num;
+    bool Enabled;
+
+    u32 DispCnt;
+    u16 BGCnt[4];
+
+    u16 BGXPos[4];
+    u16 BGYPos[4];
+
+    s32 BGXRefInternal[2];
+    s32 BGYRefInternal[2];
+    s16 BGRotA[2];
+    s16 BGRotB[2];
+    s16 BGRotC[2];
+    s16 BGRotD[2];
+
+    u8 Win0Coords[4];
+    u8 Win1Coords[4];
+    u8 WinCnt[4];
+    u32 Win0Active;
+    u32 Win1Active;
+
+    u8 BGMosaicSize[2];
+    u8 OBJMosaicSize[2];
+    u8 BGMosaicY;
+    u8 OBJMosaicY;
+
+    u16 BlendCnt;
+    u8 EVA, EVB;
+    u8 EVY;
+
+    bool CaptureLatch;
+    u32 CaptureCnt;
+
+    u16 MasterBrightness;
+
+    void CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) const;
+};
+
+class Unit : public UnitState
 {
 public:
     // take a reference to the GPU so we can access its state
@@ -69,23 +112,15 @@ public:
 
     void CheckWindows(u32 line);
 
-    u16* GetBGExtPal(u32 slot, u32 pal) const;
-    u16* GetOBJExtPal() const;
-
-    void GetBGVRAM(u8*& data, u32& mask) const;
-    void GetOBJVRAM(u8*& data, u32& mask) const;
-
-    // per-line state updates that go with drawing a scanline. the renderer only reads the Unit,
-    // so these run around its DrawScanline/DrawSprites calls (line = VCount)
+    // per-line state updates that go with drawing a scanline. the renderer only reads snapshots
+    // of the Unit, so these run around taking them in GPU::StartHBlank (line = VCount)
     void PreDrawScanline(u32 line);
     void PostDrawScanline(u32 line);
     void ResetOBJMosaicCounters();
 
     void UpdateMosaicCounters(u32 line);
-    void CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) const;
 
-    u32 Num;
-    bool Enabled;
+    const UnitState& State() const { return *this; }
 
     u16 DispFIFO[16];
     u32 DispFIFOReadPtr;
@@ -93,43 +128,38 @@ public:
 
     u16 DispFIFOBuffer[256];
 
-    u32 DispCnt;
-    u16 BGCnt[4];
-
-    u16 BGXPos[4];
-    u16 BGYPos[4];
-
     s32 BGXRef[2];
     s32 BGYRef[2];
-    s32 BGXRefInternal[2];
-    s32 BGYRefInternal[2];
-    s16 BGRotA[2];
-    s16 BGRotB[2];
-    s16 BGRotC[2];
-    s16 BGRotD[2];
 
-    u8 Win0Coords[4];
-    u8 Win1Coords[4];
-    u8 WinCnt[4];
-    u32 Win0Active;
-    u32 Win1Active;
+    u8 BGMosaicYMax;
+    u8 OBJMosaicYCount, OBJMosaicYMax;
 
-    u8 BGMosaicSize[2];
-    u8 OBJMosaicSize[2];
-    u8 BGMosaicY, BGMosaicYMax;
-    u8 OBJMosaicYCount, OBJMosaicY, OBJMosaicYMax;
-
-    u16 BlendCnt;
     u16 BlendAlpha;
-    u8 EVA, EVB;
-    u8 EVY;
-
-    bool CaptureLatch;
-    u32 CaptureCnt;
-
-    u16 MasterBrightness;
 private:
     melonDS::GPU& GPU;
+};
+
+// one HBlank's worth of 2D drawing: the BG/OBJ pass of the current line and the sprites of the
+// next one, for both Units. GPU::StartHBlank builds it on the emulator thread, and the renderer
+// draws only from it plus VRAM (and its flat copies), palette and OAM
+struct LineJob
+{
+    bool DrawBG;            // DrawScanline(Line) for both Units
+    bool DrawOBJ;           // then DrawSprites(SpriteLine) for both Units
+    u32 Line;               // framebuffer and 3D line
+    u32 SpriteLine;
+    u16 VCount;             // the line the BG pass draws (differs from Line after a VCount write)
+
+    bool Accelerated;       // OpenGL/Compute 3D: the accelerated line format
+    u16 RenderXPos;         // 3D layer X position, for the accelerated format's control word
+    u32* Framebuffer[2];    // per Unit, as assigned when the job was built (POWCNT can swap them)
+    u32* Line3D;            // unit A's 3D line, or null when this line didn't fetch it (the renderer keeps the last one)
+    u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks
+
+    UnitState BG[2];        // after PreDrawScanline, before PostDrawScanline
+    UnitState OBJ[2];       // after PostDrawScanline (line 0: after ResetOBJMosaicCounters)
+
+    u16 DispFIFOBuffer[256]; // unit A's, only copied when it uses the display FIFO
 };
 
 class Renderer2D
@@ -137,8 +167,8 @@ class Renderer2D
 public:
     virtual ~Renderer2D() {}
 
-    virtual void DrawScanline(u32 line, Unit* unit) = 0;
-    virtual void DrawSprites(u32 line, Unit* unit) = 0;
+    // the only drawing entry point: everything a line needs comes in the job
+    virtual void RunJob(const LineJob& job) = 0;
 
     virtual void VBlankEnd(Unit* unitA, Unit* unitB) = 0;
 
@@ -147,10 +177,12 @@ public:
         Framebuffer[0] = unitA;
         Framebuffer[1] = unitB;
     }
+    u32* GetFramebuffer(u32 num) const { return Framebuffer[num]; }
 protected:
     u32* Framebuffer[2];
 
-    const Unit* CurUnit;
+    const LineJob* CurJob;
+    const UnitState* CurUnit;
 };
 
 }

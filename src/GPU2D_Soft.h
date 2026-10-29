@@ -33,10 +33,19 @@ public:
     SoftRenderer(melonDS::GPU& gpu);
     ~SoftRenderer() override {}
 
-    void DrawScanline(u32 line, Unit* unit) override;
-    void DrawSprites(u32 line, Unit* unit) override;
+    void RunJob(const LineJob& job) override;
     void VBlankEnd(Unit* unitA, Unit* unitB) override;
 private:
+    void DrawScanline(u32 line, const UnitState* unit);
+    void DrawSprites(u32 line, const UnitState* unit);
+
+    // the current Unit's memory (flat VRAM copies), found from CurUnit->Num
+    u16* GetBGExtPal(u32 slot, u32 pal) const;
+    u16* GetOBJExtPal() const;
+
+    void GetBGVRAM(u8*& data, u32& mask) const;
+    void GetOBJVRAM(u8*& data, u32& mask) const;
+
     melonDS::GPU& GPU;
     alignas(8) u32 BGOBJLine[256*3];
     u32* _3DLine;

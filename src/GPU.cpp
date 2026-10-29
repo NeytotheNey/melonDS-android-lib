@@ -888,20 +888,22 @@ void GPU::StartHBlank(u32 line) noexcept
         // note: this should start 48 cycles after the scanline start
         if (line < 192)
         {
-            // the renderer only reads the Units, their per-line updates happen around it
+            // the renderer draws from the job alone. the Units' per-line updates happen around
+            // taking their snapshots: the BG pass sees PreDrawScanline, the sprites see PostDrawScanline
+            GPU2D::LineJob& job = Job2D;
+            Start2DJob(job);
+
             GPU2D_A.PreDrawScanline(VCount);
             GPU2D_B.PreDrawScanline(VCount);
-            GPU2D_Renderer->DrawScanline(line, &GPU2D_A);
-            GPU2D_Renderer->DrawScanline(line, &GPU2D_B);
+            Snapshot2DScanline(job, line);
             GPU2D_A.PostDrawScanline(VCount);
             GPU2D_B.PostDrawScanline(VCount);
-        }
 
-        // sprites are pre-rendered one scanline in advance
-        if (line < 191)
-        {
-            GPU2D_Renderer->DrawSprites(line+1, &GPU2D_A);
-            GPU2D_Renderer->DrawSprites(line+1, &GPU2D_B);
+            // sprites are pre-rendered one scanline in advance
+            if (line < 191)
+                Snapshot2DSprites(job, line+1);
+
+            GPU2D_Renderer->RunJob(job);
         }
 
         NDS.CheckDMAs(0, 0x02);
@@ -914,8 +916,11 @@ void GPU::StartHBlank(u32 line) noexcept
     {
         GPU2D_A.ResetOBJMosaicCounters();
         GPU2D_B.ResetOBJMosaicCounters();
-        GPU2D_Renderer->DrawSprites(0, &GPU2D_A);
-        GPU2D_Renderer->DrawSprites(0, &GPU2D_B);
+
+        GPU2D::LineJob& job = Job2D;
+        Start2DJob(job);
+        Snapshot2DSprites(job, 0);
+        GPU2D_Renderer->RunJob(job);
     }
 
     if (DispStat[0] & (1<<4)) NDS.SetIRQ(0, IRQ_HBlank);
@@ -925,6 +930,84 @@ void GPU::StartHBlank(u32 line) noexcept
         NDS.ScheduleEvent(Event_LCD, true, (LINE_CYCLES - HBLANK_CYCLES), LCD_StartScanline, line+1);
     else
         NDS.ScheduleEvent(Event_LCD, true, (LINE_CYCLES - HBLANK_CYCLES), LCD_FinishFrame, line+1);
+}
+
+// the GPU state the renderer reads during a line, which is the same for all of a job's draw calls
+void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
+{
+    job.DrawBG = false;
+    job.DrawOBJ = false;
+    job.Line3D = nullptr;
+
+    job.VCount = VCount;
+    job.Accelerated = GPU3D.IsRendererAccelerated();
+    job.RenderXPos = GPU3D.GetRenderXPos();
+    job.Framebuffer[0] = GPU2D_Renderer->GetFramebuffer(0);
+    job.Framebuffer[1] = GPU2D_Renderer->GetFramebuffer(1);
+    job.VRAMMap_LCDC = VRAMMap_LCDC;
+}
+
+// for DrawScanline(line): call after PreDrawScanline, before PostDrawScanline
+void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
+{
+    MakeVRAMFlat_2DBGCoherent();
+
+    job.DrawBG = true;
+    job.Line = line;
+    job.BG[0] = GPU2D_A.State();
+    job.BG[1] = GPU2D_B.State();
+
+    // unit A's 3D line, fetched in the same cases the renderer used to: always with the software
+    // renderer, and for display capture with the GL ones (their GetLine maps a GL buffer on line 0)
+    if (!job.Accelerated)
+        job.Line3D = GPU3D.GetLine(line);
+    else if (GPU2D_A.CaptureLatch && (((GPU2D_A.CaptureCnt >> 29) & 0x3) != 1))
+        job.Line3D = GPU3D.GetLine(line);
+
+    // display mode 3 and capture source B can read the display FIFO
+    if (GPU2D_A.UsesFIFO())
+        memcpy(job.DispFIFOBuffer, GPU2D_A.DispFIFOBuffer, sizeof(job.DispFIFOBuffer));
+}
+
+// for DrawSprites(line): call after PostDrawScanline (or ResetOBJMosaicCounters for line 0)
+void GPU::Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept
+{
+    MakeVRAMFlat_2DOBJCoherent();
+
+    job.DrawOBJ = true;
+    job.SpriteLine = line;
+    job.OBJ[0] = GPU2D_A.State();
+    job.OBJ[1] = GPU2D_B.State();
+}
+
+// the 2D renderer reads the flat VRAM copies. making them coherent consumes the shared VRAMDirty
+// bits, so it happens here before the job is built, not in the renderer.
+// these used to run between the draw calls of an HBlank and now all run before them. the only
+// VRAM the draw calls write is display capture's, to an LCDC bank, which no BG/OBJ mapping
+// includes, so the copies come out the same
+void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
+{
+    auto bgDirtyA = VRAMDirty_ABG.DeriveState(VRAMMap_ABG, *this);
+    MakeVRAMFlat_ABGCoherent(bgDirtyA);
+    auto bgExtPalDirtyA = VRAMDirty_ABGExtPal.DeriveState(VRAMMap_ABGExtPal, *this);
+    MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirtyA);
+    auto objExtPalDirtyA = VRAMDirty_AOBJExtPal.DeriveState(&VRAMMap_AOBJExtPal, *this);
+    MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirtyA);
+
+    auto bgDirtyB = VRAMDirty_BBG.DeriveState(VRAMMap_BBG, *this);
+    MakeVRAMFlat_BBGCoherent(bgDirtyB);
+    auto bgExtPalDirtyB = VRAMDirty_BBGExtPal.DeriveState(VRAMMap_BBGExtPal, *this);
+    MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirtyB);
+    auto objExtPalDirtyB = VRAMDirty_BOBJExtPal.DeriveState(&VRAMMap_BOBJExtPal, *this);
+    MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirtyB);
+}
+
+void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
+{
+    auto objDirtyA = VRAMDirty_AOBJ.DeriveState(VRAMMap_AOBJ, *this);
+    MakeVRAMFlat_AOBJCoherent(objDirtyA);
+    auto objDirtyB = VRAMDirty_BOBJ.DeriveState(VRAMMap_BOBJ, *this);
+    MakeVRAMFlat_BOBJCoherent(objDirtyB);
 }
 
 void GPU::FinishFrame(u32 lines) noexcept

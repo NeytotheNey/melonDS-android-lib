@@ -623,6 +623,14 @@ private:
     void AssignFramebuffers() noexcept;
     void InitFramebuffers() noexcept;
     void LogHash2D() noexcept;
+
+    // building the 2D renderer's line jobs (see GPU2D::LineJob), on the emulator thread
+    void Start2DJob(GPU2D::LineJob& job) noexcept;
+    void Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept;
+    void Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept;
+    void MakeVRAMFlat_2DBGCoherent() noexcept;
+    void MakeVRAMFlat_2DOBJCoherent() noexcept;
+
     template<typename T>
     T ReadVRAM_ABGExtPal(u32 addr) const noexcept
     {
@@ -705,6 +713,9 @@ private:
     u16 VMatch[2] {};
 
     std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = nullptr;
+
+    // only lives for one HBlank, so it isn't savestated
+    GPU2D::LineJob Job2D {};
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;

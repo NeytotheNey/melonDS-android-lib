@@ -102,34 +102,78 @@ u32 SoftRenderer::ColorComposite(int i, u32 val1, u32 val2) const
     return val1;
 }
 
-void SoftRenderer::DrawScanline(u32 line, Unit* unit)
+void SoftRenderer::RunJob(const LineJob& job)
 {
-    CurUnit = unit;
+    CurJob = &job;
 
-    int stride = GPU.GPU3D.IsRendererAccelerated() ? (256*3 + 1) : 256;
-    u32* dst = &Framebuffer[CurUnit->Num][stride * line];
+    if (job.DrawBG)
+    {
+        DrawScanline(job.Line, &job.BG[0]);
+        DrawScanline(job.Line, &job.BG[1]);
+    }
 
-    int n3dline = line;
-    line = GPU.VCount;
+    // sprites are pre-rendered one scanline in advance
+    if (job.DrawOBJ)
+    {
+        DrawSprites(job.SpriteLine, &job.OBJ[0]);
+        DrawSprites(job.SpriteLine, &job.OBJ[1]);
+    }
+}
 
+u16* SoftRenderer::GetBGExtPal(u32 slot, u32 pal) const
+{
+    const u32 PaletteSize = 256 * 2;
+    const u32 SlotSize = PaletteSize * 16;
+    return (u16*)&(CurUnit->Num == 0
+         ? GPU.VRAMFlat_ABGExtPal
+         : GPU.VRAMFlat_BBGExtPal)[slot * SlotSize + pal * PaletteSize];
+}
+
+u16* SoftRenderer::GetOBJExtPal() const
+{
+    return CurUnit->Num == 0
+         ? (u16*)GPU.VRAMFlat_AOBJExtPal
+         : (u16*)GPU.VRAMFlat_BOBJExtPal;
+}
+
+void SoftRenderer::GetBGVRAM(u8*& data, u32& mask) const
+{
     if (CurUnit->Num == 0)
     {
-        auto bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
-        GPU.MakeVRAMFlat_ABGCoherent(bgDirty);
-        auto bgExtPalDirty = GPU.VRAMDirty_ABGExtPal.DeriveState(GPU.VRAMMap_ABGExtPal, GPU);
-        GPU.MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirty);
-        auto objExtPalDirty = GPU.VRAMDirty_AOBJExtPal.DeriveState(&GPU.VRAMMap_AOBJExtPal, GPU);
-        GPU.MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirty);
+        data = GPU.VRAMFlat_ABG;
+        mask = 0x7FFFF;
     }
     else
     {
-        auto bgDirty = GPU.VRAMDirty_BBG.DeriveState(GPU.VRAMMap_BBG, GPU);
-        GPU.MakeVRAMFlat_BBGCoherent(bgDirty);
-        auto bgExtPalDirty = GPU.VRAMDirty_BBGExtPal.DeriveState(GPU.VRAMMap_BBGExtPal, GPU);
-        GPU.MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirty);
-        auto objExtPalDirty = GPU.VRAMDirty_BOBJExtPal.DeriveState(&GPU.VRAMMap_BOBJExtPal, GPU);
-        GPU.MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirty);
+        data = GPU.VRAMFlat_BBG;
+        mask = 0x1FFFF;
     }
+}
+
+void SoftRenderer::GetOBJVRAM(u8*& data, u32& mask) const
+{
+    if (CurUnit->Num == 0)
+    {
+        data = GPU.VRAMFlat_AOBJ;
+        mask = 0x3FFFF;
+    }
+    else
+    {
+        data = GPU.VRAMFlat_BOBJ;
+        mask = 0x1FFFF;
+    }
+}
+
+void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
+{
+    CurUnit = unit;
+
+    int stride = CurJob->Accelerated ? (256*3 + 1) : 256;
+    u32* dst = &CurJob->Framebuffer[CurUnit->Num][stride * line];
+
+    line = CurJob->VCount;
+
+    // the flat VRAM copies are made coherent by GPU::MakeVRAMFlat_2DBGCoherent
 
     bool forceblank = false;
 
@@ -143,23 +187,17 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
 
     // CaptureLatch is set for line 0 by Unit::PreDrawScanline
 
-    if (CurUnit->Num == 0)
-    {
-        if (!GPU.GPU3D.IsRendererAccelerated())
-            _3DLine = GPU.GPU3D.GetLine(n3dline);
-        else if (CurUnit->CaptureLatch && (((CurUnit->CaptureCnt >> 29) & 0x3) != 1))
-        {
-            _3DLine = GPU.GPU3D.GetLine(n3dline);
-            //GPU3D::GLRenderer::PrepareCaptureFrame();
-        }
-    }
+    // the 3D line is fetched when the job is built (GPU::Snapshot2DScanline), as the GL renderers
+    // read it back from a GL buffer. lines that don't fetch one keep the last one, as before
+    if (CurUnit->Num == 0 && CurJob->Line3D)
+        _3DLine = CurJob->Line3D;
 
     if (forceblank)
     {
         for (int i = 0; i < 256; i++)
             dst[i] = 0xFFFFFFFF;
 
-        if (GPU.GPU3D.IsRendererAccelerated())
+        if (CurJob->Accelerated)
         {
             dst[256*3] = 0;
         }
@@ -192,7 +230,7 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     case 2: // VRAM display
         {
             u32 vrambank = (CurUnit->DispCnt >> 18) & 0x3;
-            if (GPU.VRAMMap_LCDC & (1<<vrambank))
+            if (CurJob->VRAMMap_LCDC & (1<<vrambank))
             {
                 u16* vram = (u16*)GPU.VRAM[vrambank];
                 vram = &vram[line * 256];
@@ -221,7 +259,7 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
         {
             for (int i = 0; i < 256; i++)
             {
-                u16 color = CurUnit->DispFIFOBuffer[i];
+                u16 color = CurJob->DispFIFOBuffer[i];
                 u8 r = (color & 0x001F) << 1;
                 u8 g = (color & 0x03E0) >> 4;
                 u8 b = (color & 0x7C00) >> 9;
@@ -250,9 +288,9 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
 
     u32 masterBrightness = CurUnit->MasterBrightness;
 
-    if (GPU.GPU3D.IsRendererAccelerated())
+    if (CurJob->Accelerated)
     {
-        u32 xpos = GPU.GPU3D.GetRenderXPos();
+        u32 xpos = CurJob->RenderXPos;
 
         dst[256*3] = masterBrightness |
                      (CurUnit->DispCnt & 0x30000) |
@@ -323,7 +361,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
 
     // TODO: confirm this
     // it should work like VRAM display mode, which requires VRAM to be mapped to LCDC
-    if (!(GPU.VRAMMap_LCDC & (1<<dstvram)))
+    if (!(CurJob->VRAMMap_LCDC & (1<<dstvram)))
         return;
 
     u16* dst = (u16*)GPU.VRAM[dstvram];
@@ -339,7 +377,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
     else
     {
         srcA = BGOBJLine;
-        if (GPU.GPU3D.IsRendererAccelerated())
+        if (CurJob->Accelerated)
         {
             // in GPU3D::CurrentRenderer->Accelerated mode, compositing is normally done on the GPU
             // but when doing display capture, we do need the composited output
@@ -405,13 +443,13 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
 
     if (captureCnt & (1<<25))
     {
-        srcB = &CurUnit->DispFIFOBuffer[0];
+        srcB = &CurJob->DispFIFOBuffer[0];
         srcBaddr = 0;
     }
     else
     {
         u32 srcvram = (CurUnit->DispCnt >> 18) & 0x3;
-        if (GPU.VRAMMap_LCDC & (1<<srcvram))
+        if (CurJob->VRAMMap_LCDC & (1<<srcvram))
             srcB = (u16*)GPU.VRAM[srcvram];
 
         if (((CurUnit->DispCnt >> 16) & 0x3) != 2)
@@ -543,12 +581,12 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
     { \
         if ((bgCnt[num] & 0x0040) && (CurUnit->BGMosaicSize[0] > 0)) \
         { \
-            if (GPU.GPU3D.IsRendererAccelerated()) DrawBG_##type<true, DrawPixel_Accel>(line, num); \
+            if (CurJob->Accelerated) DrawBG_##type<true, DrawPixel_Accel>(line, num); \
             else DrawBG_##type<true, DrawPixel_Normal>(line, num); \
         } \
         else \
         { \
-            if (GPU.GPU3D.IsRendererAccelerated()) DrawBG_##type<false, DrawPixel_Accel>(line, num); \
+            if (CurJob->Accelerated) DrawBG_##type<false, DrawPixel_Accel>(line, num); \
             else DrawBG_##type<false, DrawPixel_Normal>(line, num); \
         } \
     } while (false)
@@ -558,18 +596,18 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
     { \
         if ((bgCnt[2] & 0x0040) && (CurUnit->BGMosaicSize[0] > 0)) \
         { \
-            if (GPU.GPU3D.IsRendererAccelerated()) DrawBG_Large<true, DrawPixel_Accel>(line); \
+            if (CurJob->Accelerated) DrawBG_Large<true, DrawPixel_Accel>(line); \
             else DrawBG_Large<true, DrawPixel_Normal>(line); \
         } \
         else \
         { \
-            if (GPU.GPU3D.IsRendererAccelerated()) DrawBG_Large<false, DrawPixel_Accel>(line); \
+            if (CurJob->Accelerated) DrawBG_Large<false, DrawPixel_Accel>(line); \
             else DrawBG_Large<false, DrawPixel_Normal>(line); \
         } \
     } while (false)
 
 #define DoInterleaveSprites(prio) \
-    if (GPU.GPU3D.IsRendererAccelerated()) InterleaveSprites<DrawPixel_Accel>(prio); else InterleaveSprites<DrawPixel_Normal>(prio);
+    if (CurJob->Accelerated) InterleaveSprites<DrawPixel_Accel>(prio); else InterleaveSprites<DrawPixel_Normal>(prio);
 
 template<u32 bgmode>
 void SoftRenderer::DrawScanlineBGMode(u32 line)
@@ -737,7 +775,7 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
     // color special effects
     // can likely be optimized
 
-    if (!GPU.GPU3D.IsRendererAccelerated())
+    if (!CurJob->Accelerated)
     {
         for (int i = 0; i < 256; i++)
         {
@@ -878,7 +916,7 @@ void SoftRenderer::DrawBG_3D()
 {
     int i = 0;
 
-    if (GPU.GPU3D.IsRendererAccelerated())
+    if (CurJob->Accelerated)
     {
         for (i = 0; i < 256; i++)
         {
@@ -932,7 +970,7 @@ void SoftRenderer::DrawBG_Text(u32 line, u32 bgnum)
 
     u8* bgvram;
     u32 bgvrammask;
-    CurUnit->GetBGVRAM(bgvram, bgvrammask);
+    GetBGVRAM(bgvram, bgvrammask);
     if (CurUnit->Num)
     {
         tilesetaddr = ((bgcnt & 0x003C) << 12);
@@ -973,7 +1011,7 @@ void SoftRenderer::DrawBG_Text(u32 line, u32 bgnum)
         {
             curtile = *(u16*)&bgvram[(tilemapaddr + ((xoff & 0xF8) >> 2) + ((xoff & widexmask) << 3)) & bgvrammask];
 
-            if (extpal) curpal = CurUnit->GetBGExtPal(extpalslot, curtile>>12);
+            if (extpal) curpal = GetBGExtPal(extpalslot, curtile>>12);
             else        curpal = pal;
 
             pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6)
@@ -994,7 +1032,7 @@ void SoftRenderer::DrawBG_Text(u32 line, u32 bgnum)
                 // load a new tile
                 curtile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
 
-                if (extpal) curpal = CurUnit->GetBGExtPal(extpalslot, curtile>>12);
+                if (extpal) curpal = GetBGExtPal(extpalslot, curtile>>12);
                 else        curpal = pal;
 
                 pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6)
@@ -1110,7 +1148,7 @@ void SoftRenderer::DrawBG_Affine(u32 line, u32 bgnum)
 
     u8* bgvram;
     u32 bgvrammask;
-    CurUnit->GetBGVRAM(bgvram, bgvrammask);
+    GetBGVRAM(bgvram, bgvrammask);
 
     if (CurUnit->Num)
     {
@@ -1180,7 +1218,7 @@ void SoftRenderer::DrawBG_Extended(u32 line, u32 bgnum)
 
     u8* bgvram;
     u32 bgvrammask;
-    CurUnit->GetBGVRAM(bgvram, bgvrammask);
+    GetBGVRAM(bgvram, bgvrammask);
 
     extpal = (CurUnit->DispCnt & 0x40000000);
 
@@ -1364,7 +1402,7 @@ void SoftRenderer::DrawBG_Extended(u32 line, u32 bgnum)
                 {
                     curtile = *(u16*)&bgvram[(tilemapaddr + (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1)) & bgvrammask];
 
-                    if (extpal) curpal = CurUnit->GetBGExtPal(bgnum, curtile>>12);
+                    if (extpal) curpal = GetBGExtPal(bgnum, curtile>>12);
                     else        curpal = pal;
 
                     // draw pixel
@@ -1438,7 +1476,7 @@ void SoftRenderer::DrawBG_Large(u32 line) // BG is always BG2
 
     u8* bgvram;
     u32 bgvrammask;
-    CurUnit->GetBGVRAM(bgvram, bgvrammask);
+    GetBGVRAM(bgvram, bgvrammask);
 
     // 256-color bitmap
 
@@ -1517,7 +1555,7 @@ void SoftRenderer::InterleaveSprites(u32 prio)
 
     if (CurUnit->DispCnt & 0x80000000)
     {
-        u16* extpal = CurUnit->GetOBJExtPal();
+        u16* extpal = GetOBJExtPal();
 
         for (u32 i = 0; i < 256; i++)
         {
@@ -1569,22 +1607,12 @@ void SoftRenderer::InterleaveSprites(u32 prio)
         DrawSprite_##type<false>(__VA_ARGS__); \
     }
 
-void SoftRenderer::DrawSprites(u32 line, Unit* unit)
+void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
 {
     CurUnit = unit;
 
-    // the OBJ mosaic counters are reset for line 0 by Unit::ResetOBJMosaicCounters
-
-    if (CurUnit->Num == 0)
-    {
-        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
-        GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
-    }
-    else
-    {
-        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
-        GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
-    }
+    // the OBJ mosaic counters are reset for line 0 by Unit::ResetOBJMosaicCounters,
+    // and the flat VRAM copies are made coherent by GPU::MakeVRAMFlat_2DOBJCoherent
 
     NumSprites[CurUnit->Num] = 0;
     memset(OBJLine[CurUnit->Num], 0, 256*4);
@@ -1698,7 +1726,7 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
 
     u8* objvram;
     u32 objvrammask;
-    CurUnit->GetOBJVRAM(objvram, objvrammask);
+    GetOBJVRAM(objvram, objvrammask);
 
     u32* objLine = OBJLine[CurUnit->Num];
     u8* objWindow = OBJWindow[CurUnit->Num];
@@ -1915,7 +1943,7 @@ void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s
 
     u8* objvram;
     u32 objvrammask;
-    CurUnit->GetOBJVRAM(objvram, objvrammask);
+    GetOBJVRAM(objvram, objvrammask);
 
     u32* objLine = OBJLine[CurUnit->Num];
     u8* objWindow = OBJWindow[CurUnit->Num];

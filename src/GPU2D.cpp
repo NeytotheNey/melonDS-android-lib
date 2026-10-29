@@ -87,8 +87,9 @@ using Platform::LogLevel;
 
 namespace GPU2D
 {
-Unit::Unit(u32 num, melonDS::GPU& gpu) : Num(num), GPU(gpu)
+Unit::Unit(u32 num, melonDS::GPU& gpu) : GPU(gpu)
 {
+    Num = num;
 }
 
 void Unit::Reset()
@@ -615,7 +616,8 @@ void Unit::PreDrawScanline(u32 line)
 void Unit::PostDrawScanline(u32 line)
 {
     // these used to be done by the renderer as it drew the line, so they have to
-    // skip exactly the cases it skips (see SoftRenderer::DrawScanline and DrawScanline_BGOBJ)
+    // skip exactly the cases it skips (see SoftRenderer::DrawScanline and DrawScanline_BGOBJ).
+    // the line's snapshot for DrawScanline is taken before this, the one for DrawSprites after
 
     // forced white: nothing is drawn
     if (line > 192) return;
@@ -703,22 +705,6 @@ void Unit::SampleFIFO(u32 offset, u32 num)
     }
 }
 
-u16* Unit::GetBGExtPal(u32 slot, u32 pal) const
-{
-    const u32 PaletteSize = 256 * 2;
-    const u32 SlotSize = PaletteSize * 16;
-    return (u16*)&(Num == 0
-         ? GPU.VRAMFlat_ABGExtPal
-         : GPU.VRAMFlat_BBGExtPal)[slot * SlotSize + pal * PaletteSize];
-}
-
-u16* Unit::GetOBJExtPal() const
-{
-    return Num == 0
-         ? (u16*)GPU.VRAMFlat_AOBJExtPal
-         : (u16*)GPU.VRAMFlat_BOBJExtPal;
-}
-
 void Unit::CheckWindows(u32 line)
 {
     line &= 0xFF;
@@ -728,7 +714,7 @@ void Unit::CheckWindows(u32 line)
     else if (line == Win1Coords[2]) Win1Active |=  0x1;
 }
 
-void Unit::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) const
+void UnitState::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) const
 {
     // works on copies of the window state: the X carry-over to the next line is done by PostDrawScanline
     u32 win0Active = Win0Active;
@@ -775,34 +761,6 @@ void Unit::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) co
 
             if (win0Active == 0x3) windowMask[i] = WinCnt[0];
         }
-    }
-}
-
-void Unit::GetBGVRAM(u8*& data, u32& mask) const
-{
-    if (Num == 0)
-    {
-        data = GPU.VRAMFlat_ABG;
-        mask = 0x7FFFF;
-    }
-    else
-    {
-        data = GPU.VRAMFlat_BBG;
-        mask = 0x1FFFF;
-    }
-}
-
-void Unit::GetOBJVRAM(u8*& data, u32& mask) const
-{
-    if (Num == 0)
-    {
-        data = GPU.VRAMFlat_AOBJ;
-        mask = 0x3FFFF;
-    }
-    else
-    {
-        data = GPU.VRAMFlat_BOBJ;
-        mask = 0x1FFFF;
     }
 }
 
