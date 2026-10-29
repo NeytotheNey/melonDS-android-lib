@@ -69,14 +69,20 @@ public:
 
     void CheckWindows(u32 line);
 
-    u16* GetBGExtPal(u32 slot, u32 pal);
-    u16* GetOBJExtPal();
+    u16* GetBGExtPal(u32 slot, u32 pal) const;
+    u16* GetOBJExtPal() const;
 
     void GetBGVRAM(u8*& data, u32& mask) const;
     void GetOBJVRAM(u8*& data, u32& mask) const;
 
+    // per-line state updates that go with drawing a scanline. the renderer only reads the Unit,
+    // so these run around its DrawScanline/DrawSprites calls (line = VCount)
+    void PreDrawScanline(u32 line);
+    void PostDrawScanline(u32 line);
+    void ResetOBJMosaicCounters();
+
     void UpdateMosaicCounters(u32 line);
-    void CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow);
+    void CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) const;
 
     u32 Num;
     bool Enabled;
@@ -144,7 +150,7 @@ public:
 protected:
     u32* Framebuffer[2];
 
-    Unit* CurUnit;
+    const Unit* CurUnit;
 };
 
 }

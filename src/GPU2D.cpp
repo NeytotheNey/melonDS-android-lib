@@ -592,6 +592,77 @@ void Unit::UpdateMosaicCounters(u32 line)
     }
 }
 
+void Unit::ResetOBJMosaicCounters()
+{
+    // reset those counters here
+    // TODO: find out when those are supposed to be reset
+    // it would make sense to reset them at the end of VBlank
+    // however, sprites are rendered one scanline in advance
+    // so they need to be reset a bit earlier
+
+    OBJMosaicY = 0;
+    OBJMosaicYCount = 0;
+}
+
+void Unit::PreDrawScanline(u32 line)
+{
+    // display capture is armed at the start of line 0 and stays on until VBlank
+    // lines that the renderer forces white (GPU B disabled) don't arm it
+    if (line == 0 && (CaptureCnt & (1<<31)) && !(Num && !Enabled))
+        CaptureLatch = true;
+}
+
+void Unit::PostDrawScanline(u32 line)
+{
+    // these used to be done by the renderer as it drew the line, so they have to
+    // skip exactly the cases it skips (see SoftRenderer::DrawScanline and DrawScanline_BGOBJ)
+
+    // forced white: nothing is drawn
+    if (line > 192) return;
+    if (Num && !Enabled) return;
+
+    // forced blank skips BG/OBJ compositing, but not the OBJ mosaic counters
+    if (!(DispCnt & (1<<7)))
+    {
+        // window X state carries over to the next line. CalculateWindowMask leaves it as set by
+        // the last edge it crosses: open if x1 > x2, closed otherwise (x1 == x2 closes)
+        if (DispCnt & (1<<14))
+        {
+            if (Win1Coords[0] > Win1Coords[1]) Win1Active |=  0x2;
+            else                               Win1Active &= ~0x2;
+        }
+        if (DispCnt & (1<<13))
+        {
+            if (Win0Coords[0] > Win0Coords[1]) Win0Active |=  0x2;
+            else                               Win0Active &= ~0x2;
+        }
+
+        // affine reference points advance on every line their BG is drawn as an
+        // affine/extended/large BG (BG2: modes 2, 4, 5, 6; BG3: modes 1-5)
+        u32 bgmode = DispCnt & 0x7;
+        if ((DispCnt & 0x0400) && (bgmode == 2 || bgmode == 4 || bgmode == 5 || bgmode == 6))
+        {
+            BGXRefInternal[0] += BGRotB[0];
+            BGYRefInternal[0] += BGRotD[0];
+        }
+        if ((DispCnt & 0x0800) && (bgmode >= 1 && bgmode <= 5))
+        {
+            BGXRefInternal[1] += BGRotB[1];
+            BGYRefInternal[1] += BGRotD[1];
+        }
+
+        if (BGMosaicY >= BGMosaicYMax)
+        {
+            BGMosaicY = 0;
+            BGMosaicYMax = BGMosaicSize[1];
+        }
+        else
+            BGMosaicY++;
+    }
+
+    UpdateMosaicCounters(line);
+}
+
 void Unit::VBlank()
 {
     if (CaptureLatch)
@@ -632,7 +703,7 @@ void Unit::SampleFIFO(u32 offset, u32 num)
     }
 }
 
-u16* Unit::GetBGExtPal(u32 slot, u32 pal)
+u16* Unit::GetBGExtPal(u32 slot, u32 pal) const
 {
     const u32 PaletteSize = 256 * 2;
     const u32 SlotSize = PaletteSize * 16;
@@ -641,7 +712,7 @@ u16* Unit::GetBGExtPal(u32 slot, u32 pal)
          : GPU.VRAMFlat_BBGExtPal)[slot * SlotSize + pal * PaletteSize];
 }
 
-u16* Unit::GetOBJExtPal()
+u16* Unit::GetOBJExtPal() const
 {
     return Num == 0
          ? (u16*)GPU.VRAMFlat_AOBJExtPal
@@ -657,8 +728,12 @@ void Unit::CheckWindows(u32 line)
     else if (line == Win1Coords[2]) Win1Active |=  0x1;
 }
 
-void Unit::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow)
+void Unit::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow) const
 {
+    // works on copies of the window state: the X carry-over to the next line is done by PostDrawScanline
+    u32 win0Active = Win0Active;
+    u32 win1Active = Win1Active;
+
     for (u32 i = 0; i < 256; i++)
         windowMask[i] = WinCnt[2]; // window outside
 
@@ -680,10 +755,10 @@ void Unit::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow)
 
         for (int i = 0; i < 256; i++)
         {
-            if (i == x2)      Win1Active &= ~0x2;
-            else if (i == x1) Win1Active |=  0x2;
+            if (i == x2)      win1Active &= ~0x2;
+            else if (i == x1) win1Active |=  0x2;
 
-            if (Win1Active == 0x3) windowMask[i] = WinCnt[1];
+            if (win1Active == 0x3) windowMask[i] = WinCnt[1];
         }
     }
 
@@ -695,10 +770,10 @@ void Unit::CalculateWindowMask(u32 line, u8* windowMask, const u8* objWindow)
 
         for (int i = 0; i < 256; i++)
         {
-            if (i == x2)      Win0Active &= ~0x2;
-            else if (i == x1) Win0Active |=  0x2;
+            if (i == x2)      win0Active &= ~0x2;
+            else if (i == x1) win0Active |=  0x2;
 
-            if (Win0Active == 0x3) windowMask[i] = WinCnt[0];
+            if (win0Active == 0x3) windowMask[i] = WinCnt[0];
         }
     }
 }

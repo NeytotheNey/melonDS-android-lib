@@ -888,8 +888,13 @@ void GPU::StartHBlank(u32 line) noexcept
         // note: this should start 48 cycles after the scanline start
         if (line < 192)
         {
+            // the renderer only reads the Units, their per-line updates happen around it
+            GPU2D_A.PreDrawScanline(VCount);
+            GPU2D_B.PreDrawScanline(VCount);
             GPU2D_Renderer->DrawScanline(line, &GPU2D_A);
             GPU2D_Renderer->DrawScanline(line, &GPU2D_B);
+            GPU2D_A.PostDrawScanline(VCount);
+            GPU2D_B.PostDrawScanline(VCount);
         }
 
         // sprites are pre-rendered one scanline in advance
@@ -907,6 +912,8 @@ void GPU::StartHBlank(u32 line) noexcept
     }
     else if (VCount == 262)
     {
+        GPU2D_A.ResetOBJMosaicCounters();
+        GPU2D_B.ResetOBJMosaicCounters();
         GPU2D_Renderer->DrawSprites(0, &GPU2D_A);
         GPU2D_Renderer->DrawSprites(0, &GPU2D_B);
     }

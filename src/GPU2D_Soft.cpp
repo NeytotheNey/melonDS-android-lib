@@ -141,8 +141,7 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     // oddly that's not the case for GPU A
     if (CurUnit->Num && !CurUnit->Enabled) forceblank = true;
 
-    if (line == 0 && CurUnit->CaptureCnt & (1 << 31) && !forceblank)
-        CurUnit->CaptureLatch = true;
+    // CaptureLatch is set for line 0 by Unit::PreDrawScanline
 
     if (CurUnit->Num == 0)
     {
@@ -172,7 +171,6 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
 
     // always render regular graphics
     DrawScanline_BGOBJ(line);
-    CurUnit->UpdateMosaicCounters(line);
 
     switch (dispmode)
     {
@@ -402,7 +400,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
         }
     }
 
-    u16* srcB = NULL;
+    const u16* srcB = NULL;
     u32 srcBaddr = line * 256;
 
     if (captureCnt & (1<<25))
@@ -577,7 +575,7 @@ template<u32 bgmode>
 void SoftRenderer::DrawScanlineBGMode(u32 line)
 {
     u32 dispCnt = CurUnit->DispCnt;
-    u16* bgCnt = CurUnit->BGCnt;
+    const u16* bgCnt = CurUnit->BGCnt;
     for (int i = 3; i >= 0; i--)
     {
         if ((bgCnt[3] & 0x3) == i)
@@ -632,7 +630,7 @@ void SoftRenderer::DrawScanlineBGMode(u32 line)
 void SoftRenderer::DrawScanlineBGMode6(u32 line)
 {
     u32 dispCnt = CurUnit->DispCnt;
-    u16* bgCnt = CurUnit->BGCnt;
+    const u16* bgCnt = CurUnit->BGCnt;
     for (int i = 3; i >= 0; i--)
     {
         if ((bgCnt[2] & 0x3) == i)
@@ -660,7 +658,7 @@ void SoftRenderer::DrawScanlineBGMode6(u32 line)
 void SoftRenderer::DrawScanlineBGMode7(u32 line)
 {
     u32 dispCnt = CurUnit->DispCnt;
-    u16* bgCnt = CurUnit->BGCnt;
+    const u16* bgCnt = CurUnit->BGCnt;
     // mode 7 only has text-mode BG0 and BG1
 
     for (int i = 3; i >= 0; i--)
@@ -841,13 +839,8 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         }
     }
 
-    if (CurUnit->BGMosaicY >= CurUnit->BGMosaicYMax)
-    {
-        CurUnit->BGMosaicY = 0;
-        CurUnit->BGMosaicYMax = CurUnit->BGMosaicSize[1];
-    }
-    else
-        CurUnit->BGMosaicY++;
+    // the BG and OBJ mosaic counters, affine reference points and window X state
+    // advance in Unit::PostDrawScanline
 
     /*if (OBJMosaicY >= OBJMosaicYMax)
     {
@@ -1174,9 +1167,6 @@ void SoftRenderer::DrawBG_Affine(u32 line, u32 bgnum)
         rotX += rotA;
         rotY += rotC;
     }
-
-    CurUnit->BGXRefInternal[bgnum-2] += rotB;
-    CurUnit->BGYRefInternal[bgnum-2] += rotD;
 }
 
 template<bool mosaic, SoftRenderer::DrawPixel drawPixel>
@@ -1395,9 +1385,6 @@ void SoftRenderer::DrawBG_Extended(u32 line, u32 bgnum)
             rotY += rotC;
         }
     }
-
-    CurUnit->BGXRefInternal[bgnum-2] += rotB;
-    CurUnit->BGYRefInternal[bgnum-2] += rotD;
 }
 
 template<bool mosaic, SoftRenderer::DrawPixel drawPixel>
@@ -1489,9 +1476,6 @@ void SoftRenderer::DrawBG_Large(u32 line) // BG is always BG2
         rotX += rotA;
         rotY += rotC;
     }
-
-    CurUnit->BGXRefInternal[0] += rotB;
-    CurUnit->BGYRefInternal[0] += rotD;
 }
 
 // OBJ line buffer:
@@ -1589,17 +1573,7 @@ void SoftRenderer::DrawSprites(u32 line, Unit* unit)
 {
     CurUnit = unit;
 
-    if (line == 0)
-    {
-        // reset those counters here
-        // TODO: find out when those are supposed to be reset
-        // it would make sense to reset them at the end of VBlank
-        // however, sprites are rendered one scanline in advance
-        // so they need to be reset a bit earlier
-
-        CurUnit->OBJMosaicY = 0;
-        CurUnit->OBJMosaicYCount = 0;
-    }
+    // the OBJ mosaic counters are reset for line 0 by Unit::ResetOBJMosaicCounters
 
     if (CurUnit->Num == 0)
     {
