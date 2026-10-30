@@ -52,6 +52,9 @@ public:
     void RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept;
     void SetOutputTexture(int buf, GLuint texture);
     void BindOutputTexture(int buf);
+    // drops the held WideMelon wings (see WingHold), for a reset or a savestate load.
+    // CPU state only, so it needs no GL context
+    void ResetWingHold() noexcept;
 private:
     GLCompositor(GLuint CompShader) noexcept;
     int Scale = 0;
@@ -66,6 +69,29 @@ private:
     GLuint CompWideScaleLoc = 0;
     GLuint CompWideRatioLoc = 0;
     GLuint CompWideOffsetLoc = 0;
+    GLuint CompWideHoldLoc = 0;
+
+    // WideMelon wing hold. games with 3D on both screens move unit A (and the 3D) to the other
+    // screen every frame, so each half only gets 3D wings every other frame. the frames in
+    // between reuse the half's wings from the last frame that had them, kept in HeldWingsTex
+    // (both wings side by side, full output height). see PrepareWingHold
+    static constexpr int WingHoldNever = 1000;
+    struct WingHoldHalf
+    {
+        int SinceLive = WingHoldNever;  // frames since this half last had unit A's 3D wings
+        int SinceCopy = WingHoldNever;  // frames since they were copied to HeldWingsTex
+        int HoldRun = 0;                // frames held in a row
+        std::array<u32, 6> CopyLines {};// the copied frame's lines that had 3D wings
+    };
+    std::array<WingHoldHalf, 2> WingHold {};
+    std::array<bool, 2> WingCopy {};
+    std::array<u32, 12> WingHoldLines {};   // uvec4 uWingHold[3] in the shader
+    GLuint HeldWingsTex = 0;
+    GLuint HeldWingsFB = 0;
+    int HeldWingsW = 0, HeldWingsH = 0;
+
+    void PrepareWingHold(const GPU& gpu, int backbuf) noexcept;
+    void CopyHeldWings(int backbuf) noexcept;
 
     GLuint CompVertexBufferID = 0;
     GLuint CompVertexArrayID = 0;

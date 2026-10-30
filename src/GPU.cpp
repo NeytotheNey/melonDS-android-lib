@@ -332,7 +332,10 @@ void GPU::DoSavestate(Savestate* file) noexcept
     GPU3D.DoSavestate(file);
 
     if (!file->Saving)
+    {
         ResetVRAMCache();
+        GPU3D.GetCurrentRenderer().SavestateLoaded();
+    }
 }
 
 void GPU::AssignFramebuffers() noexcept

@@ -62,6 +62,10 @@ precision mediump usampler2D;
 uniform uint u3DScale;
 #ifdef WIDE
 uniform int uWideOffset;
+// one bit per line (0-383), 128 lines per element: reuse the wings in HeldWingsTex.
+// highp, as mediump can be 16 bits
+uniform highp uvec4 uWingHold[3];
+uniform mediump sampler2D HeldWingsTex;
 #endif
 
 uniform usampler2D ScreenTex;
@@ -132,6 +136,19 @@ void main()
 #ifdef WIDE
     if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
     {
+        // a held line takes the wings from an earlier frame's output as they are. HeldWingsTex
+        // has the left wing, then the right one, at the output's rows
+        int line = int(fTexcoord.y);
+        if (((uWingHold[line >> 7][(line >> 5) & 3] >> uint(line & 31)) & 1u) != 0u)
+        {
+            ivec2 coord = ivec2(gl_FragCoord.xy);
+            int wingW = uWideOffset * int(u3DScale);
+            if (coord.x >= wingW)
+                coord.x -= 256 * int(u3DScale);
+            oColor = vec4(texelFetch(HeldWingsTex, coord, 0).rgb, 1.0);
+            return;
+        }
+
         ivec4 wing = WingPixel();
         wing.rgb <<= 2;
         wing.rgb |= (wing.rgb >> 6);

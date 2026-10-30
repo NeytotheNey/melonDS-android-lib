@@ -327,8 +327,8 @@ GLRenderer::~GLRenderer()
 
 void GLRenderer::Reset(GPU& gpu)
 {
-    // This is where the compositor's Reset() method would be called,
-    // except there's no such method right now.
+    // held WideMelon wings belong to the old scene
+    CurGLCompositor.ResetWingHold();
 }
 
 void GLRenderer::SetBetterPolygons(bool betterpolygons) noexcept
@@ -1433,6 +1433,11 @@ void GLRenderer::SetOutputTexture(int buffer, u32 texture)
 void GLRenderer::BindOutputTexture(int buffer)
 {
     CurGLCompositor.BindOutputTexture(buffer);
+}
+
+void GLRenderer::SavestateLoaded()
+{
+    CurGLCompositor.ResetWingHold();
 }
 
 u32* GLRenderer::GetLine(int line)

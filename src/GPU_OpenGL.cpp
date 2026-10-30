@@ -18,6 +18,7 @@
 
 #include "GPU_OpenGL.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <cstdio>
 #include <cstring>
@@ -127,6 +128,8 @@ GLCompositor::~GLCompositor()
     glDeleteFramebuffers(CompScreenOutputFB.size(), &CompScreenOutputFB[0]);
     glDeleteTextures(1, &CompScreenInputTex);
     glDeleteTextures(CompScreenOutputTex.size(), &CompScreenOutputTex[0]);
+    glDeleteFramebuffers(1, &HeldWingsFB);
+    glDeleteTextures(1, &HeldWingsTex);
 
     glDeleteVertexArrays(1, &CompVertexArrayID);
     glDeleteBuffers(1, &CompVertexBufferID);
@@ -147,6 +150,14 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     CompWideScaleLoc(other.CompWideScaleLoc),
     CompWideRatioLoc(other.CompWideRatioLoc),
     CompWideOffsetLoc(other.CompWideOffsetLoc),
+    CompWideHoldLoc(other.CompWideHoldLoc),
+    WingHold(other.WingHold),
+    WingCopy(other.WingCopy),
+    WingHoldLines(other.WingHoldLines),
+    HeldWingsTex(other.HeldWingsTex),
+    HeldWingsFB(other.HeldWingsFB),
+    HeldWingsW(other.HeldWingsW),
+    HeldWingsH(other.HeldWingsH),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -155,6 +166,8 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     CompScreenOutputTex(other.CompScreenOutputTex),
     CompScreenOutputFB(other.CompScreenOutputFB)
 {
+    other.HeldWingsTex = {};
+    other.HeldWingsFB = {};
     other.CompScreenOutputFB = {};
     other.CompScreenInputTex = {};
     other.CompScreenOutputTex = {};
@@ -177,6 +190,12 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         CompWideScaleLoc = other.CompWideScaleLoc;
         CompWideRatioLoc = other.CompWideRatioLoc;
         CompWideOffsetLoc = other.CompWideOffsetLoc;
+        CompWideHoldLoc = other.CompWideHoldLoc;
+        WingHold = other.WingHold;
+        WingCopy = other.WingCopy;
+        WingHoldLines = other.WingHoldLines;
+        HeldWingsW = other.HeldWingsW;
+        HeldWingsH = other.HeldWingsH;
         CompVertices = other.CompVertices;
 
         // Clean up these resources before overwriting them
@@ -201,6 +220,14 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         glDeleteFramebuffers(CompScreenOutputFB.size(), &CompScreenOutputFB[0]);
         CompScreenOutputFB = other.CompScreenOutputFB;
 
+        glDeleteTextures(1, &HeldWingsTex);
+        HeldWingsTex = other.HeldWingsTex;
+
+        glDeleteFramebuffers(1, &HeldWingsFB);
+        HeldWingsFB = other.HeldWingsFB;
+
+        other.HeldWingsTex = {};
+        other.HeldWingsFB = {};
         other.CompScreenOutputFB = {};
         other.CompScreenInputTex = {};
         other.CompScreenOutputTex = {};
@@ -239,10 +266,12 @@ bool GLCompositor::PrepareWide() noexcept
     CompWideScaleLoc = glGetUniformLocation(CompShaderWide, "u3DScale");
     CompWideRatioLoc = glGetUniformLocation(CompShaderWide, "uWideRatio");
     CompWideOffsetLoc = glGetUniformLocation(CompShaderWide, "uWideOffset");
+    CompWideHoldLoc = glGetUniformLocation(CompShaderWide, "uWingHold");
 
     glUseProgram(CompShaderWide);
     glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
     glUniform1i(glGetUniformLocation(CompShaderWide, "_3DTex"), 1);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "HeldWingsTex"), 2);
 
     return true;
 }
@@ -261,6 +290,9 @@ void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
     ViewWidth = viewWidth;
     ScreenW = viewWidth * scale;
     ScreenH = (384+2) * scale;
+
+    // held wings are only reused at the width and scale they were made at
+    ResetWingHold();
 
     for (int i = 0; i < 2; i++)
     {
@@ -291,11 +323,141 @@ void GLCompositor::Stop(const GPU& gpu) noexcept
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    ResetWingHold();
+}
+
+void GLCompositor::ResetWingHold() noexcept
+{
+    WingHold = {};
+    WingCopy = {};
+    WingHoldLines = {};
+}
+
+// decides, from the control words of the frame being composited, which wing lines are held
+// (WingHoldLines, for the shader) and which halves get copied after drawing (WingCopy).
+// a half is held while unit A's 3D wings are in the other half this frame (the game moved
+// unit A over), it had its own in a copy made at most 2 frames ago, and it hasn't been held
+// for 2 frames in a row yet. only lines that had 3D wings in the copy and would be black
+// now are held, so 2D-only lines and white lines stay as they are. games with 3D on one
+// screen never have 3D wings in both halves, so they never copy or hold
+void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
+{
+    std::array<bool, 2> live {};
+    std::array<std::array<u32, 6>, 2> liveLines {}, blackLines {};
+    for (int half = 0; half < 2; half++)
+    {
+        const u32* fb = gpu.Framebuffer[backbuf][half].get();
+        for (int line = 0; line < 192; line++)
+        {
+            u32 ctrl = fb[line * (256*3 + 1) + 256*3];
+            if (ctrl & (1 << 18))
+            {
+                liveLines[half][line >> 5] |= 1u << (line & 31);
+                live[half] = true;
+            }
+            else if (!(ctrl & (1 << 21)))
+                blackLines[half][line >> 5] |= 1u << (line & 31);
+        }
+
+        WingHoldHalf& hold = WingHold[half];
+        hold.SinceLive = live[half] ? 0 : std::min(hold.SinceLive + 1, WingHoldNever);
+        hold.SinceCopy = std::min(hold.SinceCopy + 1, WingHoldNever);
+    }
+
+    // a half's live wings are copied while the other half had 3D wings in the last 2 frames
+    WingCopy[0] = live[0] && WingHold[1].SinceLive <= 2;
+    WingCopy[1] = live[1] && WingHold[0].SinceLive <= 2;
+
+    int wingW = (ViewWidth - 256) / 2 * Scale;
+    if ((WingCopy[0] || WingCopy[1]) && (HeldWingsW != wingW * 2 || HeldWingsH != ScreenH))
+    {
+        if (!HeldWingsTex)
+        {
+            glGenTextures(1, &HeldWingsTex);
+            glGenFramebuffers(1, &HeldWingsFB);
+        }
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wingW * 2, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, HeldWingsFB);
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HeldWingsTex, 0);
+
+        HeldWingsW = wingW * 2;
+        HeldWingsH = ScreenH;
+        // what was in the old texture is gone
+        WingHold[0].SinceCopy = WingHold[1].SinceCopy = WingHoldNever;
+    }
+
+    WingHoldLines = {};
+    for (int half = 0; half < 2; half++)
+    {
+        WingHoldHalf& hold = WingHold[half];
+        if (live[half])
+        {
+            hold.HoldRun = 0;
+            continue;
+        }
+
+        if (WingHold[half ^ 1].SinceLive != 0 || hold.SinceCopy > 2 || hold.HoldRun >= 2)
+            continue;
+
+        hold.HoldRun++;
+        for (int i = 0; i < 6; i++)
+            WingHoldLines[half * 6 + i] = hold.CopyLines[i] & blackLines[half][i];
+    }
+
+    for (int half = 0; half < 2; half++)
+    {
+        if (WingCopy[half])
+            WingHold[half].CopyLines = liveLines[half];
+    }
+}
+
+// copies the wings of the halves PrepareWingHold picked from the output just drawn. the
+// wings are the output's first and last wingW columns, and its halves are 192 lines each
+// with the 2 padding lines between them
+void GLCompositor::CopyHeldWings(int backbuf) noexcept
+{
+    int wingW = (ViewWidth - 256) / 2 * Scale;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, HeldWingsFB);
+
+    for (int half = 0; half < 2; half++)
+    {
+        if (!WingCopy[half])
+            continue;
+
+        int y0 = half * 194 * Scale;
+        int y1 = y0 + 192 * Scale;
+        glBlitFramebuffer(0, y0, wingW, y1, 0, y0, wingW, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBlitFramebuffer(ScreenW - wingW, y0, ScreenW, y1, wingW, y0, wingW * 2, y1,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        WingHold[half].SinceCopy = 0;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
 }
 
 void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 {
     int backbuf = gpu.FrontBuffer ^ 1;
+    bool hasFramebuffers = gpu.Framebuffer[backbuf][0] && gpu.Framebuffer[backbuf][1];
+
+    // before the output is bound, as this can set up the held wings' framebuffer
+    bool wingHold = ViewWidth != 256 && hasFramebuffers;
+    if (wingHold)
+        PrepareWingHold(gpu, backbuf);
+    else
+        WingHoldLines = {};
+
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
 
@@ -318,12 +480,16 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1ui(CompWideScaleLoc, Scale);
         glUniform1f(CompWideRatioLoc, ViewWidth / 256.0f);
         glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
+        glUniform4uiv(CompWideHoldLoc, WingHoldLines.size() / 4, WingHoldLines.data());
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
     }
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, CompScreenInputTex);
 
-    if (gpu.Framebuffer[backbuf][0] && gpu.Framebuffer[backbuf][1])
+    if (hasFramebuffers)
     {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256*3 + 1, 192, GL_RGBA_INTEGER,
                         GL_UNSIGNED_BYTE, gpu.Framebuffer[backbuf][0].get());
@@ -337,6 +503,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
     glBindVertexArray(CompVertexArrayID);
     glDrawArrays(GL_TRIANGLES, 0, 4*3);
+
+    if (wingHold && (WingCopy[0] || WingCopy[1]))
+        CopyHeldWings(backbuf);
 }
 
 void GLCompositor::SetOutputTexture(int buf, GLuint texture)

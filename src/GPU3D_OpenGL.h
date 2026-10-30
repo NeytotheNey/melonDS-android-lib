@@ -65,6 +65,7 @@ public:
 
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
+    void SavestateLoaded() override;
 
     static std::unique_ptr<GLRenderer> New() noexcept;
 private:

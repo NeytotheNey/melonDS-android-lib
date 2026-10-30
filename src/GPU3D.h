@@ -368,6 +368,8 @@ public:
     virtual void FlushCommands() {}
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
+    // after a savestate is loaded, for what the renderer keeps from earlier frames' output
+    virtual void SavestateLoaded() {}
 
     // WideMelon, in native pixels: the width new geometry should be built for, and the width of
     // the output right now (it can lag behind for the polygons still being drawn).
