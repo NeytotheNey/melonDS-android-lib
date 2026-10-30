@@ -1415,6 +1415,11 @@ void GLRenderer::PrepareCaptureFrame()
     glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 }
 
+void GLRenderer::FlushCommands()
+{
+    glFlush();
+}
+
 void GLRenderer::Blit(const GPU& gpu)
 {
     CurGLCompositor.RenderFrame(gpu, *this);

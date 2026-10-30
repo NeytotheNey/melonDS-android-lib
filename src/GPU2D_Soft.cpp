@@ -377,6 +377,11 @@ void SoftRenderer::VBlankEnd(Unit* unitA, Unit* unitB)
         if ((unitA->CaptureCnt & (1<<31)) && (((unitA->CaptureCnt >> 29) & 0x3) != 1))
         {
             renderer3d.PrepareCaptureFrame();
+
+            // the lines this arms are held until line 192 (see GPU::Begin2DJob), so submit the
+            // readback now instead of leaving it to the map there
+            if (GPU.DeferCapture2D && GPU.EarlyFlushCapture)
+                renderer3d.FlushCommands();
         }
     }
 #endif

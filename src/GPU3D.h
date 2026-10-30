@@ -363,6 +363,9 @@ public:
 
     virtual void SetupAccelFrame() {}
     virtual void PrepareCaptureFrame() {}
+    // submits the queued GPU work without waiting for it, so the GPU starts on what display
+    // capture will read back (see GPU::StartHBlank at line 215 and SoftRenderer::VBlankEnd)
+    virtual void FlushCommands() {}
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
 

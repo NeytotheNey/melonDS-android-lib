@@ -632,6 +632,10 @@ public:
     // hold display capture lines back until line 192 with an accelerated 3D renderer (see
     // Begin2DJob). only turned off by a debug switch, to compare against drawing them at HBlank
     bool DeferCapture2D = true;
+    // with DeferCapture2D, submit the GPU work held lines wait for (the 3D frame at line 215, its
+    // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
+    // line 192. only turned off by a debug switch, to compare
+    bool EarlyFlushCapture = true;
 
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;
@@ -803,6 +807,9 @@ private:
     std::unique_ptr<GPU2D::LineJob[]> Deferred2DJobs;
     u32 Deferred2DEnd = 0;
     u32 Deferred2DPending = 0;
+    // set when this frame holds a line that reads 3D (Snapshot2DScanline), cleared at line 215
+    // (see StartHBlank)
+    bool CaptureHeldThisFrame = false;
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;

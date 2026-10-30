@@ -60,6 +60,7 @@ public:
 
     void SetupAccelFrame() override;
     void PrepareCaptureFrame() override;
+    void FlushCommands() override;
     void Blit(const GPU& gpu) override;
 
     void SetOutputTexture(int buffer, u32 texture) override;

@@ -1180,6 +1180,11 @@ void ComputeRenderer::PrepareCaptureFrame()
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+void ComputeRenderer::FlushCommands()
+{
+    glFlush();
+}
+
 void ComputeRenderer::SetOutputTexture(int buffer, u32 texture)
 {
     CurGLCompositor.SetOutputTexture(buffer, (GLuint) texture);

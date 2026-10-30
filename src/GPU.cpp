@@ -166,6 +166,7 @@ void GPU::ResetVRAMCache() noexcept
 void GPU::Reset() noexcept
 {
     Sync2D();
+    CaptureHeldThisFrame = false;
 
     VCount = 0;
     NextVCount = -1;
@@ -984,6 +985,16 @@ void GPU::StartHBlank(u32 line) noexcept
             Flush2DDeferred();
 
         GPU3D.VCount215(*this);
+
+        // this frame held lines that capture 3D, so the next one most likely reads this 3D
+        // frame back too. submit it now: otherwise the GPU only starts on it at the frontend's
+        // frame-end flush, and the held lines' map at line 192 waits for that
+        if (CaptureHeldThisFrame)
+        {
+            CaptureHeldThisFrame = false;
+            if (EarlyFlushCapture)
+                GPU3D.GetCurrentRenderer().FlushCommands();
+        }
     }
     else if (VCount == 262)
     {
@@ -1041,6 +1052,7 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
         {
             job.Fetch3DLine = true;
             job.Abort3DLine = GPU3D.AbortFrame;
+            CaptureHeldThisFrame = true;
         }
         else
             job.Line3D = GPU3D.GetLine(line);
