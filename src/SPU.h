@@ -19,6 +19,8 @@
 #ifndef SPU_H
 #define SPU_H
 
+#include <atomic>
+
 #include "Savestate.h"
 #include "Platform.h"
 
@@ -248,6 +250,7 @@ public:
     void BufferAudio();
 
     void TrimOutput();
+    int TrimOutputIfAbove(int threshold, int keep);
     void DrainOutput();
     void InitOutput();
     int GetOutputSize() const;
@@ -266,7 +269,11 @@ public:
 private:
     u32 OutputBufferSize = 0;
     double OutputSampleRate;
+    // the skew the blip buffers currently use. only touched by the emulator thread
     double OutputSkew = 1.0;
+    // the skew asked for by SetOutputSkew(), which may be called from the audio thread.
+    // it is applied by BufferAudio(), between two blip frames
+    std::atomic<double> RequestedOutputSkew {1.0};
     melonDS::NDS& NDS;
 
     blip_t* BlipLeft;

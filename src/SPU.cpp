@@ -1027,6 +1027,16 @@ void SPU::BufferAudio()
     blip_read_samples(BlipLeft, temp, avail, true);
     blip_read_samples(BlipRight, temp + 1, avail, true);
 
+    // apply a new output skew now that the blip buffers are empty, so they are
+    // only ever changed from this thread
+    double skew = RequestedOutputSkew.load(std::memory_order_relaxed);
+    if (skew != OutputSkew)
+    {
+        OutputSkew = skew;
+        blip_set_rates(BlipLeft, INTERNAL_SAMPLE_RATE * OutputSkew, OutputSampleRate);
+        blip_set_rates(BlipRight, INTERNAL_SAMPLE_RATE * OutputSkew, OutputSampleRate);
+    }
+
     Platform::Mutex_Lock(AudioLock);
     for (int i = 0; i < avail * 2; i += 2)
     {
@@ -1057,6 +1067,36 @@ void SPU::TrimOutput()
     Platform::Mutex_Unlock(AudioLock);
 }
 
+int SPU::TrimOutputIfAbove(int threshold, int keep)
+{
+    // like TrimOutput(), but only if more than threshold frames are buffered, keeping
+    // the newest keep frames. checking and trimming under one lock hold means the read
+    // position only ever moves forward. constant time, so it can be called from the
+    // audio thread. returns the number of frames dropped
+    int dropped = 0;
+    Platform::Mutex_Lock(AudioLock);
+
+    int fill;
+    if (OutputBufferWritePos >= OutputBufferReadPos)
+        fill = OutputBufferWritePos - OutputBufferReadPos;
+    else
+        fill = (OutputBufferSize*2) - OutputBufferReadPos + OutputBufferWritePos;
+    fill >>= 1;
+
+    if (keep < 0) keep = 0;
+    if (fill > threshold && fill > keep)
+    {
+        int readpos = OutputBufferWritePos - (keep*2);
+        if (readpos < 0) readpos += (OutputBufferSize*2);
+
+        OutputBufferReadPos = readpos;
+        dropped = fill - keep;
+    }
+
+    Platform::Mutex_Unlock(AudioLock);
+    return dropped;
+}
+
 void SPU::DrainOutput()
 {
     Platform::Mutex_Lock(AudioLock);
@@ -1069,6 +1109,7 @@ void SPU::InitOutput()
 {
     Platform::Mutex_Lock(AudioLock);
 
+    OutputSkew = RequestedOutputSkew.load(std::memory_order_relaxed);
     blip_set_rates(BlipLeft, INTERNAL_SAMPLE_RATE * OutputSkew, OutputSampleRate);
     blip_set_rates(BlipRight, INTERNAL_SAMPLE_RATE * OutputSkew, OutputSampleRate);
 
@@ -1172,9 +1213,8 @@ void SPU::SetOutputSampleRate(double rate)
 
 void SPU::SetOutputSkew(double skew)
 {
-    blip_set_rates(BlipLeft, INTERNAL_SAMPLE_RATE * skew, OutputSampleRate);
-    blip_set_rates(BlipRight, INTERNAL_SAMPLE_RATE * skew, OutputSampleRate);
-    OutputSkew = skew;
+    // safe to call from the audio thread: the skew is applied by BufferAudio()
+    RequestedOutputSkew.store(skew, std::memory_order_relaxed);
 }
 
 
