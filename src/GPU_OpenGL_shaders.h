@@ -87,14 +87,13 @@ ivec4 Fetch3D(float xpos, float ypos)
 }
 
 #ifdef WIDE
-// the wide output's extra columns. only the top screen's 3D layer goes there, on the lines
-// where unit A shows it (control word bit 18), and the 2D layers stay native.
-// lines that are all white (bit 21) get white wings
+// the wide output's extra columns. only unit A's 3D layer goes there, on the lines where it
+// shows it (control word bit 18), and the 2D layers stay native. unit A writes its control
+// words into whichever screen it's on, so the wings follow the 3D to the bottom half too (the
+// frontend shows that half wide when the player swaps the screens). lines that are all white
+// (bit 21, from either unit) get white wings
 ivec4 WingPixel()
 {
-    if (fTexcoord.y >= 192.0)
-        return ivec4(0);
-
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
 
@@ -107,7 +106,7 @@ ivec4 WingPixel()
     {
         // same X scroll as the middle
         float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
-        pixel = Fetch3D(fTexcoord.x + _3dxpos, fTexcoord.y);
+        pixel = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
 
         // BLDCNT fade, as for 3D on top in the middle (bits 19-20, EVY in bits 8-12)
         int effect = (mbright.b >> 3) & 0x3;
