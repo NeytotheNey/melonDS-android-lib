@@ -85,18 +85,21 @@ public:
     /// The 2D thread while threaded 2D is on, otherwise null (so the frontend can find it, e.g. for CPU hints)
     [[nodiscard]] Platform::Thread* Get2DThread() const noexcept;
 
-    /// The 2D barrier: waits until the 2D thread has drawn every line it was given. Call it before
-    /// changing anything a queued line reads: palette, OAM, LCDC VRAM banks, VRAM mappings, the
-    /// flat VRAM copies, the framebuffers or the 2D renderer. It's only a check while the thread is
-    /// idle, or when threaded 2D is off
+    /// The 2D barrier: waits until the 2D thread has drawn every line it was given, and draws the
+    /// lines held back for display capture (see Begin2DJob). Call it before changing anything a
+    /// queued line reads: palette, OAM, LCDC VRAM banks, VRAM mappings, the flat VRAM copies, the
+    /// framebuffers or the 2D renderer. It's only a check while no line is waiting
     void Sync2D() noexcept
     {
-        if (Is2DThreadBusy())
+        if (Is2DRingBusy())
             Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+        if (Deferred2DPending)
+            Flush2DDeferred();
     }
 
-    /// The barrier for writes to LCDC banks. A queued line only reads them in VRAM display mode
-    /// (display capture is never queued), so it only syncs while such a line may still be queued
+    /// The barrier for writes to LCDC banks. A queued line only reads them in VRAM display mode,
+    /// and a line held for display capture writes one, so it only syncs while such a line may
+    /// still be waiting
     void Sync2DForLCDC() noexcept
     {
         if (Queued2DReadsLCDC)
@@ -114,8 +117,12 @@ public:
     void MapVRAM_I(u32 bank, u8 cnt) noexcept;
 
     template<typename T>
-    T ReadVRAM_LCDC(u32 addr) const noexcept
+    T ReadVRAM_LCDC(u32 addr) noexcept
     {
+        // display capture writes an LCDC bank, so the lines held back for it are drawn first
+        if (Deferred2DPending)
+            Flush2DDeferred();
+
         int bank;
 
         switch (addr & 0xFF8FC000)
@@ -622,6 +629,9 @@ public:
 
     // debug only: log a checksum of both 2D framebuffers at the end of every frame (see LogHash2D)
     bool Hash2DLogging = false;
+    // hold display capture lines back until line 192 with an accelerated 3D renderer (see
+    // Begin2DJob). only turned off by a debug switch, to compare against drawing them at HBlank
+    bool DeferCapture2D = true;
 
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;
@@ -667,13 +677,27 @@ private:
     void MakeVRAMFlat_2DBGCoherent() noexcept;
     void MakeVRAMFlat_2DOBJCoherent() noexcept;
 
-    // a job is either queued for the 2D thread (a ring slot) or drawn right away (Job2D)
+    // a job is either queued for the 2D thread (a ring slot), held for display capture (a
+    // Deferred2DJobs slot) or drawn right away (Job2D)
     GPU2D::LineJob& Begin2DJob() noexcept;
     void End2DJob(GPU2D::LineJob& job) noexcept;
     bool Is2DJobQueued(const GPU2D::LineJob& job) const noexcept { return &job != &Job2D; }
+    // only true for the job being built, between Begin2DJob and End2DJob
+    bool Is2DJobDeferred(const GPU2D::LineJob& job) const noexcept
+    {
+        const GPU2D::LineJob* deferred = Deferred2DJobs.get();
+        return deferred && &job == deferred + Deferred2DEnd;
+    }
+    GPU2D::LineJob* BeginDeferred2DJob() noexcept;
+    void Flush2DDeferred() noexcept;
 
-    // threaded 2D, see SetThreaded2D in GPU.cpp
+    // true while some line isn't drawn yet: queued for the 2D thread or held for display capture
     bool Is2DThreadBusy() const noexcept
+    {
+        return Deferred2DPending || Is2DRingBusy();
+    }
+    // threaded 2D, see SetThreaded2D in GPU.cpp
+    bool Is2DRingBusy() const noexcept
     {
         return Jobs2DQueued.load(std::memory_order_relaxed) != Jobs2DDone.load(std::memory_order_acquire);
     }
@@ -767,9 +791,18 @@ private:
     // only lives for one HBlank, so it isn't savestated
     GPU2D::LineJob Job2D {};
 
-    // emulator thread only: set when a queued job uses VRAM display, cleared by Sync2DForLCDC once
-    // the ring is drained (a drain elsewhere leaves it set, which only costs one idle check)
+    // emulator thread only: set when a queued job uses VRAM display or a job is held for display
+    // capture, cleared by Sync2DForLCDC once both are drawn (a drain elsewhere leaves it set, which
+    // only costs one idle check)
     bool Queued2DReadsLCDC = false;
+
+    // display capture lines held back until line 192 (see Begin2DJob), on the emulator thread only.
+    // the buffer is made the first time a line is held. jobs [Deferred2DEnd - Deferred2DPending,
+    // Deferred2DEnd) wait to be drawn, and Deferred2DEnd is the slot of the job being built.
+    // nothing is held between frames, so none of this is savestated
+    std::unique_ptr<GPU2D::LineJob[]> Deferred2DJobs;
+    u32 Deferred2DEnd = 0;
+    u32 Deferred2DPending = 0;
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;

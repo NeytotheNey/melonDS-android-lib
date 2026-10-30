@@ -187,8 +187,9 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
 
     // CaptureLatch is set for line 0 by Unit::PreDrawScanline
 
-    // the 3D line is fetched when the job is built (GPU::Snapshot2DScanline), as the GL renderers
-    // read it back from a GL buffer. lines that don't fetch one keep the last one, as before
+    // the 3D line is fetched when the job is built (GPU::Snapshot2DScanline), or just before a held
+    // display capture line is drawn (GPU::Flush2DDeferred), as the GL renderers read it back from a
+    // GL buffer. lines that don't fetch one keep the last one, as before
     if (CurUnit->Num == 0 && CurJob->Line3D)
         _3DLine = CurJob->Line3D;
 

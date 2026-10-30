@@ -977,6 +977,12 @@ void GPU::StartHBlank(u32 line) noexcept
     }
     else if (VCount == 215)
     {
+        // lines still held for display capture (a VCount write skipped line 192) read the GL
+        // readback buffer, which the 3D render can reallocate, so they're drawn first. only the
+        // held lines: nothing is queued while lines are held, and software 3D needs no ring sync here
+        if (Deferred2DPending)
+            Flush2DDeferred();
+
         GPU3D.VCount215(*this);
     }
     else if (VCount == 262)
@@ -1025,11 +1031,20 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
     job.BG[1] = GPU2D_B.State();
 
     // unit A's 3D line, fetched in the same cases the renderer used to: always with the software
-    // renderer, and for display capture with the GL ones (their GetLine maps a GL buffer on line 0)
+    // renderer, and for display capture with the GL ones (their GetLine maps a GL buffer on line 0).
+    // a line held for capture fetches it when it's drawn, with the scroll and abort state of now
     if (!job.Accelerated)
         job.Line3D = GPU3D.GetLine(line);
     else if (GPU2D_A.CaptureLatch && (((GPU2D_A.CaptureCnt >> 29) & 0x3) != 1))
-        job.Line3D = GPU3D.GetLine(line);
+    {
+        if (Is2DJobDeferred(job))
+        {
+            job.Fetch3DLine = true;
+            job.Abort3DLine = GPU3D.AbortFrame;
+        }
+        else
+            job.Line3D = GPU3D.GetLine(line);
+    }
 
     // the 3D renderer reuses its line buffer, so a queued job keeps a copy
     if (job.Line3D && Is2DJobQueued(job))
@@ -1113,6 +1128,19 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 // is armed at line 0 and stays on until VBlank, so a frame that captures goes back to drawing here
 // from its first captured line on, and the next frame starts on the thread again.
 // the 3D line is copied into queued jobs (see Snapshot2DScanline), so software 3D works threaded too
+//
+// display capture with an accelerated 3D renderer (and DeferCapture2D): the lines aren't drawn at
+// their HBlank but held in Deferred2DJobs, and drawn in order on the emulator thread by
+// Flush2DDeferred, at the latest by the Sync2D before the GL compositor at line 192. the 3D frame
+// is submitted at line 215 and read back into a GL buffer at line 0, and the first captured line
+// maps that buffer (GetLine(0)), which waits for the GPU. drawing it at line 192 instead gives the
+// GPU the whole frame to finish. this works with threaded 2D on or off: the ring is drained when
+// the first line is held, and a line that isn't held draws the held ones first, so nothing is
+// queued while lines are held.
+// held lines count as not drawn yet for every barrier: Sync2D draws them, Is2DThreadBusy is true
+// (the flat copies), LCDC writes sync (Queued2DReadsLCDC is set) and LCDC reads draw them first
+// (ReadVRAM_LCDC), since DoCapture writes an LCDC bank and capture source B reads one. a game that
+// touches any of that mid-frame gets an early draw, which costs what drawing at HBlank did
 
 static inline void CPURelax() noexcept
 {
@@ -1305,21 +1333,33 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
 {
     GPU2D::LineJob* job = &Job2D;
 
-    if (Threaded2D)
+    if (GPU2D_A.CaptureLatch && DeferCapture2D && GPU3D.IsRendererAccelerated())
     {
-        if (!GPU2D_A.CaptureLatch)
-        {
-            // the next ring slot, once the thread is done with the job that used it last
-            u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
-            if (queued - Jobs2DDone.load(std::memory_order_acquire) >= Ring2DSize)
-                Wait2DJobs(queued - Ring2DSize + 1);
+        // display capture with GL: held until line 192 (see above SetThreaded2D)
+        job = BeginDeferred2DJob();
+    }
+    else
+    {
+        // held lines are drawn before any line that isn't
+        if (Deferred2DPending)
+            Flush2DDeferred();
 
-            job = &Threaded2D->Jobs[queued % Ring2DSize];
-        }
-        else
+        if (Threaded2D)
         {
-            // display capture: drawn here, after the lines queued before it
-            Sync2D();
+            if (!GPU2D_A.CaptureLatch)
+            {
+                // the next ring slot, once the thread is done with the job that used it last
+                u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
+                if (queued - Jobs2DDone.load(std::memory_order_acquire) >= Ring2DSize)
+                    Wait2DJobs(queued - Ring2DSize + 1);
+
+                job = &Threaded2D->Jobs[queued % Ring2DSize];
+            }
+            else
+            {
+                // display capture: drawn here, after the lines queued before it
+                Sync2D();
+            }
         }
     }
 
@@ -1327,11 +1367,64 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
     return *job;
 }
 
+// a frame holds 192 lines at most (lines 0-191). if a VCount write skipped VBlank, line 262's
+// sprite job would be the 193rd, so the held lines are drawn first and it starts a new buffer
+static constexpr u32 Deferred2DSize = 192;
+
+GPU2D::LineJob* GPU::BeginDeferred2DJob() noexcept
+{
+    // the lines queued before it are drawn first. only the ring: the held lines stay held
+    if (Is2DRingBusy())
+        Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+
+    if (!Deferred2DJobs)
+        Deferred2DJobs = std::make_unique<GPU2D::LineJob[]>(Deferred2DSize);
+
+    if (Deferred2DEnd == Deferred2DSize)
+        Flush2DDeferred();
+    if (!Deferred2DPending)
+        Deferred2DEnd = 0;
+
+    // DoCapture writes an LCDC bank and capture source B can read one, so LCDC writes must sync
+    Queued2DReadsLCDC = true;
+
+    GPU2D::LineJob* job = &Deferred2DJobs[Deferred2DEnd];
+    job->Fetch3DLine = false;
+    return job;
+}
+
+// draws the held display capture lines, in order, as StartHBlank would have drawn them. the 2D
+// thread is idle here (nothing is queued while lines are held), and the job being built, if any,
+// isn't held yet (it's at Deferred2DEnd)
+void GPU::Flush2DDeferred() noexcept
+{
+    for (u32 i = Deferred2DEnd - Deferred2DPending; i < Deferred2DEnd; i++)
+    {
+        GPU2D::LineJob& job = Deferred2DJobs[i];
+
+        // the first one with a 3D line maps the GL readback buffer (GetLine(0)), the rest read
+        // the copy the renderer made of it
+        if (job.Fetch3DLine)
+            job.Line3D = GPU3D.GetLine(job.Line, job.RenderXPos, job.Abort3DLine);
+
+        GPU2D_Renderer->RunJob(job);
+    }
+
+    Deferred2DPending = 0;
+}
+
 void GPU::End2DJob(GPU2D::LineJob& job) noexcept
 {
     if (!Is2DJobQueued(job))
     {
         GPU2D_Renderer->RunJob(job);
+        return;
+    }
+
+    if (Is2DJobDeferred(job))
+    {
+        Deferred2DEnd++;
+        Deferred2DPending++;
         return;
     }
 
@@ -1493,7 +1586,8 @@ void GPU::StartScanline(u32 line) noexcept
             // the last lines are usually still being drawn here, and nothing below needs them until
             // the GL compositor reads the 2D back buffers (the Blit at the end), so the wait is there.
             // the VBlank DMAs and the CPU only reach what a queued line reads through the write
-            // barriers (palette, OAM, LCDC banks, the mappings and the flat copies), the 3D renderers
+            // barriers (palette, OAM, LCDC banks, the mappings and the flat copies; LCDC reads too,
+            // for the lines held for display capture), the 3D renderers
             // don't touch the 2D output, and with software 3D nothing reads it before FinishFrame,
             // which syncs
 
@@ -1524,7 +1618,8 @@ void GPU::StartScanline(u32 line) noexcept
             // Need a better way to identify the openGL renderer in particular
             if (GPU3D.IsRendererAccelerated())
             {
-                // the compositor uploads this frame's 2D back buffers, so every line must be drawn
+                // the compositor uploads this frame's 2D back buffers, so every line must be drawn.
+                // this is where the lines held for display capture are usually drawn
                 Sync2D();
                 GPU3D.Blit(*this);
             }

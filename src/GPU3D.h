@@ -117,7 +117,10 @@ public:
     // it follows the renderer's GetViewWidth(), latched when the polygon RAM is swapped (or at
     // VBlank while the geometry engine is off)
     [[nodiscard]] int GetViewWidth() const noexcept { return ViewWidth; }
-    u32* GetLine(int line) noexcept;
+    u32* GetLine(int line) noexcept { return GetLine(line, RenderXPos, AbortFrame); }
+    // with the X scroll and abort state a line had when it was built, for a display capture
+    // line that is drawn later (see GPU::Begin2DJob)
+    u32* GetLine(int line, u16 xpos, bool abort) noexcept;
 
     void WriteToGXFIFO(u32 val) noexcept;
 

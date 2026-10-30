@@ -142,7 +142,8 @@ private:
 // one HBlank's worth of 2D drawing: the BG/OBJ pass of the current line and the sprites of the
 // next one, for both Units. GPU::StartHBlank builds it on the emulator thread, and the renderer
 // draws only from it plus VRAM (and its flat copies), palette and OAM.
-// with threaded 2D, jobs wait in a ring until the 2D thread draws them (see GPU::Begin2DJob)
+// with threaded 2D, jobs wait in a ring until the 2D thread draws them, and display capture lines
+// with an accelerated 3D renderer wait until line 192 (see GPU::Begin2DJob)
 struct LineJob
 {
     bool DrawBG;            // DrawScanline(Line) for both Units
@@ -156,6 +157,8 @@ struct LineJob
     bool WideView;          // the 3D output is wider than 256, so the control word carries the wings info
     u32* Framebuffer[2];    // per Unit, as assigned when the job was built (POWCNT can swap them)
     u32* Line3D;            // unit A's 3D line, or null when this line didn't fetch it (the renderer keeps the last one)
+    bool Fetch3DLine;       // held for display capture: Line3D is fetched when the job is drawn (GPU::Flush2DDeferred)
+    bool Abort3DLine;       // and GPU3D::AbortFrame as it was when the job was built (RenderXPos is above)
     u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks
 
     UnitState BG[2];        // after PreDrawScanline, before PostDrawScanline

@@ -2586,19 +2586,19 @@ void GPU3D::SetRenderXPos(u16 xpos) noexcept
 }
 
 
-u32* GPU3D::GetLine(int line) noexcept
+u32* GPU3D::GetLine(int line, u16 xpos, bool abort) noexcept
 {
-    if (!AbortFrame)
+    if (!abort)
     {
         u32* rawline = CurrentRenderer->GetLine(line);
 
-        if (RenderXPos == 0) return rawline;
+        if (xpos == 0) return rawline;
 
         // apply X scroll
 
-        if (RenderXPos & 0x100)
+        if (xpos & 0x100)
         {
-            int i = 0, j = RenderXPos;
+            int i = 0, j = xpos;
             for (; j < 512; i++, j++)
                 ScrolledLine[i] = 0;
             for (j = 0; i < 256; i++, j++)
@@ -2606,7 +2606,7 @@ u32* GPU3D::GetLine(int line) noexcept
         }
         else
         {
-            int i = 0, j = RenderXPos;
+            int i = 0, j = xpos;
             for (; j < 256; i++, j++)
                 ScrolledLine[i] = rawline[j];
             for (; i < 256; i++)
