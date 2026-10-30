@@ -150,7 +150,6 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     CompWideScaleLoc(other.CompWideScaleLoc),
     CompWideRatioLoc(other.CompWideRatioLoc),
     CompWideOffsetLoc(other.CompWideOffsetLoc),
-    CompWideHoldLoc(other.CompWideHoldLoc),
     WingHold(other.WingHold),
     WingCopy(other.WingCopy),
     WingHoldLines(other.WingHoldLines),
@@ -190,7 +189,6 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         CompWideScaleLoc = other.CompWideScaleLoc;
         CompWideRatioLoc = other.CompWideRatioLoc;
         CompWideOffsetLoc = other.CompWideOffsetLoc;
-        CompWideHoldLoc = other.CompWideHoldLoc;
         WingHold = other.WingHold;
         WingCopy = other.WingCopy;
         WingHoldLines = other.WingHoldLines;
@@ -266,7 +264,6 @@ bool GLCompositor::PrepareWide() noexcept
     CompWideScaleLoc = glGetUniformLocation(CompShaderWide, "u3DScale");
     CompWideRatioLoc = glGetUniformLocation(CompShaderWide, "uWideRatio");
     CompWideOffsetLoc = glGetUniformLocation(CompShaderWide, "uWideOffset");
-    CompWideHoldLoc = glGetUniformLocation(CompShaderWide, "uWingHold");
 
     glUseProgram(CompShaderWide);
     glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
@@ -335,12 +332,15 @@ void GLCompositor::ResetWingHold() noexcept
 }
 
 // decides, from the control words of the frame being composited, which wing lines are held
-// (WingHoldLines, for the shader) and which halves get copied after drawing (WingCopy).
-// a half is held while unit A's 3D wings are in the other half this frame (the game moved
-// unit A over), it had its own in a copy made at most 2 frames ago, and it hasn't been held
-// for 2 frames in a row yet. only lines that had 3D wings in the copy and would be black
-// now are held, so 2D-only lines and white lines stay as they are. games with 3D on one
-// screen never have 3D wings in both halves, so they never copy or hold
+// (WingHoldLines, and for the shader WingHeldBit in WingCtrl) and which halves get copied after
+// drawing (WingCopy).
+// a half is held while unit A's 3D is in the other half this frame (control word bit 22, the
+// game moved unit A over), it had its own in a copy made at most 2 frames ago, and it hasn't
+// been held for 2 frames in a row yet. only lines that had 3D wings (bit 18) in the copy and
+// would be black now are held, so 2D-only lines and white lines stay as they are. bit 22 is
+// set whatever the windows do, so a window that hides the wings on every line of unit A's
+// screen still counts as unit A being there. games with 3D on one screen never have unit A's
+// 3D in both halves, so they never copy or hold
 void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
 {
     std::array<bool, 2> live {};
@@ -351,11 +351,11 @@ void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
         for (int line = 0; line < 192; line++)
         {
             u32 ctrl = fb[line * (256*3 + 1) + 256*3];
-            if (ctrl & (1 << 18))
-            {
-                liveLines[half][line >> 5] |= 1u << (line & 31);
+            if (ctrl & (1 << 22))
                 live[half] = true;
-            }
+
+            if (ctrl & (1 << 18))
+                liveLines[half][line >> 5] |= 1u << (line & 31);
             else if (!(ctrl & (1 << 21)))
                 blackLines[half][line >> 5] |= 1u << (line & 31);
         }
@@ -365,7 +365,7 @@ void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
         hold.SinceCopy = std::min(hold.SinceCopy + 1, WingHoldNever);
     }
 
-    // a half's live wings are copied while the other half had 3D wings in the last 2 frames
+    // a half's live wings are copied while unit A was in the other half in the last 2 frames
     WingCopy[0] = live[0] && WingHold[1].SinceLive <= 2;
     WingCopy[1] = live[1] && WingHold[0].SinceLive <= 2;
 
@@ -411,6 +411,22 @@ void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
         hold.HoldRun++;
         for (int i = 0; i < 6; i++)
             WingHoldLines[half * 6 + i] = hold.CopyLines[i] & blackLines[half][i];
+    }
+
+    // the shader reads the held flag from the control words, so RenderFrame uploads this copy
+    // of them over the frame's. the bit is cleared everywhere else, as a game can write any
+    // value to MASTER_BRIGHT
+    for (int half = 0; half < 2; half++)
+    {
+        const u32* fb = gpu.Framebuffer[backbuf][half].get();
+        for (int line = 0; line < 192; line++)
+        {
+            int outLine = half * 192 + line;
+            u32 ctrl = fb[line * (256*3 + 1) + 256*3] & ~WingHeldBit;
+            if ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1)
+                ctrl |= WingHeldBit;
+            WingCtrl[outLine] = ctrl;
+        }
     }
 
     for (int half = 0; half < 2; half++)
@@ -480,7 +496,6 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1ui(CompWideScaleLoc, Scale);
         glUniform1f(CompWideRatioLoc, ViewWidth / 256.0f);
         glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
-        glUniform4uiv(CompWideHoldLoc, WingHoldLines.size() / 4, WingHoldLines.data());
 
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
@@ -495,6 +510,11 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
                         GL_UNSIGNED_BYTE, gpu.Framebuffer[backbuf][0].get());
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256*3 + 1, 192, GL_RGBA_INTEGER,
                         GL_UNSIGNED_BYTE, gpu.Framebuffer[backbuf][1].get());
+
+        // the control words again, with the held lines flagged (see PrepareWingHold)
+        if (wingHold)
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 256*3, 0, 1, 384, GL_RGBA_INTEGER,
+                            GL_UNSIGNED_BYTE, WingCtrl.data());
     }
 
     glActiveTexture(GL_TEXTURE1);

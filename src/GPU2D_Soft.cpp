@@ -305,8 +305,12 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
         {
             // wide 3D view: bit 18 = this line shows unit A's 3D layer in the wings, bits 19-20 = its
             // BLDCNT fade (BG0 as 1st target) and bits 8-12 = EVY for it, bit 21 = white wings, for
-            // a white line (screen off or forced blank). the master brightness register doesn't use
-            // bits 5-13
+            // a white line (screen off or forced blank), bit 22 = unit A shows 3D on BG0 on this
+            // line, whatever the windows do with it (the wing hold reads it to tell which half
+            // unit A is in). the fade bits are only read with bit 18: a line whose wings a window
+            // hid has black wings, and a held line takes the copied wings with their fade as
+            // drawn. the master brightness register doesn't use bits 5-13 (the GL compositor
+            // flags held wing lines with bit 13 in its own copy, see GLCompositor::PrepareWingHold)
             dst[256*3] &= ~0x1F00;
 
             if ((dispmode == 0) || ((dispmode == 1) && (CurUnit->DispCnt & 0x80)))
@@ -316,11 +320,20 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
             else if ((CurUnit->Num == 0) && CurUnit->Enabled && (dispmode == 1) &&
                 ((CurUnit->DispCnt & 0x188) == 0x108))
             {
-                u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
-                u32 evy = CurUnit->EVY;
-                if (evy > 16) evy = 16;
+                dst[256*3] |= (1 << 22);
 
-                dst[256*3] |= (1 << 18) | (effect << 19) | (evy << 8);
+                // with windows on, the wings follow BG0 at the edge columns (the mask built by
+                // DrawScanline_BGOBJ for this line, with WINOUT and the OBJ window in it), so a
+                // window letterbox blacks them out with the middle. the control word has one
+                // wings bit, so both show 3D if either edge does
+                if (!(CurUnit->DispCnt & 0xE000) || ((WindowMask[0] | WindowMask[255]) & 0x01))
+                {
+                    u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
+                    u32 evy = CurUnit->EVY;
+                    if (evy > 16) evy = 16;
+
+                    dst[256*3] |= (1 << 18) | (effect << 19) | (evy << 8);
+                }
             }
         }
         return;
@@ -786,7 +799,22 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
     }
 
     if (CurUnit->DispCnt & 0xE000)
+    {
         CurUnit->CalculateWindowMask(line, WindowMask, OBJWindow[CurUnit->Num]);
+
+        // wide 3D view: x2 is exclusive and at most 255, so column 255 is only inside a window
+        // that wraps (x1 > x2), and a game may start one at x1 = 1. on hardware that's a hidden
+        // edge pixel, but here the wings carry on past it, so it shows as a 1-px seam (backdrop)
+        // between the middle and the wings. give the edge columns their neighbour's mask, for
+        // both units (unit B can sit next to held wings, see GLCompositor::PrepareWingHold).
+        // this also goes into display capture, and the wings rule in DrawScanline reads the
+        // patched edges
+        if (CurJob->WideView)
+        {
+            WindowMask[0] = WindowMask[1];
+            WindowMask[255] = WindowMask[254];
+        }
+    }
     else
         memset(WindowMask, 0xFF, 256);
 

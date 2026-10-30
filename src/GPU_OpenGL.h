@@ -69,7 +69,6 @@ private:
     GLuint CompWideScaleLoc = 0;
     GLuint CompWideRatioLoc = 0;
     GLuint CompWideOffsetLoc = 0;
-    GLuint CompWideHoldLoc = 0;
 
     // WideMelon wing hold. games with 3D on both screens move unit A (and the 3D) to the other
     // screen every frame, so each half only gets 3D wings every other frame. the frames in
@@ -78,14 +77,19 @@ private:
     static constexpr int WingHoldNever = 1000;
     struct WingHoldHalf
     {
-        int SinceLive = WingHoldNever;  // frames since this half last had unit A's 3D wings
+        int SinceLive = WingHoldNever;  // frames since this half last had unit A's 3D (bit 22)
         int SinceCopy = WingHoldNever;  // frames since they were copied to HeldWingsTex
         int HoldRun = 0;                // frames held in a row
         std::array<u32, 6> CopyLines {};// the copied frame's lines that had 3D wings
     };
     std::array<WingHoldHalf, 2> WingHold {};
     std::array<bool, 2> WingCopy {};
-    std::array<u32, 12> WingHoldLines {};   // uvec4 uWingHold[3] in the shader
+    std::array<u32, 12> WingHoldLines {};   // one bit per output line (0-383): held
+    // the control words (column 256*3 of the screen texture) of both halves as uploaded, with
+    // WingHeldBit set on the held lines and cleared on the others. bit 13 is free: the master
+    // brightness field only uses bits 0-4 and 14-15 there, and the wings' fade EVY bits 8-12
+    static constexpr u32 WingHeldBit = 1u << 13;
+    std::array<u32, 384> WingCtrl {};
     GLuint HeldWingsTex = 0;
     GLuint HeldWingsFB = 0;
     int HeldWingsW = 0, HeldWingsH = 0;
