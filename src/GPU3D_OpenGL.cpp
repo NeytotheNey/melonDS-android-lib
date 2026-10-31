@@ -1576,6 +1576,13 @@ void GLRenderer::RenderFrame(GPU& gpu)
     if (unibuf) memcpy(unibuf, &ShaderConfig, sizeof(ShaderConfig));
     glUnmapBuffer(GL_UNIFORM_BUFFER);
 
+    // the fog pass and the compositor rebind units 0 and 1 every frame,
+    // so the render and clear-bitmap shaders need these bound again here
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, TexMemID);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, TexPalMemID);
+
     if (textureChanged)
     {
         // TexMem is 1024 texels wide: one row is two dirty chunks of a texture slot
@@ -1583,7 +1590,6 @@ void GLRenderer::RenderFrame(GPU& gpu)
         constexpr u32 numRows = sizeof(gpu.VRAMFlat_Texture) / 1024;
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, TexMemID);
         for (u32 row = 0; row < numRows; )
         {
             if (!AnyDirty(textureDirty, row*chunksPerRow, chunksPerRow)) { row++; continue; }
@@ -1604,7 +1610,6 @@ void GLRenderer::RenderFrame(GPU& gpu)
         constexpr u32 numRows = 6 * 8;
 
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, TexPalMemID);
         for (u32 row = 0; row < numRows; )
         {
             if (!AnyDirty(texPalDirty, row*chunksPerRow, chunksPerRow)) { row++; continue; }
