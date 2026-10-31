@@ -82,11 +82,9 @@ public:
         u64 entriesCount = ((startBit + bitsCount + 0x3F) >> 6) - startEntry;
         for (u32 j = startEntry; j < startEntry + entriesCount; j++)
         {
+            // the hash covers the whole range, so the first dirty piece decides
             if (GetRangedBitMask(j, startBit, bitsCount) & dirty[j & ((vramSize / VRAMDirtyGranularity)-1)])
-            {
-                if (MaskedHash(vram, vramSize, start, size) != oldHash)
-                    return true;
-            }
+                return MaskedHash(vram, vramSize, start, size) != oldHash;
         }
 
         return false;
@@ -299,21 +297,21 @@ public:
 private:
     struct TexArrayEntry
     {
-        TexHandleT TextureID;
-        u32 Layer;
+        TexHandleT TextureID {};
+        u32 Layer {};
     };
 
     struct TexCacheEntry
     {
-        u32 LastVariant; // very cheap way to make variant lookup faster
+        u32 LastVariant {}; // very cheap way to make variant lookup faster
 
-        u32 TextureRAMStart[2], TextureRAMSize[2];
-        u32 TexPalStart, TexPalSize;
-        u8 WidthLog2, HeightLog2;
-        TexArrayEntry Texture;
+        u32 TextureRAMStart[2] {}, TextureRAMSize[2] {};
+        u32 TexPalStart {}, TexPalSize {};
+        u8 WidthLog2 {}, HeightLog2 {};
+        TexArrayEntry Texture {};
 
-        u64 TextureHash[2];
-        u64 TexPalHash;
+        u64 TextureHash[2] {};
+        u64 TexPalHash {};
     };
     std::unordered_map<u64, TexCacheEntry> Cache;
 

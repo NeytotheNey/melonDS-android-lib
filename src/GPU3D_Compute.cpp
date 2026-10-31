@@ -269,7 +269,7 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
             glSamplerParameteri(result->Samplers[i+j*3], GL_TEXTURE_WRAP_S, translateWrapMode[i]);
             glSamplerParameteri(result->Samplers[i+j*3], GL_TEXTURE_WRAP_T, translateWrapMode[j]);
             glSamplerParameteri(result->Samplers[i+j*3], GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glSamplerParameterf(result->Samplers[i+j*3], GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glSamplerParameteri(result->Samplers[i+j*3], GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         }
     }
 
@@ -277,7 +277,7 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     glBindBuffer(GL_PIXEL_PACK_BUFFER, result->PixelBuffer);
     glBufferData(GL_PIXEL_PACK_BUFFER, 256*192*4, NULL, GL_DYNAMIC_READ);
 
-    glGenBuffers(1, &result->CaptureFrameBuffer);
+    glGenFramebuffers(1, &result->CaptureFrameBuffer);
 
     return result;
 }
@@ -301,7 +301,7 @@ ComputeRenderer::~ComputeRenderer()
 
     glDeleteSamplers(9, Samplers);
     glDeleteBuffers(1, &PixelBuffer);
-    glDeleteBuffers(1, &CaptureFrameBuffer);
+    glDeleteFramebuffers(1, &CaptureFrameBuffer);
 
     DeleteShaders();
 }
@@ -398,8 +398,15 @@ bool ComputeRenderer::TargetFits(int width, int scale) const noexcept
 
     // the biggest work buffer is a tile memory layer: 4*TileSize^2 bytes for each of the
     // MaxWorkTiles (16 per tile), so 64 bytes per pixel of the rounded up target
-    s64 screenW = (s64)InternalWidthFor(width, scale, TileSizeForScale(scale)) * scale;
+    int tileSize = TileSizeForScale(scale);
+    s64 screenW = (s64)InternalWidthFor(width, scale, tileSize) * scale;
     s64 largestBuffer = 64 * screenW * (192 * scale);
+
+    // the WorkDescs keep a work tile's index in 21 bits, and SortWork dispatches a group per 32
+    // of them along X, which only goes to 65535
+    s64 maxWorkTiles = (screenW / tileSize) * (192 * scale / tileSize) * 16;
+    if (maxWorkTiles > 65535 * 32)
+        return false;
     // the sizes are passed to glBufferData as int
     if (largestBuffer > INT32_MAX)
         return false;
@@ -443,6 +450,18 @@ void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinate
     int targetWidth = ScaleFactor == -1 ? ViewWidth : TargetWidth;
     if (!TargetFits(targetWidth, scale))
         targetWidth = ViewWidth;
+
+    // the frontend calls this on every settings change, but the shaders and work buffers only
+    // depend on the scale and the target width. hi-res coordinates are only used here on the CPU
+    if (scale == ScaleFactor && targetWidth == TargetWidth)
+    {
+        if (highResolutionCoordinates != HiresCoordinates)
+        {
+            HiresCoordinates = highResolutionCoordinates;
+            ForceRender = true;
+        }
+        return;
+    }
 
     ResizeTargets(scale, highResolutionCoordinates, targetWidth);
 }
@@ -507,6 +526,8 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     glBindTexture(GL_TEXTURE_2D, Framebuffer);
     // only the real width, the wide compositor clips its 3D reads to the texture's size
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, TargetWidth * ScaleFactor, ScreenHeight);
+    // it's empty, so the next frame has to fill it even if it's the same
+    ForceRender = true;
 
     // eh those are pretty bad guesses
     // though real hw shouldn't be eable to render all 2048 polygons on every line either
@@ -771,8 +792,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     if (!TargetFits(targetWidth, ScaleFactor) ||
         (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
         targetWidth = ViewWidth;
-    bool resized = targetWidth != TargetWidth;
-    if (resized)
+    if (targetWidth != TargetWidth)
     {
         ResizeTargets(ScaleFactor, HiresCoordinates, targetWidth);
         int current, count;
@@ -784,14 +804,18 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
 
     assert(!NeedsShaderCompile());
-    // new targets are empty, so they're drawn even if the frame is the same
-    if (!Texcache.Update(gpu) && gpu.GPU3D.RenderFrameIdentical && !resized)
+    // new targets are empty (here or after SetRenderSettings), so they're drawn even if the frame is the same
+    if (!Texcache.Update(gpu) && gpu.GPU3D.RenderFrameIdentical && !ForceRender)
     {
         return;
     }
+    ForceRender = false;
 
     int numYSpans = 0;
     int numSetupIndices = 0;
+    // the polygons that fit in the span buffers, the rest of the frame is dropped
+    int numPolygons = gpu.GPU3D.RenderNumPolygons;
+    const int maxSetupIndices = (int)YSpanIndices.size();
 
     /*
         Some games really like to spam small textures, often
@@ -871,12 +895,17 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
                     }
                 }
 
+                if (numVariants == MaxVariants)
+                {
+                    // out of variants, drop this polygon and the rest of the frame
+                    numPolygons = i;
+                    break;
+                }
                 prevVariant = numVariants;
                 variants[numVariants] = variant;
                 variants[numVariants].Width = TextureWidth(polygon->TexParam);
                 variants[numVariants].Height = TextureHeight(polygon->TexParam);
                 numVariants++;
-                assert(numVariants <= MaxVariants);
             foundVariant:;
 
                 if (textureLastVariant)
@@ -920,6 +949,16 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             ytop = std::min(scaledPositions[i][1], ytop);
             ybot = std::max(scaledPositions[i][1], ybot);
         }
+
+        // the span buffers are sized by guesses, so stop before they overflow. each side makes at
+        // most one y-span per vertex, and each line one setup index (one if it's flat)
+        if (numYSpans + 2 * (int)nverts > MaxYSpanSetups
+            || numSetupIndices + std::max(ybot - ytop, 1) > maxSetupIndices)
+        {
+            numPolygons = i;
+            break;
+        }
+
         RenderPolygons[i].YTop = ytop;
         RenderPolygons[i].YBot = ybot;
         RenderPolygons[i].XMin = ScreenWidth;
@@ -1040,7 +1079,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         glBufferSubData(GL_TEXTURE_BUFFER, 0, numSetupIndices*4*2, YSpanIndices.data());
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, RenderPolygonMemory);
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, gpu.GPU3D.RenderNumPolygons*sizeof(RenderPolygon), RenderPolygons);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, numPolygons*sizeof(RenderPolygon), RenderPolygons);
         // we haven't accessed image data yet, so we don't need to invalidate anything
     }
 
@@ -1058,7 +1097,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     MetaUniform meta;
     meta.DispCnt = gpu.GPU3D.RenderDispCnt;
-    meta.NumPolygons = gpu.GPU3D.RenderNumPolygons;
+    meta.NumPolygons = numPolygons;
     meta.NumVariants = numVariants;
     meta.AlphaRef = gpu.GPU3D.RenderAlphaRef;
     {
@@ -1131,7 +1170,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
         // bin polygons
         glUseProgram(ShaderBinCombined);
-        glDispatchCompute(((gpu.GPU3D.RenderNumPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
+        glDispatchCompute(((numPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
 
         // calculate list offsets
@@ -1231,7 +1270,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     
     glUseProgram(ShaderFinalPass[finalPassShader]);
     glDispatchCompute(ScreenWidth/32, ScreenHeight, 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    // the compositor reads the 3D image with texelFetch, and capture reads the low res one with glReadPixels
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
 
     glBindSampler(0, 0);
 

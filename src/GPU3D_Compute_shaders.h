@@ -273,6 +273,8 @@ layout (std430, binding = 6) buffer BinResultBuffer
 {
     uvec4 VariantWorkCount[MaxVariants];
     uint SortedWorkOffset[MaxVariants];
+    // see BinResultHeader, VariantWorkCount's .y and .z are the split rasterise dispatch
+    uint VariantWorkRealCount[MaxVariants];
 
     uvec4 SortWorkWorkCount;
 
@@ -978,6 +980,25 @@ void main()
 
     int linearTile = fineTile.x + fineTile.y * TilesPerLine + coarseTile.x * CoarseTileCountX + coarseTile.y * TilesPerLine * CoarseTileCountY;
 
+    // WorkDescs and the tile memory only have room for MaxWorkTiles, so the polygons past that
+    // are dropped from this tile. it's done before the masks are stored, so DepthBlend only sees
+    // the work that was written. VariantWorkCount[0].w can still end up past MaxWorkTiles
+    uint workOffset = 0U;
+    if (binnedMask != 0U)
+    {
+        workOffset = atomicAdd(VariantWorkCount[0].w, uint(bitCount(binnedMask)));
+        if (workOffset >= uint(MaxWorkTiles))
+        {
+            binnedMask = 0U;
+        }
+        else
+        {
+            uint keepCount = uint(MaxWorkTiles) - workOffset;
+            while (uint(bitCount(binnedMask)) > keepCount)
+                binnedMask &= ~(1U << findMSB(binnedMask));
+        }
+    }
+
     BinningMaskAndOffset[BinningMaskStart + linearTile * BinStride + groupIdx] = binnedMask;
     int coarseMaskIdx = linearTile * CoarseBinStride + (groupIdx >> 5);
     if (binnedMask != 0U)
@@ -985,7 +1006,6 @@ void main()
 
     if (binnedMask != 0U)
     {
-        uint workOffset = atomicAdd(VariantWorkCount[0].w, uint(bitCount(binnedMask)));
         BinningMaskAndOffset[BinningWorkOffsetsStart + linearTile * BinStride + groupIdx] = workOffset;
 
         uint tilePositionCombined = uint(bitfieldInsert(fineTileTopLeft.x, fineTileTopLeft.y, 16, 16));
@@ -1021,9 +1041,19 @@ void main()
         if (gl_GlobalInvocationID.x == 0u)
         {
             // a bit of a cheat putting this here, but this shader won't run that often
-            SortWorkWorkCount = uvec4((VariantWorkCount[0].w + 31u) / 32u, 1u, 1u, 0u);
+            // (binning only wrote the first MaxWorkTiles entries)
+            SortWorkWorkCount = uvec4((min(VariantWorkCount[0].w, uint(MaxWorkTiles)) + 31u) / 32u, 1u, 1u, 0u);
         }
-        SortedWorkOffset[gl_GlobalInvocationID.x] = atomicAdd(VariantWorkCount[1].w, VariantWorkCount[gl_GlobalInvocationID.x].z);
+        uint realCount = VariantWorkCount[gl_GlobalInvocationID.x].z;
+        SortedWorkOffset[gl_GlobalInvocationID.x] = atomicAdd(VariantWorkCount[1].w, realCount);
+
+        // the rasterise dispatch is (1, y, z) with y*z >= the count and neither past the 65535 GL
+        // guarantees, split evenly so at most y-1 groups are empty. only .y and .z change, [0].w and
+        // [1].w are still counters
+        uint chunks = (realCount + 65534u) / 65535u;
+        VariantWorkRealCount[gl_GlobalInvocationID.x] = realCount;
+        VariantWorkCount[gl_GlobalInvocationID.x].y = chunks;
+        VariantWorkCount[gl_GlobalInvocationID.x].z = chunks == 0u ? 0u : (realCount + chunks - 1u) / chunks;
     }
 }
 
@@ -1039,7 +1069,8 @@ layout (local_size_x = 32) in;
 
 void main()
 {
-    if (gl_GlobalInvocationID.x < VariantWorkCount[0].w)
+    // binning dropped the work past MaxWorkTiles
+    if (gl_GlobalInvocationID.x < min(VariantWorkCount[0].w, uint(MaxWorkTiles)))
     {
         uvec2 workDesc = WorkDescs[WorkDescsUnsortedStart + gl_GlobalInvocationID.x];
         int inVariantOffset = int(bitfieldExtract(workDesc.y, 11, 21));
@@ -1069,7 +1100,13 @@ layout (location = 1) uniform vec2 InvTextureSize;
 
 void main()
 {
-    uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + gl_WorkGroupID.z];
+    // the dispatch is split across Y and Z (see CalcOffsets), the last chunk can go past the end.
+    // the return is the same for the whole group and there are no barriers below
+    uint workIdx = gl_WorkGroupID.y * gl_NumWorkGroups.z + gl_WorkGroupID.z;
+    if (workIdx >= VariantWorkRealCount[CurVariant])
+        return;
+
+    uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + workIdx];
     Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, 11)];
     ivec2 position = ivec2(int(bitfieldExtract(workDesc.x, 0, 16)), int(bitfieldExtract(workDesc.x, 16, 16))) + ivec2(gl_LocalInvocationID.xy);
     int tileOffset = int(bitfieldExtract(workDesc.y, 11, 21)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);

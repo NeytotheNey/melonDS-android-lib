@@ -275,11 +275,11 @@ bool CompileComputeProgram(GLuint& result, const std::string& source, const std:
         }
         else
         {
+            Log(LogLevel::Error, "Shader %s from cache was rejected\n", name.c_str());
         }
     }*/
-    Log(LogLevel::Error, "Shader %s from cache was rejected\n", name.c_str());
 
-    GLuint shader;
+    GLuint shader = 0;
     bool linkingSucess = false;
 
     if (!glCreateShader || !glDeleteShader)
@@ -288,12 +288,18 @@ bool CompileComputeProgram(GLuint& result, const std::string& source, const std:
     shader = glCreateShader(GL_COMPUTE_SHADER);
 
     if (!CompilerShader(shader, source, name, "compute"))
+    {
+        // CompilerShader already deleted it
+        shader = 0;
         goto error;
+    }
 
     linkingSucess = LinkProgram(result, &shader, 1);
 
 error:
-    glDeleteShader(shader);
+    // 0 if glCreateShader isn't loaded, and glDeleteShader might not be either
+    if (shader != 0)
+        glDeleteShader(shader);
 
     if (!linkingSucess)
     {
@@ -332,11 +338,18 @@ bool CompileVertexFragmentProgram(GLuint& result,
 
     bool linkingSucess = false;
 
+    // CompilerShader deletes a shader that failed, deleting 0 below does nothing
     if (!CompilerShader(shaders[0], vs, name, "vertex"))
+    {
+        shaders[0] = 0;
         goto error;
+    }
 
     if (!CompilerShader(shaders[1], fs, name, "fragment"))
+    {
+        shaders[1] = 0;
         goto error;
+    }
 
 
     for (const AttributeTarget& target : vertexInAttrs)

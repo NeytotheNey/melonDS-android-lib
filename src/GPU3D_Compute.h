@@ -92,13 +92,13 @@ private:
     GLuint ShaderSortWork {};
     GLuint ShaderFinalPass[8] {};
 
-    GLuint YSpanIndicesTextureMemory;
-    GLuint YSpanIndicesTexture;
-    GLuint YSpanSetupMemory;
-    GLuint XSpanSetupMemory;
-    GLuint BinResultMemory;
-    GLuint RenderPolygonMemory;
-    GLuint WorkDescMemory;
+    GLuint YSpanIndicesTextureMemory {};
+    GLuint YSpanIndicesTexture {};
+    GLuint YSpanSetupMemory {};
+    GLuint XSpanSetupMemory {};
+    GLuint BinResultMemory {};
+    GLuint RenderPolygonMemory {};
+    GLuint WorkDescMemory {};
 
     enum
     {
@@ -108,8 +108,8 @@ private:
         tilememoryLayer_Num,
     };
 
-    GLuint TileMemory[tilememoryLayer_Num];
-    GLuint FinalTileMemory;
+    GLuint TileMemory[tilememoryLayer_Num] {};
+    GLuint FinalTileMemory {};
 
     u32 DummyLine[256] = {};
 
@@ -174,13 +174,13 @@ private:
         float TextureLayer;
     };
 
-    int TileSize;
+    int TileSize {};
     static constexpr int CoarseTileCountX = 8;
-    int CoarseTileCountY;
-    int CoarseTileArea;
-    int CoarseTileW;
-    int CoarseTileH;
-    int ClearCoarseBinMaskLocalSize;
+    int CoarseTileCountY {};
+    int CoarseTileArea {};
+    int CoarseTileW {};
+    int CoarseTileH {};
+    int ClearCoarseBinMaskLocalSize {};
 
     static constexpr int BinStride = 2048/32;
     static constexpr int CoarseBinStride = BinStride/32;
@@ -196,6 +196,9 @@ private:
     {
         u32 VariantWorkCount[MaxVariants*4];
         u32 SortedWorkOffset[MaxVariants];
+        // the real work count of each variant, VariantWorkCount's .y and .z hold the rasterise
+        // dispatch split in two so neither goes past the 65535 work groups GL allows
+        u32 VariantWorkRealCount[MaxVariants];
 
         u32 SortWorkWorkCount[4];
     };
@@ -221,22 +224,25 @@ private:
 
         u32 FogOffset, FogShift, FogColor;
     };
-    GLuint MetaUniformMemory;
+    GLuint MetaUniformMemory {};
 
-    GLuint Samplers[9];
+    GLuint Samplers[9] {};
 
     GLuint Framebuffer = 0;
-    GLuint LowResFramebuffer;
-    GLuint PixelBuffer;
-    GLuint CaptureFrameBuffer;
+    GLuint LowResFramebuffer {};
+    GLuint PixelBuffer {};
+    GLuint CaptureFrameBuffer {};
 
     u32 FramebufferCPU[256*192];
 
-    int ScreenWidth, ScreenHeight;
-    int TilesPerLine, TileLines;
+    int ScreenWidth {}, ScreenHeight {};
+    int TilesPerLine {}, TileLines {};
     int ScaleFactor = -1;
-    int MaxWorkTiles;
-    bool HiresCoordinates;
+    int MaxWorkTiles {};
+    bool HiresCoordinates {};
+    // the next frame is drawn even if it's the same: ResizeTargets made a new, empty Framebuffer,
+    // or the hi-res coordinates setting changed how the polygons are set up
+    bool ForceRender = true;
 
     int RequestedViewWidth = 256;
     int ViewWidth = 256;
