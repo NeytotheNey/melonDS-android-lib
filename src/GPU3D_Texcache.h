@@ -90,7 +90,9 @@ public:
         return false;
     }
 
-    bool Update(GPU& gpu)
+    // clrBitmapDirty gets bit 0 when texture slot 2 (the clear colour bitmap) changed and
+    // bit 1 for slot 3 (the clear depth bitmap)
+    bool Update(GPU& gpu, u8& clrBitmapDirty)
     {
         auto textureDirty = gpu.VRAMDirty_Texture.DeriveState(gpu.VRAMMap_Texture, gpu);
         auto texPalDirty = gpu.VRAMDirty_TexPal.DeriveState(gpu.VRAMMap_TexPal, gpu);
@@ -98,8 +100,28 @@ public:
         bool textureChanged = gpu.MakeVRAMFlat_TextureCoherent(textureDirty);
         bool texPalChanged = gpu.MakeVRAMFlat_TexPalCoherent(texPalDirty);
 
+        clrBitmapDirty = 0;
+
         if (textureChanged || texPalChanged)
         {
+            // check if slots 2 and 3 are dirty (for the clear bitmap)
+            for (u32 j = (0x40000/(VRAMDirtyGranularity*64)); j < (0x60000/(VRAMDirtyGranularity*64)); j++)
+            {
+                if (textureDirty.Data[j])
+                {
+                    clrBitmapDirty |= (1<<0);
+                    break;
+                }
+            }
+            for (u32 j = (0x60000/(VRAMDirtyGranularity*64)); j < (0x80000/(VRAMDirtyGranularity*64)); j++)
+            {
+                if (textureDirty.Data[j])
+                {
+                    clrBitmapDirty |= (1<<1);
+                    break;
+                }
+            }
+
             //printf("check invalidation %d\n", TexCache.size());
             for (auto it = Cache.begin(); it != Cache.end();)
             {

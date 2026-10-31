@@ -371,6 +371,8 @@ layout (std140, binding = 0) uniform MetaUniform
     uint ClearColor, ClearDepth, ClearAttr;
 
     uint FogOffset, FogShift, FogColor;
+
+    vec2 ClearBitmapOffset;
 };
 
 #ifdef InterpSpans
@@ -1301,6 +1303,9 @@ const std::string DepthBlend =
     ResultBuffer +
     BinningBuffer + R"(
 
+layout (binding = 0) uniform usampler2D ClearBitmapColor;
+layout (binding = 1) uniform usampler2D ClearBitmapDepth;
+
 layout (local_size_x = TileSize, local_size_y = TileSize) in;
 
 void PlotTranslucent(inout uint color, inout uint depth, inout uint attr, bool isShadow, uint tileColor, uint srcA, uint tileDepth, uint srcAttr, bool writeDepth)
@@ -1502,9 +1507,24 @@ void main()
     uint coarseMaskLo = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + 0];
     uint coarseMaskHi = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + 1];
 
-    uvec2 color = uvec2(ClearColor, 0U);
-    uvec2 depth = uvec2(ClearDepth, 0U);
+    uvec2 color, depth;
     uvec2 attr = uvec2(ClearAttr, 0U);
+    if ((DispCnt & (1U<<14)) != 0U)
+    {
+        // clear bitmap: native resolution, scrolled by ClearAttr2 and wrapping through REPEAT.
+        // the colour is already the packed 6-bit format, the depth texel is depth24 | fog<<24
+        float scale = 1.0 / float(ScreenWidth);
+        vec2 pos = (vec2(gl_GlobalInvocationID.xy) * scale) + ClearBitmapOffset;
+        color = uvec2(texture(ClearBitmapColor, pos).r, 0U);
+        depth = uvec2(texture(ClearBitmapDepth, pos).r, 0U);
+        attr.x = (attr.x & ~0x8000U) | ((depth.x >> 9) & 0x8000U);
+        depth.x &= 0xFFFFFFU;
+    }
+    else
+    {
+        color = uvec2(ClearColor, 0U);
+        depth = uvec2(ClearDepth, 0U);
+    }
     uint stencil = 0U;
     bool prevIsShadowMask = false;
 

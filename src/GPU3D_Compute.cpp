@@ -56,6 +56,7 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     shaderSource += "precision highp float;\n";
     shaderSource += "precision highp int;\n";
     shaderSource += "precision highp usampler2DArray;\n";
+    shaderSource += "precision highp usampler2D;\n";
     shaderSource += "precision highp image2D;\n";
     shaderSource += "precision highp uimage2D;\n";
     for (const char* define : defines)
@@ -282,6 +283,18 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
         }
     }
 
+    // init textures for the clear bitmap
+    glGenTextures(2, result->ClearBitmapTex);
+    for (int i = 0; i < 2; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D, result->ClearBitmapTex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 256, 256, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+    }
+
     glGenBuffers(1, &result->PixelBuffer);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, result->PixelBuffer);
     glBufferData(GL_PIXEL_PACK_BUFFER, 256*192*4, NULL, GL_DYNAMIC_READ);
@@ -339,6 +352,7 @@ ComputeRenderer::~ComputeRenderer()
     glDeleteBuffers(1, &MetaUniformMemory);
 
     glDeleteSamplers(9, Samplers);
+    glDeleteTextures(2, ClearBitmapTex);
     glDeleteBuffers(1, &PixelBuffer);
     glDeleteFramebuffers(1, &CaptureFrameBuffer);
     if (CaptureFence)
@@ -399,6 +413,7 @@ void ComputeRenderer::Reset(GPU& gpu)
     Texcache.Reset();
     // held WideMelon wings belong to the old scene
     CurGLCompositor.ResetWingHold();
+    ClearBitmapDirty = 0x3;
 }
 
 void ComputeRenderer::SavestateLoaded()
@@ -851,11 +866,53 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     assert(!NeedsShaderCompile());
     // new targets are empty (here or after SetRenderSettings), so they're drawn even if the frame is the same
-    if (!Texcache.Update(gpu) && gpu.GPU3D.RenderFrameIdentical && !ForceRender)
+    u8 clrBitmapDirty;
+    if (!Texcache.Update(gpu, clrBitmapDirty) && gpu.GPU3D.RenderFrameIdentical && !ForceRender)
     {
         return;
     }
     ForceRender = false;
+
+    // if we're using a clear bitmap, set that up
+    ClearBitmapDirty |= clrBitmapDirty;
+    if (gpu.GPU3D.RenderDispCnt & (1<<14))
+    {
+        if (ClearBitmapDirty & (1<<0))
+        {
+            u16* vram = (u16*)&gpu.VRAMFlat_Texture[0x40000];
+            for (int i = 0; i < 256*256; i++)
+            {
+                u16 color = vram[i];
+                u32 r = (color << 1) & 0x3E; if (r) r++;
+                u32 g = (color >> 4) & 0x3E; if (g) g++;
+                u32 b = (color >> 9) & 0x3E; if (b) b++;
+                u32 a = (color & 0x8000) ? 31 : 0;
+
+                ClearBitmap[0][i] = r | (g << 8) | (b << 16) | (a << 24);
+            }
+
+            glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[0]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 256, GL_RED_INTEGER, GL_UNSIGNED_INT, ClearBitmap[0]);
+        }
+
+        if (ClearBitmapDirty & (1<<1))
+        {
+            u16* vram = (u16*)&gpu.VRAMFlat_Texture[0x60000];
+            for (int i = 0; i < 256*256; i++)
+            {
+                u16 val = vram[i];
+                u32 depth = ((val & 0x7FFF) * 0x200) + 0x1FF;
+                u32 fog = (val & 0x8000) << 9;
+
+                ClearBitmap[1][i] = depth | fog;
+            }
+
+            glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[1]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 256, GL_RED_INTEGER, GL_UNSIGNED_INT, ClearBitmap[1]);
+        }
+
+        ClearBitmapDirty = 0;
+    }
 
     int numYSpans = 0;
     int numSetupIndices = 0;
@@ -1176,6 +1233,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         meta.ClearColor = r | (g << 8) | (b << 16) | (a << 24);
         meta.ClearDepth = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
         meta.ClearAttr = gpu.GPU3D.RenderClearAttr1 & 0x3F008000;
+
+        u8 xoff = (gpu.GPU3D.RenderClearAttr2 >> 16) & 0xFF;
+        u8 yoff = (gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF;
+        meta.ClearBitmapOffset[0] = (float)xoff / 256.0;
+        meta.ClearBitmapOffset[1] = (float)yoff / 256.0;
     }
     for (u32 i = 0; i < 32; i++)
     {
@@ -1350,6 +1412,16 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         }
     }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    // the clear bitmap textures wrap with their own REPEAT parameters, so the rasteriser's
+    // sampler objects must not stay bound on their units
+    glBindSampler(0, 0);
+    glBindSampler(1, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[0]);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[1]);
+    glActiveTexture(GL_TEXTURE0);
 
     // compose final image
     glUseProgram(ShaderDepthBlend[wbuffer]);
