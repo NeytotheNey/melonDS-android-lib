@@ -827,6 +827,16 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         for (int i = 0; i < 256; i++)
             BGOBJLine[i] = 0xFF3F3F3F;
 
+        if (CurJob->Accelerated)
+        {
+            // no 3D pixel involved (see the compositing below)
+            for (int i = 0; i < 256; i++)
+            {
+                BGOBJLine[256+i] = 0;
+                BGOBJLine[512+i] = 0x07000000;
+            }
+        }
+
         return;
     }
 
