@@ -137,6 +137,20 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
     result->ClearUniformLoc[2] = glGetUniformLocation(result->ClearShaderPlain, "uOpaquePolyID");
     result->ClearUniformLoc[3] = glGetUniformLocation(result->ClearShaderPlain, "uFogFlag");
 
+    if (!OpenGL::CompileVertexFragmentProgram(result->ClearShaderBitmap,
+            kClearBitmapVS, kClearBitmapFS,
+            "ClearShaderBitmap",
+            {{"vPosition", 0}},
+            {{"oColor", 0}, {"oAttr", 1}}))
+        return nullptr;
+
+    result->ClearBitmapULoc[0] = glGetUniformLocation(result->ClearShaderBitmap, "uScale");
+    result->ClearBitmapULoc[1] = glGetUniformLocation(result->ClearShaderBitmap, "uOffset");
+    result->ClearBitmapULoc[2] = glGetUniformLocation(result->ClearShaderBitmap, "uOpaquePolyID");
+
+    glUseProgram(result->ClearShaderBitmap);
+    glUniform1i(glGetUniformLocation(result->ClearShaderBitmap, "TexMem"), 0);
+
     memset(result->RenderShader, 0, sizeof(RenderShader));
 
     if (!result->BuildRenderShader(0, kRenderVS_Z, kRenderFS_ZO))
@@ -324,6 +338,7 @@ GLRenderer::~GLRenderer()
         glDeleteProgram(RenderShader[i]);
     }
     glDeleteProgram(ClearShaderPlain);
+    glDeleteProgram(ClearShaderBitmap);
     glDeleteProgram(FinalPassEdgeShader);
     glDeleteProgram(FinalPassFogShader);
 
@@ -1074,6 +1089,8 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     {
         // pass 2: if needed, render translucent pixels that are against background pixels
         // when background alpha is zero, those need to be rendered with blending disabled
+        // (with a clear bitmap this still tests the clear attribute's alpha, not the bitmap's
+        // per-pixel alpha; upstream's GL renderer has the same gap)
 
         if ((gpu3d.RenderClearAttr1 & 0x001F0000) == 0)
         {
@@ -1626,32 +1643,51 @@ void GLRenderer::RenderFrame(GPU& gpu)
     glStencilMask(0xFF);
 
     // clear buffers
-    // TODO: clear bitmap
     // TODO: check whether 'clear polygon ID' affects translucent polyID
     // (for example when alpha is 1..30)
     {
-        glUseProgram(ClearShaderPlain);
-        glDepthFunc(GL_ALWAYS);
-
-        u32 r = gpu.GPU3D.RenderClearAttr1 & 0x1F;
-        u32 g = (gpu.GPU3D.RenderClearAttr1 >> 5) & 0x1F;
-        u32 b = (gpu.GPU3D.RenderClearAttr1 >> 10) & 0x1F;
-        u32 fog = (gpu.GPU3D.RenderClearAttr1 >> 15) & 0x1;
-        u32 a = (gpu.GPU3D.RenderClearAttr1 >> 16) & 0x1F;
         u32 polyid = (gpu.GPU3D.RenderClearAttr1 >> 24) & 0x3F;
-        u32 z = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
 
+        glDepthFunc(GL_ALWAYS);
         glStencilFunc(GL_ALWAYS, 0xFF, 0xFF);
         glStencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE);
 
-        /*if (r) r = r*2 + 1;
-        if (g) g = g*2 + 1;
-        if (b) b = b*2 + 1;*/
+        if (gpu.GPU3D.RenderDispCnt & (1<<14))
+        {
+            // clear bitmap: the shader reads it from TexMem, which the dirty tracking above
+            // keeps current (and a write to it defeats the identical-frame skip). the bitmap
+            // is tiled at native resolution across the whole target, with native x=0 at the
+            // centre 256 columns of a wide one, like the capture readback
+            glUseProgram(ClearShaderBitmap);
 
-        glUniform4ui(ClearUniformLoc[0], r, g, b, a);
-        glUniform1ui(ClearUniformLoc[1], z);
-        glUniform1ui(ClearUniformLoc[2], polyid);
-        glUniform1ui(ClearUniformLoc[3], fog);
+            int xorigin = ((TargetWidth - WideMelon::NativeWidth) / 2);
+            int xoff = ((int)((gpu.GPU3D.RenderClearAttr2 >> 16) & 0xFF) - xorigin) & 0xFF;
+            int yoff = (gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF;
+
+            glUniform1i(ClearBitmapULoc[0], ScaleFactor);
+            glUniform2i(ClearBitmapULoc[1], xoff, yoff);
+            glUniform1ui(ClearBitmapULoc[2], polyid);
+        }
+        else
+        {
+            glUseProgram(ClearShaderPlain);
+
+            u32 r = gpu.GPU3D.RenderClearAttr1 & 0x1F;
+            u32 g = (gpu.GPU3D.RenderClearAttr1 >> 5) & 0x1F;
+            u32 b = (gpu.GPU3D.RenderClearAttr1 >> 10) & 0x1F;
+            u32 fog = (gpu.GPU3D.RenderClearAttr1 >> 15) & 0x1;
+            u32 a = (gpu.GPU3D.RenderClearAttr1 >> 16) & 0x1F;
+            u32 z = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
+
+            /*if (r) r = r*2 + 1;
+            if (g) g = g*2 + 1;
+            if (b) b = b*2 + 1;*/
+
+            glUniform4ui(ClearUniformLoc[0], r, g, b, a);
+            glUniform1ui(ClearUniformLoc[1], z);
+            glUniform1ui(ClearUniformLoc[2], polyid);
+            glUniform1ui(ClearUniformLoc[3], fog);
+        }
 
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
         glBindVertexArray(ClearVertexArrayID);

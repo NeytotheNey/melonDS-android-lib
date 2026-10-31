@@ -124,6 +124,8 @@ private:
 
 
     GLuint ClearShaderPlain {};
+    // clear bitmap (DISP3DCNT bit 14), sampling slots 2 and 3 of texture VRAM from TexMem
+    GLuint ClearShaderBitmap {};
 
     GLuint RenderShader[16] {};
     GLint RenderShaderDepthBiasLoc[16] {};
@@ -153,6 +155,7 @@ private:
 
     GLuint ClearVertexBufferID = 0, ClearVertexArrayID {};
     GLint ClearUniformLoc[4] {};
+    GLint ClearBitmapULoc[3] {}; // uScale, uOffset, uOpaquePolyID
 
     // vertex buffer
     // * XYZW: 4x16bit

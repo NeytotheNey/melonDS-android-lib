@@ -57,6 +57,70 @@ void main()
 }
 )";
 
+// clear bitmap (DISP3DCNT bit 14): the colour and depth bitmaps are slots 2 and 3 of texture
+// VRAM, which TexMem already holds (R8UI, 1024 bytes per row), so they are fetched from there
+// instead of being converted and uploaded separately like upstream's GL renderer does
+const char* kClearBitmapVS = kShaderHeader R"(
+
+in vec2 vPosition;
+
+void main()
+{
+    gl_Position = vec4(vPosition, 0.0, 1.0);
+}
+)";
+
+const char* kClearBitmapFS = kShaderHeader R"(
+
+precision highp float;
+precision highp int;
+precision mediump usampler2D;
+
+uniform usampler2D TexMem;
+
+uniform int uScale;
+uniform ivec2 uOffset;
+uniform uint uOpaquePolyID;
+
+layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oAttr;
+
+uint ReadTexVRAM16(int addr)
+{
+    ivec2 coord = ivec2(addr & 0x3FF, addr >> 10);
+    uint lo = texelFetch(TexMem, coord, 0).r;
+    uint hi = texelFetch(TexMem, coord + ivec2(1, 0), 0).r;
+    return lo | (hi << 8);
+}
+
+void main()
+{
+    // native pixel, scrolled by the clear attributes, wrapping at 256 both ways.
+    // our targets keep DS line 0 at row 0, so no Y flip
+    int x = ((int(gl_FragCoord.x) / uScale) + uOffset.x) & 0xFF;
+    int y = ((int(gl_FragCoord.y) / uScale) + uOffset.y) & 0xFF;
+    int addr = ((y << 8) + x) << 1;
+
+    uint color = ReadTexVRAM16(0x40000 + addr);
+    uint depth = ReadTexVRAM16(0x60000 + addr);
+
+    // same 5->6 bit expansion as the software renderer
+    uint r = (color << 1) & 0x3Eu; if (r != 0u) r++;
+    uint g = (color >> 4) & 0x3Eu; if (g != 0u) g++;
+    uint b = (color >> 9) & 0x3Eu; if (b != 0u) b++;
+    uint a = ((color & 0x8000u) != 0u) ? 31u : 0u;
+
+    uint z = ((depth & 0x7FFFu) * 0x200u) + 0x1FFu;
+
+    oColor = (vec4(float(r), float(g), float(b), float(a)) / vec4(63.0, 63.0, 63.0, 31.0)).bgra;
+    oAttr.r = float(uOpaquePolyID) / 63.0;
+    oAttr.g = 0.0;
+    oAttr.b = float((depth >> 15) & 1u);
+    oAttr.a = 1.0;
+    gl_FragDepth = float(z) / 16777216.0;
+}
+)";
+
 
 
 const char* kFinalPassVS = kShaderHeader R"(
