@@ -733,7 +733,14 @@ vec4 FinalColor()
 )";
 
 
-const char* kRenderVS_Z = R"(
+// the render shaders come in a Z-buffer and a W-buffer build (WBuffer defined by
+// BuildRenderShader); the pass (opaque / translucent / shadow mask) is picked per draw
+// through uRenderMode, as upstream does, instead of a program per combination
+const char* kRenderVS = R"(
+
+#ifdef WBuffer
+smooth out float fZ;
+#endif
 
 void main()
 {
@@ -742,7 +749,12 @@ void main()
 
     vec4 fpos;
     fpos.xy = (((vec2(vPosition.xy) ) * 2.0) / uScreenSize) - 1.0;
+#ifdef WBuffer
+    fpos.z = 0.0;
+    fZ = (float(vPosition.z << zshift) + uDepthBias) / 16777216.0;
+#else
     fpos.z = ((float(vPosition.z << zshift) + uDepthBias) / 8388608.0) - 1.0;
+#endif
     fpos.w = float(vPosition.w) / 65536.0f;
     fpos.xyz *= fpos.w;
 
@@ -754,139 +766,49 @@ void main()
 }
 )";
 
-const char* kRenderVS_W = R"(
+const char* kRenderFS = R"(
 
-smooth out float fZ;
-
-void main()
-{
-    int attr = vPolygonAttr.x;
-    int zshift = (attr >> 16) & 0x1F;
-
-    vec4 fpos;
-    fpos.xy = (((vec2(vPosition.xy) ) * 2.0) / uScreenSize) - 1.0;
-    fpos.z = 0.0;
-    fZ = (float(vPosition.z << zshift) + uDepthBias) / 16777216.0;
-    fpos.w = float(vPosition.w) / 65536.0f;
-    fpos.xy *= fpos.w;
-    fpos.z = 0.0;
-
-    fColor = vec4(vColor) / vec4(255.0,255.0,255.0,31.0);
-    fTexcoord = vec2(vTexcoord) / 16.0;
-    fPolygonAttr = vPolygonAttr;
-
-    gl_Position = fpos;
-}
-)";
-
-
-const char* kRenderFS_ZO = R"(
-
-void main()
-{
-    vec4 col = FinalColor();
-    if (col.a < 30.5/31.0) discard;
-
-    oColor = col;
-    oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
-    oAttr.g = 0.0;
-    oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-    oAttr.a = 1.0;
-}
-)";
-
-const char* kRenderFS_WO = R"(
-
+#ifdef WBuffer
 smooth in float fZ;
+#endif
+
+uniform int uRenderMode; // 0=opaque 1=translucent 2=shadowmask
 
 void main()
 {
-    vec4 col = FinalColor();
-    if (col.a < 30.5/31.0) discard;
+    if (uRenderMode == 2)
+    {
+        oColor = vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    else
+    {
+        vec4 col = FinalColor();
+        if (uRenderMode == 0)
+        {
+            // opaque pixels
+            if (col.a < 30.5/31.0) discard;
 
-    oColor = col;
-    oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
-    oAttr.g = 0.0;
-    oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-    oAttr.a = 1.0;
+            oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
+            oAttr.g = 0.0;
+            oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
+            oAttr.a = 1.0;
+        }
+        else
+        {
+            // translucent pixels
+            if (col.a < 0.5/31.0) discard;
+            if (col.a >= 30.5/31.0) discard;
+
+            oAttr.b = 0.0;
+            oAttr.a = 1.0;
+        }
+
+        oColor = col;
+    }
+
+#ifdef WBuffer
     gl_FragDepth = fZ;
-}
-)";
-
-const char* kRenderFS_ZE = R"(
-
-void main()
-{
-    vec4 col = FinalColor();
-    if (col.a < 30.5/31.0) discard;
-
-    oAttr.g = 1.0;
-    oAttr.a = 1.0;
-}
-)";
-
-const char* kRenderFS_WE = R"(
-
-smooth in float fZ;
-
-void main()
-{
-    vec4 col = FinalColor();
-    if (col.a < 30.5/31.0) discard;
-
-    oAttr.g = 1.0;
-    oAttr.a = 1.0;
-    gl_FragDepth = fZ;
-}
-)";
-
-const char* kRenderFS_ZT = R"(
-
-void main()
-{
-    vec4 col = FinalColor();
-    if (col.a < 0.5/31.0) discard;
-    if (col.a >= 30.5/31.0) discard;
-
-    oColor = col;
-    oAttr.b = 0.0;
-    oAttr.a = 1.0;
-}
-)";
-
-const char* kRenderFS_WT = R"(
-
-smooth in float fZ;
-
-void main()
-{
-    vec4 col = FinalColor();
-    if (col.a < 0.5/31.0) discard;
-    if (col.a >= 30.5/31.0) discard;
-
-    oColor = col;
-    oAttr.b = 0.0;
-    oAttr.a = 1.0;
-    gl_FragDepth = fZ;
-}
-)";
-
-const char* kRenderFS_ZSM = R"(
-
-void main()
-{
-    oColor = vec4(0,0,0,1);
-}
-)";
-
-const char* kRenderFS_WSM = R"(
-
-smooth in float fZ;
-
-void main()
-{
-    oColor = vec4(0,0,0,1);
-    gl_FragDepth = fZ;
+#endif
 }
 )";
 }

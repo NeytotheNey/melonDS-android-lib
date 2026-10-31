@@ -31,22 +31,25 @@
 namespace melonDS
 {
 
-bool GLRenderer::BuildRenderShader(u32 flags, const std::string& vs, const std::string& fs)
+bool GLRenderer::BuildRenderShader(bool wbuffer)
 {
     char shadername[32];
-    snprintf(shadername, sizeof(shadername), "RenderShader%02X", flags);
+    snprintf(shadername, sizeof(shadername), "RenderShader%c", wbuffer?'W':'Z');
 
-    int headerlen = strlen(kShaderHeader);
+    // kShaderHeader has no newline of its own, the common sources start with one
+    const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
 
     std::string vsbuf;
     vsbuf += kShaderHeader;
+    vsbuf += wbufdef;
     vsbuf += kRenderVSCommon;
-    vsbuf += vs;
+    vsbuf += kRenderVS;
 
     std::string fsbuf;
     fsbuf += kShaderHeader;
+    fsbuf += wbufdef;
     fsbuf += kRenderFSCommon;
-    fsbuf += fs;
+    fsbuf += kRenderFS;
 
     GLuint prog;
     bool ret = OpenGL::CompileVertexFragmentProgram(prog,
@@ -67,19 +70,31 @@ bool GLRenderer::BuildRenderShader(u32 flags, const std::string& vs, const std::
     uni_id = glGetUniformLocation(prog, "TexPalMem");
     glUniform1i(uni_id, 1);
 
-    RenderShaderDepthBiasLoc[flags] = glGetUniformLocation(prog, "uDepthBias");
-    glUniform1f(RenderShaderDepthBiasLoc[flags], 0.0f);
+    int id = (int)wbuffer;
+    DepthBiasLoc[id] = glGetUniformLocation(prog, "uDepthBias");
+    glUniform1f(DepthBiasLoc[id], 0.0f);
+    DepthBias[id] = 0.0f;
 
-    RenderShader[flags] = prog;
+    RenderShader[id] = prog;
+    RenderModeULoc[id] = glGetUniformLocation(prog, "uRenderMode");
 
     return true;
 }
 
-void GLRenderer::UseRenderShader(u32 flags)
+void GLRenderer::UseRenderShader(bool wbuffer, int mode)
 {
-    if (CurShaderID == flags) return;
-    glUseProgram(RenderShader[flags]);
-    CurShaderID = flags;
+    int id = (int)wbuffer;
+    if (CurShaderID != id)
+    {
+        glUseProgram(RenderShader[id]);
+        CurShaderID = id;
+        CurRenderMode = -1;
+    }
+    if (CurRenderMode != mode)
+    {
+        glUniform1i(RenderModeULoc[id], mode);
+        CurRenderMode = mode;
+    }
 }
 
 void SetupDefaultTexParams(GLuint tex)
@@ -153,28 +168,10 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
 
     memset(result->RenderShader, 0, sizeof(RenderShader));
 
-    if (!result->BuildRenderShader(0, kRenderVS_Z, kRenderFS_ZO))
+    if (!result->BuildRenderShader(false))
         return nullptr;
 
-    if (!result->BuildRenderShader(RenderFlag_WBuffer, kRenderVS_W, kRenderFS_WO))
-        return nullptr;
-
-    if (!result->BuildRenderShader(RenderFlag_Edge, kRenderVS_Z, kRenderFS_ZE))
-        return nullptr;
-
-    if (!result->BuildRenderShader(RenderFlag_Edge | RenderFlag_WBuffer, kRenderVS_W, kRenderFS_WE))
-        return nullptr;
-
-    if (!result->BuildRenderShader(RenderFlag_Trans, kRenderVS_Z, kRenderFS_ZT))
-        return nullptr;
-
-    if (!result->BuildRenderShader(RenderFlag_Trans | RenderFlag_WBuffer, kRenderVS_W, kRenderFS_WT))
-        return nullptr;
-
-    if (!result->BuildRenderShader(RenderFlag_ShadowMask, kRenderVS_Z, kRenderFS_ZSM))
-        return nullptr;
-
-    if (!result->BuildRenderShader(RenderFlag_ShadowMask | RenderFlag_WBuffer, kRenderVS_W, kRenderFS_WSM))
+    if (!result->BuildRenderShader(true))
         return nullptr;
 
     if (!OpenGL::CompileVertexFragmentProgram(result->FinalPassEdgeShader,
@@ -332,7 +329,7 @@ GLRenderer::~GLRenderer()
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 16; i++)
+    for (int i = 0; i < 2; i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -885,12 +882,13 @@ void GLRenderer::ClearShadowMaskLines(const Polygon* polygon, const bool* lastWa
     if (scissorOn) glDisable(GL_SCISSOR_TEST);
 }
 
-void GLRenderer::SetDepthBias(u32 flags, float bias)
+void GLRenderer::SetDepthBias(float bias)
 {
-    // RenderShader[flags] has to be in use
-    if (RenderShaderDepthBias[flags] == bias) return;
-    glUniform1f(RenderShaderDepthBiasLoc[flags], bias);
-    RenderShaderDepthBias[flags] = bias;
+    // for the program in use (UseRenderShader). the opaque, translucent and shadow mask passes
+    // share it, so every draw sets its bias instead of relying on a resting value of 0
+    if (DepthBias[CurShaderID] == bias) return;
+    glUniform1f(DepthBiasLoc[CurShaderID], bias);
+    DepthBias[CurShaderID] = bias;
 }
 
 void GLRenderer::SetPolygonDepthBias(u32 polyattr)
@@ -901,9 +899,9 @@ void GLRenderer::SetPolygonDepthBias(u32 polyattr)
     // than the DS would. set right before every draw, for the shader in use
     float bias = 0.0f;
     if (EqualDepthMargin && (polyattr & (1<<14)))
-        bias = (CurShaderID & RenderFlag_WBuffer) ? -255.0f : -512.0f;
+        bias = CurShaderID ? -255.0f : -512.0f;
 
-    SetDepthBias(CurShaderID, bias);
+    SetDepthBias(bias);
 }
 
 void GLRenderer::LogFrameStats(const GPU3D& gpu3d)
@@ -1000,8 +998,7 @@ void GLRenderer::FlushShadowLog()
 
 void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 {
-    u32 flags = 0;
-    if (gpu3d.RenderPolygonRAM[0]->WBuffer) flags |= RenderFlag_WBuffer;
+    bool wbuffer = gpu3d.RenderPolygonRAM[0]->WBuffer;
 
     if (h != 192) glScissor(0, y*ScaleFactor, ScreenW, h*ScaleFactor);
 
@@ -1013,7 +1010,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
     // pass 1: opaque pixels
 
-    UseRenderShader(flags);
+    UseRenderShader(wbuffer, RenderMode_Opaque);
     glLineWidth(1.0);
 
     glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
@@ -1104,7 +1101,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                 {
                     // draw actual shadow mask
 
-                    UseRenderShader(flags | RenderFlag_ShadowMask);
+                    UseRenderShader(wbuffer, RenderMode_ShadowMask);
 
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1116,6 +1113,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     glStencilOp(GL_KEEP, GL_INVERT, GL_KEEP);
                     glStencilMask(0x01);
 
+                    SetDepthBias(0.0f);
                     i += RenderPolygonBatch(i);
                 }
                 else if (rp->PolyData->Translucent)
@@ -1132,7 +1130,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     if (needopaque)
                     {
-                        UseRenderShader(flags);
+                        UseRenderShader(wbuffer, RenderMode_Opaque);
 
                         glDisable(GL_BLEND);
                         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1148,7 +1146,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                         RenderSinglePolygon(i);
                     }
 
-                    UseRenderShader(flags | RenderFlag_Trans);
+                    UseRenderShader(wbuffer, RenderMode_Translucent);
 
                     GLboolean transfog;
                     if (!(polyattr & (1<<15))) transfog = fogenable;
@@ -1251,7 +1249,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 // draw actual shadow mask
 
-                UseRenderShader(flags | RenderFlag_ShadowMask);
+                UseRenderShader(wbuffer, RenderMode_ShadowMask);
 
                 glDisable(GL_BLEND);
                 glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1267,27 +1265,25 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     // depth-equal mask: the DS test passes within a margin (+-0x200 Z-buffering,
                     // +-0xFF W-buffering) and the mask marks where it fails, so mark where the
                     // polygon is more than that in front, then more than that behind
-                    u32 maskflags = flags | RenderFlag_ShadowMask;
-                    float margin = (flags & RenderFlag_WBuffer) ? 255.0f : 512.0f;
+                    float margin = wbuffer ? 255.0f : 512.0f;
 
                     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
 
                     glDepthFunc(GL_LESS);
-                    SetDepthBias(maskflags, margin);
+                    SetDepthBias(margin);
                     if (ShadowMaskLineClear) RenderSinglePolygon(i);
                     else                     RenderPolygonBatch(i);
 
                     glDepthFunc(GL_GREATER);
-                    SetDepthBias(maskflags, -margin);
+                    SetDepthBias(-margin);
                     i += ShadowMaskLineClear ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
-
-                    SetDepthBias(maskflags, 0.0f);
                 }
                 else
                 {
                     glDepthFunc(GL_LESS);
                     glStencilOp(GL_KEEP, GL_REPLACE, GL_KEEP);
 
+                    SetDepthBias(0.0f);
                     i += ShadowMaskLineClear ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
                 }
             }
@@ -1305,7 +1301,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 if (needopaque)
                 {
-                    UseRenderShader(flags);
+                    UseRenderShader(wbuffer, RenderMode_Opaque);
 
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1321,7 +1317,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     RenderSinglePolygon(i);
                 }
 
-                UseRenderShader(flags | RenderFlag_Trans);
+                UseRenderShader(wbuffer, RenderMode_Translucent);
 
                 GLboolean transfog;
                 if (!(polyattr & (1<<15))) transfog = fogenable;
@@ -1338,8 +1334,8 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     bool depthbias = (polyattr & (1<<14)) &&
                         (EqualDepthMargin || (ShadowMaskDepthTest && !(polyattr & (1<<11))));
                     float bias = 0.0f;
-                    if (depthbias) bias = (flags & RenderFlag_WBuffer) ? -255.0f : -512.0f;
-                    SetDepthBias(flags | RenderFlag_Trans, bias);
+                    if (depthbias) bias = wbuffer ? -255.0f : -512.0f;
+                    SetDepthBias(bias);
 
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1505,6 +1501,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
     TargetsChanged = false;
 
     CurShaderID = -1;
+    CurRenderMode = -1;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
@@ -1702,9 +1699,6 @@ void GLRenderer::RenderFrame(GPU& gpu)
     if (gpu.GPU3D.RenderNumPolygons)
     {
         // render shit here
-        u32 flags = 0;
-        if (gpu.GPU3D.RenderPolygonRAM[0]->WBuffer) flags |= RenderFlag_WBuffer;
-
         int npolys = 0;
         int firsttrans = -1;
         for (u32 i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)

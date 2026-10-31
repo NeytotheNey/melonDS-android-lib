@@ -93,8 +93,8 @@ private:
     GLCompositor CurGLCompositor;
     RendererPolygon PolygonList[2048] {};
 
-    bool BuildRenderShader(u32 flags, const std::string& vs, const std::string& fs);
-    void UseRenderShader(u32 flags);
+    bool BuildRenderShader(bool wbuffer);
+    void UseRenderShader(bool wbuffer, int mode);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
     u32 WideVertexX(s32 hiresx) const;
@@ -106,7 +106,7 @@ private:
     int RenderPolygonBatch(int i) const;
     int RenderPolygonEdgeBatch(int i) const;
     void ClearShadowMaskLines(const Polygon* polygon, const bool* lastWasMask) const;
-    void SetDepthBias(u32 flags, float bias);
+    void SetDepthBias(float bias);
     void SetPolygonDepthBias(u32 polyattr);
     void LogFrameStats(const GPU3D& gpu3d);
     int BeginShadowLogQuery();
@@ -116,10 +116,9 @@ private:
 
     enum
     {
-        RenderFlag_WBuffer     = 0x01,
-        RenderFlag_Trans       = 0x02,
-        RenderFlag_ShadowMask  = 0x04,
-        RenderFlag_Edge        = 0x08,
+        RenderMode_Opaque = 0,
+        RenderMode_Translucent,
+        RenderMode_ShadowMask,
     };
 
 
@@ -127,10 +126,15 @@ private:
     // clear bitmap (DISP3DCNT bit 14), sampling slots 2 and 3 of texture VRAM from TexMem
     GLuint ClearShaderBitmap {};
 
-    GLuint RenderShader[16] {};
-    GLint RenderShaderDepthBiasLoc[16] {};
-    float RenderShaderDepthBias[16] {};
-    GLuint CurShaderID = -1;
+    // [0]: Z-buffer, [1]: W-buffer; the pass is selected with uRenderMode. uDepthBias is
+    // cached per program: GL keeps a program's uniforms across glUseProgram, so the cache
+    // only has to follow what this code set
+    GLuint RenderShader[2] {};
+    GLint RenderModeULoc[2] {};
+    GLint DepthBiasLoc[2] {};
+    float DepthBias[2] {};
+    int CurShaderID = -1;
+    int CurRenderMode = -1;
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
