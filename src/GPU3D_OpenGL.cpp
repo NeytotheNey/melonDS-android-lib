@@ -334,6 +334,8 @@ void GLRenderer::Reset(GPU& gpu)
 {
     // held WideMelon wings belong to the old scene
     CurGLCompositor.ResetWingHold();
+    TexMemDirtyAll = true;
+    TargetsChanged = true;
 }
 
 void GLRenderer::SetBetterPolygons(bool betterpolygons) noexcept
@@ -400,6 +402,7 @@ void GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) 
     ScaleFactor = scale;
     TargetWidth = targetWidth;
     BetterPolygons = betterpolygons;
+    TargetsChanged = true;
 
     ScreenW = targetWidth * scale;
     ScreenH = 192 * scale;
@@ -1441,8 +1444,34 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 }
 
 
+template <u32 Size>
+static bool AnyDirty(const NonStupidBitField<Size>& dirty, u32 start, u32 count)
+{
+    for (u32 i = start; i < start + count; i++)
+        if (dirty[i]) return true;
+    return false;
+}
+
 void GLRenderer::RenderFrame(GPU& gpu)
 {
+    // same path as the software and compute renderers: DeriveState gathers the dirty 512 byte
+    // chunks of the texture and palette mappings (clearing the bank dirty bits they came from,
+    // so this runs exactly once per frame), the flat copies are made coherent, and only the
+    // rows of TexMem / TexPalMem covering those chunks are uploaded below
+    auto textureDirty = gpu.VRAMDirty_Texture.DeriveState(gpu.VRAMMap_Texture, gpu);
+    auto texPalDirty = gpu.VRAMDirty_TexPal.DeriveState(gpu.VRAMMap_TexPal, gpu);
+
+    bool textureChanged = gpu.MakeVRAMFlat_TextureCoherent(textureDirty);
+    bool texPalChanged = gpu.MakeVRAMFlat_TexPalCoherent(texPalDirty);
+
+    if (TexMemDirtyAll)
+    {
+        textureDirty.SetRange(0, 512*1024 / VRAMDirtyGranularity);
+        texPalDirty.SetRange(0, 96*1024 / VRAMDirtyGranularity);
+        textureChanged = texPalChanged = true;
+        TexMemDirtyAll = false;
+    }
+
     // the targets match the polygons drawn here, so after a width change they only shrink once
     // the game has built geometry at the new width. this runs after the frame's Blit, so the
     // compositor's width only changes between frames as well
@@ -1451,6 +1480,12 @@ void GLRenderer::RenderFrame(GPU& gpu)
         (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
         targetWidth = ViewWidth;
     ResizeTargets(BetterPolygons, ScaleFactor, targetWidth);
+
+    // nothing changed since the last frame: MainFramebuffer still holds it, so Blit and the
+    // capture readback keep working from it (upstream's GL renderer skips the same way)
+    if (!textureChanged && !texPalChanged && !TargetsChanged && gpu.GPU3D.RenderFrameIdentical)
+        return;
+    TargetsChanged = false;
 
     CurShaderID = -1;
 
@@ -1524,53 +1559,59 @@ void GLRenderer::RenderFrame(GPU& gpu)
     if (unibuf) memcpy(unibuf, &ShaderConfig, sizeof(ShaderConfig));
     glUnmapBuffer(GL_UNIFORM_BUFFER);
 
-    // SUCKY!!!!!!!!!!!!!!!!!!
-    // TODO: detect when VRAM blocks are modified!
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, TexMemID);
-    for (int i = 0; i < 4; i++)
+    if (textureChanged)
     {
-        u32 mask = gpu.VRAMMap_Texture[i];
-        u8* vram;
-        if (!mask) continue;
-        else if (mask & (1<<0)) vram = gpu.VRAM_A;
-        else if (mask & (1<<1)) vram = gpu.VRAM_B;
-        else if (mask & (1<<2)) vram = gpu.VRAM_C;
-        else if (mask & (1<<3)) vram = gpu.VRAM_D;
+        // TexMem is 1024 texels wide: one row is two dirty chunks of a texture slot
+        constexpr u32 chunksPerRow = 1024 / VRAMDirtyGranularity;
+        constexpr u32 numRows = sizeof(gpu.VRAMFlat_Texture) / 1024;
 
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, i*128, 1024, 128, GL_RED_INTEGER, GL_UNSIGNED_BYTE, vram);
-    }
-
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, TexPalMemID);
-
-    u16* tempBuffer = (u16*) malloc(1024 * 8 * 2);
-    for (int i = 0; i < 6; i++)
-    {
-        // 6 x 16K chunks
-        u32 mask = gpu.VRAMMap_TexPal[i];
-        u8* vram;
-        if (!mask) continue;
-        else if (mask & (1<<4)) vram = &gpu.VRAM_E[(i&3)*0x4000];
-        else if (mask & (1<<5)) vram = gpu.VRAM_F;
-        else if (mask & (1<<6)) vram = gpu.VRAM_G;
-
-        memcpy(tempBuffer, vram, 1024 * 8 * 2);
-        for (int j = 0; j < 1024 * 8; j++)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, TexMemID);
+        for (u32 row = 0; row < numRows; )
         {
-            u16 value = tempBuffer[j];
+            if (!AnyDirty(textureDirty, row*chunksPerRow, chunksPerRow)) { row++; continue; }
 
-            u8 a = (value >> 15) & 0x1;
-            u8 b = (value >> 10) & 0x1F;
-            u8 g = (value >> 5) & 0x1F;
-            u8 r = (value >> 0) & 0x1F;
+            u32 start = row;
+            while (row < numRows && AnyDirty(textureDirty, row*chunksPerRow, chunksPerRow)) row++;
 
-            tempBuffer[j] = (r << 11) | (g << 6) | (b << 1) | a;
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, start, 1024, row - start, GL_RED_INTEGER, GL_UNSIGNED_BYTE,
+                &gpu.VRAMFlat_Texture[start * 1024]);
         }
-
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, i*8, 1024, 8, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, tempBuffer);
     }
-    free(tempBuffer);
+
+    if (texPalChanged)
+    {
+        // TexPalMem is 1024 16-bit texels wide: one row is four dirty chunks, 8 rows per 16K slot.
+        // the 15-bit palette entries are swizzled into RGB5_A1 on the way
+        constexpr u32 chunksPerRow = 2048 / VRAMDirtyGranularity;
+        constexpr u32 numRows = 6 * 8;
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, TexPalMemID);
+        for (u32 row = 0; row < numRows; )
+        {
+            if (!AnyDirty(texPalDirty, row*chunksPerRow, chunksPerRow)) { row++; continue; }
+
+            u32 start = row;
+            while (row < numRows && AnyDirty(texPalDirty, row*chunksPerRow, chunksPerRow)) row++;
+
+            const u16* src = (const u16*)&gpu.VRAMFlat_TexPal[start * 2048];
+            u16* dst = &TexPalConvBuffer[start * 1024];
+            for (u32 j = 0; j < (row - start) * 1024; j++)
+            {
+                u16 value = src[j];
+
+                u8 a = (value >> 15) & 0x1;
+                u8 b = (value >> 10) & 0x1F;
+                u8 g = (value >> 5) & 0x1F;
+                u8 r = (value >> 0) & 0x1F;
+
+                dst[j] = (r << 11) | (g << 6) | (b << 1) | a;
+            }
+
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, start, 1024, row - start, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, dst);
+        }
+    }
 
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);

@@ -180,6 +180,15 @@ private:
     GLuint TexMemID {};
     GLuint TexPalMemID {};
 
+    // texture VRAM upload tracking. the dirty texture / palette chunks come from the shared
+    // VRAMDirty_Texture / VRAMDirty_TexPal sets (consumed once per RenderFrame, like the other
+    // renderers do). TexMemDirtyAll forces a full upload after construction or Reset, since a
+    // previous renderer may have consumed the dirty bits before us
+    bool TexMemDirtyAll = true;
+    // the colour target was reallocated (scale, width): the frame can't be skipped
+    bool TargetsChanged = true;
+    u16 TexPalConvBuffer[1024 * 48] {};
+
     int ScaleFactor {};
     bool BetterPolygons {};
     int ScreenW {}, ScreenH {};
