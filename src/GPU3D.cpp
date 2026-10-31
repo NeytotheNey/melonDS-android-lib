@@ -166,7 +166,7 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
     CurrentRenderer = std::move(renderer);
     CurrentRenderer->Reset(NDS.GPU);
 
-    // software and compute only do 256, so don't keep squeezing geometry for them
+    // software only does 256, so don't keep squeezing geometry for it
     ViewWidth = CurrentRenderer->GetViewWidth();
 }
 

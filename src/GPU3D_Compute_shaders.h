@@ -1639,13 +1639,26 @@ void main()
 
     vec4 result = vec4(float(bitfieldExtract(color.x, 16, 8)), float(bitfieldExtract(color.x, 8, 8)), float(color.x & 0x3FU), float(bitfieldExtract(color.x, 24, 8)));
     result /= vec4(63.0, 63.0, 63.0, 31.0);
+#ifdef WideOutputWidth
+    // WideMelon: the columns the tiles were rounded up by stay out of the output
+    if (gl_GlobalInvocationID.x < uint(WideOutputWidth))
+#endif
     imageStore(FinalFB, ivec2(gl_GlobalInvocationID.xy), result);
 
+#ifdef WideOutputWidth
+    // the game only ever sees the native 256 it asked for, so capture (and GetLine) take the
+    // centre of a wide view
+    const int scale = ScreenHeight/192;
+    ivec2 lowresCoordinate = ivec2(gl_GlobalInvocationID.xy) / scale - ivec2(WideLowResOffset, 0);
+    ivec2 lowresCoordinateRest = ivec2(gl_GlobalInvocationID.xy) % scale;
+    if (lowresCoordinateRest == ivec2(0, 0) && lowresCoordinate.x >= 0 && lowresCoordinate.x < 256)
+#else
     // It's a division by constant, so using the builtin division is fine
     const int scale = ScreenWidth/256;
     ivec2 lowresCoordinate = ivec2(gl_GlobalInvocationID.xy) / scale;
     ivec2 lowresCoordinateRest = ivec2(gl_GlobalInvocationID.xy) % scale;
     if (lowresCoordinateRest == ivec2(0, 0))
+#endif
     {
         uvec4 color8;
         color8.x = bitfieldExtract(color.x, 0, 8);

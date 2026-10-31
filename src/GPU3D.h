@@ -373,7 +373,7 @@ public:
 
     // WideMelon, in native pixels: the width new geometry should be built for, and the width of
     // the output right now (it can lag behind for the polygons still being drawn).
-    // only the GL renderer goes wider than 256
+    // only the GL and compute renderers go wider than 256
     [[nodiscard]] virtual int GetViewWidth() const noexcept { return 256; }
     [[nodiscard]] virtual int GetOutputWidth() const noexcept { return 256; }
 

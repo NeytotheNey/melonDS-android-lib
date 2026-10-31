@@ -45,6 +45,15 @@ public:
 
     void SetRenderSettings(int scale, bool highResolutionCoordinates);
 
+    // WideMelon: same rules as GLRenderer's (see GPU3D_OpenGL.h). the work buffers and shaders are
+    // built for the width, so a change of GetOutputWidth recompiles every shader, at RenderFrame
+    // (or with the next SetRenderSettings). the targets are rounded up to whole coarse tiles, and
+    // only the first GetOutputWidth() x scale columns reach the compositor
+    void SetViewWidth(int width) noexcept;
+    [[nodiscard]] int GetViewWidth() const noexcept override { return ViewWidth; }
+    [[nodiscard]] int GetOutputWidth() const noexcept override { return TargetWidth; }
+    void SavestateLoaded() override;
+
     void VCount144(GPU& gpu) override;
 
     void RenderFrame(GPU& gpu) override;
@@ -229,11 +238,27 @@ private:
     int MaxWorkTiles;
     bool HiresCoordinates;
 
+    int RequestedViewWidth = 256;
+    int ViewWidth = 256;
+    int TargetWidth = 256;
+    int MaxTargetWidth {};
+    s64 MaxBufferSize {};
+
+    // set per frame, as in GLRenderer: the polygons were built for a wide view, or are drawn into
+    // one, and how far to move them when the two widths differ
+    bool WideFrame {};
+    s32 WideXAdjust {};
+
     GLCompositor CurGLCompositor;
 
     int ShaderStepIdx = 0;
 
     void DeleteShaders();
+
+    bool TargetFits(int width, int scale) const noexcept;
+    int ResolveViewWidth(int width, int scale) noexcept;
+    void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth);
+    s32 WideVertexX(s32 hiresx) const;
 
     void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to);
     void SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2]);
