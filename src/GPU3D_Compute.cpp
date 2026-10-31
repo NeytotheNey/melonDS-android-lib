@@ -20,6 +20,8 @@
 
 #include <assert.h>
 #include <algorithm>
+#include <iterator>
+#include <utility>
 
 #include "Utils.h"
 #include "Platform.h"
@@ -285,6 +287,36 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
 ComputeRenderer::~ComputeRenderer()
 {
     Texcache.Reset();
+
+    // On Adreno, deleting a buffer doesn't give its memory back right away: the driver keeps the
+    // storage of deleted buffers until the next game allocates, so leaving a 4x compute game kept
+    // ~250 MB of graphics memory on the ROM list. Storage that glBufferData replaces is freed, so
+    // shrink the buffers before deleting them, which leaves ~130 MB at 4x. The order matters on the
+    // phone: shrinking the small buffers first kept the big ones anyway, biggest first doesn't.
+    // Which buffer is biggest depends on the scale and width, so they're sorted by their real size
+    std::pair<GLint64, GLuint> buffers[] = {
+        { 0, TileMemory[0] }, { 0, TileMemory[1] }, { 0, TileMemory[2] }, { 0, XSpanSetupMemory },
+        { 0, FinalTileMemory }, { 0, WorkDescMemory }, { 0, BinResultMemory },
+        { 0, YSpanIndicesTextureMemory }, { 0, YSpanSetupMemory }, { 0, RenderPolygonMemory },
+        { 0, PixelBuffer }, { 0, MetaUniformMemory } };
+    for (auto& [size, buffer] : buffers)
+    {
+        if (buffer == 0)
+            continue;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &size);
+    }
+    std::stable_sort(std::begin(buffers), std::end(buffers),
+                     [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (const auto& [size, buffer] : buffers)
+    {
+        if (buffer == 0)
+            continue;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 4, nullptr, GL_DYNAMIC_DRAW);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    glFinish();
 
     glDeleteBuffers(1, &YSpanSetupMemory);
     glDeleteBuffers(1, &RenderPolygonMemory);
