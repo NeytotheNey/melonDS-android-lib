@@ -962,18 +962,20 @@ void GPU::StartHBlank(u32 line) noexcept
     DispStat[0] |= (1<<1);
     DispStat[1] |= (1<<1);
 
+    // the renderer draws from the job alone. the Units' per-line updates happen around taking
+    // their snapshots: the BG pass sees PreDrawScanline, the sprites see PostDrawScanline.
+    // PreDrawScanline runs at every HBlank: it latches the DISPCNT enables (so writes during
+    // VBlank settle before line 0, and line 262's sprite snapshot sees the latch too) and arms
+    // display capture at line 0 (that decides where the job is drawn)
+    GPU2D_A.PreDrawScanline(VCount);
+    GPU2D_B.PreDrawScanline(VCount);
+
     if (VCount < 192)
     {
         // draw
         // note: this should start 48 cycles after the scanline start
         if (line < 192)
         {
-            // the renderer draws from the job alone. the Units' per-line updates happen around
-            // taking their snapshots: the BG pass sees PreDrawScanline, the sprites see PostDrawScanline.
-            // the job starts after PreDrawScanline, which arms display capture (that decides where it's drawn)
-            GPU2D_A.PreDrawScanline(VCount);
-            GPU2D_B.PreDrawScanline(VCount);
-
             GPU2D::LineJob& job = Begin2DJob();
             Snapshot2DScanline(job, line);
             GPU2D_A.PostDrawScanline(VCount);

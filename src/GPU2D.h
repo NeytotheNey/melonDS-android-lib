@@ -37,6 +37,9 @@ struct UnitState
     bool Enabled;
 
     u32 DispCnt;
+    u8 LayerEnable;         // DISPCNT bits 8-12 as the BG pass sees them: enabling a layer is delayed by 2 lines
+    u8 OBJEnable;           // DISPCNT bit 12 as the sprite pass sees it: enabling is delayed by 1 line
+    u8 ForcedBlank;         // DISPCNT bit 7 as the BG pass sees it: leaving forced blank is delayed by 2 lines
     u16 BGCnt[4];
 
     u16 BGXPos[4];
@@ -127,6 +130,8 @@ public:
     u32 DispFIFOWritePtr;
 
     u16 DispFIFOBuffer[256];
+
+    u32 DispCntLatch[3];    // DispCnt at the last three HBlanks, for the enable latency above
 
     s32 BGXRef[2];
     s32 BGYRef[2];

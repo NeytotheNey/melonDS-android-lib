@@ -96,6 +96,10 @@ void Unit::Reset()
 {
     Enabled = false;
     DispCnt = 0;
+    memset(DispCntLatch, 0, sizeof(DispCntLatch));
+    LayerEnable = 0;
+    OBJEnable = 0;
+    ForcedBlank = 0;
     memset(BGCnt, 0, 4*2);
     memset(BGXPos, 0, 4*2);
     memset(BGYPos, 0, 4*2);
@@ -147,6 +151,10 @@ void Unit::DoSavestate(Savestate* file)
     file->Section((char*)(Num ? "GP2B" : "GP2A"));
 
     file->Var32(&DispCnt);
+    file->VarArray(DispCntLatch, sizeof(DispCntLatch));
+    file->Var8(&LayerEnable);
+    file->Var8(&OBJEnable);
+    file->Var8(&ForcedBlank);
     file->VarArray(BGCnt, 4*2);
     file->VarArray(BGXPos, 4*2);
     file->VarArray(BGYPos, 4*2);
@@ -646,6 +654,18 @@ void Unit::PreDrawScanline(u32 line)
     // display capture is armed at the start of line 0 and stays on until VBlank
     if (line == 0 && (CaptureCnt & (1<<31)))
         CaptureLatch = true;
+
+    if (!Enabled) return;
+
+    // enabling BG/OBJ layers or disabling forced blank takes two scanlines to apply (one for the
+    // sprite pass, which runs a line ahead). disabling layers or enabling forced blank applies
+    // immediately. this runs at every HBlank, so writes during VBlank have settled by line 0
+    DispCntLatch[2] = DispCntLatch[1];
+    DispCntLatch[1] = DispCntLatch[0];
+    DispCntLatch[0] = DispCnt;
+    LayerEnable = ((DispCntLatch[2] & DispCnt) >> 8) & 0x1F;
+    OBJEnable = ((DispCntLatch[1] & DispCnt) >> 12) & 0x1;
+    ForcedBlank = ((DispCntLatch[2] | DispCnt) >> 7) & 0x1;
 }
 
 void Unit::PostDrawScanline(u32 line)
@@ -658,44 +678,39 @@ void Unit::PostDrawScanline(u32 line)
     if (line > 192) return;
     if (!Enabled) return;
 
-    // forced blank skips BG/OBJ compositing, but not the OBJ mosaic counters
-    if (!(DispCnt & (1<<7)))
+    // the counters below keep running during forced blank: it only blanks the output
+
+    // window X state carries over to the next line. CalculateWindowMask leaves it as set by
+    // the last edge it crosses: open if x1 > x2, closed otherwise (x1 == x2 closes)
+    if (DispCnt & (1<<14))
     {
-        // window X state carries over to the next line. CalculateWindowMask leaves it as set by
-        // the last edge it crosses: open if x1 > x2, closed otherwise (x1 == x2 closes)
-        if (DispCnt & (1<<14))
-        {
-            if (Win1Coords[0] > Win1Coords[1]) Win1Active |=  0x2;
-            else                               Win1Active &= ~0x2;
-        }
-        if (DispCnt & (1<<13))
-        {
-            if (Win0Coords[0] > Win0Coords[1]) Win0Active |=  0x2;
-            else                               Win0Active &= ~0x2;
-        }
-
-        // affine reference points advance on every line their BG is drawn as an
-        // affine/extended/large BG (BG2: modes 2, 4, 5, 6; BG3: modes 1-5)
-        u32 bgmode = DispCnt & 0x7;
-        if ((DispCnt & 0x0400) && (bgmode == 2 || bgmode == 4 || bgmode == 5 || bgmode == 6))
-        {
-            BGXRefInternal[0] += BGRotB[0];
-            BGYRefInternal[0] += BGRotD[0];
-        }
-        if ((DispCnt & 0x0800) && (bgmode >= 1 && bgmode <= 5))
-        {
-            BGXRefInternal[1] += BGRotB[1];
-            BGYRefInternal[1] += BGRotD[1];
-        }
-
-        if (BGMosaicY >= BGMosaicYMax)
-        {
-            BGMosaicY = 0;
-            BGMosaicYMax = BGMosaicSize[1];
-        }
-        else
-            BGMosaicY++;
+        if (Win1Coords[0] > Win1Coords[1]) Win1Active |=  0x2;
+        else                               Win1Active &= ~0x2;
     }
+    if (DispCnt & (1<<13))
+    {
+        if (Win0Coords[0] > Win0Coords[1]) Win0Active |=  0x2;
+        else                               Win0Active &= ~0x2;
+    }
+
+    // affine reference points advance on every line their BG is enabled (as latched above),
+    // whatever the BG mode
+    for (int i = 0; i < 2; i++)
+    {
+        if (!(LayerEnable & (4<<i)))
+            continue;
+
+        BGXRefInternal[i] += BGRotB[i];
+        BGYRefInternal[i] += BGRotD[i];
+    }
+
+    if (BGMosaicY >= BGMosaicYMax)
+    {
+        BGMosaicY = 0;
+        BGMosaicYMax = BGMosaicSize[1];
+    }
+    else
+        BGMosaicY++;
 
     // the OBJ mosaic counter only runs while OBJ are enabled (the unit's power is checked above)
     if (DispCnt & (1<<12))

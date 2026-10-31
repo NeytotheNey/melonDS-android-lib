@@ -315,12 +315,12 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
             dst[256*3] &= ~0x1F00;
 
             if ((dispmode == 0) || ((dispmode == 1) &&
-                ((CurUnit->DispCnt & 0x80) || (CurUnit->Num && !CurUnit->Enabled))))
+                (CurUnit->ForcedBlank || (CurUnit->Num && !CurUnit->Enabled))))
             {
                 dst[256*3] |= (1 << 21);
             }
             else if ((CurUnit->Num == 0) && CurUnit->Enabled && (dispmode == 1) &&
-                ((CurUnit->DispCnt & 0x188) == 0x108))
+                !CurUnit->ForcedBlank && (CurUnit->LayerEnable & 0x01) && (CurUnit->DispCnt & 0x8))
             {
                 dst[256*3] |= (1 << 22);
 
@@ -686,12 +686,13 @@ template<u32 bgmode>
 void SoftRenderer::DrawScanlineBGMode(u32 line)
 {
     u32 dispCnt = CurUnit->DispCnt;
+    u32 layerEnable = CurUnit->LayerEnable;
     const u16* bgCnt = CurUnit->BGCnt;
     for (int i = 3; i >= 0; i--)
     {
         if ((bgCnt[3] & 0x3) == i)
         {
-            if (dispCnt & 0x0800)
+            if (layerEnable & 0x08)
             {
                 if (bgmode >= 3)
                     DoDrawBG(Extended, line, 3);
@@ -703,7 +704,7 @@ void SoftRenderer::DrawScanlineBGMode(u32 line)
         }
         if ((bgCnt[2] & 0x3) == i)
         {
-            if (dispCnt & 0x0400)
+            if (layerEnable & 0x04)
             {
                 if (bgmode == 5)
                     DoDrawBG(Extended, line, 2);
@@ -715,14 +716,14 @@ void SoftRenderer::DrawScanlineBGMode(u32 line)
         }
         if ((bgCnt[1] & 0x3) == i)
         {
-            if (dispCnt & 0x0200)
+            if (layerEnable & 0x02)
             {
                 DoDrawBG(Text, line, 1);
             }
         }
         if ((bgCnt[0] & 0x3) == i)
         {
-            if (dispCnt & 0x0100)
+            if (layerEnable & 0x01)
             {
                 if (!CurUnit->Num && (dispCnt & 0x8))
                     DrawBG_3D();
@@ -730,7 +731,7 @@ void SoftRenderer::DrawScanlineBGMode(u32 line)
                     DoDrawBG(Text, line, 0);
             }
         }
-        if ((dispCnt & 0x1000) && NumSprites[CurUnit->Num])
+        if ((layerEnable & 0x10) && NumSprites[CurUnit->Num])
         {
             DoInterleaveSprites(0x40000 | (i<<16));
         }
@@ -741,25 +742,26 @@ void SoftRenderer::DrawScanlineBGMode(u32 line)
 void SoftRenderer::DrawScanlineBGMode6(u32 line)
 {
     u32 dispCnt = CurUnit->DispCnt;
+    u32 layerEnable = CurUnit->LayerEnable;
     const u16* bgCnt = CurUnit->BGCnt;
     for (int i = 3; i >= 0; i--)
     {
         if ((bgCnt[2] & 0x3) == i)
         {
-            if (dispCnt & 0x0400)
+            if (layerEnable & 0x04)
             {
                 DoDrawBG_Large(line);
             }
         }
         if ((bgCnt[0] & 0x3) == i)
         {
-            if (dispCnt & 0x0100)
+            if (layerEnable & 0x01)
             {
                 if ((!CurUnit->Num) && (dispCnt & 0x8))
                     DrawBG_3D();
             }
         }
-        if ((dispCnt & 0x1000) && NumSprites[CurUnit->Num])
+        if ((layerEnable & 0x10) && NumSprites[CurUnit->Num])
         {
             DoInterleaveSprites(0x40000 | (i<<16))
         }
@@ -769,6 +771,7 @@ void SoftRenderer::DrawScanlineBGMode6(u32 line)
 void SoftRenderer::DrawScanlineBGMode7(u32 line)
 {
     u32 dispCnt = CurUnit->DispCnt;
+    u32 layerEnable = CurUnit->LayerEnable;
     const u16* bgCnt = CurUnit->BGCnt;
     // mode 7 only has text-mode BG0 and BG1
 
@@ -776,14 +779,14 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
     {
         if ((bgCnt[1] & 0x3) == i)
         {
-            if (dispCnt & 0x0200)
+            if (layerEnable & 0x02)
             {
                 DoDrawBG(Text, line, 1);
             }
         }
         if ((bgCnt[0] & 0x3) == i)
         {
-            if (dispCnt & 0x0100)
+            if (layerEnable & 0x01)
             {
                 if (!CurUnit->Num && (dispCnt & 0x8))
                     DrawBG_3D();
@@ -791,7 +794,7 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
                     DoDrawBG(Text, line, 0);
             }
         }
-        if ((dispCnt & 0x1000) && NumSprites[CurUnit->Num])
+        if ((layerEnable & 0x10) && NumSprites[CurUnit->Num])
         {
             DoInterleaveSprites(0x40000 | (i<<16))
         }
@@ -821,8 +824,9 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         return;
     }
 
-    // forced blank disables BG/OBJ compositing
-    if (CurUnit->DispCnt & (1<<7))
+    // forced blank disables BG/OBJ compositing (leaving it takes effect two lines later, see
+    // Unit::PreDrawScanline)
+    if (CurUnit->ForcedBlank)
     {
         for (int i = 0; i < 256; i++)
             BGOBJLine[i] = 0xFF3F3F3F;
@@ -1737,7 +1741,8 @@ void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
     memset(OBJWindow[CurUnit->Num], 0, 256);
     // the OBJ buffers don't get updated at all if the 2D engine is disabled
     if (!CurUnit->Enabled) return;
-    if (!(CurUnit->DispCnt & 0x1000)) return;
+    // OBJ enable as latched for this line's sprite pass (see Unit::PreDrawScanline)
+    if (!CurUnit->OBJEnable) return;
 
     u16* oam = (u16*)&GPU.OAM[CurUnit->Num ? 0x400 : 0];
 
