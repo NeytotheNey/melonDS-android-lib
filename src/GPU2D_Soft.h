@@ -147,6 +147,7 @@ private:
     void ApplySpriteMosaicX();
     template<DrawPixel drawPixel>
     void InterleaveSprites(u32 prio);
+    template<bool window> static void DrawSpritePixel(u32* objLine, u8* objWindow, int color, u32 pixelattr, s32 xpos);
     template<bool window> void DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos);
     template<bool window> void DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos);
 

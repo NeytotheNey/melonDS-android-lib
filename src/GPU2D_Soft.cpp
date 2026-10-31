@@ -1620,13 +1620,22 @@ void SoftRenderer::DrawBG_Large(u32 line) // BG is always BG2
 // * bit0-15: color (bit15=1: direct color, bit15=0: palette index, bit12=0 to indicate extpal)
 // * bit16-17: BG-relative priority
 // * bit18: non-transparent sprite pixel exists here
-// * bit19: X mosaic should be applied here
+// * bit19: a sprite covers this pixel (transparent or not)
+// * bit20: X mosaic should be applied here
 // * bit24-31: compositor flags
 
 void SoftRenderer::ApplySpriteMosaicX()
 {
     // apply X mosaic if needed
     // X mosaic for sprites is applied after all sprites are rendered
+    //
+    // rules:
+    // pixels are processed from left to right
+    // the current pixel value is latched if:
+    // - the X mosaic counter is 0
+    // - the current pixel doesn't receive sprite mosaic
+    // - the latched pixel doesn't receive sprite mosaic
+    // - the current BG-relative priority value is lower than the latched one
 
     if (CurUnit->OBJMosaicSize[0] == 0) return;
 
@@ -1634,16 +1643,26 @@ void SoftRenderer::ApplySpriteMosaicX()
 
     u8* curOBJXMosaicTable = MosaicTable[CurUnit->OBJMosaicSize[0]].data();
 
-    u32 lastcolor = objLine[0];
+    u32 latchcolor = 0;
 
-    for (u32 i = 1; i < 256; i++)
+    for (u32 i = 0; i < 256; i++)
     {
-        u32 currentcolor = objLine[i];
+        u32 curcolor = objLine[i];
+        bool latch = false;
 
-        if (!(lastcolor & currentcolor & 0x100000) || curOBJXMosaicTable[i] == 0)
-            lastcolor = currentcolor;
-        else
-            objLine[i] = lastcolor;
+        if (curOBJXMosaicTable[i] == 0)
+            latch = true;
+        else if (!(curcolor & 0x100000))
+            latch = true;
+        else if (!(latchcolor & 0x100000))
+            latch = true;
+        else if ((curcolor & 0x30000) < (latchcolor & 0x30000))
+            latch = true;
+
+        if (latch)
+            latchcolor = curcolor;
+
+        objLine[i] = latchcolor;
     }
 }
 
@@ -1739,82 +1758,104 @@ void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
         64, 32, 64, 8
     };
 
-    for (int bgnum = 0x0C00; bgnum >= 0x0000; bgnum -= 0x0400)
+    // sprites are drawn in OAM order: a pixel replaces the one already there only if that one
+    // is transparent or has a strictly lower priority (see DrawSpritePixel)
+    for (int sprnum = 0; sprnum < 128; sprnum++)
     {
-        for (int sprnum = 127; sprnum >= 0; sprnum--)
-        {
-            u16* attrib = &oam[sprnum*4];
+        u16* attrib = &oam[sprnum*4];
 
-            if ((attrib[2] & 0x0C00) != bgnum)
+        bool iswin = (((attrib[0] >> 10) & 0x3) == 2);
+
+        u32 sprline;
+        if ((attrib[0] & 0x1000) && !iswin)
+        {
+            // apply Y mosaic
+            sprline = CurUnit->OBJMosaicY;
+        }
+        else
+            sprline = line;
+
+        if (attrib[0] & 0x0100)
+        {
+            u32 sizeparam = (attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12);
+            s32 width = spritewidth[sizeparam];
+            s32 height = spriteheight[sizeparam];
+            s32 boundwidth = width;
+            s32 boundheight = height;
+
+            if (attrib[0] & 0x0200)
+            {
+                boundwidth <<= 1;
+                boundheight <<= 1;
+            }
+
+            u32 ypos = attrib[0] & 0xFF;
+            if (((line - ypos) & 0xFF) >= (u32)boundheight)
+                continue;
+            ypos = (sprline - ypos) & 0xFF;
+            // a ypos past the sprite height means we underflowed, because OBJMosaicY was
+            // latched before the sprite's top: clamp to the first row
+            if (ypos >= (u32)boundheight) ypos = 0;
+
+            s32 xpos = (s32)(attrib[1] << 23) >> 23;
+            if (xpos <= -boundwidth)
                 continue;
 
-            bool iswin = (((attrib[0] >> 10) & 0x3) == 2);
+            DoDrawSprite(Rotscale, sprnum, boundwidth, boundheight, width, height, xpos, ypos);
 
-            u32 sprline;
-            if ((attrib[0] & 0x1000) && !iswin)
-            {
-                // apply Y mosaic
-                sprline = CurUnit->OBJMosaicY;
-            }
-            else
-                sprline = line;
-
-            if (attrib[0] & 0x0100)
-            {
-                u32 sizeparam = (attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12);
-                s32 width = spritewidth[sizeparam];
-                s32 height = spriteheight[sizeparam];
-                s32 boundwidth = width;
-                s32 boundheight = height;
-
-                if (attrib[0] & 0x0200)
-                {
-                    boundwidth <<= 1;
-                    boundheight <<= 1;
-                }
-
-                u32 ypos = attrib[0] & 0xFF;
-                if (((line - ypos) & 0xFF) >= (u32)boundheight)
-                    continue;
-                ypos = (sprline - ypos) & 0xFF;
-                // a ypos past the sprite height means we underflowed, because OBJMosaicY was
-                // latched before the sprite's top: clamp to the first row
-                if (ypos >= (u32)boundheight) ypos = 0;
-
-                s32 xpos = (s32)(attrib[1] << 23) >> 23;
-                if (xpos <= -boundwidth)
-                    continue;
-
-                u32 rotparamgroup = (attrib[1] >> 9) & 0x1F;
-
-                DoDrawSprite(Rotscale, sprnum, boundwidth, boundheight, width, height, xpos, ypos);
-
-                NumSprites[CurUnit->Num]++;
-            }
-            else
-            {
-                if (attrib[0] & 0x0200)
-                    continue;
-
-                u32 sizeparam = (attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12);
-                s32 width = spritewidth[sizeparam];
-                s32 height = spriteheight[sizeparam];
-
-                u32 ypos = attrib[0] & 0xFF;
-                if (((line - ypos) & 0xFF) >= (u32)height)
-                    continue;
-                ypos = (sprline - ypos) & 0xFF;
-                if (ypos >= (u32)height) ypos = 0;
-
-                s32 xpos = (s32)(attrib[1] << 23) >> 23;
-                if (xpos <= -width)
-                    continue;
-
-                DoDrawSprite(Normal, sprnum, width, height, xpos, ypos);
-
-                NumSprites[CurUnit->Num]++;
-            }
+            NumSprites[CurUnit->Num]++;
         }
+        else
+        {
+            if (attrib[0] & 0x0200)
+                continue;
+
+            u32 sizeparam = (attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12);
+            s32 width = spritewidth[sizeparam];
+            s32 height = spriteheight[sizeparam];
+
+            u32 ypos = attrib[0] & 0xFF;
+            if (((line - ypos) & 0xFF) >= (u32)height)
+                continue;
+            ypos = (sprline - ypos) & 0xFF;
+            if (ypos >= (u32)height) ypos = 0;
+
+            s32 xpos = (s32)(attrib[1] << 23) >> 23;
+            if (xpos <= -width)
+                continue;
+
+            DoDrawSprite(Normal, sprnum, width, height, xpos, ypos);
+
+            NumSprites[CurUnit->Num]++;
+        }
+    }
+}
+
+// one sprite pixel into the OBJ line, in OAM order. an opaque pixel only replaces an opaque one of
+// strictly lower priority. a transparent pixel over no opaque pixel still marks the pixel as
+// covered by a sprite and takes over its priority and mosaic flag (the last sprite in OAM order
+// wins), which is what the sprite X mosaic and the OBJ blending see there
+template<bool window>
+void SoftRenderer::DrawSpritePixel(u32* objLine, u8* objWindow, int color, u32 pixelattr, s32 xpos)
+{
+    if (window)
+    {
+        if (color != -1)
+            objWindow[xpos] = 1;
+        return;
+    }
+
+    u32 oldpixel = objLine[xpos];
+    bool oldisopaque = !!(oldpixel & 0x40000);
+
+    if (color != -1)
+    {
+        if (!oldisopaque || ((pixelattr & 0x30000) < (oldpixel & 0x30000)))
+            objLine[xpos] = color | pixelattr;
+    }
+    else if (!oldisopaque)
+    {
+        objLine[xpos] = (oldpixel & ~0x130000) | (pixelattr & 0x1B0000);
     }
 }
 
@@ -1917,16 +1958,7 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
             {
                 color = *(u16*)&objvram[(pixelsaddr + ((rotY >> 8) * ytilefactor) + ((rotX >> 8) << 1)) & objvrammask];
 
-                if (color & 0x8000)
-                {
-                    if (window) objWindow[xpos] = 1;
-                    else        objLine[xpos] = color | pixelattr;
-                }
-                else if (!window)
-                {
-                    if (objLine[xpos] == 0)
-                        objLine[xpos] = pixelattr & 0x180000;
-                }
+                DrawSpritePixel<window>(objLine, objWindow, (color & 0x8000) ? color : -1, pixelattr, xpos);
             }
 
             rotX += rotA;
@@ -1972,16 +2004,7 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
                 {
                     color = objvram[(pixelsaddr + ((rotY>>11)*ytilefactor) + ((rotY&0x700)>>5) + ((rotX>>11)*64) + ((rotX&0x700)>>8)) & objvrammask];
 
-                    if (color)
-                    {
-                        if (window) objWindow[xpos] = 1;
-                        else        objLine[xpos] = color | pixelattr;
-                    }
-                    else if (!window)
-                    {
-                        if (objLine[xpos] == 0)
-                            objLine[xpos] = pixelattr & 0x180000;
-                    }
+                    DrawSpritePixel<window>(objLine, objWindow, color ? color : -1, pixelattr, xpos);
                 }
 
                 rotX += rotA;
@@ -2009,16 +2032,7 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
                     else
                         color &= 0x0F;
 
-                    if (color)
-                    {
-                        if (window) objWindow[xpos] = 1;
-                        else        objLine[xpos] = color | pixelattr;
-                    }
-                    else if (!window)
-                    {
-                        if (objLine[xpos] == 0)
-                            objLine[xpos] = pixelattr & 0x180000;
-                    }
+                    DrawSpritePixel<window>(objLine, objWindow, color ? color : -1, pixelattr, xpos);
                 }
 
                 rotX += rotA;
@@ -2135,16 +2149,7 @@ void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s
 
             pixelsaddr += pixelstride;
 
-            if (color & 0x8000)
-            {
-                if (window) objWindow[xpos] = 1;
-                else        objLine[xpos] = color | pixelattr;
-            }
-            else if (!window)
-            {
-                if (objLine[xpos] == 0)
-                    objLine[xpos] = pixelattr & 0x180000;
-            }
+            DrawSpritePixel<window>(objLine, objWindow, (color & 0x8000) ? color : -1, pixelattr, xpos);
 
             xoff++;
             xpos++;
@@ -2202,16 +2207,7 @@ void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s
 
                 pixelsaddr += pixelstride;
 
-                if (color)
-                {
-                    if (window) objWindow[xpos] = 1;
-                    else        objLine[xpos] = color | pixelattr;
-                }
-                else if (!window)
-                {
-                    if (objLine[xpos] == 0)
-                        objLine[xpos] = pixelattr & 0x180000;
-                }
+                DrawSpritePixel<window>(objLine, objWindow, color ? color : -1, pixelattr, xpos);
 
                 xoff++;
                 xpos++;
@@ -2262,16 +2258,7 @@ void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s
                     else              color = objvram[pixelsaddr & objvrammask] & 0x0F;
                 }
 
-                if (color)
-                {
-                    if (window) objWindow[xpos] = 1;
-                    else        objLine[xpos] = color | pixelattr;
-                }
-                else if (!window)
-                {
-                    if (objLine[xpos] == 0)
-                        objLine[xpos] = pixelattr & 0x180000;
-                }
+                DrawSpritePixel<window>(objLine, objWindow, color ? color : -1, pixelattr, xpos);
 
                 xoff++;
                 xpos++;
