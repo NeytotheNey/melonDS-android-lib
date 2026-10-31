@@ -662,7 +662,9 @@ void Unit::PostDrawScanline(u32 line)
             BGMosaicY++;
     }
 
-    UpdateMosaicCounters(line);
+    // the OBJ mosaic counter only runs while the unit is powered and OBJ are enabled
+    if (Enabled && (DispCnt & (1<<12)))
+        UpdateMosaicCounters(line);
 }
 
 void Unit::VBlank()
