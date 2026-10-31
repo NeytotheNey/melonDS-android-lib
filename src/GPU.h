@@ -636,6 +636,17 @@ public:
     // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
     // line 192. only turned off by a debug switch, to compare
     bool EarlyFlushCapture = true;
+    // OpenGL renderer: clear the shadow mask per scanline like the software renderer does,
+    // instead of over the whole screen for every mask. only turned off by a debug switch, to compare
+    bool ShadowMaskLineClear = true;
+    // OpenGL renderer: depth-equal shadow masks and shadows (polygon attr bit 14) get the DS
+    // margin instead of a plain GL_LESS/GL_LEQUAL. only turned off by a debug switch, to compare
+    bool ShadowMaskDepthTest = true;
+    // OpenGL renderer: all other depth-equal polygons get the far side of the DS margin too
+    // (see GLRenderer::SetPolygonDepthBias). only turned off by a debug switch, to compare
+    bool EqualDepthMargin = true;
+    // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
+    int ShadowLogFrames = 0;
 
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;

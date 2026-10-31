@@ -105,6 +105,13 @@ private:
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
     int RenderPolygonEdgeBatch(int i) const;
+    void ClearShadowMaskLines(const Polygon* polygon, const bool* lastWasMask) const;
+    void SetDepthBias(u32 flags, float bias);
+    void SetPolygonDepthBias(u32 polyattr);
+    void LogFrameStats(const GPU3D& gpu3d);
+    int BeginShadowLogQuery();
+    void LogShadowPolygon(char type, int i, int query);
+    void FlushShadowLog();
     void RenderSceneChunk(const GPU3D& gpu3d, int y, int h);
 
     enum
@@ -119,6 +126,8 @@ private:
     GLuint ClearShaderPlain {};
 
     GLuint RenderShader[16] {};
+    GLint RenderShaderDepthBiasLoc[16] {};
+    float RenderShaderDepthBias[16] {};
     GLuint CurShaderID = -1;
 
     GLuint FinalPassEdgeShader {};
@@ -184,6 +193,30 @@ private:
     // two widths differ (right after a change), WideXAdjust keeps them centred
     bool WideFrame {};
     s32 WideXAdjust {};
+
+    // set per frame from GPU::ShadowMaskLineClear, GPU::ShadowMaskDepthTest and GPU::EqualDepthMargin
+    bool ShadowMaskLineClear = true;
+    bool ShadowMaskDepthTest = true;
+    bool EqualDepthMargin = true;
+
+    // debug only (GPU::ShadowLogFrames): the masks and shadows of a frame, logged at the start of
+    // the next one so their occlusion queries are done by then
+    struct ShadowLogEntry
+    {
+        char Type;
+        int Index;
+        u32 Attr;
+        bool WBuffer, FacingView;
+        s32 YTop, YBottom;
+        u32 ZMin, ZMax;
+        int Query;
+    };
+    bool ShadowLogActive = false;
+    u32 ShadowLogFrame = 0;
+    int NumShadowLogEntries = 0;
+    int NumShadowLogQueries = 0;
+    ShadowLogEntry ShadowLogEntries[64] {};
+    GLuint ShadowLogQueries[64] {};
 
     GLuint ColorBufferTex {}, DepthBufferTex {}, AttrBufferTex {};
     GLuint DownScaleBufferTex {};

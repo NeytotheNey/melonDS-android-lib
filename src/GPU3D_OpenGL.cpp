@@ -67,6 +67,9 @@ bool GLRenderer::BuildRenderShader(u32 flags, const std::string& vs, const std::
     uni_id = glGetUniformLocation(prog, "TexPalMem");
     glUniform1i(uni_id, 1);
 
+    RenderShaderDepthBiasLoc[flags] = glGetUniformLocation(prog, "uDepthBias");
+    glUniform1f(RenderShaderDepthBiasLoc[flags], 0.0f);
+
     RenderShader[flags] = prog;
 
     return true;
@@ -323,6 +326,8 @@ GLRenderer::~GLRenderer()
     glDeleteProgram(ClearShaderPlain);
     glDeleteProgram(FinalPassEdgeShader);
     glDeleteProgram(FinalPassFogShader);
+
+    if (ShadowLogQueries[0]) glDeleteQueries(64, ShadowLogQueries);
 }
 
 void GLRenderer::Reset(GPU& gpu)
@@ -822,12 +827,165 @@ int GLRenderer::RenderPolygonEdgeBatch(int i) const
     return numpolys;
 }
 
+// the lines the software renderer draws a polygon on (see SoftRenderer::RenderScanline)
+static void GetPolygonLines(const Polygon* polygon, int& ytop, int& ybottom)
+{
+    ytop = std::max(polygon->YTop, 0);
+    ybottom = std::min((polygon->YBottom == polygon->YTop) ? polygon->YTop + 1 : polygon->YBottom, 192);
+}
+
+void GLRenderer::ClearShadowMaskLines(const Polygon* polygon, const bool* lastWasMask) const
+{
+    // clear the stencil buffer (with the caller's stencil mask) on the polygon's lines where
+    // the last polygon wasn't a mask. DS line y is GL row y here, the target isn't flipped.
+    // scissor is off for the whole 3D frame (RenderFrame turns it off), so it's just turned
+    // back off after, without querying it (glGet can stall threaded drivers)
+    int ytop, ybottom;
+    GetPolygonLines(polygon, ytop, ybottom);
+
+    bool scissorOn = false;
+
+    for (int y = ytop; y < ybottom; )
+    {
+        if (lastWasMask[y]) { y++; continue; }
+
+        int yend = y + 1;
+        while (yend < ybottom && !lastWasMask[yend]) yend++;
+
+        if (!scissorOn)
+        {
+            glEnable(GL_SCISSOR_TEST);
+            scissorOn = true;
+        }
+
+        glScissor(0, y*ScaleFactor, ScreenW, (yend-y)*ScaleFactor);
+        glClear(GL_STENCIL_BUFFER_BIT);
+
+        y = yend;
+    }
+
+    if (scissorOn) glDisable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer::SetDepthBias(u32 flags, float bias)
+{
+    // RenderShader[flags] has to be in use
+    if (RenderShaderDepthBias[flags] == bias) return;
+    glUniform1f(RenderShaderDepthBiasLoc[flags], bias);
+    RenderShaderDepthBias[flags] = bias;
+}
+
+void GLRenderer::SetPolygonDepthBias(u32 polyattr)
+{
+    // depth-equal polygons (attr bit 14) are drawn with GL_LEQUAL, but the DS test passes within a
+    // margin (+-0x200 Z-buffering, +-0xFF W-buffering), so move them forward by it. that covers
+    // the far side, the near side stays open. depth writes store the moved depth, slightly nearer
+    // than the DS would. set right before every draw, for the shader in use
+    float bias = 0.0f;
+    if (EqualDepthMargin && (polyattr & (1<<14)))
+        bias = (CurShaderID & RenderFlag_WBuffer) ? -255.0f : -512.0f;
+
+    SetDepthBias(CurShaderID, bias);
+}
+
+void GLRenderer::LogFrameStats(const GPU3D& gpu3d)
+{
+    // debug: what kinds of polygons the frame has, to find what a game draws its shadows with
+    int numopaque = 0, numtrans = 0, nummasks = 0, numshadows = 0;
+    int numequalopaque = 0, numequaltrans = 0, numequaltransdepth = 0;
+    for (int i = 0; i < NumFinalPolys; i++)
+    {
+        const Polygon* polygon = PolygonList[i].PolyData;
+        if (polygon->Translucent) numtrans++;
+        else                      numopaque++;
+        if (polygon->IsShadowMask) nummasks++;
+        else if (polygon->IsShadow) numshadows++;
+
+        if (!(polygon->Attr & (1<<14))) continue;
+        if (!polygon->Translucent) numequalopaque++;
+        else
+        {
+            numequaltrans++;
+            if (polygon->Attr & (1<<11)) numequaltransdepth++;
+        }
+    }
+
+    bool wbuffer = gpu3d.RenderNumPolygons && gpu3d.RenderPolygonRAM[0]->WBuffer;
+    Platform::Log(Platform::LogLevel::Info,
+                  "SHADOWSTATS f=%u %c polys=%d opaque=%d trans=%d masks=%d shadows=%d eq_opaque=%d eq_trans=%d eq_trans_dw=%d\n",
+                  ShadowLogFrame, wbuffer ? 'W' : 'Z', NumFinalPolys, numopaque, numtrans, nummasks, numshadows,
+                  numequalopaque, numequaltrans, numequaltransdepth);
+}
+
+int GLRenderer::BeginShadowLogQuery()
+{
+    // GLES only has 'any samples passed', which is enough to see a shadow that drew nothing
+    if (!ShadowLogActive || NumShadowLogQueries >= 64) return -1;
+
+    if (!ShadowLogQueries[0]) glGenQueries(64, ShadowLogQueries);
+    glBeginQuery(GL_ANY_SAMPLES_PASSED, ShadowLogQueries[NumShadowLogQueries]);
+    return NumShadowLogQueries++;
+}
+
+void GLRenderer::LogShadowPolygon(char type, int i, int query)
+{
+    if (!ShadowLogActive || NumShadowLogEntries >= 64) return;
+
+    const Polygon* polygon = PolygonList[i].PolyData;
+    ShadowLogEntry& entry = ShadowLogEntries[NumShadowLogEntries++];
+    entry.Type = type;
+    entry.Index = i;
+    entry.Attr = polygon->Attr;
+    entry.WBuffer = polygon->WBuffer;
+    entry.FacingView = polygon->FacingView;
+    entry.YTop = polygon->YTop;
+    entry.YBottom = polygon->YBottom;
+    entry.ZMin = 0xFFFFFFFF;
+    entry.ZMax = 0;
+    for (u32 v = 0; v < polygon->NumVertices; v++)
+    {
+        entry.ZMin = std::min(entry.ZMin, (u32)polygon->FinalZ[v]);
+        entry.ZMax = std::max(entry.ZMax, (u32)polygon->FinalZ[v]);
+    }
+    entry.Query = query;
+}
+
+void GLRenderer::FlushShadowLog()
+{
+    // one line per frame, masks (M) and shadows (S) in pass 3 order. a=polygon attr (bit 14 depth
+    // equal, bit 11 depth write), W/Z buffer, F/B facing, z=depth range (W when W-buffering),
+    // px=whether the shadow drew any pixels
+    char line[3072];
+    int len = snprintf(line, sizeof(line), "SHADOWLOG f=%u", ShadowLogFrame);
+
+    for (int i = 0; i < NumShadowLogEntries && len < (int)sizeof(line) - 96; i++)
+    {
+        const ShadowLogEntry& entry = ShadowLogEntries[i];
+        len += snprintf(line + len, sizeof(line) - len, " | %c%d id=%u a=%08X %c%c y=%d-%d z=%X-%X",
+                        entry.Type, entry.Index, (entry.Attr >> 24) & 0x3F, entry.Attr,
+                        entry.WBuffer ? 'W' : 'Z', entry.FacingView ? 'F' : 'B',
+                        entry.YTop, entry.YBottom, entry.ZMin, entry.ZMax);
+
+        if (entry.Query >= 0)
+        {
+            GLuint passed = 0;
+            glGetQueryObjectuiv(ShadowLogQueries[entry.Query], GL_QUERY_RESULT, &passed);
+            len += snprintf(line + len, sizeof(line) - len, " px=%u", passed);
+        }
+    }
+
+    Platform::Log(Platform::LogLevel::Info, "%s\n", line);
+
+    NumShadowLogEntries = 0;
+    NumShadowLogQueries = 0;
+}
+
 void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 {
     u32 flags = 0;
     if (gpu3d.RenderPolygonRAM[0]->WBuffer) flags |= RenderFlag_WBuffer;
 
-    if (h != 192) glScissor(0, y<<ScaleFactor, ScreenW, h<<ScaleFactor);
+    if (h != 192) glScissor(0, y*ScaleFactor, ScreenW, h*ScaleFactor);
 
     GLboolean fogenable = (gpu3d.RenderDispCnt & (1<<7)) ? GL_TRUE : GL_FALSE;
 
@@ -866,6 +1024,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         glStencilMask(0xFF);
 
+        SetPolygonDepthBias(polyattr);
         i += RenderPolygonBatch(i);
     }
 
@@ -965,6 +1124,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                         glDepthMask(GL_TRUE);
 
+                        SetPolygonDepthBias(polyattr);
                         RenderSinglePolygon(i);
                     }
 
@@ -991,6 +1151,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                         if (polyattr & (1<<11)) glDepthMask(GL_TRUE);
                         else                    glDepthMask(GL_FALSE);
 
+                        SetPolygonDepthBias(polyattr);
                         i += needopaque ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
                     }
                     else
@@ -1005,6 +1166,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                         if (polyattr & (1<<11)) glDepthMask(GL_TRUE);
                         else                    glDepthMask(GL_FALSE);
 
+                        SetPolygonDepthBias(polyattr);
                         i += needopaque ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
                     }
                 }
@@ -1018,16 +1180,54 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
         // pass 3: translucent pixels
 
+        // with ShadowMaskLineClear, the shadow bits are cleared per line like the software renderer:
+        // a mask clears its lines unless the last polygon on that line (in list order, drawn in this
+        // pass or not) was a mask too. clearing the whole screen for every mask wipes the mask of an
+        // earlier shadow whenever another polygon sorts between the two
+        bool lastWasMask[192] {};
+        int nextLinePoly = 0;
+        bool maskCleared = false;
+
+        // with fewer than two masks, the first one's full clear is all there is
+        bool trackLines = false;
+        if (ShadowMaskLineClear)
+        {
+            int nummasks = 0;
+            for (int i = 0; i < NumFinalPolys && nummasks < 2; i++)
+                if (PolygonList[i].PolyData->IsShadowMask) nummasks++;
+            trackLines = (nummasks >= 2);
+        }
+
         for (int i = 0; i < NumFinalPolys; )
         {
             RendererPolygon* rp = &PolygonList[i];
 
+            if (trackLines)
+            {
+                for (; nextLinePoly < i; nextLinePoly++)
+                {
+                    const Polygon* polygon = PolygonList[nextLinePoly].PolyData;
+                    int ytop, ybottom;
+                    GetPolygonLines(polygon, ytop, ybottom);
+                    for (int y = ytop; y < ybottom; y++)
+                        lastWasMask[y] = polygon->IsShadowMask;
+                }
+            }
+
             if (rp->PolyData->IsShadowMask)
             {
                 // clear shadow bits in stencil buffer
+                // the first mask clears the whole screen, which also drops the bits left by the
+                // clear plane and pass 2
 
                 glStencilMask(0x80);
-                glClear(GL_STENCIL_BUFFER_BIT);
+                if (!ShadowMaskLineClear || !maskCleared)
+                {
+                    glClear(GL_STENCIL_BUFFER_BIT);
+                    maskCleared = true;
+                }
+                else
+                    ClearShadowMaskLines(rp->PolyData, lastWasMask);
 
                 // draw actual shadow mask
 
@@ -1038,11 +1238,38 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                 glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
                 glDepthMask(GL_FALSE);
 
-                glDepthFunc(GL_LESS);
                 glStencilFunc(GL_ALWAYS, 0x80, 0x80);
-                glStencilOp(GL_KEEP, GL_REPLACE, GL_KEEP);
+                LogShadowPolygon('M', i, -1);
 
-                i += RenderPolygonBatch(i);
+                // one at a time, so each mask's clear comes right before it
+                if (ShadowMaskDepthTest && (rp->PolyData->Attr & (1<<14)))
+                {
+                    // depth-equal mask: the DS test passes within a margin (+-0x200 Z-buffering,
+                    // +-0xFF W-buffering) and the mask marks where it fails, so mark where the
+                    // polygon is more than that in front, then more than that behind
+                    u32 maskflags = flags | RenderFlag_ShadowMask;
+                    float margin = (flags & RenderFlag_WBuffer) ? 255.0f : 512.0f;
+
+                    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+
+                    glDepthFunc(GL_LESS);
+                    SetDepthBias(maskflags, margin);
+                    if (ShadowMaskLineClear) RenderSinglePolygon(i);
+                    else                     RenderPolygonBatch(i);
+
+                    glDepthFunc(GL_GREATER);
+                    SetDepthBias(maskflags, -margin);
+                    i += ShadowMaskLineClear ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
+
+                    SetDepthBias(maskflags, 0.0f);
+                }
+                else
+                {
+                    glDepthFunc(GL_LESS);
+                    glStencilOp(GL_KEEP, GL_REPLACE, GL_KEEP);
+
+                    i += ShadowMaskLineClear ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
+                }
             }
             else if (rp->PolyData->Translucent)
             {
@@ -1070,6 +1297,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     glDepthMask(GL_TRUE);
 
+                    SetPolygonDepthBias(polyattr);
                     RenderSinglePolygon(i);
                 }
 
@@ -1081,6 +1309,18 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 if (rp->PolyData->IsShadow)
                 {
+                    // depth-equal shadow: GL_LEQUAL also misses the part of the margin behind the
+                    // pixel, so test the polygon moved that far forward. the near side of the
+                    // margin can't be done in one draw, but GL_LEQUAL passed it already.
+                    // with only maskdepth, not with depth write (bit 11): the moved depth would be
+                    // stored, and a fixup draw can't tell this shadow's pixels from earlier ones with
+                    // the same ID. equaldepth accepts that, like for every other depth-equal polygon
+                    bool depthbias = (polyattr & (1<<14)) &&
+                        (EqualDepthMargin || (ShadowMaskDepthTest && !(polyattr & (1<<11))));
+                    float bias = 0.0f;
+                    if (depthbias) bias = (flags & RenderFlag_WBuffer) ? -255.0f : -512.0f;
+                    SetDepthBias(flags | RenderFlag_Trans, bias);
+
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
                     glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1102,7 +1342,12 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     if (polyattr & (1<<11)) glDepthMask(GL_TRUE);
                     else                    glDepthMask(GL_FALSE);
 
+                    int query = BeginShadowLogQuery();
+                    LogShadowPolygon('S', i, query);
+
                     i += RenderSinglePolygon(i);
+
+                    if (query >= 0) glEndQuery(GL_ANY_SAMPLES_PASSED);
                 }
                 else
                 {
@@ -1117,11 +1362,16 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     if (polyattr & (1<<11)) glDepthMask(GL_TRUE);
                     else                    glDepthMask(GL_FALSE);
 
+                    SetPolygonDepthBias(polyattr);
                     i += needopaque ? RenderSinglePolygon(i) : RenderPolygonBatch(i);
                 }
             }
             else
+            {
+                // opaque shadows were drawn in pass 1, without the mask
+                if (rp->PolyData->IsShadow) LogShadowPolygon('O', i, -1);
                 i++;
+            }
         }
     }
 
@@ -1213,6 +1463,15 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
     WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
+    ShadowMaskLineClear = gpu.ShadowMaskLineClear;
+    ShadowMaskDepthTest = gpu.ShadowMaskDepthTest;
+    EqualDepthMargin = gpu.EqualDepthMargin;
+
+    // debug: log the last frame's masks and shadows, its queries should be done by now
+    if (NumShadowLogEntries) FlushShadowLog();
+    ShadowLogActive = gpu.ShadowLogFrames > 0;
+    if (ShadowLogActive) gpu.ShadowLogFrames--;
+    ShadowLogFrame++;
 
     for (int i = 0; i < 32; i++)
     {
@@ -1390,6 +1649,10 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
         RenderSceneChunk(gpu.GPU3D, 0, 192);
     }
+    else
+        NumFinalPolys = 0;
+
+    if (ShadowLogActive) LogFrameStats(gpu.GPU3D);
 }
 
 void GLRenderer::Stop(const GPU& gpu)
