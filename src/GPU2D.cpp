@@ -655,9 +655,9 @@ void Unit::PostDrawScanline(u32 line)
     // skip exactly the cases it skips (see SoftRenderer::DrawScanline and DrawScanline_BGOBJ).
     // the line's snapshot for DrawScanline is taken before this, the one for DrawSprites after
 
-    // forced white: nothing is drawn
+    // forced white, or the unit is disabled by POWCNT1: nothing is drawn
     if (line > 192) return;
-    if (Num && !Enabled) return;
+    if (!Enabled) return;
 
     // forced blank skips BG/OBJ compositing, but not the OBJ mosaic counters
     if (!(DispCnt & (1<<7)))

@@ -151,6 +151,7 @@ private:
     template<bool window> void DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos);
 
     void DoCapture(u32 line, u32 width);
+    void FillScreensOff(u32* dst);
 };
 
 }

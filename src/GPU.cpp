@@ -902,7 +902,14 @@ void GPU::SetPowerCnt(u32 val) noexcept
     // * bit9: disables engine B palette, OAM and rendering (screen turns white)
     // * bit15: screen swap
 
-    if (!(val & (1<<0))) Log(LogLevel::Warn, "!!! CLEARING POWCNT BIT0. DANGER\n");
+    // bit0 is the LCD enable: the screens show black while it is clear (see ScreensEnabled)
+    if (!(val & (1<<0)))
+    {
+        if (!LCDPowerLogged) Log(LogLevel::Warn, "!!! CLEARING POWCNT BIT0. DANGER\n");
+        LCDPowerLogged = true;
+    }
+    else
+        LCDPowerLogged = false;
 
     Sync2D();
 
@@ -939,6 +946,8 @@ void GPU::DisplayFIFO(u32 x) noexcept
 
 void GPU::StartFrame() noexcept
 {
+    ScreensEnabled = !!(NDS.PowerControl9 & (1<<0));
+
     // only run the display FIFO if needed:
     // * if it is used for display or capture
     // * if we have display FIFO DMA
@@ -1032,6 +1041,7 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     job.Framebuffer[0] = GPU2D_Renderer->GetFramebuffer(0);
     job.Framebuffer[1] = GPU2D_Renderer->GetFramebuffer(1);
     job.VRAMMap_LCDC = VRAMMap_LCDC;
+    job.ScreensEnabled = ScreensEnabled;
 }
 
 // for DrawScanline(line): call after PreDrawScanline, before PostDrawScanline

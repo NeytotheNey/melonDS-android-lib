@@ -181,9 +181,7 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
     // (as a result of writing to VCount) are filled white
     if (line > 192) forceblank = true;
 
-    // GPU B can be completely disabled by POWCNT1
-    // oddly that's not the case for GPU A
-    if (CurUnit->Num && !CurUnit->Enabled) forceblank = true;
+    // a unit disabled by POWCNT1 outputs a fixed colour instead (see DrawScanline_BGOBJ)
 
     // CaptureLatch is set for line 0 by Unit::PreDrawScanline
 
@@ -206,6 +204,9 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
             if (CurJob->WideView)
                 dst[256*3] = (1 << 21);
         }
+
+        if (!CurJob->ScreensEnabled)
+            FillScreensOff(dst);
         return;
     }
 
@@ -313,7 +314,8 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
             // flags held wing lines with bit 13 in its own copy, see GLCompositor::PrepareWingHold)
             dst[256*3] &= ~0x1F00;
 
-            if ((dispmode == 0) || ((dispmode == 1) && (CurUnit->DispCnt & 0x80)))
+            if ((dispmode == 0) || ((dispmode == 1) &&
+                ((CurUnit->DispCnt & 0x80) || (CurUnit->Num && !CurUnit->Enabled))))
             {
                 dst[256*3] |= (1 << 21);
             }
@@ -336,6 +338,9 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
                 }
             }
         }
+
+        if (!CurJob->ScreensEnabled)
+            FillScreensOff(dst);
         return;
     }
 
@@ -379,6 +384,28 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
         c = r | g | b;
 
         *(u64*)&dst[i] = c | ((c & 0x00C0C0C000C0C0C0) >> 6) | 0xFF000000FF000000;
+    }
+
+    if (!CurJob->ScreensEnabled)
+        FillScreensOff(dst);
+}
+
+// POWCNT1 bit 0 clear: the screens show black, whatever the units output. display capture
+// is done by then, so it still sees the units' output
+void SoftRenderer::FillScreensOff(u32* dst)
+{
+    if (CurJob->Accelerated)
+    {
+        // the compositor shader composites the line as usual, then applies the control word's
+        // master brightness: regular display with brightness down by 16 ((x*16+0xF)>>4 == x)
+        // yields black for every 6-bit value, so no extra shader bit is needed. the wings bits
+        // are cleared, so a wide view's wings go black too
+        dst[256*3] = 0x00018010;
+    }
+    else
+    {
+        for (int i = 0; i < 256; i++)
+            dst[i] = 0xFF000000;
     }
 }
 
@@ -773,6 +800,27 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
 
 void SoftRenderer::DrawScanline_BGOBJ(u32 line)
 {
+    if (!CurUnit->Enabled)
+    {
+        // a unit disabled by POWCNT1 outputs a fixed colour: black for unit A, white for unit B.
+        // display mode, master brightness and display capture still apply to it
+        u32 fillcolor = (CurUnit->Num == 0) ? 0xFF000000 : 0xFF3F3F3F;
+        for (int i = 0; i < 256; i++)
+            BGOBJLine[i] = fillcolor;
+
+        if (CurJob->Accelerated)
+        {
+            // no 3D pixel involved (see the compositing below)
+            for (int i = 0; i < 256; i++)
+            {
+                BGOBJLine[256+i] = 0;
+                BGOBJLine[512+i] = 0x07000000;
+            }
+        }
+
+        return;
+    }
+
     // forced blank disables BG/OBJ compositing
     if (CurUnit->DispCnt & (1<<7))
     {
@@ -1677,6 +1725,8 @@ void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
     NumSprites[CurUnit->Num] = 0;
     memset(OBJLine[CurUnit->Num], 0, 256*4);
     memset(OBJWindow[CurUnit->Num], 0, 256);
+    // the OBJ buffers don't get updated at all if the 2D engine is disabled
+    if (!CurUnit->Enabled) return;
     if (!(CurUnit->DispCnt & 0x1000)) return;
 
     u16* oam = (u16*)&GPU.OAM[CurUnit->Num ? 0x400 : 0];

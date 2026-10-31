@@ -814,6 +814,11 @@ private:
 
     bool RunFIFO = false;
 
+    // POWCNT1 bit 0 (LCD enable), latched at the start of each frame. not savestated: a frame of
+    // wrong output after a load is acceptable
+    bool ScreensEnabled = true;
+    bool LCDPowerLogged = false;
+
     u16 VMatch[2] {};
 
     // only lives for one HBlank, so it isn't savestated

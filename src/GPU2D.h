@@ -160,6 +160,7 @@ struct LineJob
     bool Fetch3DLine;       // held for display capture: Line3D is fetched when the job is drawn (GPU::Flush2DDeferred)
     bool Abort3DLine;       // and GPU3D::AbortFrame as it was when the job was built (RenderXPos is above)
     u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks
+    bool ScreensEnabled;    // POWCNT1 bit 0 as latched at the frame start: clear = both screens black
 
     UnitState BG[2];        // after PreDrawScanline, before PostDrawScanline
     UnitState OBJ[2];       // after PostDrawScanline (line 0: after ResetOBJMosaicCounters)
