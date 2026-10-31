@@ -831,6 +831,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     */
     u32 numVariants = 0, prevVariant, prevTexLayer;
     Variant variants[MaxVariants];
+    // for the direct dispatches: how many tiles each variant's polygons could be binned to, from
+    // their bounding boxes. binning normally makes no more work than this, and if it does the shaders
+    // loop over the rest, so it only decides how many work groups are launched
+    u32 variantTileBound[MaxVariants];
+    u32 totalTileBound = 0;
 
     bool enableTextureMaps = gpu.GPU3D.RenderDispCnt & (1<<0);
 
@@ -902,6 +907,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
                     break;
                 }
                 prevVariant = numVariants;
+                variantTileBound[numVariants] = 0;
                 variants[numVariants] = variant;
                 variants[numVariants].Width = TextureWidth(polygon->TexParam);
                 variants[numVariants].Height = TextureHeight(polygon->TexParam);
@@ -1058,6 +1064,22 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             }
         }
 
+        {
+            // the tiles the bounding box touches, a pixel wider on each side for the edge rounding
+            // (binning goes by the x-spans). bottom Y is exclusive
+            const RenderPolygon& rp = RenderPolygons[i];
+            s32 tileX0 = std::max(rp.XMin - 1, 0) / TileSize;
+            s32 tileX1 = std::min(rp.XMax + 1, ScreenWidth - 1) / TileSize;
+            s32 tileY0 = std::max(rp.YTop, 0) / TileSize;
+            s32 tileY1 = (std::min(rp.YBot, ScreenHeight) - 1) / TileSize;
+            if (tileX1 >= tileX0 && tileY1 >= tileY0 && rp.YBot > 0)
+            {
+                u32 tiles = (u32)((tileX1 - tileX0 + 1) * (tileY1 - tileY0 + 1));
+                variantTileBound[prevVariant] += tiles;
+                totalTileBound += tiles;
+            }
+        }
+
         //printf("polygon min max %d %d | %d %d\n", RenderPolygons[i].XMin, RenderPolygons[i].XMinY, RenderPolygons[i].XMax, RenderPolygons[i].XMaxY);
     }
 
@@ -1159,6 +1181,15 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     {
         wbuffer = gpu.GPU3D.RenderPolygonRAM[0]->WBuffer;
 
+        // Adreno's driver waits on the CPU for the GPU to finish (gsl_command_waittimestamp, 5-6.5 ms
+        // a frame at 4x) at the first indirect dispatch whose arguments the GPU wrote in this frame, so
+        // CPU and GPU took turns. it's the indirect dispatch itself, dropping the command barriers
+        // alone still waited. by default SortWork and Rasterise are dispatched with sizes from the
+        // CPU's bounding box estimate instead, and the shaders loop if binning made more work than
+        // that, so nothing here waits for the GPU and the command barriers aren't needed
+        const bool directDispatch = gpu.ComputeDirectDispatch;
+        const GLbitfield commandBarrier = directDispatch ? 0 : GL_COMMAND_BARRIER_BIT;
+
         glUseProgram(ShaderClearIndirectWorkCount);
         glDispatchCompute((numVariants+31)/32, 1, 1);
 
@@ -1166,23 +1197,33 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
         glUseProgram(ShaderInterpXSpans[wbuffer]);
         glDispatchCompute((numSetupIndices + 31) / 32, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // bin polygons
         glUseProgram(ShaderBinCombined);
         glDispatchCompute(((numPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // calculate list offsets
         glUseProgram(ShaderCalculateWorkListOffset);
         glDispatchCompute((numVariants + 31) / 32, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // sort shader work
         glUseProgram(ShaderSortWork);
-        glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, BinResultMemory);
-        glDispatchComputeIndirect(offsetof(BinResultHeader, SortWorkWorkCount));
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        if (directDispatch)
+        {
+            // a thread per work tile, binning stops at MaxWorkTiles (TargetFits keeps that to 65535
+            // groups)
+            u32 sortCount = std::min(totalTileBound, (u32)MaxWorkTiles);
+            glDispatchCompute(std::max((sortCount + 31) / 32, 1u), 1, 1);
+        }
+        else
+        {
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, BinResultMemory);
+            glDispatchComputeIndirect(offsetof(BinResultHeader, SortWorkWorkCount));
+        }
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         glActiveTexture(GL_TEXTURE0);
 
@@ -1246,8 +1287,19 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
                 glUniform1ui(UniformIdxCurVariant, i);
                 glUniform2f(UniformIdxTextureSize, 1.f / variants[i].Width, 1.f / variants[i].Height);
-                glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, BinResultMemory);
-                glDispatchComputeIndirect(offsetof(BinResultHeader, VariantWorkCount) + i*4*4);
+                if (directDispatch)
+                {
+                    // a group per work tile, split across Y and Z like CalcOffsets does. at least
+                    // one, so the loop in the shader covers the variant even if the estimate is off
+                    u32 groups = std::clamp(variantTileBound[i], 1u, (u32)MaxWorkTiles);
+                    u32 chunks = (groups + 65534) / 65535;
+                    glDispatchCompute(1, chunks, (groups + chunks - 1) / chunks);
+                }
+                else
+                {
+                    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, BinResultMemory);
+                    glDispatchComputeIndirect(offsetof(BinResultHeader, VariantWorkCount) + i*4*4);
+                }
             }
         }
     }

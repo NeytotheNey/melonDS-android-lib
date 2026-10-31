@@ -647,6 +647,10 @@ public:
     bool EqualDepthMargin = true;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;
+    // compute renderer: size the SortWork and Rasterise dispatches on the CPU instead of having the
+    // GPU write indirect arguments, which Adreno's driver waits on (see ComputeRenderer::RenderFrame).
+    // only turned off by a debug switch, to compare
+    bool ComputeDirectDispatch = true;
 
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;

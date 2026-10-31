@@ -1069,16 +1069,19 @@ layout (local_size_x = 32) in;
 
 void main()
 {
-    // binning dropped the work past MaxWorkTiles
-    if (gl_GlobalInvocationID.x < min(VariantWorkCount[0].w, uint(MaxWorkTiles)))
+    // binning dropped the work past MaxWorkTiles. the indirect dispatch has a thread per work tile,
+    // the direct one is sized on the CPU from an estimate, so it strides over whatever is left
+    uint count = min(VariantWorkCount[0].w, uint(MaxWorkTiles));
+    uint stride = gl_NumWorkGroups.x * 32u;
+    for (uint workIdx = gl_GlobalInvocationID.x; workIdx < count; workIdx += stride)
     {
-        uvec2 workDesc = WorkDescs[WorkDescsUnsortedStart + gl_GlobalInvocationID.x];
+        uvec2 workDesc = WorkDescs[WorkDescsUnsortedStart + workIdx];
         int inVariantOffset = int(bitfieldExtract(workDesc.y, 11, 21));
         int polygonIdx = int(bitfieldExtract(workDesc.y, 0, 11));
         int variantIdx = Polygons[polygonIdx].Variant;
 
         int sortedIndex = int(SortedWorkOffset[variantIdx]) + inVariantOffset;
-        WorkDescs[WorkDescsSortedStart + uint(sortedIndex)] = uvec2(workDesc.x, bitfieldInsert(workDesc.y, gl_GlobalInvocationID.x, 11, 21));
+        WorkDescs[WorkDescsSortedStart + uint(sortedIndex)] = uvec2(workDesc.x, bitfieldInsert(workDesc.y, workIdx, 11, 21));
     }
 }
 
@@ -1098,14 +1101,8 @@ layout (binding = 0) uniform usampler2DArray CurrentTexture;
 layout (location = 0) uniform uint CurVariant;
 layout (location = 1) uniform vec2 InvTextureSize;
 
-void main()
+void RasteriseTile(uint workIdx)
 {
-    // the dispatch is split across Y and Z (see CalcOffsets), the last chunk can go past the end.
-    // the return is the same for the whole group and there are no barriers below
-    uint workIdx = gl_WorkGroupID.y * gl_NumWorkGroups.z + gl_WorkGroupID.z;
-    if (workIdx >= VariantWorkRealCount[CurVariant])
-        return;
-
     uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + workIdx];
     Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, 11)];
     ivec2 position = ivec2(int(bitfieldExtract(workDesc.x, 0, 16)), int(bitfieldExtract(workDesc.x, 16, 16))) + ivec2(gl_LocalInvocationID.xy);
@@ -1281,6 +1278,19 @@ void main()
     }
 
     ColorTiles[tileOffset] = color;
+}
+
+void main()
+{
+    // the dispatch is split across Y and Z (see CalcOffsets), the last chunk can go past the end.
+    // the indirect dispatch has a group per work tile, the direct one is sized on the CPU from an
+    // estimate, so a group strides over whatever is left. the loop is the same for the whole group
+    // and RasteriseTile has no barriers
+    uint workIdx = gl_WorkGroupID.y * gl_NumWorkGroups.z + gl_WorkGroupID.z;
+    uint stride = gl_NumWorkGroups.y * gl_NumWorkGroups.z;
+    uint count = VariantWorkRealCount[CurVariant];
+    for (; workIdx < count; workIdx += stride)
+        RasteriseTile(workIdx);
 }
 
 )";
