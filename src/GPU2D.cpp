@@ -107,6 +107,8 @@ void Unit::Reset()
     memset(BGYRef, 0, 2*4);
     memset(BGXRefInternal, 0, 2*4);
     memset(BGYRefInternal, 0, 2*4);
+    memset(BGXRefReload, 0, 2*4);
+    memset(BGYRefReload, 0, 2*4);
     memset(BGRotA, 0, 2*2);
     memset(BGRotB, 0, 2*2);
     memset(BGRotC, 0, 2*2);
@@ -125,6 +127,8 @@ void Unit::Reset()
     OBJMosaicSize[1] = 0;
     BGMosaicY = 0;
     BGMosaicYMax = 0;
+    BGMosaicLatch = true;
+    BGMosaicLine = 0;
     OBJMosaicY = 0;
     OBJMosaicYMax = 0;
     OBJMosaicYCount = 0;
@@ -162,6 +166,8 @@ void Unit::DoSavestate(Savestate* file)
     file->VarArray(BGYRef, 2*4);
     file->VarArray(BGXRefInternal, 2*4);
     file->VarArray(BGYRefInternal, 2*4);
+    file->VarArray(BGXRefReload, 2*4);
+    file->VarArray(BGYRefReload, 2*4);
     file->VarArray(BGRotA, 2*2);
     file->VarArray(BGRotB, 2*2);
     file->VarArray(BGRotC, 2*2);
@@ -177,6 +183,8 @@ void Unit::DoSavestate(Savestate* file)
     file->Var8(&BGMosaicYMax);
     file->Var8(&OBJMosaicY);
     file->Var8(&OBJMosaicYMax);
+    file->Bool32(&BGMosaicLatch);
+    file->Var32(&BGMosaicLine);
 
     file->Var16(&BlendCnt);
     file->Var16(&BlendAlpha);
@@ -476,21 +484,21 @@ void Unit::Write16(u32 addr, u16 val)
     case 0x026: BGRotD[0] = val; return;
     case 0x028:
         BGXRef[0] = (BGXRef[0] & 0xFFFF0000) | val;
-        if (GPU.VCount < 192) BGXRefInternal[0] = BGXRef[0];
+        BGXRefReload[0] = BGXRef[0];
         return;
     case 0x02A:
         if (val & 0x0800) val |= 0xF000;
         BGXRef[0] = (BGXRef[0] & 0xFFFF) | (val << 16);
-        if (GPU.VCount < 192) BGXRefInternal[0] = BGXRef[0];
+        BGXRefReload[0] = BGXRef[0];
         return;
     case 0x02C:
         BGYRef[0] = (BGYRef[0] & 0xFFFF0000) | val;
-        if (GPU.VCount < 192) BGYRefInternal[0] = BGYRef[0];
+        BGYRefReload[0] = BGYRef[0];
         return;
     case 0x02E:
         if (val & 0x0800) val |= 0xF000;
         BGYRef[0] = (BGYRef[0] & 0xFFFF) | (val << 16);
-        if (GPU.VCount < 192) BGYRefInternal[0] = BGYRef[0];
+        BGYRefReload[0] = BGYRef[0];
         return;
 
     case 0x030: BGRotA[1] = val; return;
@@ -499,21 +507,21 @@ void Unit::Write16(u32 addr, u16 val)
     case 0x036: BGRotD[1] = val; return;
     case 0x038:
         BGXRef[1] = (BGXRef[1] & 0xFFFF0000) | val;
-        if (GPU.VCount < 192) BGXRefInternal[1] = BGXRef[1];
+        BGXRefReload[1] = BGXRef[1];
         return;
     case 0x03A:
         if (val & 0x0800) val |= 0xF000;
         BGXRef[1] = (BGXRef[1] & 0xFFFF) | (val << 16);
-        if (GPU.VCount < 192) BGXRefInternal[1] = BGXRef[1];
+        BGXRefReload[1] = BGXRef[1];
         return;
     case 0x03C:
         BGYRef[1] = (BGYRef[1] & 0xFFFF0000) | val;
-        if (GPU.VCount < 192) BGYRefInternal[1] = BGYRef[1];
+        BGYRefReload[1] = BGYRef[1];
         return;
     case 0x03E:
         if (val & 0x0800) val |= 0xF000;
         BGYRef[1] = (BGYRef[1] & 0xFFFF) | (val << 16);
-        if (GPU.VCount < 192) BGYRefInternal[1] = BGYRef[1];
+        BGYRefReload[1] = BGYRef[1];
         return;
 
     case 0x040:
@@ -595,23 +603,23 @@ void Unit::Write32(u32 addr, u32 val)
         case 0x028:
             if (val & 0x08000000) val |= 0xF0000000;
             BGXRef[0] = val;
-            if (GPU.VCount < 192) BGXRefInternal[0] = BGXRef[0];
+            BGXRefReload[0] = BGXRef[0];
             return;
         case 0x02C:
             if (val & 0x08000000) val |= 0xF0000000;
             BGYRef[0] = val;
-            if (GPU.VCount < 192) BGYRefInternal[0] = BGYRef[0];
+            BGYRefReload[0] = BGYRef[0];
             return;
 
         case 0x038:
             if (val & 0x08000000) val |= 0xF0000000;
             BGXRef[1] = val;
-            if (GPU.VCount < 192) BGXRefInternal[1] = BGXRef[1];
+            BGXRefReload[1] = BGXRef[1];
             return;
         case 0x03C:
             if (val & 0x08000000) val |= 0xF0000000;
             BGYRef[1] = val;
-            if (GPU.VCount < 192) BGYRefInternal[1] = BGYRef[1];
+            BGYRefReload[1] = BGYRef[1];
             return;
         }
     }
@@ -666,6 +674,21 @@ void Unit::PreDrawScanline(u32 line)
     LayerEnable = ((DispCntLatch[2] & DispCnt) >> 8) & 0x1F;
     OBJEnable = ((DispCntLatch[1] & DispCnt) >> 12) & 0x1;
     ForcedBlank = ((DispCntLatch[2] | DispCnt) >> 7) & 0x1;
+
+    // the renderer draws the line from the reference points latched here. a BG with vertical
+    // mosaic keeps the ones latched at the start of its mosaic row (while the running ones go on
+    // adding rotB/rotD), and text BGs use the row's first line instead of their own
+    if (BGMosaicLatch)
+        BGMosaicLine = line;
+
+    for (int i = 0; i < 2; i++)
+    {
+        if (!(BGCnt[2+i] & (1<<6)) || BGMosaicLatch)
+        {
+            BGXRefInternal[i] = BGXRef[i];
+            BGYRefInternal[i] = BGYRef[i];
+        }
+    }
 }
 
 void Unit::PostDrawScanline(u32 line)
@@ -700,17 +723,24 @@ void Unit::PostDrawScanline(u32 line)
         if (!(LayerEnable & (4<<i)))
             continue;
 
-        BGXRefInternal[i] += BGRotB[i];
-        BGYRefInternal[i] += BGRotD[i];
+        BGXRef[i] += BGRotB[i];
+        BGYRef[i] += BGRotD[i];
     }
 
-    if (BGMosaicY >= BGMosaicYMax)
+    // the BG mosaic size is copied to an internal register when the row restarts (the OBJ one is
+    // checked against MOSAIC directly, see UpdateMosaicCounters); the next line latches the row
+    if (BGMosaicY == BGMosaicYMax)
     {
-        BGMosaicY = 0;
         BGMosaicYMax = BGMosaicSize[1];
+        BGMosaicY = 0;
+        BGMosaicLatch = true;
     }
     else
+    {
         BGMosaicY++;
+        BGMosaicY &= 0xF;
+        BGMosaicLatch = false;
+    }
 
     // the OBJ mosaic counter only runs while OBJ are enabled (the unit's power is checked above)
     if (DispCnt & (1<<12))
@@ -732,13 +762,16 @@ void Unit::VBlank()
 void Unit::VBlankEnd()
 {
     // TODO: find out the exact time this happens
-    BGXRefInternal[0] = BGXRef[0];
-    BGXRefInternal[1] = BGXRef[1];
-    BGYRefInternal[0] = BGYRef[0];
-    BGYRefInternal[1] = BGYRef[1];
+    // the running reference points restart from the values the CPU wrote, and line 0 starts a
+    // mosaic row (PreDrawScanline then latches both for the renderer)
+    BGXRef[0] = BGXRefReload[0];
+    BGXRef[1] = BGXRefReload[1];
+    BGYRef[0] = BGYRefReload[0];
+    BGYRef[1] = BGYRefReload[1];
 
     BGMosaicY = 0;
     BGMosaicYMax = BGMosaicSize[1];
+    BGMosaicLatch = true;
     //OBJMosaicY = 0;
     //OBJMosaicYMax = OBJMosaicSize[1];
     //OBJMosaicY = 0;

@@ -1077,13 +1077,15 @@ void SoftRenderer::DrawBG_Text(u32 line, u32 bgnum)
     u32 extpal, extpalslot;
 
     u16 xoff = CurUnit->BGXPos[bgnum];
-    u16 yoff = CurUnit->BGYPos[bgnum] + line;
+    u16 yoff = CurUnit->BGYPos[bgnum];
 
     if (bgcnt & 0x0040)
     {
-        // vertical mosaic
-        yoff -= CurUnit->BGMosaicY;
+        // vertical mosaic: the line the mosaic row started on
+        yoff += CurUnit->BGMosaicLine;
     }
+    else
+        yoff += line;
 
     u32 widexmask = (bgcnt & 0x4000) ? 0x100 : 0;
 
@@ -1254,19 +1256,11 @@ void SoftRenderer::DrawBG_Affine(u32 line, u32 bgnum)
     else                overflowmask = ~(coordmask | 0x7FF);
 
     s16 rotA = CurUnit->BGRotA[bgnum-2];
-    s16 rotB = CurUnit->BGRotB[bgnum-2];
     s16 rotC = CurUnit->BGRotC[bgnum-2];
-    s16 rotD = CurUnit->BGRotD[bgnum-2];
 
+    // vertical mosaic is in the latched reference points (see Unit::PreDrawScanline)
     s32 rotX = CurUnit->BGXRefInternal[bgnum-2];
     s32 rotY = CurUnit->BGYRefInternal[bgnum-2];
-
-    if (bgcnt & 0x0040)
-    {
-        // vertical mosaic
-        rotX -= (CurUnit->BGMosaicY * rotB);
-        rotY -= (CurUnit->BGMosaicY * rotD);
-    }
 
     u8* bgvram;
     u32 bgvrammask;
@@ -1345,19 +1339,11 @@ void SoftRenderer::DrawBG_Extended(u32 line, u32 bgnum)
     extpal = (CurUnit->DispCnt & 0x40000000);
 
     s16 rotA = CurUnit->BGRotA[bgnum-2];
-    s16 rotB = CurUnit->BGRotB[bgnum-2];
     s16 rotC = CurUnit->BGRotC[bgnum-2];
-    s16 rotD = CurUnit->BGRotD[bgnum-2];
 
+    // vertical mosaic is in the latched reference points (see Unit::PreDrawScanline)
     s32 rotX = CurUnit->BGXRefInternal[bgnum-2];
     s32 rotY = CurUnit->BGYRefInternal[bgnum-2];
-
-    if (bgcnt & 0x0040)
-    {
-        // vertical mosaic
-        rotX -= (CurUnit->BGMosaicY * rotB);
-        rotY -= (CurUnit->BGMosaicY * rotD);
-    }
 
     if (bgcnt & 0x0080)
     {
@@ -1582,19 +1568,11 @@ void SoftRenderer::DrawBG_Large(u32 line) // BG is always BG2
     }
 
     s16 rotA = CurUnit->BGRotA[0];
-    s16 rotB = CurUnit->BGRotB[0];
     s16 rotC = CurUnit->BGRotC[0];
-    s16 rotD = CurUnit->BGRotD[0];
 
+    // vertical mosaic is in the latched reference points (see Unit::PreDrawScanline)
     s32 rotX = CurUnit->BGXRefInternal[0];
     s32 rotY = CurUnit->BGYRefInternal[0];
-
-    if (bgcnt & 0x0040)
-    {
-        // vertical mosaic
-        rotX -= (CurUnit->BGMosaicY * rotB);
-        rotY -= (CurUnit->BGMosaicY * rotD);
-    }
 
     u8* bgvram;
     u32 bgvrammask;

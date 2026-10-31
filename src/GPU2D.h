@@ -45,7 +45,7 @@ struct UnitState
     u16 BGXPos[4];
     u16 BGYPos[4];
 
-    s32 BGXRefInternal[2];
+    s32 BGXRefInternal[2];  // affine reference points as latched for this line (see Unit::PreDrawScanline)
     s32 BGYRefInternal[2];
     s16 BGRotA[2];
     s16 BGRotB[2];
@@ -60,7 +60,7 @@ struct UnitState
 
     u8 BGMosaicSize[2];
     u8 OBJMosaicSize[2];
-    u8 BGMosaicY;
+    u32 BGMosaicLine;       // the line the current BG mosaic row started on, for text BGs
     u8 OBJMosaicY;
 
     u16 BlendCnt;
@@ -133,10 +133,13 @@ public:
 
     u32 DispCntLatch[3];    // DispCnt at the last three HBlanks, for the enable latency above
 
-    s32 BGXRef[2];
+    s32 BGXRef[2];          // the running reference points, advanced every line (PostDrawScanline)
     s32 BGYRef[2];
+    s32 BGXRefReload[2];    // as written by the CPU: the running ones restart from them each frame
+    s32 BGYRefReload[2];
 
-    u8 BGMosaicYMax;
+    u8 BGMosaicY, BGMosaicYMax;
+    bool BGMosaicLatch;     // this line starts a BG mosaic row: the renderer's refs and line are latched
     u8 OBJMosaicYCount, OBJMosaicYMax;
 
     u16 BlendAlpha;
