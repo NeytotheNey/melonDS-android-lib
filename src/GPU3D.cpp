@@ -2801,6 +2801,16 @@ u32 GPU3D::Read32(u32 addr) noexcept
     return 0;
 }
 
+// one-shot log to find games that use the 3D clear bitmap (DISP3DCNT bit 14), so the GL and
+// compute renderers' handling of it can be checked against the software renderer
+static void NoteClearBitmapUse(u32 dispcnt)
+{
+    static bool logged = false;
+    if (logged || !(dispcnt & (1<<14))) return;
+    logged = true;
+    Log(LogLevel::Debug, "GPU3D: DISP3DCNT bit 14 set, game uses the 3D clear bitmap\n");
+}
+
 void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
@@ -2863,6 +2873,7 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
         if (val & (1<<12)) DispCnt &= ~(1<<12);
         if (val & (1<<13)) DispCnt &= ~(1<<13);
         AlphaRef = (DispCnt & (1<<2)) ? AlphaRefVal : 0;
+        NoteClearBitmapUse(DispCnt);
         return;
 
     case 0x04000340:
@@ -2950,6 +2961,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
         if (val & (1<<12)) DispCnt &= ~(1<<12);
         if (val & (1<<13)) DispCnt &= ~(1<<13);
         AlphaRef = (DispCnt & (1<<2)) ? AlphaRefVal : 0;
+        NoteClearBitmapUse(DispCnt);
         return;
 
     case 0x04000340:
