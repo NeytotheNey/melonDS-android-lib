@@ -1734,6 +1734,9 @@ void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
                 if (((line - ypos) & 0xFF) >= (u32)boundheight)
                     continue;
                 ypos = (sprline - ypos) & 0xFF;
+                // a ypos past the sprite height means we underflowed, because OBJMosaicY was
+                // latched before the sprite's top: clamp to the first row
+                if (ypos >= (u32)boundheight) ypos = 0;
 
                 s32 xpos = (s32)(attrib[1] << 23) >> 23;
                 if (xpos <= -boundwidth)
@@ -1758,6 +1761,7 @@ void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
                 if (((line - ypos) & 0xFF) >= (u32)height)
                     continue;
                 ypos = (sprline - ypos) & 0xFF;
+                if (ypos >= (u32)height) ypos = 0;
 
                 s32 xpos = (s32)(attrib[1] << 23) >> 23;
                 if (xpos <= -width)
