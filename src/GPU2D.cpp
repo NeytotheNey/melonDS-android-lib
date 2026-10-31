@@ -644,8 +644,7 @@ void Unit::ResetOBJMosaicCounters()
 void Unit::PreDrawScanline(u32 line)
 {
     // display capture is armed at the start of line 0 and stays on until VBlank
-    // lines that the renderer forces white (GPU B disabled) don't arm it
-    if (line == 0 && (CaptureCnt & (1<<31)) && !(Num && !Enabled))
+    if (line == 0 && (CaptureCnt & (1<<31)))
         CaptureLatch = true;
 }
 
@@ -698,8 +697,8 @@ void Unit::PostDrawScanline(u32 line)
             BGMosaicY++;
     }
 
-    // the OBJ mosaic counter only runs while the unit is powered and OBJ are enabled
-    if (Enabled && (DispCnt & (1<<12)))
+    // the OBJ mosaic counter only runs while OBJ are enabled (the unit's power is checked above)
+    if (DispCnt & (1<<12))
         UpdateMosaicCounters(line);
 }
 
