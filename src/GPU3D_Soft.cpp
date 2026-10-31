@@ -127,6 +127,7 @@ void SoftRenderer::Reset(GPU& gpu)
     memset(AttrBuffer, 0, BufferSize * 2 * 4);
 
     PrevIsShadowMask = false;
+    ForceRender = true;
 
     SetupRenderThread(gpu);
     EnableRenderThread();
@@ -1752,7 +1753,10 @@ void SoftRenderer::RenderFrame(GPU& gpu)
     bool textureChanged = gpu.MakeVRAMFlat_TextureCoherent(textureDirty);
     bool texPalChanged = gpu.MakeVRAMFlat_TexPalCoherent(texPalDirty);
 
-    FrameIdentical = !(textureChanged || texPalChanged) && gpu.GPU3D.RenderFrameIdentical;
+    // after a Reset (first frame, renderer switch) the buffers hold nothing useful,
+    // and another renderer may already have consumed the dirty bits
+    FrameIdentical = !(textureChanged || texPalChanged) && gpu.GPU3D.RenderFrameIdentical && !ForceRender;
+    ForceRender = false;
 
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {

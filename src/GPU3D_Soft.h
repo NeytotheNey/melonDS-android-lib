@@ -484,6 +484,7 @@ private:
     bool Enabled;
 
     bool FrameIdentical;
+    bool ForceRender = true;
 
     // threading
 
