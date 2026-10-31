@@ -1047,7 +1047,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     // TODO BETTER EDGE MARKING!!! THIS SUCKS
     /*if (RenderDispCnt & (1<<5))
     {
-        UseRenderShader(flags | RenderFlag_Edge);
+        UseRenderShader(wbuffer, RenderMode_Edge); // no such mode exists any more, the edge pass was never built
         glLineWidth(1.5);
 
         glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
