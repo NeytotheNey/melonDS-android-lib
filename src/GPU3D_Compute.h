@@ -63,6 +63,7 @@ public:
     void SetupAccelFrame() override;
     void PrepareCaptureFrame() override;
     void FlushCommands() override;
+    bool FlushAfterCaptureBlit() const override { return true; }
 
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
@@ -232,6 +233,14 @@ private:
     GLuint LowResFramebuffer {};
     GLuint PixelBuffer {};
     GLuint CaptureFrameBuffer {};
+    // GPU::CaptureSpinUs (copied at RenderFrame): a fence after the capture readback, polled
+    // before the map
+    GLsync CaptureFence = nullptr;
+    int CaptureSpinUs = 0;
+#ifdef MELONADE_DEBUG_TOOLS
+    // when RenderFrame last started (ns), for the capture stats
+    s64 RenderFrameStartNs = 0;
+#endif
 
     u32 FramebufferCPU[256*192];
 

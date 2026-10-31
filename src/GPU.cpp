@@ -1637,6 +1637,11 @@ void GPU::StartScanline(u32 line) noexcept
                 // this is where the lines held for display capture are usually drawn
                 Sync2D();
                 GPU3D.Blit(*this);
+
+                // compute renderer: submit the compositor now, while the GPU is idle after the
+                // capture map, instead of ahead of the 3D at the line-215 flush (see BlitFlushCapture)
+                if (BlitFlushCapture && CaptureHeldThisFrame && GPU3D.GetCurrentRenderer().FlushAfterCaptureBlit())
+                    GPU3D.GetCurrentRenderer().FlushCommands();
             }
         }
     }

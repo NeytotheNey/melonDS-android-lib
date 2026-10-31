@@ -366,6 +366,9 @@ public:
     // submits the queued GPU work without waiting for it, so the GPU starts on what display
     // capture will read back (see GPU::StartHBlank at line 215 and SoftRenderer::VBlankEnd)
     virtual void FlushCommands() {}
+    // whether GPU::BlitFlushCapture flushes right after the line-192 Blit in capture frames. only
+    // the compute renderer gains from it; with classic OpenGL it cost ~9% more GPU cycles for no fps
+    virtual bool FlushAfterCaptureBlit() const { return false; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
     // after a savestate is loaded, for what the renderer keeps from earlier frames' output
@@ -376,6 +379,17 @@ public:
     // only the GL and compute renderers go wider than 256
     [[nodiscard]] virtual int GetViewWidth() const noexcept { return 256; }
     [[nodiscard]] virtual int GetOutputWidth() const noexcept { return 256; }
+
+#ifdef MELONADE_DEBUG_TOOLS
+    // debug builds only, for the frontend's CAPWAIT log, compute renderer only: summed over the
+    // capture readback maps since the frontend last zeroed them. the wait is the time in
+    // glMapBufferRange, the spin the CaptureSpinUs poll before it, and the span the time from
+    // RenderFrame's start to the map's return
+    s64 CaptureMapCount = 0;
+    s64 CaptureMapWaitNs = 0;
+    s64 CaptureSpinNs = 0;
+    s64 CaptureSpanNs = 0;
+#endif
 
     virtual bool NeedsShaderCompile() { return false; }
     virtual void ShaderCompileStep(int& current, int& count) {}

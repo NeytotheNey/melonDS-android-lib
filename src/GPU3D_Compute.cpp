@@ -20,7 +20,9 @@
 
 #include <assert.h>
 #include <algorithm>
+#include <chrono>
 #include <iterator>
+#include <thread>
 #include <utility>
 
 #include "Utils.h"
@@ -33,6 +35,11 @@
 
 namespace melonDS
 {
+
+static s64 SteadyNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 ComputeRenderer::ComputeRenderer(GLCompositor&& compositor)
     : Renderer3D(true), Texcache(TexcacheOpenGLLoader()), CurGLCompositor(std::move(compositor))
@@ -334,6 +341,8 @@ ComputeRenderer::~ComputeRenderer()
     glDeleteSamplers(9, Samplers);
     glDeleteBuffers(1, &PixelBuffer);
     glDeleteFramebuffers(1, &CaptureFrameBuffer);
+    if (CaptureFence)
+        glDeleteSync(CaptureFence);
 
     DeleteShaders();
 }
@@ -817,6 +826,11 @@ s32 ComputeRenderer::WideVertexX(s32 hiresx) const
 
 void ComputeRenderer::RenderFrame(GPU& gpu)
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    RenderFrameStartNs = SteadyNowNs();
+#endif
+    CaptureSpinUs = gpu.CaptureSpinUs;
+
     // the targets match the polygons drawn here, so after a width change they only shrink once
     // the game has built geometry at the new width (see GLRenderer::RenderFrame). this is inside
     // RunFrame, so the shaders for the new width are compiled right here
@@ -1417,10 +1431,41 @@ u32* ComputeRenderer::GetLine(int line)
 
     if (line == 0)
     {
+#ifdef MELONADE_DEBUG_TOOLS
+        s64 start = SteadyNowNs();
+#endif
+        if (CaptureFence)
+        {
+            // wait for the readback on the CPU, polling, instead of sleeping in the map, so the
+            // emulator thread's clock doesn't drop meanwhile. the first poll also flushes, in case
+            // nothing flushed the fence yet (the early flushes are off)
+            s64 deadline = SteadyNowNs() + (s64)CaptureSpinUs * 1000;
+            GLbitfield flags = GL_SYNC_FLUSH_COMMANDS_BIT;
+            while (glClientWaitSync(CaptureFence, flags, 0) == GL_TIMEOUT_EXPIRED && SteadyNowNs() < deadline)
+            {
+                flags = 0;
+                std::this_thread::yield();
+            }
+            glDeleteSync(CaptureFence);
+            CaptureFence = nullptr;
+        }
+#ifdef MELONADE_DEBUG_TOOLS
+        s64 mapStart = SteadyNowNs();
+#endif
+
         glBindBuffer(GL_PIXEL_PACK_BUFFER, PixelBuffer);
         u8* data = (u8*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 4 * stride * 192, GL_MAP_READ_BIT);
         if (data) memcpy(&FramebufferCPU[0], data, 4*stride*192);
         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+
+#ifdef MELONADE_DEBUG_TOOLS
+        s64 end = SteadyNowNs();
+        CaptureMapCount++;
+        CaptureSpinNs += mapStart - start;
+        CaptureMapWaitNs += end - mapStart;
+        if (RenderFrameStartNs != 0 && end - RenderFrameStartNs < 100000000)
+            CaptureSpanNs += end - RenderFrameStartNs;
+#endif
     }
 
     return &FramebufferCPU[stride * line];
@@ -1438,6 +1483,15 @@ void ComputeRenderer::PrepareCaptureFrame()
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, LowResFramebuffer, 0);
     glReadPixels(0, 0, 256, 192, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // GetLine(0) polls this before it maps the readback (see GPU::CaptureSpinUs)
+    if (CaptureFence)
+    {
+        glDeleteSync(CaptureFence);
+        CaptureFence = nullptr;
+    }
+    if (CaptureSpinUs > 0)
+        CaptureFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }
 
 void ComputeRenderer::FlushCommands()

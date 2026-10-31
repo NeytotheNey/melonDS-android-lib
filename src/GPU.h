@@ -651,6 +651,15 @@ public:
     // GPU write indirect arguments, which Adreno's driver waits on (see ComputeRenderer::RenderFrame).
     // only turned off by a debug switch, to compare
     bool ComputeDirectDispatch = true;
+    // compute renderer (Renderer3D::FlushAfterCaptureBlit): in frames that hold capture lines,
+    // flush right after the line-192 Blit, so the GPU runs the compositor while it would otherwise
+    // idle (after the capture map) until the line-215 flush, instead of ahead of the 3D there.
+    // only turned off by a debug switch, to compare
+    bool BlitFlushCapture = true;
+    // compute renderer: before mapping the capture readback, poll a fence for up to this many µs
+    // (yielding in between) instead of sleeping in the driver's map, which keeps the emulator
+    // thread's clock up. 0 = no fence, no poll. only changed by a debug switch
+    int CaptureSpinUs = 6000;
 
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;
