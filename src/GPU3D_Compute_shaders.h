@@ -372,7 +372,7 @@ layout (std140, binding = 0) uniform MetaUniform
 
     uint FogOffset, FogShift, FogColor;
 
-    vec2 ClearBitmapOffset;
+    ivec2 ClearBitmapOffset;
 };
 
 #ifdef InterpSpans
@@ -1511,12 +1511,14 @@ void main()
     uvec2 attr = uvec2(ClearAttr, 0U);
     if ((DispCnt & (1U<<14)) != 0U)
     {
-        // clear bitmap: native resolution, scrolled by ClearAttr2 and wrapping through REPEAT.
+        // clear bitmap: tiled at native resolution across the whole target, scrolled by
+        // ClearAttr2 (with a wide target's centre folded in, see RenderFrame) and wrapping at
+        // 256. ScreenWidth is the tile-rounded width, so the scale comes from the height.
         // the colour is already the packed 6-bit format, the depth texel is depth24 | fog<<24
-        float scale = 1.0 / float(ScreenWidth);
-        vec2 pos = (vec2(gl_GlobalInvocationID.xy) * scale) + ClearBitmapOffset;
-        color = uvec2(texture(ClearBitmapColor, pos).r, 0U);
-        depth = uvec2(texture(ClearBitmapDepth, pos).r, 0U);
+        const int scale = ScreenHeight/192;
+        ivec2 pos = (ivec2(gl_GlobalInvocationID.xy) / scale + ClearBitmapOffset) & 0xFF;
+        color = uvec2(texelFetch(ClearBitmapColor, pos, 0).r, 0U);
+        depth = uvec2(texelFetch(ClearBitmapDepth, pos, 0).r, 0U);
         attr.x = (attr.x & ~0x8000U) | ((depth.x >> 9) & 0x8000U);
         depth.x &= 0xFFFFFFU;
     }

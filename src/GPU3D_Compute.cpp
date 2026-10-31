@@ -288,8 +288,6 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     for (int i = 0; i < 2; i++)
     {
         glBindTexture(GL_TEXTURE_2D, result->ClearBitmapTex[i]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 256, 256, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
@@ -1234,10 +1232,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         meta.ClearDepth = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
         meta.ClearAttr = gpu.GPU3D.RenderClearAttr1 & 0x3F008000;
 
-        u8 xoff = (gpu.GPU3D.RenderClearAttr2 >> 16) & 0xFF;
-        u8 yoff = (gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF;
-        meta.ClearBitmapOffset[0] = (float)xoff / 256.0;
-        meta.ClearBitmapOffset[1] = (float)yoff / 256.0;
+        // in native pixels, wrapping at 256 across the whole target, with native x=0 at the
+        // centre 256 columns of a wide one (like the capture readback and GLRenderer)
+        int xorigin = (TargetWidth - WideMelon::NativeWidth) / 2;
+        meta.ClearBitmapOffset[0] = ((int)((gpu.GPU3D.RenderClearAttr2 >> 16) & 0xFF) - xorigin) & 0xFF;
+        meta.ClearBitmapOffset[1] = (gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF;
     }
     for (u32 i = 0; i < 32; i++)
     {
@@ -1413,10 +1412,6 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    // the clear bitmap textures wrap with their own REPEAT parameters, so the rasteriser's
-    // sampler objects must not stay bound on their units
-    glBindSampler(0, 0);
-    glBindSampler(1, 0);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[0]);
     glActiveTexture(GL_TEXTURE1);

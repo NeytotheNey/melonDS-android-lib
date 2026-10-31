@@ -226,9 +226,9 @@ private:
 
         u32 FogOffset, FogShift, FogColor;
 
-        float ClearBitmapOffset[2];
+        s32 ClearBitmapOffset[2];
     };
-    // std140: the vec2 needs 8 byte alignment, which the 146 uints before it already give
+    // std140: the ivec2 needs 8 byte alignment, which the 146 uints before it already give
     static_assert(offsetof(MetaUniform, ClearBitmapOffset) == 584 && sizeof(MetaUniform) == 592,
         "MetaUniform must match the std140 layout of the shader's MetaUniform block");
     GLuint MetaUniformMemory {};
@@ -236,7 +236,7 @@ private:
     GLuint Samplers[9] {};
 
     // 3D clear bitmap (DISP3DCNT bit 14): texture slots 2 and 3 converted on the CPU into
-    // R32UI textures with REPEAT wrapping, like upstream's compute renderer.
+    // R32UI textures, like upstream's compute renderer, read with texelFetch.
     // [0]: colour as the packed 6-bit RGB + 5-bit alpha the shaders use, [1]: depth24 | fog<<24.
     // ClearBitmapDirty accumulates the texcache's slot 2/3 bits until the mode is on
     GLuint ClearBitmapTex[2] = {};
