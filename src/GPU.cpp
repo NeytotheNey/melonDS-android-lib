@@ -1650,17 +1650,21 @@ void GPU::StartScanline(u32 line) noexcept
 }
 
 
-void GPU::SetDispStat(u32 cpu, u16 val) noexcept
+void GPU::SetDispStat(u32 cpu, u16 val, u16 mask) noexcept
 {
-    val &= 0xFFB8;
-    DispStat[cpu] &= 0x0047;
+    const u16 ro_mask = 0x0047;
+
+    val &= (mask & ~ro_mask);
+    DispStat[cpu] &= (~mask | ro_mask);
     DispStat[cpu] |= val;
 
-    VMatch[cpu] = (val >> 8) | ((val & 0x80) << 1);
+    VMatch[cpu] = (DispStat[cpu] >> 8) | ((DispStat[cpu] & 0x80) << 1);
 }
 
-void GPU::SetVCount(u16 val) noexcept
+void GPU::SetVCount(u16 val, u16 mask) noexcept
 {
+    val = (NextVCount & ~mask) | (val & mask);
+
     // VCount write is delayed until the next scanline
 
     // TODO: how does the 3D engine react to VCount writes while it's rendering?

@@ -294,6 +294,42 @@ void Unit::Write8(u32 addr, u8 val)
     case 0x11:
         if (!Num) GPU.GPU3D.SetRenderXPos((GPU.GPU3D.GetRenderXPos() & 0x00FF) | (val << 8));
         break;
+
+    case 0x064:
+        if (!Num) CaptureCnt = (CaptureCnt & 0xFFFFFF00) | (val & 0x1F);
+        return;
+    case 0x065:
+        if (!Num) CaptureCnt = (CaptureCnt & 0xFFFF00FF) | ((val & 0x1F) << 8);
+        return;
+    case 0x066:
+        if (!Num) CaptureCnt = (CaptureCnt & 0xFF00FFFF) | ((val & 0x3F) << 16);
+        return;
+    case 0x067:
+        if (!Num) CaptureCnt = (CaptureCnt & 0x00FFFFFF) | ((val & 0xEF) << 24);
+        return;
+
+    case 0x068:
+        if (!Num) DispFIFO[DispFIFOWritePtr] = val * 0x0101;
+        return;
+    case 0x069:
+        return;
+    case 0x06A:
+        if (!Num) DispFIFO[DispFIFOWritePtr+1] = val * 0x0101;
+        return;
+    case 0x06B:
+        if (!Num)
+        {
+            DispFIFOWritePtr += 2;
+            DispFIFOWritePtr &= 0xF;
+        }
+        return;
+
+    case 0x06C:
+        MasterBrightness = (MasterBrightness & 0xFF00) | (val & 0x1F);
+        return;
+    case 0x06D:
+        MasterBrightness = (MasterBrightness & 0x00FF) | ((val & 0xC0) << 8);
+        return;
     }
 
     if (!Enabled) return;
@@ -405,7 +441,7 @@ void Unit::Write16(u32 addr, u16 val)
         DispFIFOWritePtr &= 0xF;
         return;
 
-    case 0x06C: MasterBrightness = val; return;
+    case 0x06C: MasterBrightness = val & 0xC01F; return;
     }
 
     if (!Enabled) return;

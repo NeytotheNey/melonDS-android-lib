@@ -563,9 +563,9 @@ public:
 
     void DisplayFIFO(u32 x) noexcept;
 
-    void SetDispStat(u32 cpu, u16 val) noexcept;
+    void SetDispStat(u32 cpu, u16 val, u16 mask = 0xFFFF) noexcept;
 
-    void SetVCount(u16 val) noexcept;
+    void SetVCount(u16 val, u16 mask = 0xFFFF) noexcept;
     bool MakeVRAMFlat_ABGCoherent(NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty) noexcept;
     bool MakeVRAMFlat_BBGCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty) noexcept;
 

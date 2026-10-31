@@ -3206,6 +3206,19 @@ void NDS::ARM9IOWrite8(u32 addr, u8 val)
 {
     switch (addr)
     {
+    case 0x04000004: GPU.SetDispStat(0, val, 0x00FF); return;
+    case 0x04000005: GPU.SetDispStat(0, val << 8, 0xFF00); return;
+    case 0x04000006: GPU.SetVCount(val, 0x00FF); return;
+    case 0x04000007: GPU.SetVCount(val << 8, 0xFF00); return;
+
+    case 0x04000064:
+    case 0x04000065:
+    case 0x04000066:
+    case 0x04000067:
+    case 0x04000068:
+    case 0x04000069:
+    case 0x0400006A:
+    case 0x0400006B:
     case 0x0400006C:
     case 0x0400006D: GPU.GPU2D_A.Write8(addr, val); return;
     case 0x0400106C:
@@ -4019,6 +4032,11 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
 {
     switch (addr)
     {
+    case 0x04000004: GPU.SetDispStat(1, val, 0x00FF); return;
+    case 0x04000005: GPU.SetDispStat(1, val << 8, 0xFF00); return;
+    case 0x04000006: GPU.SetVCount(val, 0x00FF); return;
+    case 0x04000007: GPU.SetVCount(val << 8, 0xFF00); return;
+
     case 0x04000132:
         KeyCnt[1] = (KeyCnt[1] & 0xFF00) | val;
         return;
