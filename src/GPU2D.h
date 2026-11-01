@@ -166,9 +166,10 @@ struct LineJob
     u32* Framebuffer[2];    // per Unit, as assigned when the job was built (POWCNT can swap them)
     u32* Line3D;            // unit A's 3D line, or null when this line didn't fetch it (the renderer keeps the last one)
     bool Fetch3DLine;       // held for display capture: Line3D is fetched when the job is drawn (GPU::Flush2DDeferred)
-    bool Abort3DLine;       // and GPU3D::AbortFrame as it was when the job was built (RenderXPos is above)
+    bool Abort3DLine;       // and GPU3D::AbortFrame as it was when the job was built (RenderXPos is above). set on every line that captures 3D
     u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks
     bool ScreensEnabled;    // POWCNT1 bit 0 as latched at the frame start: clear = both screens black
+    bool HiresCapture;      // Accelerated, GPU::HiresCapture and the compositor's pass would run: capture lines fill the record, VRAM display lines get the flag
 
     UnitState BG[2];        // after PreDrawScanline, before PostDrawScanline
     UnitState OBJ[2];       // after PostDrawScanline (line 0: after ResetOBJMosaicCounters)

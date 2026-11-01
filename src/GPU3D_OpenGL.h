@@ -52,6 +52,7 @@ public:
     void SetViewWidth(int width) noexcept;
     [[nodiscard]] int GetViewWidth() const noexcept override { return ViewWidth; }
     [[nodiscard]] int GetOutputWidth() const noexcept override { return TargetWidth; }
+    [[nodiscard]] bool RunsHiresCapture(int debug) const noexcept override { return CurGLCompositor.RunsHiresCapture(debug); }
 
     void VCount144(GPU& gpu) override {};
     void RenderFrame(GPU& gpu) override;

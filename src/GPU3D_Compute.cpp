@@ -409,14 +409,16 @@ void ComputeRenderer::DeleteShaders()
 void ComputeRenderer::Reset(GPU& gpu)
 {
     Texcache.Reset();
-    // held WideMelon wings belong to the old scene
+    // held WideMelon wings and hi-res capture copies belong to the old scene
     CurGLCompositor.ResetWingHold();
+    CurGLCompositor.ResetHiresCapture();
     ClearBitmapDirty = 0x3;
 }
 
 void ComputeRenderer::SavestateLoaded()
 {
     CurGLCompositor.ResetWingHold();
+    CurGLCompositor.ResetHiresCapture();
 }
 
 // the tile size for a scale: starting at 4.5x it doubles every time the scale doubles

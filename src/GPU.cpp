@@ -241,6 +241,7 @@ void GPU::Reset() noexcept
     GPU2D_Renderer->SetFramebuffer(Framebuffer[backbuf][1].get(), Framebuffer[backbuf][0].get());
 
     ResetVRAMCache();
+    ResetHiresCapture();
 
     OAMDirty = 0x3;
     PaletteDirty = 0xF;
@@ -334,8 +335,85 @@ void GPU::DoSavestate(Savestate* file) noexcept
     if (!file->Saving)
     {
         ResetVRAMCache();
+        // nothing hi-res is saved: the copies are dropped and rebuild from native source B
+        ResetHiresCapture();
         GPU3D.GetCurrentRenderer().SavestateLoaded();
     }
+}
+
+// the hi-res capture copies no longer match VRAM: all four banks count as written, which drops
+// them at the next Blit, and an unconsumed record goes with them
+void GPU::ResetHiresCapture() noexcept
+{
+    HiresCapWrites = 0xF;
+    HiresCapWritesInCapture = 0;
+    NativeCapturedSincePass = 0;
+    if (HiresCapRecord)
+    {
+        HiresCapRecord->Clear();
+        HiresCapRecord->StaleMask = 0;
+    }
+}
+
+void GPU::SetHiresCapture(bool enable) noexcept
+{
+    if (enable == HiresCapture)
+        return;
+
+    // native capture went on without the record meanwhile (or will), so the copies are stale
+    Sync2D();
+    HiresCapture = enable;
+    ResetHiresCapture();
+}
+
+HiresCaptureRecord& GPU::RecordHiresCaptureLine(u32 line, u32 captureCnt) noexcept
+{
+    if (!HiresCapRecord)
+    {
+        HiresCapRecord = std::make_unique<HiresCaptureRecord>();
+        HiresCapRecord->StaleMask = NativeCapturedSincePass;
+    }
+
+    HiresCaptureRecord& record = *HiresCapRecord;
+    u32 dstbank = (captureCnt >> 16) & 0x3;
+    u32 layout = captureCnt & 0x3F0000;
+
+    bool first = true;
+    for (u32 mask : record.LineMask)
+        first = first && !mask;
+    if (first)
+        record.Layout = layout;
+    else if (layout != record.Layout)
+        record.Skip |= HiresCapSkip_Layout;
+
+    record.LineMask[line >> 5] |= 1u << (line & 31);
+    record.DstMask |= 1 << dstbank;
+    if (captureCnt & (0x3 << 18))
+        record.OffsetMask |= 1 << dstbank;
+
+    // set even when the destination isn't in LCDC mode and nothing gets written: that only makes
+    // the bank native for longer, and keeps the rule to one line
+    NativeCapturedSincePass |= 1 << dstbank;
+
+    HiresCaptureRecord::Line& entry = record.Lines[line];
+    entry = {};
+    entry.CaptureCnt = captureCnt;
+    return record;
+}
+
+// after the compositor read this frame's record and write masks (GLCompositor::RenderFrame): the
+// banks it captured into are redone (or dropped) now, and the next frame's writes start afresh
+void GPU::HiresCaptureBlitDone() noexcept
+{
+    if (HiresCapRecord)
+    {
+        NativeCapturedSincePass &= ~HiresCapRecord->DstMask;
+        HiresCapRecord->Clear();
+        HiresCapRecord->StaleMask = NativeCapturedSincePass;
+    }
+
+    HiresCapWrites = 0;
+    HiresCapWritesInCapture = 0;
 }
 
 void GPU::AssignFramebuffers() noexcept
@@ -452,6 +530,9 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
     if (oldcnt == cnt) return;
     Sync2D();
 
+    // the bank may have been written while it was mapped elsewhere
+    NoteHiresCaptureWrite(bank);
+
     u8 oldofs = (oldcnt >> 3) & 0x3;
     u8 ofs = (cnt >> 3) & 0x3;
     u32 bankmask = 1 << bank;
@@ -514,6 +595,9 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
 
     if (oldcnt == cnt) return;
     Sync2D();
+
+    // the bank may have been written while it was mapped elsewhere
+    NoteHiresCaptureWrite(bank);
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -1044,6 +1128,10 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     job.Framebuffer[1] = GPU2D_Renderer->GetFramebuffer(1);
     job.VRAMMap_LCDC = VRAMMap_LCDC;
     job.ScreensEnabled = ScreensEnabled;
+    // only while the compositor's pass would run: at 1x it always skips (outside the check mode),
+    // so the record copy and the display flags would be wasted. the copies are dropped on every
+    // scale change and a new renderer starts without any, so none can be valid when this turns on
+    job.HiresCapture = job.Accelerated && HiresCapture && GPU3D.GetCurrentRenderer().RunsHiresCapture(HiresCaptureDebug);
 }
 
 // for DrawScanline(line): call after PreDrawScanline, before PostDrawScanline
@@ -1070,7 +1158,11 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
             CaptureHeldThisFrame = true;
         }
         else
+        {
             job.Line3D = GPU3D.GetLine(line);
+            // hi-res capture only reads it to tell whether this 3D line was blank
+            job.Abort3DLine = GPU3D.AbortFrame;
+        }
     }
 
     // the 3D renderer reuses its line buffer, so a queued job keeps a copy
@@ -1590,6 +1682,26 @@ void GPU::StartScanline(u32 line) noexcept
     {
         if (line == 0)
         {
+            // hi-res capture: a new frame's record. one that no Blit consumed (a VCount write
+            // skipped line 192) is dropped, and its banks stay in NativeCapturedSincePass.
+            // jobs still held from that frame (the capture stays armed without its VBlank) are
+            // drawn during this one, and their native capture lands after this, so
+            // NativeCapturedSincePass misses it: every bank counts as stale for this frame, and as
+            // they go into this frame's record with an earlier frame's planes and 3D, its pass is
+            // skipped
+            if (Deferred2DPending && HiresCapture && !HiresCapRecord)
+                HiresCapRecord = std::make_unique<HiresCaptureRecord>();
+            if (HiresCapRecord)
+            {
+                HiresCapRecord->Clear();
+                HiresCapRecord->StaleMask = NativeCapturedSincePass;
+                if (Deferred2DPending)
+                {
+                    HiresCapRecord->StaleMask = 0xF;
+                    HiresCapRecord->Skip |= HiresCapSkip_VCount;
+                }
+            }
+
             GPU2D_Renderer->VBlankEnd(&GPU2D_A, &GPU2D_B);
             GPU2D_A.VBlankEnd();
             GPU2D_B.VBlankEnd();
@@ -1649,6 +1761,7 @@ void GPU::StartScanline(u32 line) noexcept
                 // this is where the lines held for display capture are usually drawn
                 Sync2D();
                 GPU3D.Blit(*this);
+                HiresCaptureBlitDone();
 
                 // compute renderer: submit the compositor now, while the GPU is idle after the
                 // capture map, instead of ahead of the 3D at the line-215 flush (see BlitFlushCapture)

@@ -380,6 +380,10 @@ public:
     [[nodiscard]] virtual int GetViewWidth() const noexcept { return 256; }
     [[nodiscard]] virtual int GetOutputWidth() const noexcept { return 256; }
 
+    // hi-res display capture (GPU::HiresCapture): whether the GL compositor's capture pass would
+    // run with this frame's capture (GLCompositor::RunsHiresCapture). off without a compositor
+    [[nodiscard]] virtual bool RunsHiresCapture(int debug) const noexcept { return false; }
+
 #ifdef MELONADE_DEBUG_TOOLS
     // debug builds only, for the frontend's CAPWAIT log, compute renderer only: summed over the
     // capture readback maps since the frontend last zeroed them. the wait is the time in

@@ -21,6 +21,81 @@
 
 namespace melonDS
 {
+// unit A's display mode 1 composite of one pixel, from the three 2D planes the 2D renderer drew in
+// the accelerated format and the 3D pixel (only read for compmode 0-4). the compositor and the
+// hi-res capture program both use it, put after their precision statements (see
+// GLCompositor::CompositorFS). opaque is what the CPU composite in GPU2D::SoftRenderer::DoCapture
+// leaves in the alpha byte, which capture turns into the alpha bit: its blend functions always
+// return opaque, while the alpha returned here goes through the blend maths
+const char* kCompositePixelFS = R"(
+ivec4 CompositePixel(ivec4 val1, ivec4 val2, ivec4 val3, ivec4 _3dpix, out bool opaque)
+{
+    int compmode = val3.a & 0xF;
+    int eva, evb, evy;
+    opaque = val1.a != 0;
+
+    if (compmode == 4)
+    {
+        // 3D on top, blending
+
+        if (_3dpix.a > 0)
+        {
+            eva = (_3dpix.a & 0x1F) + 1;
+            evb = 32 - eva;
+
+            val1 = ((_3dpix * eva) + (val1 * evb) + 0x10) >> 5;
+            val1 = min(val1, 0x3F);
+            opaque = true;
+        }
+        else
+        {
+            val1 = val2;
+            opaque = val2.a != 0;
+        }
+    }
+    else if (compmode == 1)
+    {
+        // 3D on bottom, blending
+
+        if (_3dpix.a > 0)
+        {
+            eva = val3.g;
+            evb = val3.b;
+
+            val1 = ((val1 * eva) + (_3dpix * evb) + 0x8) >> 4;
+            val1 = min(val1, 0x3F);
+            opaque = true;
+        }
+        else
+        {
+            val1 = val2;
+            opaque = val2.a != 0;
+        }
+    }
+    else if (compmode <= 3)
+    {
+        // 3D on top, normal/fade
+
+        if (_3dpix.a > 0)
+        {
+            evy = val3.g;
+
+            val1 = _3dpix;
+            if      (compmode == 2) val1 += (((0x3F - val1) * evy) + 0x8) >> 4;
+            else if (compmode == 3) val1 -= ((val1 * evy) + 0x7) >> 4;
+            opaque = true;
+        }
+        else
+        {
+            val1 = val2;
+            opaque = val2.a != 0;
+        }
+    }
+
+    return val1;
+}
+)";
+
 const char* kCompositorVS = R"(#version 320 es
 
 in vec2 vPosition;
@@ -49,7 +124,9 @@ void main()
 }
 )";
 
-const char* kCompositorFS_Nearest = R"(#version 320 es
+// the compositor's fragment shader is kCompositorFS_Nearest_Head + kCompositePixelFS +
+// kCompositorFS_Nearest_Main (see GLCompositor::CompositorFS)
+const char* kCompositorFS_Nearest_Head = R"(#version 320 es
 
 #ifdef WIDE
 // wide coordinates need more precision than mediump (which can be fp16) has
@@ -68,10 +145,19 @@ uniform mediump sampler2D HeldWingsTex;
 uniform usampler2D ScreenTex;
 uniform sampler2D _3DTex;
 
+// hi-res display capture (see GLCompositor::PrepareHiresDisplay): VRAM display lines flagged in
+// the control word (bit 7) show this bank copy instead. it holds bank words, so it's highp:
+// 0x8000 doesn't fit a mediump int
+uniform int uHiresCap;
+uniform highp usampler2D HiresBankTex;
+
 smooth in vec2 fTexcoord;
 
 layout(location = 0) out vec4 oColor;
+)";
 
+// the rest of the compositor's fragment shader, after kCompositePixelFS
+const char* kCompositorFS_Nearest_Main = R"(
 ivec4 Fetch3D(float xpos, float ypos)
 {
 #ifdef WIDE
@@ -168,72 +254,34 @@ void main()
 
     if (dispmode == 1)
     {
-        ivec4 val1 = pixel;
         ivec4 val2 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(256,0), 0));
         ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(512,0), 0));
 
-        int compmode = val3.a & 0xF;
-        int eva, evb, evy;
+        // the 3D pixel, for the compmodes that show 3D (0-4)
+        ivec4 _3dpix = ivec4(0);
+        if ((val3.a & 0xF) <= 4)
+            _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
 
-        if (compmode == 4)
-        {
-            // 3D on top, blending
+        bool opaque;
+        pixel = CompositePixel(pixel, val2, val3, _3dpix, opaque);
+    }
+    else if (dispmode == 2 && uHiresCap != 0 && (mbright.r & 0x80) != 0)
+    {
+        // VRAM display from the bank's hi-res copy, whose rows are the bank rows (display line L
+        // shows row L). the output has 2 padding lines between the halves, so the second half's
+        // rows start at 194 lines, and the wide output's wing comes before the middle
+        highp ivec2 coord = ivec2(gl_FragCoord.xy);
+        int scale = int(u3DScale);
+        if (coord.y >= 194 * scale)
+            coord.y -= 194 * scale;
+#ifdef WIDE
+        coord.x -= uWideOffset * scale;
+#endif
+        coord = clamp(coord, ivec2(0), ivec2(256 * scale - 1, 192 * scale - 1));
 
-            float xpos = fTexcoord.x + _3dxpos;
-            float ypos = mod(fTexcoord.y, 192.0);
-            ivec4 _3dpix = Fetch3D(xpos, ypos);
-
-            if (_3dpix.a > 0)
-            {
-                eva = (_3dpix.a & 0x1F) + 1;
-                evb = 32 - eva;
-
-                val1 = ((_3dpix * eva) + (val1 * evb) + 0x10) >> 5;
-                val1 = min(val1, 0x3F);
-            }
-            else
-                val1 = val2;
-        }
-        else if (compmode == 1)
-        {
-            // 3D on bottom, blending
-
-            float xpos = fTexcoord.x + _3dxpos;
-            float ypos = mod(fTexcoord.y, 192.0);
-            ivec4 _3dpix = Fetch3D(xpos, ypos);
-
-            if (_3dpix.a > 0)
-            {
-                eva = val3.g;
-                evb = val3.b;
-
-                val1 = ((val1 * eva) + (_3dpix * evb) + 0x8) >> 4;
-                val1 = min(val1, 0x3F);
-            }
-            else
-                val1 = val2;
-        }
-        else if (compmode <= 3)
-        {
-            // 3D on top, normal/fade
-
-            float xpos = fTexcoord.x + _3dxpos;
-            float ypos = mod(fTexcoord.y, 192.0);
-            ivec4 _3dpix = Fetch3D(xpos, ypos);
-
-            if (_3dpix.a > 0)
-            {
-                evy = val3.g;
-
-                val1 = _3dpix;
-                if      (compmode == 2) val1 += (((0x3F - val1) * evy) + 0x8) >> 4;
-                else if (compmode == 3) val1 -= ((val1 * evy) + 0x7) >> 4;
-            }
-            else
-                val1 = val2;
-        }
-
-        pixel = val1;
+        // unpacked to 6 bits like the native VRAM display line (GPU2D::SoftRenderer::DrawScanline)
+        highp uint word = texelFetch(HiresBankTex, coord, 0).r;
+        pixel = ivec4(int(word & 0x1Fu) << 1, int((word >> 5) & 0x1Fu) << 1, int((word >> 10) & 0x1Fu) << 1, 0);
     }
 
     if (dispmode != 0)
@@ -263,6 +311,167 @@ void main()
     // TODO: filters
 
     oColor = vec4(vec3(pixel.bgr) / 255.0, 1.0);
+}
+)";
+
+// hi-res display capture: the capture pass (GLCompositor::RunHiresCapture) redoes a frame's display
+// capture at the 3D scale into a bank copy, a GL_R16UI texture of 256 x 256 bank rows at the
+// scale. it draws one triangle over the viewport, which covers the captured rows
+const char* kHiresCaptureVS = R"(#version 320 es
+
+void main()
+{
+    vec2 pos = vec2(float((gl_VertexID & 1) << 2), float((gl_VertexID & 2) << 1)) - 1.0;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+)";
+
+// the capture program's fragment shader is kHiresCaptureFS_Head + kCompositePixelFS +
+// kHiresCaptureFS_Main. it makes the bank word DoCapture (GPU2D_Soft.cpp) would make for this
+// hi-res texel, with the same integer maths, so at 1x it should match the native capture exactly
+const char* kHiresCaptureFS_Head = R"(#version 320 es
+
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
+
+uniform int uScale;
+uniform int uWideOffset;    // native columns the 3D target has on each side of the middle 256
+uniform int uDstRow;        // the bank row the capture starts at
+
+// per capture line: the 3 planes (columns 0-767) as GPU::HiresCapRecord has them, then 2 control
+// texels: DISPCAPCNT, and the line's info from GLCompositor::RunHiresCapture
+uniform usampler2D PlanesTex;
+uniform sampler2D _3DTex;
+uniform usampler2D SrcBTex;     // the native source B words of each line
+uniform usampler2D BankBTex;    // the hi-res copy of the source B bank, for lines that use it
+
+layout(location = 0) out uvec4 oWord;
+)";
+
+const char* kHiresCaptureFS_Main = R"(
+// the 3D pixel at hi-res column x of the middle 256 and hi-res line y, decoded to 6-bit colour and
+// 5-bit alpha as the capture readbacks do (GLRenderer::GetLine shifts the bytes right by 2 and 3,
+// the compute renderer writes c/63 and a/31). classic GL draws polygons in float, so the bytes
+// are arbitrary and a c/63 round trip isn't exact. outside the middle 256 there's no 3D, like the
+// scrolled native line (GPU3D::GetLine)
+ivec4 Fetch3DCapture(int x, int y)
+{
+    if (x < 0 || x >= 256 * uScale)
+        return ivec4(0);
+
+    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * uScale, y), 0);
+    return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
+}
+
+uint TexelWord(uvec4 texel)
+{
+    return texel.r | (texel.g << 8) | (texel.b << 16) | (texel.a << 24);
+}
+
+void main()
+{
+    ivec2 frag = ivec2(gl_FragCoord.xy);
+    int row = frag.y - uDstRow * uScale;    // hi-res row in the captured rectangle
+    int line = row / uScale;                // the capture line
+    int subrow = row - line * uScale;
+    int x = frag.x / uScale;                // native column
+
+    uint capcnt = TexelWord(texelFetch(PlanesTex, ivec2(768, line), 0));
+    // bits 0-8: the 3D X scroll, 9: source B from BankBTex, 10: DoCapture had a source B,
+    // 16-23: the BankBTex row
+    uint linectrl = TexelWord(texelFetch(PlanesTex, ivec2(769, line), 0));
+    uint mode = (capcnt >> 29) & 0x3u;
+
+    // source A: the 3D layer alone, or the composite of the 2D planes and the 3D
+    ivec4 colA = ivec4(0);
+    bool alphaA = false;
+    if (mode != 1u)
+    {
+        int xscroll = int(linectrl & 0x1FFu);
+        if (xscroll >= 256)
+            xscroll -= 512;
+        int x3d = frag.x + xscroll * uScale;
+
+        if ((capcnt & (1u << 24)) != 0u)
+        {
+            colA = Fetch3DCapture(x3d, row);
+            alphaA = colA.a != 0;
+        }
+        else
+        {
+            ivec4 val1 = ivec4(texelFetch(PlanesTex, ivec2(x, line), 0));
+            ivec4 val2 = ivec4(texelFetch(PlanesTex, ivec2(x + 256, line), 0));
+            ivec4 val3 = ivec4(texelFetch(PlanesTex, ivec2(x + 512, line), 0));
+
+            ivec4 _3dpix = ivec4(0);
+            if ((val3.a & 0xF) <= 4)
+                _3dpix = Fetch3DCapture(x3d, row);
+
+            colA = CompositePixel(val1, val2, val3, _3dpix, alphaA);
+        }
+    }
+
+    // source B: the hi-res copy of the bank, or the native words upscaled
+    bool hasB = (linectrl & (1u << 10)) != 0u;
+    uint wordB = 0u;
+    if (mode != 0u && hasB)
+    {
+        if ((linectrl & (1u << 9)) != 0u)
+            wordB = texelFetch(BankBTex, ivec2(frag.x, int((linectrl >> 16) & 0xFFu) * uScale + subrow), 0).r;
+        else
+            wordB = texelFetch(SrcBTex, ivec2(x, line), 0).r;
+    }
+
+    uint rA = uint(colA.r >> 1) & 0x1Fu;
+    uint gA = uint(colA.g >> 1) & 0x1Fu;
+    uint bA = uint(colA.b >> 1) & 0x1Fu;
+    uint aA = alphaA ? 1u : 0u;
+
+    uint word;
+    if (mode == 0u)
+    {
+        word = rA | (gA << 5) | (bA << 10) | (aA << 15);
+    }
+    else if (mode == 1u)
+    {
+        // zero without a source B, as DoCapture writes then
+        word = wordB;
+    }
+    else
+    {
+        uint eva = min(capcnt & 0x1Fu, 16u);
+        uint evb = min((capcnt >> 8) & 0x1Fu, 16u);
+
+        if (hasB)
+        {
+            uint rB = wordB & 0x1Fu;
+            uint gB = (wordB >> 5) & 0x1Fu;
+            uint bB = (wordB >> 10) & 0x1Fu;
+            uint aB = wordB >> 15;
+
+            uint rD = min(((rA * aA * eva) + (rB * aB * evb) + 8u) >> 4, 0x1Fu);
+            uint gD = min(((gA * aA * eva) + (gB * aB * evb) + 8u) >> 4, 0x1Fu);
+            uint bD = min(((bA * aA * eva) + (bB * aB * evb) + 8u) >> 4, 0x1Fu);
+            uint aD = (eva > 0u ? aA : 0u) | (evb > 0u ? aB : 0u);
+
+            word = rD | (gD << 5) | (bD << 10) | (aD << 15);
+        }
+        else
+        {
+            // DoCapture's branch for a source B bank that isn't in LCDC mode: no B term, and the
+            // alpha only from A
+            uint rD = ((rA * aA * eva) + 8u) >> 4;
+            uint gD = ((gA * aA * eva) + 8u) >> 4;
+            uint bD = ((bA * aA * eva) + 8u) >> 4;
+            uint aD = eva > 0u ? aA : 0u;
+
+            word = rD | (gD << 5) | (bD << 10) | (aD << 15);
+        }
+    }
+
+    oWord = uvec4(word, 0u, 0u, 0u);
 }
 )";
 

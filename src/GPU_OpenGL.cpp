@@ -20,20 +20,36 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL.h"
 #include "OpenGLSupport.h"
+#include "Platform.h"
 #include "GPU_OpenGL_shaders.h"
 
 namespace melonDS
 {
 
 using namespace OpenGL;
+using Platform::Log;
+using Platform::LogLevel;
+
+std::string GLCompositor::CompositorFS()
+{
+    return std::string(kCompositorFS_Nearest_Head) + kCompositePixelFS + kCompositorFS_Nearest_Main;
+}
+
+std::string GLCompositor::HiresCaptureFS()
+{
+    return std::string(kHiresCaptureFS_Head) + kCompositePixelFS + kHiresCaptureFS_Main;
+}
 
 std::optional<GLCompositor> GLCompositor::New() noexcept
 {
@@ -41,7 +57,7 @@ std::optional<GLCompositor> GLCompositor::New() noexcept
     GLuint CompShader {};
 
     if (!OpenGL::CompileVertexFragmentProgram(CompShader,
-            kCompositorVS, kCompositorFS_Nearest,
+            kCompositorVS, CompositorFS(),
             "CompositorShader",
             {{"vPosition", 0}, {"vTexcoord", 1}},
             {{"oColor", 0}}))
@@ -53,12 +69,14 @@ std::optional<GLCompositor> GLCompositor::New() noexcept
 GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
 {
     CompScaleLoc = glGetUniformLocation(CompShader, "u3DScale");
+    CompHiresCapLoc = glGetUniformLocation(CompShader, "uHiresCap");
 
     glUseProgram(CompShader);
     GLuint screenTextureUniform = glGetUniformLocation(CompShader, "ScreenTex");
     glUniform1i(screenTextureUniform, 0);
     GLuint _3dTextureUniform = glGetUniformLocation(CompShader, "_3DTex");
     glUniform1i(_3dTextureUniform, 1);
+    glUniform1i(glGetUniformLocation(CompShader, "HiresBankTex"), 3);
 
     // all this mess is to prevent bleeding
 #define SETVERTEX(i, x, y, offset) \
@@ -130,6 +148,7 @@ GLCompositor::~GLCompositor()
     glDeleteTextures(CompScreenOutputTex.size(), &CompScreenOutputTex[0]);
     glDeleteFramebuffers(1, &HeldWingsFB);
     glDeleteTextures(1, &HeldWingsTex);
+    FreeHiresCapture();
 
     glDeleteVertexArrays(1, &CompVertexArrayID);
     glDeleteBuffers(1, &CompVertexBufferID);
@@ -145,11 +164,13 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     ScreenH(other.ScreenH),
     ScreenW(other.ScreenW),
     CompScaleLoc(other.CompScaleLoc),
+    CompHiresCapLoc(other.CompHiresCapLoc),
     CompShaderWide(other.CompShaderWide),
     CompShaderWideFailed(other.CompShaderWideFailed),
     CompWideScaleLoc(other.CompWideScaleLoc),
     CompWideRatioLoc(other.CompWideRatioLoc),
     CompWideOffsetLoc(other.CompWideOffsetLoc),
+    CompWideHiresCapLoc(other.CompWideHiresCapLoc),
     WingHold(other.WingHold),
     WingCopy(other.WingCopy),
     WingHoldLines(other.WingHoldLines),
@@ -157,6 +178,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     HeldWingsFB(other.HeldWingsFB),
     HeldWingsW(other.HeldWingsW),
     HeldWingsH(other.HeldWingsH),
+    HiresCap(other.HiresCap),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -167,6 +189,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
 {
     other.HeldWingsTex = {};
     other.HeldWingsFB = {};
+    other.HiresCap = {};
     other.CompScreenOutputFB = {};
     other.CompScreenInputTex = {};
     other.CompScreenOutputTex = {};
@@ -185,10 +208,12 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         ScreenH = other.ScreenH;
         ScreenW = other.ScreenW;
         CompScaleLoc = other.CompScaleLoc;
+        CompHiresCapLoc = other.CompHiresCapLoc;
         CompShaderWideFailed = other.CompShaderWideFailed;
         CompWideScaleLoc = other.CompWideScaleLoc;
         CompWideRatioLoc = other.CompWideRatioLoc;
         CompWideOffsetLoc = other.CompWideOffsetLoc;
+        CompWideHiresCapLoc = other.CompWideHiresCapLoc;
         WingHold = other.WingHold;
         WingCopy = other.WingCopy;
         WingHoldLines = other.WingHoldLines;
@@ -224,8 +249,12 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         glDeleteFramebuffers(1, &HeldWingsFB);
         HeldWingsFB = other.HeldWingsFB;
 
+        FreeHiresCapture();
+        HiresCap = other.HiresCap;
+
         other.HeldWingsTex = {};
         other.HeldWingsFB = {};
+        other.HiresCap = {};
         other.CompScreenOutputFB = {};
         other.CompScreenInputTex = {};
         other.CompScreenOutputTex = {};
@@ -245,7 +274,7 @@ bool GLCompositor::PrepareWide() noexcept
 
     // the same shaders with WIDE defined, which has to come after the #version line
     std::string vs = kCompositorVS;
-    std::string fs = kCompositorFS_Nearest;
+    std::string fs = CompositorFS();
     vs.insert(vs.find('\n') + 1, "#define WIDE\n");
     fs.insert(fs.find('\n') + 1, "#define WIDE\n");
 
@@ -264,11 +293,13 @@ bool GLCompositor::PrepareWide() noexcept
     CompWideScaleLoc = glGetUniformLocation(CompShaderWide, "u3DScale");
     CompWideRatioLoc = glGetUniformLocation(CompShaderWide, "uWideRatio");
     CompWideOffsetLoc = glGetUniformLocation(CompShaderWide, "uWideOffset");
+    CompWideHiresCapLoc = glGetUniformLocation(CompShaderWide, "uHiresCap");
 
     glUseProgram(CompShaderWide);
     glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
     glUniform1i(glGetUniformLocation(CompShaderWide, "_3DTex"), 1);
     glUniform1i(glGetUniformLocation(CompShaderWide, "HeldWingsTex"), 2);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "HiresBankTex"), 3);
 
     return true;
 }
@@ -282,6 +313,10 @@ void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
 {
     if (scale == Scale && viewWidth == ViewWidth)
         return;
+
+    // the hi-res capture copies are at the scale, a view width change keeps them
+    if (scale != Scale)
+        FreeHiresBanks();
 
     Scale = scale;
     ViewWidth = viewWidth;
@@ -322,6 +357,7 @@ void GLCompositor::Stop(const GPU& gpu) noexcept
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     ResetWingHold();
+    ResetHiresCapture();
 }
 
 void GLCompositor::ResetWingHold() noexcept
@@ -329,6 +365,12 @@ void GLCompositor::ResetWingHold() noexcept
     WingHold = {};
     WingCopy = {};
     WingHoldLines = {};
+}
+
+void GLCompositor::ResetHiresCapture() noexcept
+{
+    HiresCap.Banks = {};
+    HiresCap.ShowBank = -1;
 }
 
 // decides, from the control words of the frame being composited, which wing lines are held
@@ -425,7 +467,7 @@ void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
             u32 ctrl = fb[line * (256*3 + 1) + 256*3] & ~WingHeldBit;
             if ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1)
                 ctrl |= WingHeldBit;
-            WingCtrl[outLine] = ctrl;
+            CtrlWords[outLine] = ctrl;
         }
     }
 
@@ -467,12 +509,24 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     int backbuf = gpu.FrontBuffer ^ 1;
     bool hasFramebuffers = gpu.Framebuffer[backbuf][0] && gpu.Framebuffer[backbuf][1];
 
+    // hi-res capture: a bank written since the last Blit loses its copy. GPU clears the write
+    // masks right after this (GPU::HiresCaptureBlitDone), so they're folded in every frame, whether
+    // or not a pass runs: otherwise a write in a frame that doesn't capture would be forgotten
+    for (int bank = 0; bank < 4; bank++)
+    {
+        if (gpu.HiresCapWrites & (1 << bank))
+            HiresCap.Banks[bank].Valid = false;
+    }
+
     // before the output is bound, as this can set up the held wings' framebuffer
     bool wingHold = ViewWidth != 256 && hasFramebuffers;
     if (wingHold)
         PrepareWingHold(gpu, backbuf);
     else
         WingHoldLines = {};
+
+    // after the wing hold, which fills CtrlWords when it runs
+    bool hiresDisplay = hasFramebuffers && PrepareHiresDisplay(gpu, backbuf, wingHold);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
@@ -489,6 +543,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     {
         glUseProgram(CompShader);
         glUniform1ui(CompScaleLoc, Scale);
+        glUniform1i(CompHiresCapLoc, hiresDisplay);
     }
     else
     {
@@ -496,9 +551,16 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1ui(CompWideScaleLoc, Scale);
         glUniform1f(CompWideRatioLoc, ViewWidth / 256.0f);
         glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
+        glUniform1i(CompWideHiresCapLoc, hiresDisplay);
 
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
+    }
+
+    if (hiresDisplay)
+    {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, HiresCap.BankTex[HiresCap.ShowBank]);
     }
 
     glActiveTexture(GL_TEXTURE0);
@@ -511,10 +573,11 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256*3 + 1, 192, GL_RGBA_INTEGER,
                         GL_UNSIGNED_BYTE, gpu.Framebuffer[backbuf][1].get());
 
-        // the control words again, with the held lines flagged (see PrepareWingHold)
-        if (wingHold)
+        // the control words again, with the held lines flagged (see PrepareWingHold) and the
+        // hi-res capture flag only on the lines that show a copy (see PrepareHiresDisplay)
+        if (wingHold || hiresDisplay)
             glTexSubImage2D(GL_TEXTURE_2D, 0, 256*3, 0, 1, 384, GL_RGBA_INTEGER,
-                            GL_UNSIGNED_BYTE, WingCtrl.data());
+                            GL_UNSIGNED_BYTE, CtrlWords.data());
     }
 
     glActiveTexture(GL_TEXTURE1);
@@ -526,7 +589,367 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     if (wingHold && (WingCopy[0] || WingCopy[1]))
         CopyHeldWings(backbuf);
+
+    // after the draw, which shows the copies as they were before this frame's capture
+    if (gpu.HiresCapture)
+        RunHiresCapture(gpu, backbuf);
+    if (gpu.HiresCaptureDebug)
+        LogHiresCapture();
 }
+
+// hi-res display capture: decides which VRAM display lines show a hi-res bank copy. the 2D
+// renderer flags the candidates (control word bit 7, the bank in bits 5-6), and the flag is
+// cleared on the lines that fail any of:
+// - the bank's copy is valid and covers the line's row (VRAM display line L shows bank row L);
+// - no earlier capture wrote the bank without a pass redoing it (the record's StaleMask);
+// - this frame doesn't capture into the bank at a non-zero offset. at offset 0, display line L
+//   reads row L before capture line L writes it, so it sees the last pass's copy, as native does.
+// one copy is bound (unit 3), the bank of the first candidate line: other banks stay native.
+// bits 5-7 are cleared on every other line too, in case stale ones got through. returns whether
+// any line shows a copy, and then CtrlWords is what the shader gets
+bool GLCompositor::PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCopied) noexcept
+{
+    HiresCap.ShowBank = -1;
+    // without the pass no copy is valid (they're dropped on a scale change), and the 2D renderer
+    // flags no lines (GPU::Start2DJob)
+    if (!gpu.HiresCapture || !RunsHiresCapture(gpu.HiresCaptureDebug))
+        return false;
+
+    const HiresCaptureRecord* record = gpu.HiresCapRecord.get();
+    u8 stale = record ? record->StaleMask : gpu.NativeCapturedSincePass;
+    u8 offsetCapture = record ? record->OffsetMask : 0;
+
+    int firstBank = -1;
+    for (int half = 0; half < 2; half++)
+    {
+        const u32* fb = gpu.Framebuffer[backbuf][half].get();
+        for (int line = 0; line < 192; line++)
+        {
+            int outLine = half * 192 + line;
+            u32& ctrl = CtrlWords[outLine];
+            if (!ctrlCopied)
+                ctrl = fb[line * (256*3 + 1) + 256*3];
+
+            if (!(ctrl & HiresDisplayFlag))
+            {
+                ctrl &= ~HiresDisplayBits;
+                continue;
+            }
+
+            HiresCap.LinesCandidate++;
+            int bank = (ctrl >> 5) & 0x3;
+            if (firstBank < 0)
+                firstBank = bank;
+
+            if (bank == firstBank && HiresCap.BankTex[bank] && HiresCap.Banks[bank].Covers(line) &&
+                !(stale & (1 << bank)) && !(offsetCapture & (1 << bank)))
+            {
+                HiresCap.ShowBank = bank;
+                HiresCap.LinesShown++;
+            }
+            else
+                ctrl &= ~HiresDisplayBits;
+        }
+    }
+
+    return HiresCap.ShowBank >= 0;
+}
+
+// the capture pass: redoes this frame's display capture at the 3D scale, from the record the 2D
+// renderer made (GPU::HiresCapRecord), the hi-res 3D frame (still bound on unit 1 by
+// SetupAccelFrame: the next 3D frame only replaces it at line 215, after this in GL command order)
+// and the source B copy, into the destination bank's copy. the copies of the banks this frame
+// captured into are dropped first, so a capture that can't be redone leaves its destination native
+void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
+{
+    const HiresCaptureRecord* record = gpu.HiresCapRecord.get();
+    if (!record || !record->DstMask)
+        return;
+
+    HiresCap.Captures++;
+
+    u32 skip = record->Skip;
+    int dst = (record->Layout >> 16) & 0x3;
+    int dstRow = ((record->Layout >> 18) & 0x3) * 64;
+    int size = (record->Layout >> 20) & 0x3;
+    int rows = size * 64;
+
+    if (size == 0)
+        skip |= HiresCapSkip_Size;
+    else if (dstRow + rows > 256)
+        skip |= HiresCapSkip_Wrap;
+    else
+    {
+        for (int line = 0; line < rows; line++)
+        {
+            if (!record->HasLine(line))
+                skip |= HiresCapSkip_Missing;
+        }
+    }
+
+    if (gpu.HiresCapWritesInCapture & (1 << dst))
+        skip |= HiresCapSkip_Written;
+    // the check mode runs the pass at 1x too, to compare it with the native capture. GPU records
+    // nothing at 1x otherwise (RunsHiresCapture), so this only catches lines held across a change
+    if (Scale == 1 && gpu.HiresCaptureDebug < 2)
+        skip |= HiresCapSkip_Native1x;
+    if (!skip && !PrepareHiresCaptureShader())
+        skip |= HiresCapSkip_Shader;
+
+    // where each line's source B comes from, decided with the copies as they were before this
+    // pass: the source bank's copy if it's valid over the row read, no earlier capture wrote the
+    // bank without a pass, and, for the destination bank itself, the row read is the row written
+    // (capture line L reads it before writing it, so it reads the last pass's copy). one source B
+    // copy is bound, the first one a line can use. otherwise the native words, and always those
+    // for the display FIFO
+    int bankB = -1;
+    bool anyPlanes = false, anyNativeB = false;
+    if (!skip)
+    {
+        for (int line = 0; line < rows; line++)
+        {
+            const HiresCaptureRecord::Line& entry = record->Lines[line];
+            u32 capcnt = entry.CaptureCnt;
+            u32 mode = (capcnt >> 29) & 0x3;
+
+            bool hiresB = false;
+            if (mode != 0 && entry.SrcBPresent)
+            {
+                int bank = entry.SrcBBank;
+                int row = entry.SrcBRow;
+                hiresB = !entry.SrcBFIFO && HiresCap.BankTex[bank] && HiresCap.Banks[bank].Covers(row) &&
+                         !(record->StaleMask & (1 << bank)) && (bank != dst || row == dstRow + line) &&
+                         (bankB < 0 || bank == bankB);
+                if (hiresB)
+                {
+                    bankB = bank;
+                    HiresCap.LinesHiresB++;
+                }
+                else
+                {
+                    anyNativeB = true;
+                    HiresCap.LinesNativeB++;
+                }
+            }
+            if (mode != 1 && !(capcnt & (1 << 24)))
+                anyPlanes = true;
+
+            HiresCapCtrl[line * 2] = capcnt;
+            HiresCapCtrl[line * 2 + 1] = (entry.RenderXPos & 0x1FF) | (hiresB << 9) |
+                                         (entry.SrcBPresent << 10) | (entry.SrcBRow << 16);
+        }
+    }
+
+    for (int bank = 0; bank < 4; bank++)
+    {
+        if (record->DstMask & (1 << bank))
+            HiresCap.Banks[bank].Valid = false;
+    }
+
+    if (skip)
+    {
+        for (int i = 0; i < HiresCapSkipCount; i++)
+        {
+            if (skip & (1 << i))
+                HiresCap.Skips[i]++;
+        }
+        return;
+    }
+
+    if (!HiresCap.PlanesTex)
+        HiresCap.PlanesTex = MakeHiresTexture(GL_RGBA8UI, 256*3 + 2, 192);
+    if (!HiresCap.SrcBTex)
+        HiresCap.SrcBTex = MakeHiresTexture(GL_R16UI, 256, 192);
+    if (!HiresCap.ScratchTex)
+        HiresCap.ScratchTex = MakeHiresTexture(GL_R16UI, 256 * Scale, 256 * Scale);
+    if (!HiresCap.PassFB)
+        glGenFramebuffers(1, &HiresCap.PassFB);
+
+    // only the captured lines, and the planes and source B words only when a line reads them
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, HiresCap.PlanesTex);
+    if (anyPlanes)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256*3, rows, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, record->Planes);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 256*3, 0, 2, rows, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, HiresCapCtrl.data());
+
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, HiresCap.SrcBTex);
+    if (anyNativeB)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, rows, GL_RED_INTEGER, GL_UNSIGNED_SHORT, record->SrcB);
+
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, bankB >= 0 ? HiresCap.BankTex[bankB] : 0);
+    // unit 3 can still have the scratch texture from an earlier frame's draw. the capture program
+    // doesn't read it, but no texture the pass draws into stays bound
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // the captured rows only, with the viewport: classic GL leaves the scissor test off and
+    // calls glScissor assuming it is
+    GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, HiresCap.PassFB);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HiresCap.ScratchTex, 0);
+    glDrawBuffers(1, fbassign);
+    glViewport(0, dstRow * Scale, 256 * Scale, rows * Scale);
+
+    glUseProgram(HiresCap.Shader);
+    glUniform1i(HiresCap.ScaleLoc, Scale);
+    glUniform1i(HiresCap.WideOffsetLoc, (ViewWidth - 256) / 2);
+    glUniform1i(HiresCap.DstRowLoc, dstRow);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    std::swap(HiresCap.BankTex[dst], HiresCap.ScratchTex);
+    HiresCap.Banks[dst] = {true, dstRow, rows};
+    HiresCap.Passes++;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (gpu.HiresCaptureDebug >= 2 && Scale == 1 && (HiresCap.CheckCount++ % 30) == 0)
+        CheckHiresCapture(gpu, dst, dstRow, rows);
+#endif
+
+    // back to what RenderFrame leaves bound, like CopyHeldWings. the viewport too, which
+    // CopyHeldWings never changes
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glActiveTexture(GL_TEXTURE1);
+}
+
+bool GLCompositor::PrepareHiresCaptureShader() noexcept
+{
+    if (HiresCap.Shader || HiresCap.ShaderFailed)
+        return HiresCap.Shader != 0;
+
+    GLuint shader {};
+    if (!OpenGL::CompileVertexFragmentProgram(shader,
+            kHiresCaptureVS, HiresCaptureFS(),
+            "HiresCaptureShader",
+            {},
+            {{"oWord", 0}}))
+    {
+        HiresCap.ShaderFailed = true;
+        return false;
+    }
+
+    HiresCap.Shader = shader;
+    HiresCap.ScaleLoc = glGetUniformLocation(shader, "uScale");
+    HiresCap.WideOffsetLoc = glGetUniformLocation(shader, "uWideOffset");
+    HiresCap.DstRowLoc = glGetUniformLocation(shader, "uDstRow");
+
+    glUseProgram(shader);
+    glUniform1i(glGetUniformLocation(shader, "PlanesTex"), 4);
+    glUniform1i(glGetUniformLocation(shader, "_3DTex"), 1);
+    glUniform1i(glGetUniformLocation(shader, "SrcBTex"), 5);
+    glUniform1i(glGetUniformLocation(shader, "BankBTex"), 6);
+    return true;
+}
+
+// an integer texture for the capture pass, made on unit 7 so no binding the frame uses changes
+GLuint GLCompositor::MakeHiresTexture(GLenum format, int width, int height) noexcept
+{
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexStorage2D(GL_TEXTURE_2D, 1, format, width, height);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return texture;
+}
+
+// the bank copies and the scratch texture are at the scale, so a scale change frees them
+void GLCompositor::FreeHiresBanks() noexcept
+{
+    glDeleteTextures(HiresCap.BankTex.size(), HiresCap.BankTex.data());
+    glDeleteTextures(1, &HiresCap.ScratchTex);
+    HiresCap.BankTex = {};
+    HiresCap.ScratchTex = 0;
+    ResetHiresCapture();
+}
+
+void GLCompositor::FreeHiresCapture() noexcept
+{
+    FreeHiresBanks();
+    glDeleteTextures(1, &HiresCap.PlanesTex);
+    glDeleteTextures(1, &HiresCap.SrcBTex);
+    glDeleteFramebuffers(1, &HiresCap.PassFB);
+    glDeleteProgram(HiresCap.Shader);
+    HiresCap.PlanesTex = 0;
+    HiresCap.SrcBTex = 0;
+    HiresCap.PassFB = 0;
+    HiresCap.Shader = 0;
+}
+
+// debug only (GPU::HiresCaptureDebug): once a second, how many captures there were and passes
+// ran, how many VRAM display lines were candidates and showed a copy, how many capture lines took
+// source B from a copy or the native words, and why captures were skipped
+void GLCompositor::LogHiresCapture() noexcept
+{
+    static_assert(HiresCapSkipCount == HiresCapSkip_Count);
+
+    s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (HiresCap.LogStartNs == 0)
+        HiresCap.LogStartNs = now;
+    if (now - HiresCap.LogStartNs < 1000000000)
+        return;
+
+    const std::array<u32, HiresCapSkipCount>& s = HiresCap.Skips;
+    Log(LogLevel::Info, "HIRESCAP scale=%d captures=%u passes=%u shown=%u/%u srcb=%u/%u skip "
+        "layout=%u vcount=%u abort=%u nolcdc=%u size=%u wrap=%u missing=%u written=%u 1x=%u shader=%u\n",
+        Scale, HiresCap.Captures, HiresCap.Passes, HiresCap.LinesShown, HiresCap.LinesCandidate,
+        HiresCap.LinesHiresB, HiresCap.LinesHiresB + HiresCap.LinesNativeB,
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]);
+
+    HiresCap.LogStartNs = now;
+    HiresCap.Captures = HiresCap.Passes = 0;
+    HiresCap.LinesShown = HiresCap.LinesCandidate = 0;
+    HiresCap.LinesHiresB = HiresCap.LinesNativeB = 0;
+    HiresCap.Skips = {};
+}
+
+#ifdef MELONADE_DEBUG_TOOLS
+// check mode (GPU::HiresCaptureDebug 2, at 1x): reads the copy the pass just made back and
+// compares it with the native capture in VRAM, which it should match word for word
+void GLCompositor::CheckHiresCapture(const GPU& gpu, int bank, int rowStart, int rows) noexcept
+{
+    // R16UI reads back as GL_RGBA_INTEGER/GL_UNSIGNED_INT, which GLES 3 always allows for it.
+    // the pass framebuffer still has the copy attached
+    std::vector<u32> texels(256 * rows * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, HiresCap.PassFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glReadPixels(0, rowStart, 256, rows, GL_RGBA_INTEGER, GL_UNSIGNED_INT, texels.data());
+
+    const u16* vram = (const u16*)gpu.VRAM[bank];
+    int mismatches = 0, firstX = -1, firstY = -1;
+    u32 firstHires = 0, firstNative = 0;
+    for (int y = 0; y < rows; y++)
+    {
+        for (int x = 0; x < 256; x++)
+        {
+            u32 hires = texels[(y * 256 + x) * 4];
+            u32 native = vram[(rowStart + y) * 256 + x];
+            if (hires == native)
+                continue;
+
+            if (mismatches++ == 0)
+            {
+                firstX = x;
+                firstY = rowStart + y;
+                firstHires = hires;
+                firstNative = native;
+            }
+        }
+    }
+
+    Log(LogLevel::Info, "HIRESCAP check bank=%c rows=%d-%d mismatches=%d first=(%d,%d) hires=%04X native=%04X\n",
+        'A' + bank, rowStart, rowStart + rows - 1, mismatches, firstX, firstY, firstHires, firstNative);
+}
+#endif
 
 void GLCompositor::SetOutputTexture(int buf, GLuint texture)
 {

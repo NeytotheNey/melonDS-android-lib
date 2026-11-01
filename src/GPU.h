@@ -35,6 +35,67 @@ namespace Platform { struct Thread; }
 static constexpr u32 VRAMDirtyGranularity = 512;
 class GPU;
 
+// hi-res display capture (see GPU::HiresCapture): why a frame's capture isn't redone at the 3D
+// scale. the 2D renderer sets the first four while it records, the compositor the others
+enum : u32
+{
+    HiresCapSkip_Layout   = 1 << 0, // the destination, its offset or the size changed between lines
+    HiresCapSkip_VCount   = 1 << 1, // a VCount write: a captured line isn't the line it was drawn as,
+                                    // or lines held from an earlier frame go into this record
+    HiresCapSkip_Abort    = 1 << 2, // the 3D frame was aborted, so the capture read no 3D
+    HiresCapSkip_NoLCDC   = 1 << 3, // the destination bank isn't in LCDC mode
+    HiresCapSkip_Size     = 1 << 4, // 128x128 (two lines per bank row)
+    HiresCapSkip_Wrap     = 1 << 5, // the rectangle wraps past row 255
+    HiresCapSkip_Missing  = 1 << 6, // not every line of the rectangle was captured
+    HiresCapSkip_Written  = 1 << 7, // the CPU wrote or remapped the destination during the capture
+    HiresCapSkip_Native1x = 1 << 8, // at 1x the native capture is already what the pass would make
+    HiresCapSkip_Shader   = 1 << 9, // the capture program didn't build
+    HiresCapSkip_Count    = 10,
+};
+
+// hi-res display capture: what DoCapture saw on each capture line of a frame, for the GL
+// compositor's capture pass (GLCompositor::RunHiresCapture), which redoes the frame's capture at
+// the 3D scale from it. lines are indexed by the capture line. the 2D renderer writes it on the
+// emulator thread (capture lines are never drawn on the 2D thread), the compositor reads it at the
+// line-192 Blit, and GPU clears it right after (see GPU::HiresCaptureBlitDone)
+struct HiresCaptureRecord
+{
+    u32 Skip;               // HiresCapSkip_* bits
+    u32 LineMask[6];        // the capture lines recorded
+    u32 Layout;             // the first line's destination bank, offset and size (DISPCAPCNT bits 16-21)
+    u8 DstMask;             // the banks this frame captured into (see GPU::NativeCapturedSincePass)
+    u8 OffsetMask;          // the ones of them captured at a non-zero offset
+    u8 StaleMask;           // GPU::NativeCapturedSincePass before this frame's lines: banks an earlier
+                            // capture wrote that no pass redid
+
+    struct Line
+    {
+        u32 CaptureCnt;
+        u16 RenderXPos;     // the 3D X scroll the line's 3D was fetched with
+        u8 SrcBBank;        // source B's LCDC bank and the row DoCapture read
+        u8 SrcBRow;
+        bool SrcBPresent;   // DoCapture's srcB != NULL: without it, it takes its A-only branch
+        bool SrcBFIFO;      // source B is the display FIFO
+    };
+    Line Lines[192];
+
+    // the three accelerated 2D planes (val1, val2, val3) before DoCapture composites plane 0
+    u32 Planes[192][256*3];
+    // source B as DoCapture read it
+    u16 SrcB[192][256];
+
+    void Clear() noexcept
+    {
+        Skip = 0;
+        for (u32& mask : LineMask) mask = 0;
+        Layout = 0;
+        DstMask = 0;
+        OffsetMask = 0;
+    }
+
+    bool HasLine(u32 line) const noexcept { return (LineMask[line >> 5] >> (line & 31)) & 1; }
+};
+
 template <u32 Size, u32 MappingGranularity>
 struct VRAMTrackingSet
 {
@@ -253,6 +314,10 @@ public:
         {
             *(T*)&VRAM[bank][addr] = val;
             VRAMDirty[bank][addr / VRAMDirtyGranularity] = true;
+
+            // banks A-D can hold a hi-res capture copy, which this write makes stale
+            if (bank < 4)
+                NoteHiresCaptureWrite(bank);
         }
     }
 
@@ -661,6 +726,37 @@ public:
     // thread's clock up. 0 = no fence, no poll. only changed by a debug switch
     int CaptureSpinUs = 6000;
 
+    // hi-res display capture, OpenGL and compute renderers: the GL compositor keeps an upscaled
+    // shadow copy of the banks (A-D) display capture writes, redone each capture frame from the
+    // 2D planes and the hi-res 3D (GLCompositor::RunHiresCapture), and VRAM display shows it.
+    // native capture and what the game reads stay as they were. set with SetHiresCapture
+    bool HiresCapture = false;
+    // debug only: 1 logs a HIRESCAP line once a second, 2 also runs the pass at 1x and compares
+    // the copy with the native capture every 30 passes
+    int HiresCaptureDebug = 0;
+    // banks A-D written (by the CPU, DMA or a VRAMCNT change) since the last Blit, and of those the
+    // ones written while this frame's capture was armed. both only live one frame: the compositor
+    // folds them into its bank state at every Blit, then they're cleared (HiresCaptureBlitDone)
+    u8 HiresCapWrites = 0;
+    u8 HiresCapWritesInCapture = 0;
+    // banks native capture wrote (DoCapture, set on every capture line) that no capture pass has
+    // redone yet. only clearing them consumes a record, so a record no Blit reached keeps its
+    // banks native until a later pass covers them
+    u8 NativeCapturedSincePass = 0;
+    // this frame's capture lines, made the first time one is recorded (~680 KB)
+    std::unique_ptr<HiresCaptureRecord> HiresCapRecord;
+
+    void SetHiresCapture(bool enable) noexcept;
+    // DoCapture, on every capture line it draws with HiresCapture on: the line's record entry
+    HiresCaptureRecord& RecordHiresCaptureLine(u32 line, u32 captureCnt) noexcept;
+
+    void NoteHiresCaptureWrite(u32 bank) noexcept
+    {
+        HiresCapWrites |= 1 << bank;
+        if (GPU2D_A.CaptureLatch)
+            HiresCapWritesInCapture |= 1 << bank;
+    }
+
     GPU2D::Unit GPU2D_A;
     GPU2D::Unit GPU2D_B;
     melonDS::GPU3D GPU3D;
@@ -694,6 +790,8 @@ public:
     alignas(u64) u8 VRAMFlat_TexPal[128*1024] {};
 private:
     void ResetVRAMCache() noexcept;
+    void ResetHiresCapture() noexcept;
+    void HiresCaptureBlitDone() noexcept;
     void AssignFramebuffers() noexcept;
     void InitFramebuffers() noexcept;
     void LogHash2D() noexcept;

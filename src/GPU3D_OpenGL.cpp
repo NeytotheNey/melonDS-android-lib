@@ -344,8 +344,9 @@ GLRenderer::~GLRenderer()
 
 void GLRenderer::Reset(GPU& gpu)
 {
-    // held WideMelon wings belong to the old scene
+    // held WideMelon wings and hi-res capture copies belong to the old scene
     CurGLCompositor.ResetWingHold();
+    CurGLCompositor.ResetHiresCapture();
     TexMemDirtyAll = true;
     TargetsChanged = true;
 }
@@ -1777,6 +1778,7 @@ void GLRenderer::BindOutputTexture(int buffer)
 void GLRenderer::SavestateLoaded()
 {
     CurGLCompositor.ResetWingHold();
+    CurGLCompositor.ResetHiresCapture();
 }
 
 u32* GLRenderer::GetLine(int line)

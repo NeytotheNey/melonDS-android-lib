@@ -302,6 +302,19 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
                      (CurUnit->DispCnt & 0x30000) |
                      (xpos << 24) | ((xpos & 0x100) << 15);
 
+        if (CurJob->HiresCapture)
+        {
+            // hi-res display capture: bit 7 = a VRAM display line the GL compositor may show from
+            // its hi-res copy of the bank in bits 5-6 (see GLCompositor::PrepareHiresDisplay). only
+            // when the bank is in LCDC mode and no VCount write moved the line, so the line shows
+            // bank row Line. MasterBrightness is masked again first: a savestate loads it unmasked,
+            // and older ones may have these bits set
+            dst[256*3] &= ~0x3FE0;
+            u32 vrambank = (CurUnit->DispCnt >> 18) & 0x3;
+            if (dispmode == 2 && (CurJob->VRAMMap_LCDC & (1<<vrambank)) && CurJob->VCount == CurJob->Line)
+                dst[256*3] |= 0x80 | (vrambank << 5);
+        }
+
         if (CurJob->WideView)
         {
             // wide 3D view: bit 18 = this line shows unit A's 3D layer in the wings, bits 19-20 = its
@@ -310,8 +323,9 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
             // line, whatever the windows do with it (the wing hold reads it to tell which half
             // unit A is in). the fade bits are only read with bit 18: a line whose wings a window
             // hid has black wings, and a held line takes the copied wings with their fade as
-            // drawn. the master brightness register doesn't use bits 5-13 (the GL compositor
-            // flags held wing lines with bit 13 in its own copy, see GLCompositor::PrepareWingHold)
+            // drawn. the master brightness register doesn't use bits 5-13: 5-7 are the hi-res
+            // capture flag above, and the GL compositor flags held wing lines with bit 13 in its
+            // own copy (see GLCompositor::PrepareWingHold)
             dst[256*3] &= ~0x1F00;
 
             if ((dispmode == 0) || ((dispmode == 1) &&
@@ -431,11 +445,32 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
 {
     u32 captureCnt = CurUnit->CaptureCnt;
     u32 dstvram = (captureCnt >> 16) & 0x3;
+    u32 capmode = (captureCnt >> 29) & 0x3;
+
+    // hi-res display capture: what this line captures from, for the GL compositor to redo it at
+    // the 3D scale (see GPU::HiresCapture). the native capture below is unchanged
+    HiresCaptureRecord* record = nullptr;
+    HiresCaptureRecord::Line* recordLine = nullptr;
+    if (CurJob->HiresCapture)
+    {
+        record = &GPU.RecordHiresCaptureLine(line, captureCnt);
+        recordLine = &record->Lines[line];
+        recordLine->RenderXPos = CurJob->RenderXPos;
+
+        if (CurJob->VCount != CurJob->Line)
+            record->Skip |= HiresCapSkip_VCount;
+        if (capmode != 1 && CurJob->Abort3DLine)
+            record->Skip |= HiresCapSkip_Abort;
+    }
 
     // TODO: confirm this
     // it should work like VRAM display mode, which requires VRAM to be mapped to LCDC
     if (!(CurJob->VRAMMap_LCDC & (1<<dstvram)))
+    {
+        if (record)
+            record->Skip |= HiresCapSkip_NoLCDC;
         return;
+    }
 
     u16* dst = (u16*)GPU.VRAM[dstvram];
     u32 dstaddr = (((captureCnt >> 18) & 0x3) << 14) + (line * width);
@@ -450,6 +485,11 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
     else
     {
         srcA = BGOBJLine;
+
+        // the planes as the compositor gets them, before plane 0 is overwritten below
+        if (record && capmode != 1)
+            memcpy(record->Planes[line], BGOBJLine, sizeof(record->Planes[line]));
+
         if (CurJob->Accelerated)
         {
             // in GPU3D::CurrentRenderer->Accelerated mode, compositing is normally done on the GPU
@@ -531,6 +571,19 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
 
     dstaddr &= 0xFFFF;
     srcBaddr &= 0xFFFF;
+
+    if (record && capmode != 0)
+    {
+        recordLine->SrcBPresent = srcB != NULL;
+        recordLine->SrcBFIFO = (captureCnt & (1<<25)) != 0;
+        recordLine->SrcBBank = (CurUnit->DispCnt >> 18) & 0x3;
+        recordLine->SrcBRow = srcBaddr >> 8;
+        if (srcB)
+        {
+            for (u32 i = 0; i < 256; i++)
+                record->SrcB[line][i] = srcB[(srcBaddr + i) & 0xFFFF];
+        }
+    }
 
     static_assert(VRAMDirtyGranularity == 512);
     GPU.VRAMDirty[dstvram][(dstaddr * 2) / VRAMDirtyGranularity] = true;
