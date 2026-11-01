@@ -697,8 +697,7 @@ void Unit::PostDrawScanline(u32 line)
     // skip exactly the cases it skips (see SoftRenderer::DrawScanline and DrawScanline_BGOBJ).
     // the line's snapshot for DrawScanline is taken before this, the one for DrawSprites after
 
-    // forced white, or the unit is disabled by POWCNT1: nothing is drawn
-    if (line > 192) return;
+    // the unit is disabled by POWCNT1: nothing is drawn
     if (!Enabled) return;
 
     // the counters below keep running during forced blank: it only blanks the output

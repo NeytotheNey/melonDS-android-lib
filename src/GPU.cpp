@@ -1675,7 +1675,11 @@ void GPU::SetDispStat(u32 cpu, u16 val, u16 mask) noexcept
 
 void GPU::SetVCount(u16 val, u16 mask) noexcept
 {
-    val = (NextVCount & ~mask) | (val & mask);
+    // the VCount register is 9 bits wide. a byte write merges with the value already
+    // pending for the next scanline, or with the current VCount when there is none
+    // (NextVCount is the no-write sentinel then, not a value to merge into)
+    u16 base = (NextVCount != 0xFFFFFFFF) ? (u16)NextVCount : VCount;
+    val = ((base & ~mask) | (val & mask)) & 0x1FF;
 
     // VCount write is delayed until the next scanline
 
