@@ -30,7 +30,11 @@ for the Nintendo DS system. This code is in no way affiliated with Nintendo
 and is not derived from Nintendo's BIOS implementation but has been implemented
 using publically available documentation.
 
-It can be assembled using the included Makefile along with a proper ARM gcc
-toolchain. Change the first four lines to point to the proper toolchain of your
-choice.
+It can be assembled with build.sh (or `make`), which uses clang, ld.lld and
+llvm-objcopy by default, or a GNU ARM toolchain when PREFIX is set, e.g.
+`PREFIX=arm-none-eabi- ./build.sh`. build.sh writes drastic_bios_arm7.bin
+(16384 bytes) and drastic_bios_arm9.bin (4096 bytes) and regenerates the
+arrays in ../src/FreeBIOS.cpp. check.sh (or `make check`) rebuilds into a
+temporary directory and fails if the committed .bin files or the arrays in
+src/FreeBIOS.cpp do not match bios_common.S. Never hand-edit the hex.
 

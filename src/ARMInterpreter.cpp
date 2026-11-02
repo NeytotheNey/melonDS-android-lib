@@ -23,6 +23,9 @@
 #include "ARMInterpreter_Branch.h"
 #include "ARMInterpreter_LoadStore.h"
 #include "Platform.h"
+#ifdef MELONADE_SWI_LOG
+#include "SWILog.h"
+#endif
 
 #ifdef GDBSTUB_ENABLED
 #include "debug/GdbStub.h"
@@ -266,6 +269,9 @@ void A_MRC(ARM* cpu)
 
 void A_SVC(ARM* cpu)
 {
+#ifdef MELONADE_SWI_LOG
+    SWILog::OnEntry(cpu, cpu->CurInstr & 0xFFFFFF, false);
+#endif
     u32 oldcpsr = cpu->CPSR;
     cpu->CPSR &= ~0xBF;
     cpu->CPSR |= 0x93;
@@ -278,6 +284,9 @@ void A_SVC(ARM* cpu)
 
 void T_SVC(ARM* cpu)
 {
+#ifdef MELONADE_SWI_LOG
+    SWILog::OnEntry(cpu, cpu->CurInstr & 0xFF, true);
+#endif
     u32 oldcpsr = cpu->CPSR;
     cpu->CPSR &= ~0xBF;
     cpu->CPSR |= 0x93;
