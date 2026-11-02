@@ -447,34 +447,54 @@ swi_cpu_set:
   b swi_complete
 
 
-// TODO: Make this actually faster (ldm/stm)
+// Length is in words and is rounded up to a multiple of 8 (GBATEK); each
+// iteration moves 8 words with ldm/stm. r5-r10 are stacked for the burst.
+#define fast_count    r12
+
 swi_cpu_fast_set:
   // Only take 21 bits for length.
-  bic length, copy_control, #0xFF000000
-  bic length, length, #0x00E00000
+  bic fast_count, copy_control, #0xFF000000
+  bic fast_count, fast_count, #0x00E00000
 
+  // Round up to a multiple of 8 words and count 8-word blocks
+  add fast_count, fast_count, #7
+  movs fast_count, fast_count, lsr #3
+  beq swi_complete
+
+  stmdb sp!, { r5 - r10 }
   tst copy_control, #(1 << 24)
   bic source, #0x3
   bic dest, #0x3
   bne fast_set_32bit
 
  0:
-  ldr value, [ source ], #4
-  subs length, length, #1
-  str value, [ dest ], #4
+  ldmia source!, { r3 - r10 }
+  subs fast_count, fast_count, #1
+  stmia dest!, { r3 - r10 }
   bne 0b
 
+  ldmia sp!, { r5 - r10 }
   b swi_complete
 
  fast_set_32bit:
-  ldr value, [ source ]
+  ldr r3, [ source ]
+  mov r4, r3
+  mov r5, r3
+  mov r6, r3
+  mov r7, r3
+  mov r8, r3
+  mov r9, r3
+  mov r10, r3
 
  0:
-  str value, [ dest ], #4
-  subs length, length, #1
+  stmia dest!, { r3 - r10 }
+  subs fast_count, fast_count, #1
   bne 0b
 
+  ldmia sp!, { r5 - r10 }
   b swi_complete
+
+#undef fast_count
 
 
 #undef remainder
@@ -778,9 +798,111 @@ swi_lz77_decompress_vram:
   b 0b
  
 
-// TODO: Needs to be implemented 
+// Huffman decompression (GBATEK HuffUnComp).
+// Header: bits 0-3 data size in bits (4 or 8), bits 4-7 type (2), bits 8-31
+// decompressed size in bytes. Then the tree: a tree-size byte (table length
+// (byte+1)*2, counted from that byte), the root node, and the rest of the
+// nodes. Node: bits 0-5 offset, bit 6 node1 end flag, bit 7 node0 end flag;
+// the children of a node at A are at (A & ~1) + 2 + offset*2 (+1 for node1).
+// The bitstream follows the tree as 32-bit words, read MSB first.
+// Output is written in 32-bit units filled LSB first. A word is only written
+// once 32 bits are collected, and the remaining size is decreased by 4 per
+// word, so a size that is not a multiple of 4 is rounded up to the next word
+// (the stream has to carry the padding symbols, as with the real BIOS). A size
+// of 0, or a data size of 0, writes nothing.
+
+#define huff_source       r0
+#define huff_dest         r1
+#define huff_size         r2
+#define huff_data_shift   r3
+#define huff_root         r4
+#define huff_node_addr    r12
+#define huff_node         lr
+#define huff_bits         r5
+#define huff_bits_left    r6
+#define huff_out          r7
+#define huff_out_left     r8
+#define huff_data_bits    r9
+#define huff_tmp          r10
+
 swi_huffman_decompress:
+  stmdb sp!, { r5 - r10 }
+  ldr huff_size, [ huff_source ], #4
+
+  ands huff_data_bits, huff_size, #0xF
+  beq 9f
+  rsb huff_data_shift, huff_data_bits, #32
+  movs huff_size, huff_size, lsr #8
+  beq 9f
+
+  // huff_source points at the tree-size byte; the root follows it and the
+  // bitstream starts (byte+1)*2 bytes after it.
+  ldrb huff_tmp, [ huff_source ]
+  add huff_root, huff_source, #1
+  add huff_source, huff_source, huff_tmp, lsl #1
+  add huff_source, huff_source, #2
+
+  mov huff_node_addr, huff_root
+  ldrb huff_node, [ huff_root ]
+  mov huff_out_left, #32
+
+  // Load the next 32 bits of the stream
+ 0:
+  ldr huff_bits, [ huff_source ], #4
+  mov huff_bits_left, #32
+
+  // Step to the child picked by the next bit
+ 1:
+  bic huff_node_addr, huff_node_addr, #1
+  and huff_tmp, huff_node, #0x3F
+  add huff_node_addr, huff_node_addr, huff_tmp, lsl #1
+  add huff_node_addr, huff_node_addr, #2
+  movs huff_bits, huff_bits, lsl #1
+  addcs huff_node_addr, huff_node_addr, #1
+  // Z is cleared if the child taken is a data node
+  tstcs huff_node, #0x40
+  tstcc huff_node, #0x80
+  ldrb huff_node, [ huff_node_addr ]
+  beq 2f
+
+  // Data node: shift the symbol into the top of the output word
+  mov huff_out, huff_out, lsr huff_data_bits
+  orr huff_out, huff_out, huff_node, lsl huff_data_shift
+  subs huff_out_left, huff_out_left, huff_data_bits
+  bgt 3f
+
+  str huff_out, [ huff_dest ], #4
+  subs huff_size, huff_size, #4
+  ble 9f
+  mov huff_out_left, #32
+
+  // Back to the root for the next symbol
+ 3:
+  mov huff_node_addr, huff_root
+  ldrb huff_node, [ huff_root ]
+
+ 2:
+  subs huff_bits_left, huff_bits_left, #1
+  bne 1b
+  b 0b
+
+ 9:
+  ldmia sp!, { r5 - r10 }
   b swi_complete
+
+#undef huff_source
+#undef huff_dest
+#undef huff_size
+#undef huff_data_shift
+#undef huff_root
+#undef huff_node_addr
+#undef huff_node
+#undef huff_bits
+#undef huff_bits_left
+#undef huff_out
+#undef huff_out_left
+#undef huff_data_bits
+#undef huff_tmp
 
   
 #define source        r0
@@ -1239,49 +1361,93 @@ swi_get_volume_table:
   b swi_complete
 #endif
 
-stack_pointer_irq:
+// SoftReset (GBATEK, NDS): clears the 200h bytes at the top of the stack
+// area (stacks, IRQ handler pointer and IRQ check flags), sets up the svc,
+// irq and sys stacks, zeroes r0-r12 and jumps to the entry address in
+// system mode with IRQs enabled. bx is used so a Thumb entry works.
+//   ARM7: clears 0380FE00h-0380FFFFh (via the 03FFFExxh mirror),
+//         sp_svc = 0380FFDCh, sp_irq = 0380FFB0h, sp_sys = 0380FF00h,
+//         entry from [027FFE34h].
+//   ARM9: clears DTCM+3E00h-DTCM+3FFFh,
+//         sp_svc = DTCM+3FC0h, sp_irq = DTCM+3F80h, sp_sys = DTCM+2F7Ch,
+//         entry from [027FFE24h]. These are the values melonDS's direct
+//         boot (NDS::SetupDirectBoot) sets with DTCM at 03000000h, used here
+//         because GBATEK could not be checked when this was written.
+// lr_svc, lr_irq and the svc/irq SPSRs are cleared; lr_sys holds the entry.
+
+#ifdef BIOS_ARM7
+stack_pointer_svc:
   .word 0x0380ffdc
+#endif
 
 swi_soft_reset:
-  // set r0 to 0x3FFFE00 (points to stack space)
+#ifdef BIOS_ARM9
+  // r0 = DTCM base + 0x4000
+  mrc p15, 0, r0, cr9, cr1, 0
+  mov r0, r0, lsr #12
+  mov r0, r0, lsl #12
+  add r0, r0, #0x4000
+#else
+  // r0 = 0x04000000, the top of the 0x03FFFE00 mirror of 0x0380FE00
   mov r0, #0x4000000
+#endif
   mov r1, #0x80
   mov r2, #0
 
-  // Clear stack space
+  // Clear 0x200 bytes downwards; r0 ends at the start of the cleared area
  0:
   str r2, [ r0, #-4 ]!
   subs r1, r1, #1
   bne 0b
 
-  // Stack pointer base
-  ldr r1, stack_pointer_irq
+  // r1 = sp_svc
+#ifdef BIOS_ARM9
+  add r1, r0, #0x1C0
+#else
+  ldr r1, stack_pointer_svc
+#endif
 
-  // Initialize supervisor SPSR, LR, and SP (disable interrupts)
+  // Supervisor mode, interrupts disabled
   mov r3, #0xd3
   msr CPSR_fsxc, r3
-  // sp_svc = 0x0380ffdc
   mov sp, r1
   mov lr, r2
   msr SPSR_fsxc, r2
 
-  // Initialize IRQ SPSR, LR, and SP (disable interrupts)
+  // IRQ mode, interrupts disabled
   mov r3, #0xd2
   msr CPSR_fsxc, r3
-  // sp_irq = 0x0380ffb0
+#ifdef BIOS_ARM9
+  // sp_irq = DTCM+3F80h
+  sub sp, r1, #0x40
+#else
+  // sp_irq = 0x0380FFB0
   sub sp, r1, #(0xdc - 0xb0)
+#endif
   mov lr, r2
   msr SPSR_fsxc, r2
 
-  // Initialize system SPSR, LR, and SP (enable interrupts)
+  // System mode, interrupts enabled
   mov r3, #0x5f
   msr CPSR_fsxc, r3
-  // sp = 0x0380ff00
+#ifdef BIOS_ARM9
+  // sp_sys = DTCM+2F7Ch
+  sub sp, r1, #0x1000
+  sub sp, sp, #0x44
+  // Entry address at 0x027FFE24
+  mov r3, #0x02800000
+  ldr lr, [ r3, #-0x1DC ]
+#else
+  // sp_sys = 0x0380FF00
   sub sp, r1, #0xdc
+  // Entry address at 0x027FFE34
+  mov r3, #0x02800000
+  ldr lr, [ r3, #-0x1CC ]
+#endif
 
-  // Set r0-r12 to 0, r0 still points to initialized stack space
+  // Set r0-r12 to 0, r0 still points to the cleared area
   ldmia r0, { r0 - r12 }
-  movs pc, lr
+  bx lr
 
 // Pad out
 

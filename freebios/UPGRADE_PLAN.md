@@ -2,7 +2,7 @@
 
 Review of `freebios/bios_common.S`, the committed `drastic_bios_arm{7,9}.bin`
 files and the arrays in `src/FreeBIOS.cpp`, compared against current upstream
-melonDS (Nov 2026). Phase 0 and Phase 1 are done (see the Plan section); the
+melonDS (Nov 2026). Phases 0, 1 and 2 are done (see the Plan section); the
 rest is the backlog.
 
 ## State of the code
@@ -27,7 +27,7 @@ rest is the backlog.
 
 ## Confirmed bugs
 
-Items 1, 2, 3 and 6 are fixed (Phase 1).
+Items 1, 2, 3 and 6 are fixed (Phase 1); items 4 and 5 are fixed (Phase 2).
 
 1. **SWI jump table is off by one.** Entry `0x1E` is missing. SWI `0x1E`
    runs `swi_custom_halt_post`; SWI `0x1F` (GBATEK CustomPost) loads the first
@@ -51,8 +51,7 @@ Items 1, 2, 3 and 6 are fixed (Phase 1).
    `GetVolumeTable`. The real BIOS does not check either. Low priority.
 
 Other notes from the source: `boot_handler` and `unhandled_exception` are
-infinite loops (fine while melonDS HLEs boot); `swi_cpu_fast_set` could use
-ldm/stm (existing TODO, performance only); `swi_bit_unpack` does not validate
+infinite loops (fine while melonDS HLEs boot); `swi_bit_unpack` does not validate
 bit widths (existing TODO).
 
 ## Plan
@@ -88,10 +87,50 @@ bit widths (existing TODO).
   address is flushed with the existing high byte. A zero length returns
   at once. The WRAM routine is unchanged.
 
-### Phase 2: missing features
-- Implement Huffman decompression (SWI 0x13).
-- Implement SoftReset per GBATEK (entry address + return-address flag).
-- Optional: ldm/stm fast path for `swi_cpu_fast_set`.
+### Phase 2: missing features (done)
+- [x] Huffman decompression (SWI 0x13, `swi_huffman_decompress`) per GBATEK
+  HuffUnComp: 4- or 8-bit data, tree walked from the root at tree+1,
+  children at `(A & ~1) + 2 + offset*2` (+1 for node1), bitstream read as
+  32-bit words MSB first, output collected LSB first and stored as 32-bit
+  words. Decisions:
+  - A word is only stored once 32 bits are collected and the remaining size
+    drops by 4 per word, so a size that is not a multiple of 4 is rounded up
+    to whole words (the stream must carry the padding symbols). This is the
+    32-bit-unit behaviour GBATEK describes; nothing partial is flushed.
+  - Size 0 or a data-size field of 0 writes nothing (the latter avoids an
+    endless loop). Other data sizes are not rejected; a size that does not
+    divide 32 stores a word as soon as 32 or more bits are collected.
+  - Uses r5-r10 (stacked).
+  - Checked by running the assembled ARM9 and ARM7 code in a small Python
+    ARM interpreter against a Python GBATEK-format encoder and an
+    independent reference decoder: 366 cases, 4- and 8-bit data, sizes
+    1-1000 including non-multiples of 4, single-symbol trees and skewed
+    trees up to code length 255; callee registers and sp are preserved and
+    only the expected words are written.
+- [x] SoftReset (SWI 0x00) clears the 200h bytes at the top of the stack
+  area, sets the svc/irq/sys stacks, clears lr_svc/lr_irq and the svc/irq
+  SPSRs, zeroes r0-r12 and jumps with `bx` (Thumb entries work) to the
+  address at `0x027FFE24` (ARM9) / `0x027FFE34` (ARM7) in system mode with
+  IRQs enabled. lr_sys holds the entry address. Stack values:
+  - ARM7: svc `0x0380FFDC`, irq `0x0380FFB0`, sys `0x0380FF00` (the existing
+    values, matching GBATEK); clears `0x0380FE00-0x0380FFFF` via the
+    `0x03FFFExx` mirror.
+  - ARM9: relative to the DTCM base read from CP15 c9,c1: svc DTCM+3FC0h,
+    irq DTCM+3F80h, sys DTCM+2F7Ch; clears DTCM+3E00h-3FFFh. GBATEK could
+    not be fetched from this environment, so these are the values melonDS's
+    direct boot (`NDS::SetupDirectBoot`, DTCM at `0x03000000`) sets. To
+    re-check against GBATEK "BIOS RAM Usage", especially the sys stack.
+  - The old "return-address flag" idea is not implemented: the NDS
+    SoftReset always uses the entry address above.
+  - Checked in the Python ARM interpreter (with MSR/MRC support) for both
+    CPUs and ARM/Thumb entries: cleared range, banked sp/lr, SPSRs, r0-r12.
+- [x] CpuFastSet (SWI 0x0C) uses `ldmia`/`stmia` of 8 registers (r3-r10,
+  r5-r10 stacked); fill mode stores 8 copies per iteration. The 21-bit
+  length is rounded up to a multiple of 8 words; a length of 0 now returns
+  at once (it used to loop 2^32 times). Checked for lengths 0-39, 0x1FFFF9
+  and 0x1FFFFF, copy and fill, with junk in bits 21-31.
+- ARM9 image now uses 0x90C of 0x1000 bytes (1780 free); ARM7 uses 0x21DC
+  of 0x4000.
 
 ### Phase 3: upstream alignment
 - Adopt upstream's `FreeBIOS_Data.h` + accessor layout.
