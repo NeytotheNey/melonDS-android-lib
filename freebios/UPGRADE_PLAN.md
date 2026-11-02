@@ -122,6 +122,11 @@ bit widths (existing TODO).
     re-check against GBATEK "BIOS RAM Usage", especially the sys stack.
   - The old "return-address flag" idea is not implemented: the NDS
     SoftReset always uses the entry address above.
+  - Intentional difference, do not "fix": melonDS direct boot sets the ARM7
+    user stack to `0x0380FD80` (what the real firmware leaves when it
+    launches a cartridge), while SoftReset sets `0x0380FF00` (what the real
+    BIOS SWI 0 sets). Both match hardware; a game that soft-resets sees the
+    same change on a real DS.
   - Checked in the Python ARM interpreter (with MSR/MRC support) for both
     CPUs and ARM/Thumb entries: cleared range, banked sp/lr, SPSRs, r0-r12.
 - [x] CpuFastSet (SWI 0x0C) uses `ldmia`/`stmia` of 8 registers (r3-r10,
@@ -132,8 +137,34 @@ bit widths (existing TODO).
 - ARM9 image now uses 0x90C of 0x1000 bytes (1780 free); ARM7 uses 0x21DC
   of 0x4000.
 
-### Phase 3: upstream alignment
-- Adopt upstream's `FreeBIOS_Data.h` + accessor layout.
+## Status / how to resume
+
+Phases 0-2 are complete on branch `bios-upgrade`. Runtime testing on the
+Android build is still pending; everything so far is verified by rebuild
+checks, disassembly and a Python ARM interpreter model, not by running games.
+
+Suggested test order once the binaries are pulled into the app:
+1. Any game with FreeBIOS, no native BIOS: boots and runs (IntrWait change,
+   SWI table change).
+2. A game that soft-resets to its title/menu (SoftReset).
+3. Games known to use BIOS decompression (Huffman SWI 0x13, RLE-to-VRAM
+   SWI 0x15): graphics should no longer be missing or corrupt.
+4. Re-check the ARM9 SoftReset stack values and the divide-by-zero result
+   against GBATEK when it is reachable.
+
+Open items: `check.sh` is not wired into CI; divide-by-zero return values
+are a safe choice, not hardware-verified.
+
+### Phase 3: upstream alignment (not started)
+- Adopt upstream's `FreeBIOS_Data.h` + accessor layout
+  (`FreeBIOSGetNtrArm7/9()`, `FreeBIOSGetTwlArm7/9()`; see upstream melonDS
+  `src/FreeBIOS.cpp`, `src/FreeBIOS.h`, `freebios/Makefile.bios`). Touches
+  `src/Args.h`, `src/NDS.cpp`, `src/DSi.cpp` and the Android frontend BIOS
+  loading.
 - Bring in the TWL build if DSi direct boot without dumps is wanted for the
   Android app (note `src/DSi.cpp` and `src/Args.h` still default DSi BIOS to
-  `BrokenBIOS`).
+  `BrokenBIOS`). Upstream's TWL variant adds SWI table entries up to 0x29,
+  moves LZ77-to-VRAM to SWI 0x02/0x19 and adds an auxiliary IRQ flag word
+  (`interrupt_check_aux`) for the ARM7.
+- Port the Phase 1/2 fixes from this branch on top, since upstream's SWI
+  code still has the original bugs.
