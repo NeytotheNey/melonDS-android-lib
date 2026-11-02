@@ -593,7 +593,7 @@ swi_bit_unpack:
  0:
   // Reload bit buffer if necessary
   cmp source_bit_buffer, #0x1
-  ldreqb source_bit_buffer, [ source ], #1
+  ldrbeq source_bit_buffer, [ source ], #1
   orreq source_bit_buffer, source_bit_buffer, #0x100
 
   // Get next from source
@@ -724,14 +724,14 @@ swi_lz77_decompress_vram:
 
  3:
   tst dest, #1
-  ldreqb lz77_vram_tmp, [ window_ptr ], #1
-  ldrneb lz77_value, [ window_ptr ], #1
+  ldrbeq lz77_vram_tmp, [ window_ptr ], #1
+  ldrbne lz77_value, [ window_ptr ], #1
   orrne lz77_value, lz77_vram_tmp, lz77_value, lsl #8
-  strneh lz77_value, [ dest, #-1 ]
+  strhne lz77_value, [ dest, #-1 ]
   add dest, dest, #1
   
   subs length, length, #1
-  ldmeqia sp!, { r5 }
+  ldmiaeq sp!, { r5 }
   beq swi_complete
 
   subs window_length, window_length, #1
@@ -744,14 +744,14 @@ swi_lz77_decompress_vram:
   // Load a single value
  2:
   tst dest, #1
-  ldreqb lz77_vram_tmp, [ source ], #1
-  ldrneb lz77_value, [ source ], #1
+  ldrbeq lz77_vram_tmp, [ source ], #1
+  ldrbne lz77_value, [ source ], #1
   orrne lz77_value, lz77_vram_tmp, lz77_value, lsl #8
-  strneh lz77_value, [ dest, #-1 ]
+  strhne lz77_value, [ dest, #-1 ]
   add dest, dest, #1
   
   subs length, length, #1
-  ldmeqia sp!, { r5 }
+  ldmiaeq sp!, { r5 }
   beq swi_complete
 
   movs lz77_control, lz77_control, lsl #1
