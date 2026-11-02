@@ -28,6 +28,9 @@
 #include "Platform.h"
 #include "GPU.h"
 #include "ARMJIT_Memory.h"
+#ifdef MELONADE_SWI_LOG
+#include "SWILog.h"
+#endif
 
 namespace melonDS
 {
@@ -301,6 +304,10 @@ void ARMv5::JumpTo(u32 addr, bool restorecpsr)
         else                addr &= ~0x1;
     }
 
+#ifdef MELONADE_SWI_LOG
+    SWILog::OnJump(this, Num, addr);
+#endif
+
     // aging cart debug crap
     //if (addr == 0x0201764C) printf("capture test %d: R1=%08X\n", R[6], R[1]);
     //if (addr == 0x020175D8) printf("capture test %d: res=%08X\n", R[6], R[0]);
@@ -368,6 +375,10 @@ void ARMv4::JumpTo(u32 addr, bool restorecpsr)
         if (CPSR & 0x20)    addr |= 0x1;
         else                addr &= ~0x1;
     }
+
+#ifdef MELONADE_SWI_LOG
+    SWILog::OnJump(this, Num, addr);
+#endif
 
     u32 oldregion = R[15] >> 23;
     u32 newregion = addr >> 23;
