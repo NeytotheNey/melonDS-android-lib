@@ -451,8 +451,13 @@ void DSi::SetupDirectBoot()
         tsc->SetMode(0x00);
         Set_SCFG_Clock9(0x0000);
 
-        SCFG_EXT[0] &= ~0xC000;
+        // what the launcher leaves for NDS cartridges (GBATEK, SCFG_EXT9/SCFG_EXT7): NITRO
+        // circuits, 4MB RAM, and no access to the SCFG/MBK registers. without bit 31 cleared,
+        // SCFG_A9ROM stays visible and games that check it think they run in DSi mode
+        SCFG_EXT[0] = 0x03000000;
+        SCFG_EXT[1] = 0x12A03000;
         ApplyNewRAMSize(0);
+        UpdateVRAMTimings();
     }
     else
     {
@@ -2313,7 +2318,8 @@ u8 DSi::ARM9IORead8(u32 addr)
 {
     switch (addr)
     {
-    case 0x04004000: return SCFG_BIOS & 0xFF;
+    // SCFG_A9ROM reads 00h once SCFG/MBK access is disabled (SCFG_EXT9 bit 31, GBATEK)
+    case 0x04004000: return (SCFG_EXT[0] & (1 << 31)) ? (SCFG_BIOS & 0xFF) : 0;
     case 0x04004006: return SCFG_RST  & 0xFF;
 
     CASE_READ8_32BIT(0x04004040, MBK[0][0])
@@ -2347,7 +2353,8 @@ u16 DSi::ARM9IORead16(u32 addr)
     assert(ConsoleType == 1);
     switch (addr)
     {
-    case 0x04004000: return SCFG_BIOS & 0xFF;
+    // SCFG_A9ROM reads 00h once SCFG/MBK access is disabled (SCFG_EXT9 bit 31, GBATEK)
+    case 0x04004000: return (SCFG_EXT[0] & (1 << 31)) ? (SCFG_BIOS & 0xFF) : 0;
     case 0x04004004: return SCFG_Clock9;
     case 0x04004006: return SCFG_RST;
     case 0x04004010: return SCFG_MC & 0xFFFF;
@@ -2383,7 +2390,8 @@ u32 DSi::ARM9IORead32(u32 addr)
     assert(ConsoleType == 1);
     switch (addr)
     {
-    case 0x04004000: return SCFG_BIOS & 0xFF;
+    // SCFG_A9ROM reads 00h once SCFG/MBK access is disabled (SCFG_EXT9 bit 31, GBATEK)
+    case 0x04004000: return (SCFG_EXT[0] & (1 << 31)) ? (SCFG_BIOS & 0xFF) : 0;
     case 0x04004004: return SCFG_Clock9 | ((u32)SCFG_RST << 16);
     case 0x04004008: return SCFG_EXT[0];
     case 0x04004010: return SCFG_MC & 0xFFFF;
