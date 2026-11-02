@@ -150,6 +150,7 @@ swi_handler:
   swi_label_arm7_only(swi_get_pitch_table)                   // 1B
   swi_label_arm7_only(swi_get_volume_table)                  // 1C
   swi_label_arm7_only(swi_get_boot_procs)                    // 1D
+  swi_label(swi_invalid)                                     // 1E
   swi_label(swi_custom_halt_post)                            // 1F
 
 swi_invalid:
@@ -251,10 +252,13 @@ swi_vblank_interrupt_wait:
 swi_interrupt_wait:
   mov io_base, #0x4000000
 
-  // See if we should return immediately or halt
+  // r0 == 0: return at once if a requested flag is already set.
+  // r0 != 0: discard the requested flags, then wait for a new one.
+  // interrupt_check overwrites r0, so test it first.
   cmp check_immediately, #0
-  blne interrupt_check
-  
+  beq swi_interrupt_check_first
+  bl interrupt_check
+
   // Perform this loop until the interrupt is risen
  0:
 #ifdef BIOS_ARM9
@@ -273,7 +277,7 @@ swi_interrupt_wait:
   b swi_complete
 
 swi_interrupt_check_first:
-  // Check for IRQ
+  // Check for IRQ (and acknowledge it)
   bl interrupt_check
   // If set exit.
   bne swi_complete
@@ -315,13 +319,21 @@ swi_sound_bias:
 #define numerator_signed    r12
 #define denominator_signed  r3
 
-#define sign_flip           r12
+#define sign_flip           r4
 
 #define result              r0
 #define remainder           r1
 #define result_abs          r3
 
 swi_divide:
+  // Division by zero hangs or is undefined on real hardware. Return a
+  // safe, non-hanging result instead: r0 = 0, r1 = numerator, r3 = 0.
+  cmp denominator, #0
+  moveq remainder, numerator
+  moveq result, #0
+  moveq result_abs, #0
+  beq swi_complete
+
   // Set if numerator is signed, and abs numerator
   ands numerator_signed, numerator, #0x80000000
   rsbmi numerator, numerator, #0
@@ -338,8 +350,11 @@ swi_divide:
 
   // This moves out the current bit to the MSB of the denominator,
   // and aligns the denominator up to the same bit-length as the
-  // numerator
+  // numerator. Stop once bit 31 is set so a numerator of 0x80000000
+  // (abs(INT_MIN)) cannot shift the denominator out to 0 and loop forever.
  0:
+  tst denominator, #0x80000000
+  bne 1f
   cmp denominator, numerator
   movls denominator, denominator, lsl #1
   movls current_bit, current_bit, lsl #1
@@ -360,6 +375,10 @@ swi_divide:
 
   tst sign_flip, #0x80000000
   rsbmi result, result, #0
+
+  // The remainder takes the sign of the numerator
+  tst numerator_signed, #0x80000000
+  rsbmi remainder, remainder, #0
 
   b swi_complete
 
@@ -773,9 +792,79 @@ swi_huffman_decompress:
 #define run_length    r3
 #define rle_value     r12
  
-// TODO: Make a safe one for VRAM.
- 
+#define rle_vram_low  r5
+#define rle_vram_tmp  r4
+
+// VRAM ignores 8-bit writes, so only halfword stores are done: a byte for
+// an even address is buffered in rle_vram_low and written together with the
+// following odd byte. An odd start or end address keeps the byte already in
+// memory next to it.
+
 swi_runlength_decompress_vram:
+  ldr header, [ source ], #4
+  movs length, header, lsr #8
+  beq swi_complete
+
+  stmdb sp!, { r5 }
+  tst dest, #1
+  ldrbne rle_vram_low, [ dest, #-1 ]
+
+ 0:
+  ldrb rle_control, [ source ], #1
+  tst rle_control, #0x80
+  and run_length, rle_control, #0x7F
+  beq 1f
+
+  ldrb rle_value, [ source ], #1
+  add run_length, run_length, #3
+
+ 2:
+  tst dest, #1
+  moveq rle_vram_low, rle_value
+  orrne rle_vram_tmp, rle_vram_low, rle_value, lsl #8
+  strhne rle_vram_tmp, [ dest, #-1 ]
+  add dest, dest, #1
+
+  subs length, length, #1
+  beq 3f
+
+  subs run_length, run_length, #1
+  bne 2b
+
+  b 0b
+
+ 1:
+  add run_length, run_length, #1
+
+ 2:
+  ldrb rle_value, [ source ], #1
+  tst dest, #1
+  moveq rle_vram_low, rle_value
+  orrne rle_vram_tmp, rle_vram_low, rle_value, lsl #8
+  strhne rle_vram_tmp, [ dest, #-1 ]
+  add dest, dest, #1
+
+  subs length, length, #1
+  beq 3f
+
+  subs run_length, run_length, #1
+  bne 2b
+
+  b 0b
+
+ 3:
+  // Flush a trailing buffered byte (output ended on an odd address)
+  tst dest, #1
+  ldrbne rle_vram_tmp, [ dest ]
+  orrne rle_vram_tmp, rle_vram_low, rle_vram_tmp, lsl #8
+  strhne rle_vram_tmp, [ dest, #-1 ]
+
+  ldmia sp!, { r5 }
+  b swi_complete
+
+#undef rle_vram_low
+#undef rle_vram_tmp
+
 swi_runlength_decompress_wram:
   ldr header, [ source ], #4
 

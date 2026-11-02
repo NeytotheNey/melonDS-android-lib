@@ -2,24 +2,20 @@
 
 Review of `freebios/bios_common.S`, the committed `drastic_bios_arm{7,9}.bin`
 files and the arrays in `src/FreeBIOS.cpp`, compared against current upstream
-melonDS (Nov 2026). Nothing here has been implemented yet; this is the backlog.
+melonDS (Nov 2026). Phase 0 and Phase 1 are done (see the Plan section); the
+rest is the backlog.
 
 ## State of the code
 
 - The assembly source, the committed `.bin` files and the arrays in
   `src/FreeBIOS.cpp` agree byte for byte.
-- The source reassembles to identical binaries with a modern toolchain, so the
-  original 2011 Pandora toolchain in the Makefile is not required:
-
-  ```bash
-  # clang's assembler wants unified suffix order (ldrb<cond>, not ldr<cond>b)
-  sed -E 's/\b(ldr|str)(eq|ne|cs|cc|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)(b|h)\b/\1\3\2/g; s/\bldm(eq|ne)ia\b/ldmia\1/g' bios_common.S > bios_unified.S
-  clang --target=arm-none-eabi -march=armv4t  -mcpu=arm7tdmi  -DBIOS_ARM7 -c bios_unified.S -o arm7.o
-  clang --target=arm-none-eabi -march=armv5te -mcpu=arm946e-s -DBIOS_ARM9 -c bios_unified.S -o arm9.o
-  ld.lld -Ttext=0 --entry=0 -o arm7.elf arm7.o && llvm-objcopy -O binary --only-section=.text arm7.elf arm7.bin
-  ld.lld -Ttext=0 --entry=0 -o arm9.elf arm9.o && llvm-objcopy -O binary --only-section=.text arm9.elf arm9.bin
-  cmp arm7.bin drastic_bios_arm7.bin && cmp arm9.bin drastic_bios_arm9.bin
-  ```
+- The source now uses unified suffix order (`ldrbeq`, `strhne`, `ldmiaeq`),
+  which both clang and GNU as accept. `freebios/build.sh` builds it with
+  clang + ld.lld + llvm-objcopy (or a GNU toolchain via
+  `PREFIX=arm-none-eabi-`) and regenerates `src/FreeBIOS.cpp`;
+  `freebios/check.sh` verifies that the source, the `.bin` files and the
+  arrays agree. Before Phase 1 the rebuild was byte-identical to the
+  original 2011 binaries.
 
 - Upstream melonDS replaced this layout in Feb 2026 (PR #2523, asie):
   `freebios/src/bios_common.s` + `Makefile.bios`, a generated
@@ -30,6 +26,8 @@ melonDS (Nov 2026). Nothing here has been implemented yet; this is the backlog.
   the IntrWait path and its message says it is still broken.
 
 ## Confirmed bugs
+
+Items 1, 2, 3 and 6 are fixed (Phase 1).
 
 1. **SWI jump table is off by one.** Entry `0x1E` is missing. SWI `0x1E`
    runs `swi_custom_halt_post`; SWI `0x1F` (GBATEK CustomPost) loads the first
@@ -59,19 +57,36 @@ bit widths (existing TODO).
 
 ## Plan
 
-### Phase 0: tooling
-- Add a build script (clang/lld as above, or arm-none-eabi-gcc) under
-  `freebios/` that regenerates the `.bin` files and the arrays in
-  `src/FreeBIOS.cpp`.
-- Add a check (CI or script) that `.bin` == embedded arrays, so fixes are never
-  hand-patched hex.
+### Phase 0: tooling (done)
+- [x] `freebios/build.sh` builds both `.bin` files (asserting 16384 / 4096
+  bytes) and regenerates the arrays in `src/FreeBIOS.cpp`. `make` calls it.
+- [x] `freebios/check.sh` (`make check`) rebuilds into a temp dir and fails if
+  the committed `.bin` files or the arrays differ, so fixes are never
+  hand-patched hex. Not wired into CI yet.
 
-### Phase 1: low-risk fixes
-- Insert the missing `0x1E` table entry (`swi_invalid`).
-- Guard `swi_divide` against zero denominators and `INT_MIN`; decide the
-  return values by checking GBATEK/real-BIOS behaviour first.
-- Fix the r0=0 IntrWait path (check, return if set, otherwise halt loop).
-- Add a real VRAM variant of RLE decompression.
+### Phase 1: low-risk fixes (done)
+- [x] Inserted the missing `0x1E` table entry (`swi_invalid`); `0x1F` now
+  reaches `swi_custom_halt_post`.
+- [x] `swi_divide` no longer hangs. Decisions:
+  - Denominator 0 (hangs/undefined on real hardware): returns r0 = 0,
+    r1 = numerator, r3 = 0.
+  - The alignment loop stops once the denominator's bit 31 is set, so
+    numerator `INT_MIN` works. `INT_MIN / -1` wraps to r0 = `0x80000000`,
+    r3 = `0x80000000`.
+  - The remainder now takes the sign of the numerator (it was always
+    positive before), e.g. -7/2 gives r0 = -3, r1 = -1, r3 = 3.
+  - `sign_flip` moved from r12 to r4 to keep the numerator sign for the
+    remainder; r4 is stacked by the SWI entry.
+  - Checked with an instruction-level Python model on edge cases and 200k
+    random inputs.
+- [x] IntrWait: r0 = 0 returns immediately if a requested flag is already set
+  (acknowledging it), otherwise halts until one is raised; r0 != 0 discards
+  the requested flags first, then halts. Reuses `swi_interrupt_check_first`.
+- [x] `swi_runlength_decompress_vram` is a separate routine that only does
+  halfword stores (buffers the even byte in r5, stores on the odd byte).
+  An odd start address keeps the existing low byte, and an odd final
+  address is flushed with the existing high byte. A zero length returns
+  at once. The WRAM routine is unchanged.
 
 ### Phase 2: missing features
 - Implement Huffman decompression (SWI 0x13).
