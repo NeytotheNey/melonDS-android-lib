@@ -268,11 +268,11 @@ bit widths (existing TODO).
 
 ## Status / how to resume
 
-Phases 0-3 are complete and Phases 0-2 are merged into `melonade` (9bd2090b)
-and picked up by the app; Phase 3 is on core branch `freebios-phase3`. The PC
-swi-harness shows no result differences against the official BIOS for Dragon
-Quest IX in DS and DSi mode. Phone testing of the individual fixes is not
-recorded here.
+Phases 0-3 are complete and merged into `melonade` (4452c00e) and picked up
+by the app. The PC swi-harness shows no result differences against the
+official BIOS for Dragon Quest IX in DS and DSi mode. On the phone, 13 games
+launched and ran with FreeBIOS as the DS-mode BIOS in DSi mode (2026-11-02),
+but none of them calls SoftReset, HuffUnComp or RLE-to-VRAM.
 
 Suggested test order on the phone:
 1. Any game with FreeBIOS, no native BIOS: boots and runs (IntrWait change,
@@ -288,3 +288,14 @@ Open items:
 - The ARM9 SoftReset cache step and step order are an interpretation of
   GBATEK (see Phase 2), and SoftReset has not run in a real game.
 - Absent DSi SWIs return instead of hanging as GBATEK describes.
+
+Next testing ideas (not started):
+- A small test ROM of our own (built with the NDK clang, like the BIOS) that
+  calls SoftReset, HuffUnComp, RLE-to-VRAM, LZ77, IntrWait r0=0 and the Div
+  edge cases with known GBATEK-format data and stores the results. The
+  swi-harness runs it with the official BIOS and with FreeBIOS and diffs the
+  outputs, so the functions no game here uses get a black-box check, and it
+  stays as a regression test.
+- A debug-build log line on the phone when a game calls SWI 0x00, to see
+  whether games that return to their title (Dragon Quest IX after a
+  quicksave) use the BIOS SoftReset or their own reset code.
