@@ -869,7 +869,7 @@ std::unique_ptr<ARM9BIOSImage> EmuInstance::loadARM9BIOS() noexcept
 {
     if (!globalCfg.GetBool("Emu.ExternalBIOSEnable"))
     {
-        return std::make_unique<ARM9BIOSImage>(bios_arm9_bin);
+        return std::make_unique<ARM9BIOSImage>(FreeBIOSGetNtrArm9());
     }
 
     string path = globalCfg.GetString("DS.BIOS9Path");
@@ -892,7 +892,7 @@ std::unique_ptr<ARM7BIOSImage> EmuInstance::loadARM7BIOS() noexcept
 {
     if (!globalCfg.GetBool("Emu.ExternalBIOSEnable"))
     {
-        return std::make_unique<ARM7BIOSImage>(bios_arm7_bin);
+        return std::make_unique<ARM7BIOSImage>(FreeBIOSGetNtrArm7());
     }
 
     string path = globalCfg.GetString("DS.BIOS7Path");

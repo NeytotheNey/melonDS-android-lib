@@ -1,5 +1,5 @@
-# Builds drastic_bios_arm7.bin / drastic_bios_arm9.bin and regenerates the
-# arrays in ../src/FreeBIOS.cpp. See build.sh for toolchain selection
+# Builds the NTR/TWL ARM9/ARM7 images into build/ and regenerates
+# ../src/FreeBIOS_Data.h. See build.sh for toolchain selection
 # (clang/lld by default, PREFIX=arm-none-eabi- for a GNU toolchain).
 
 all:
@@ -9,6 +9,6 @@ check:
 	./check.sh
 
 clean:
-	rm -f *.o *.elf
+	rm -rf build
 
 .PHONY: all check clean

@@ -30,11 +30,13 @@ for the Nintendo DS system. This code is in no way affiliated with Nintendo
 and is not derived from Nintendo's BIOS implementation but has been implemented
 using publically available documentation.
 
-It can be assembled with build.sh (or `make`), which uses clang, ld.lld and
-llvm-objcopy by default, or a GNU ARM toolchain when PREFIX is set, e.g.
-`PREFIX=arm-none-eabi- ./build.sh`. build.sh writes drastic_bios_arm7.bin
-(16384 bytes) and drastic_bios_arm9.bin (4096 bytes) and regenerates the
-arrays in ../src/FreeBIOS.cpp. check.sh (or `make check`) rebuilds into a
-temporary directory and fails if the committed .bin files or the arrays in
-src/FreeBIOS.cpp do not match bios_common.S. Never hand-edit the hex.
-
+The source is src/bios_common.s. It is assembled four times: NTR (DS) and
+TWL (DSi) builds for the ARM9 and the ARM7 (-DPLATFORM_NTR/-DPLATFORM_TWL,
+-DTARGET_ARM9/-DTARGET_ARM7), as in upstream melonDS. build.sh (or `make`)
+uses clang, ld.lld and llvm-objcopy by default, or a GNU ARM toolchain when
+PREFIX is set, e.g. `PREFIX=arm-none-eabi- ./build.sh`. It writes
+build/bios_{ntr,twl}_arm{9,7}.bin (unpadded; each must fit the BIOS size) and
+regenerates ../src/FreeBIOS_Data.h, which src/FreeBIOS.cpp wraps in
+FreeBIOSGetNtrArm9/7() and FreeBIOSGetTwlArm9/7(). check.sh (or `make check`)
+rebuilds into a temporary directory and fails if src/FreeBIOS_Data.h does not
+match the source. Never hand-edit the hex.

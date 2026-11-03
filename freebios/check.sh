@@ -1,21 +1,15 @@
 #!/bin/sh
-# Rebuild the FreeBIOS into a temp dir and verify that the committed .bin files
-# and the arrays in src/FreeBIOS.cpp match the assembly source byte for byte.
+# Rebuild the FreeBIOS into a temp dir and verify that src/FreeBIOS_Data.h
+# matches src/bios_common.s byte for byte (line endings are ignored, since a
+# Windows checkout may have CRLF).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
-CPP=$HERE/../src/FreeBIOS.cpp
+HDR=$HERE/../src/FreeBIOS_Data.h
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-cp "$CPP" "$TMP/FreeBIOS.cpp"
-"$HERE/build.sh" "$TMP" "$TMP/FreeBIOS.cpp" > /dev/null
-fail=0
-for n in drastic_bios_arm7 drastic_bios_arm9; do
-  if ! cmp -s "$TMP/$n.bin" "$HERE/$n.bin"; then
-    echo "MISMATCH: freebios/$n.bin differs from the assembly source" >&2; fail=1
-  fi
-done
-if ! cmp -s "$TMP/FreeBIOS.cpp" "$CPP"; then
-  echo "MISMATCH: src/FreeBIOS.cpp arrays differ from the assembly source" >&2; fail=1
+"$HERE/build.sh" "$TMP" "$TMP/FreeBIOS_Data.h" > /dev/null
+if ! tr -d '\r' < "$HDR" | cmp -s - "$TMP/FreeBIOS_Data.h"; then
+  echo "MISMATCH: src/FreeBIOS_Data.h differs from freebios/src/bios_common.s" >&2
+  exit 1
 fi
-[ $fail -eq 0 ] && echo "OK: .bin files and src/FreeBIOS.cpp match bios_common.S"
-exit $fail
+echo "OK: src/FreeBIOS_Data.h matches freebios/src/bios_common.s"
