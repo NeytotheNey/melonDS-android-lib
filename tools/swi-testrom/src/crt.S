@@ -5,6 +5,12 @@
     Reset Functions", "ARM CP15 Tightly Coupled Memory").
 
     All code here is ARM state (ARMv4T compatible) unless marked Thumb.
+
+    -DTWL (DSi-mode ROM): the startup first clears the memory the DSi direct
+    boot may have filled from the DSi BIOS or NAND (ITCM and DTCM on the
+    ARM9, ARM7 WRAM and shared WRAM on the ARM7), so none of it can end up in
+    a result. The ARM7 IRQ handler also handles IE2/IF2 (DSi7 IF2 check bits
+    at 0380FFC0h, GBATEK "BIOS RAM Usage").
 */
 
 #include "layout.h"
@@ -59,6 +65,20 @@ _start:
     mcr     p15, 0, r5, c1, c0, 0
     mov     r4, r4, lsr #12
     mov     r4, r4, lsl #12             @ DTCM base
+#if defined(TWL)
+    @ clear DTCM (16KB) and ITCM (32KB at 0): the DSi direct boot copies BIOS data into ITCM
+    mov     r1, #0
+    mov     r2, r4
+    add     r3, r4, #0x4000
+2:  str     r1, [r2], #4
+    cmp     r2, r3
+    blo     2b
+    mov     r2, #0
+    mov     r3, #0x8000
+2:  str     r1, [r2], #4
+    cmp     r2, r3
+    blo     2b
+#endif
     add     sp, r4, #DTCM_SVC_SP
     msr     cpsr_c, #0xD2
     add     sp, r4, #DTCM_IRQ_SP
@@ -80,6 +100,21 @@ _start:
     ldr     r1, =trap_exception
     str     r1, [r0]
 #else
+#if defined(TWL)
+    @ clear ARM7 WRAM (64KB; the DSi direct boot copies BIOS data to 03FFC400h, a mirror)
+    @ and the shared WRAM mapped to the ARM7 (32KB at 03000000h)
+    mov     r1, #0
+    ldr     r2, =0x03800000
+    add     r3, r2, #0x10000
+2:  str     r1, [r2], #4
+    cmp     r2, r3
+    blo     2b
+    mov     r2, #0x03000000
+    add     r3, r2, #0x8000
+2:  str     r1, [r2], #4
+    cmp     r2, r3
+    blo     2b
+#endif
     ldr     sp, =STACK7_SVC
     msr     cpsr_c, #0xD2
     ldr     sp, =STACK7_IRQ
@@ -91,6 +126,14 @@ _start:
     ldr     r0, =ARM7_IRQ_FLAGS
     mov     r1, #0
     str     r1, [r0]
+#if defined(TWL)
+    ldr     r0, =ARM7_IRQ_FLAGS2
+    str     r1, [r0]
+    mov     r0, #0x04000000
+    str     r1, [r0, #0x218]            @ IE2 = 0
+    mvn     r1, #0
+    str     r1, [r0, #0x21C]            @ acknowledge all IF2
+#endif
     ldr     r0, =ARM7_DEBUG_VEC
     ldr     r1, =trap_exception
     str     r1, [r0]
@@ -140,6 +183,39 @@ irq_handler:
     ldr     r2, [r0, #4]
     orr     r2, r2, r1
     str     r2, [r0, #4]                @ IRQ bits seen
+#if defined(TWL) && defined(ARM7)
+    ldr     r1, [r12, #0x18]            @ IE2
+    ldr     r2, [r12, #0x1C]            @ IF2
+    and     r1, r1, r2
+    str     r1, [r12, #0x1C]
+    ldr     r0, =ARM7_IRQ_FLAGS2
+    ldr     r2, [r0]
+    orr     r2, r2, r1
+    str     r2, [r0]
+    ldr     r0, =irq_stats
+    ldr     r2, [r0, #8]
+    orr     r2, r2, r1
+    str     r2, [r0, #8]                @ IF2 bits seen
+    @ AES kick for the IF2 IntrWait tests: on a timer 3 IRQ with aes_kick set, feed
+    @ one block (zeros) to the AES input FIFO; the AES IF2 IRQ (bit 12) that
+    @ follows is a separate IRQ, since IF2 was acknowledged above
+    ldr     r1, =irq_stats
+    ldr     r1, [r1, #4]
+    tst     r1, #(1 << 6)
+    beq     3f
+    ldr     r0, =aes_kick
+    ldr     r2, [r0]
+    cmp     r2, #0
+    beq     3f
+    mov     r2, #0
+    str     r2, [r0]
+    ldr     r0, =0x04004408
+    str     r2, [r0]
+    str     r2, [r0]
+    str     r2, [r0]
+    str     r2, [r0]
+3:
+#endif
     bx      lr
     .ltorg
 
@@ -407,6 +483,30 @@ tcb_get32:
     .ltorg
     .arm
 
+#if defined(TWL)
+/* our own SHA1 block callback (GBATEK: callback(struct, src, len) at
+   context+60h): counts calls, keeps the last src/len, changes nothing */
+    .global sha_cb
+sha_cb:
+    push    {r3}
+    ldr     r3, =cb_state
+    ldr     r0, [r3, #40]
+    add     r0, r0, #1
+    str     r0, [r3, #40]
+    str     r1, [r3, #44]
+    str     r2, [r3, #48]
+    pop     {r3}
+    bx      lr
+    .ltorg
+
+    .section .rodata
+    .balign 4
+    .global fn_table
+fn_table:
+    .word   sha_cb
+    .text
+#endif
+
 /* callback structures: Open, Close, Get8, Get16, Get32 */
     .section .rodata
     .balign 4
@@ -585,8 +685,17 @@ trap_save:
 cur_io:
     .word   0, 0
 irq_stats:
+#if defined(TWL)
+    .word   0, 0, 0, 0
+#else
     .word   0, 0
+#endif
 cb_state:
     .space  64
+#if defined(TWL) && defined(ARM7)
+    .global aes_kick
+aes_kick:
+    .word   0
+#endif
 sr_save:
     .space  128

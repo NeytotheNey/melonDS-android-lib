@@ -6,6 +6,8 @@ Writes tests_arm9.h and tests_arm7.h (the C tables plus a data blob per
 CPU) and tests.json (the manifest the report uses: names, inputs and the
 GBATEK model of each result).
 
+    python -I gen_tests.py --twl <outdir>     (DSi-mode ROM)
+
 Test inputs come from GBATEK and the edge cases in freebios/UPGRADE_PLAN.md.
 Each test runs on the CPU(s) where GBATEK lists the SWI ("BIOS Function
 Summary"). Tests that may hang or overwrite memory on real hardware are
@@ -28,6 +30,16 @@ Record layout (100h bytes, see src/runner.c):
   1-3FFFh) and were not stored (only for registers GBATEK gives no result for),
   13-31 extras (see EXTRAS), 32-47 first 64 bytes of the output
   region, 48 window offset, 49-63 60 bytes from the window offset.
+
+DSi mode (--twl): results areas of 20000h per CPU (ARM7 at 02220000h), and
+scratch registers are only stored when small (up to FFh, ARM9 up to FFFFh),
+equal to an input or a 02000000h-06FFFFFFh address (status bits 8-11 flag
+the rest). Two more kinds: "sequence" (K_SEQ, a script of SWI calls and
+stores for SHA1/RSA; status bits 16-29 flag an r0 after call n that was not
+stored) and "srccheck" (K_SRCCHK, flags only: extra 0 bit 0 = output region
+unchanged, bits 1-4 = r0-r3 unchanged; no hash, bytes, registers or cycles,
+since the source may be the BIOS). The SHA1 tests store the context's
+callback field (+60h) as 0 when it holds a BIOS address.
 """
 
 import json
@@ -39,10 +51,13 @@ sys.dont_write_bytecode = True  # keep the source tree clean
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import encoders as E  # noqa: E402
 
-F_THUMB, F_HASHONLY, F_VRAM, F_ISOLATED = 0x01, 0x02, 0x04, 0x08
-K_REGS, K_MEM, K_CB, K_TABLE, K_IRQ = range(5)
-R_RAW, R_SRC, R_DST, R_AUX, R_TMP, R_CB = range(6)
-KIND_NAMES = ["regs", "mem", "callback", "table", "irq"]
+F_THUMB, F_HASHONLY, F_VRAM, F_ISOLATED, F_FLAGSONLY = 0x01, 0x02, 0x04, 0x08, 0x10
+K_REGS, K_MEM, K_CB, K_TABLE, K_IRQ, K_SEQ, K_SRCCHK, K_PROCS = range(8)
+R_RAW, R_SRC, R_DST, R_AUX, R_TMP, R_CB, R_FN = range(7)
+KIND_NAMES = ["regs", "mem", "callback", "table", "irq", "sequence", "srccheck", "procs"]
+
+# set by main(): False builds the DS-mode (NTR) ROM, True the DSi-mode (TWL) one
+TWL = False
 
 EXTRAS = {
     K_REGS: ["io_after", "word_after"],
@@ -51,7 +66,14 @@ EXTRAS = {
            "open_r0", "open_r1", "open_r2", "close_r0"],
     K_TABLE: ["calls"],
     K_IRQ: ["flags_after", "IF_after", "IE_after", "IME_after", "irqs_taken", "irq_bits_seen"],
+    # DSi mode only
+    K_SEQ: ["swi_calls", "ctx_callback", "sha_cb_calls", "sha_cb_len", "sha_cb_src"]
+           + ["r0_after_call%d" % n for n in range(1, 15)],
+    K_SRCCHK: ["flags"],
+    K_PROCS: ["flags"],
 }
+# DSi mode: the IRQ tests also record the ARM7 IF2 check bits (0380FFC0h) and the IF2 bits seen
+EXTRAS_IRQ_TWL = EXTRAS[K_IRQ] + ["IF2_flags_after", "IF2_bits_seen"]
 
 BUFS = {
     9: dict(src=0x02100000, dst=0x02110000, aux=0x02120000, tmp=0x02121000, vram=0x06800000),
@@ -67,6 +89,16 @@ SWI_NAMES = {
     0x1A: "GetSineTable", 0x1B: "GetPitchTable", 0x1C: "GetVolumeTable", 0x1D: "GetBootProcs",
     0x1F: "CustomPost/CustomHalt",
 }
+# DSi mode (GBATEK "BIOS Function Summary", DSi7/DSi9 columns)
+SWI_NAMES_TWL = dict(SWI_NAMES)
+del SWI_NAMES_TWL[0x00]
+SWI_NAMES_TWL.update({
+    0x01: "LZ77UnCompCallback8bit", 0x02: "LZ77UnCompCallback16bit", 0x19: "LZ77UnCompCallback16bit",
+    0x12: "ignored", 0x2B: "ignored",
+    0x20: "RSA_Init_crypto_heap", 0x21: "RSA_Decrypt", 0x22: "RSA_Decrypt_Unpad",
+    0x23: "RSA_Decrypt_Unpad_OpenPGP_SHA1", 0x24: "SHA1_Init", 0x25: "SHA1_Update", 0x26: "SHA1_Finish",
+    0x27: "SHA1_Init_Update_Finish", 0x28: "SHA1_Compare_20_Bytes", 0x29: "SHA1_Init_Update_Finish_Mess",
+})
 
 # GBATEK section names, cited in the manifest and the report
 G_ARITH = "GBATEK BIOS Arithmetic Functions"
@@ -77,6 +109,8 @@ G_HALT = "GBATEK BIOS Halt Functions"
 G_MISC = "GBATEK BIOS Misc Functions"
 G_SOUND = "GBATEK BIOS Sound Functions"
 G_SUMMARY = "GBATEK BIOS Function Summary"
+G_SHA1 = "GBATEK BIOS SHA1 Functions (DSi only)"
+G_RSA = "GBATEK BIOS RSA Functions (DSi only)"
 
 DST_OFS = 0x10      # the destination pointer starts this far into the output region
 MARGIN = 0x20       # bytes after the expected end that are hashed too (overruns)
@@ -90,10 +124,15 @@ BOTH = (9, 7)
 # result registers GBATEK documents per SWI; the ROM never masks these, and the
 # report treats the other r0-r3 as scratch
 DOC_REGS = {0x09: {0, 1, 3}, 0x0D: {0}, 0x0E: {0, 3}, 0x0F: {0}, 0x12: {0}, 0x13: {0}, 0x15: {0}}
+# DSi mode: the callback LZ77 entries return the length, the SHA1/RSA calls 21h-23h and 27h-29h r0
+DOC_REGS_TWL = dict(DOC_REGS)
+del DOC_REGS_TWL[0x12], DOC_REGS_TWL[0x0F]
+DOC_REGS_TWL.update({0x01: {0}, 0x02: {0}, 0x19: {0}, 0x21: {0}, 0x22: {0}, 0x23: {0}, 0x27: {0}, 0x28: {0},
+                     0x29: {0}})
 
 
 def documented_regs(t):
-    regs = set(DOC_REGS.get(t.swi, set()))
+    regs = set((DOC_REGS_TWL if TWL else DOC_REGS).get(t.swi, set()))
     if t.swi == 0x06 and not t.name.startswith("invalid"):   # Halt: all kept, NDS9 destroys r0
         regs |= {1, 2, 3} if t.cpu == 9 else {0, 1, 2, 3}
     if t.name.startswith("invalid"):
@@ -118,10 +157,14 @@ TESTS = []
 
 
 def add(name, cpus, swi, kind=K_REGS, ins=(), flags=0, src=b"", src_at=0, aux=b"",
-        out_len=0, tmp_len=0, p=(), expect=None, isolated=False, note=""):
+        out_len=0, tmp_len=0, p=(), expect=None, isolated=False, note="", script=None):
     """ins: up to four (reloc, value) pairs or plain values. expect: dict or
     a function of the CPU returning one, with any of regs {n: value}, out
-    (bytes of the whole output region), extra {name: value}, basis, note."""
+    (bytes of the whole output region), extra {name: value}, basis, note.
+    script (K_SEQ, DSi mode): list of seq_call()/seq_store() steps; the test's
+    swi is the one whose result registers are stored (the last call)."""
+    if script is not None:
+        aux = seq_encode(script)
     for cpu in cpus:
         t = Test()
         t.name, t.cpu, t.swi, t.kind = name, cpu, swi, kind
@@ -135,7 +178,40 @@ def add(name, cpus, swi, kind=K_REGS, ins=(), flags=0, src=b"", src_at=0, aux=b"
         e = expect(cpu) if callable(expect) else expect
         t.expect = dict(e) if e else {}
         t.note = note
+        t.script = script
         TESTS.append(t)
+
+
+# K_SEQ scripts (DSi mode): n, then 8 words per step: op (bits 0-7 SWI number,
+# bit 8 Thumb, bit 9 store r1 to the address in r0 instead of a SWI call),
+# r0-r3, relocations (one byte per register), bit 0 set if r0 after this call
+# is a documented result (otherwise only address-like values are stored)
+SEQ_THUMB, SEQ_STORE = 0x100, 0x200
+
+
+def _ins4(ins):
+    ins = [(i if isinstance(i, tuple) else (R_RAW, i)) for i in ins]
+    while len(ins) < 4:
+        ins.append((R_RAW, 0))
+    return ins
+
+
+def seq_call(swi, *ins, thumb=False, doc0=None):
+    if doc0 is None:
+        doc0 = 0 in DOC_REGS_TWL.get(swi, set())
+    return (swi | (SEQ_THUMB if thumb else 0), _ins4(ins), doc0)
+
+
+def seq_store(addr, val):
+    return (SEQ_STORE, _ins4((addr, val)), False)
+
+
+def seq_encode(script):
+    out = bytearray(struct.pack("<I", len(script)))
+    for op, ins, doc0 in script:
+        rel = sum(r << (8 * n) for n, (r, _) in enumerate(ins))
+        out += struct.pack("<8I", op, *[v & 0xFFFFFFFF for _, v in ins], rel, 1 if doc0 else 0, 0)
+    return bytes(out)
 
 
 def region(out_len, dst_ofs=DST_OFS, data=None):
@@ -388,18 +464,32 @@ def lz77_tests():
         out_len=round4(DST_OFS + MARGIN), isolated=True,
         expect=dict(basis=G_DECOMP + " (LZ77UnCompReadNormalWrite8bit)", note="size 0 is not described by GBATEK"))
 
-    # SWI 12h: read by callback, write 16-bit units
+    # SWI 12h (DSi: 02h and 19h): read by callback, write 16-bit units
     runs = [("text 300 bytes", 0, 0), ("text 300 bytes", 0, F_VRAM), ("odd size 37", 0, 0),
             ("odd size 37", 0, F_VRAM), ("disp 0 blocks", 0, 0), ("ends mid flag group", 0, F_VRAM),
             ("last block overshoots the size", 0, 0), ("4224 bytes, disp FFFh", 0, F_VRAM),
             ("long runs (18-byte blocks)", 0, 0)]
     runs += [("text 300 bytes", cb, 0) for cb in (1, 2, 3, 4, 5)]
+    if not TWL:
+        lz_callback_runs(sets, "LZ77 Callback16", 0x12, runs)
+        return
+    lz_callback_runs(sets, "LZ77 Callback16 (02h)", 0x02, runs)
+    # 19h is the same function as 02h (GBATEK), so a few cases are enough
+    lz_callback_runs(sets, "LZ77 Callback16 (19h)", 0x19,
+                     [("text 300 bytes", 0, 0), ("odd size 37", 0, F_VRAM), ("disp 0 blocks", 0, 0),
+                      ("text 300 bytes", 2, 0)])
+    # 01h writes bytes, so no VRAM destination; disp 0 works there
+    lz_callback_runs(sets, "LZ77 Callback8 (01h)", 0x01,
+                     [(n, 0, 0) for n in sets] + [("text 300 bytes", cb, 0) for cb in (1, 2, 3, 4, 5)])
+
+
+def lz_callback_runs(sets, prefix, swi, runs):
     for name, cb, vram in runs:
         toks, kind = sets[name]
         stream, size, out, clean = lz77_case(toks, kind)
-        add_callback_test("LZ77 Callback16", 0x12, name, cb, vram, stream, size, out, clean,
-                          disp0=E.lz77_has_disp0(toks))
-    add("LZ77 Callback16 size 0", BOTH, 0x12, K_CB,
+        add_callback_test(prefix, swi, name, cb, vram, stream, size, out, clean,
+                          disp0=swi != 0x01 and E.lz77_has_disp0(toks))
+    add(prefix + " size 0", BOTH, swi, K_CB,
         ins=((R_SRC, 0), (R_DST, DST_OFS), CB_PARAM, (R_CB, 0)), src=E.lz77_stream([], 0),
         out_len=round4(DST_OFS + MARGIN), isolated=True,
         expect=dict(basis=G_CALLBACK, note="size 0 is not described by GBATEK"))
@@ -425,7 +515,7 @@ def add_callback_test(prefix, swi, name, cb, vram, stream, size, out, clean, dis
         if swi == 0x13:
             data, ok = E.huff_model(stream[:1] + bytes([8, 0, 0]) + stream[4:])
             clean = clean and ok
-        elif swi == 0x12:
+        elif swi in (0x01, 0x02, 0x12, 0x19):
             data, ok = E.lz77_model(stream[:1] + bytes([8, 0, 0]) + stream[4:])
             clean = clean and ok
         else:
@@ -435,7 +525,7 @@ def add_callback_test(prefix, swi, name, cb, vram, stream, size, out, clean, dis
     notes = []
     if not clean:
         notes.append("the output size is not covered by GBATEK (overshoot or partial word)")
-    if swi in (0x12, 0x15) and size % 2 and cb != 2:
+    if swi in (0x02, 0x12, 0x15, 0x19) and size % 2 and cb != 2:
         notes.append("odd size with 16-bit writes: GBATEK does not say how the last byte is written")
         clean = False
     if disp0:
@@ -619,7 +709,7 @@ def misc_tests():
     # word_after is the word at 27FFFF8h: GBATEK says the NDS9 destroys the halfword at
     # 27FFFF8h (low half) and the NDS7 the one at 27FFFFAh (high half); the model checks
     # that the other half is kept and the destroyed half changed.
-    for cpu, half, keep in [(9, 0x027FFFF8, 0xFFFF0000), (7, 0x027FFFFA, 0x0000FFFF)]:
+    for cpu, half, keep in ([] if TWL else [(9, 0x027FFFF8, 0xFFFF0000), (7, 0x027FFFFA, 0x0000FFFF)]):
         add("IsDebugger", (cpu,), 0x0F, K_REGS, ins=(), p=[0x027FFFF8, 0x12345678, 4, 0, 0, 0x027FFFF8],
             isolated=True,
             expect=dict(regs={0: 0}, extra_changed={"word_after": [keep, 0x12345678]},
@@ -638,26 +728,97 @@ def misc_tests():
     add("SoundBias r0=1 r1=0 from 000", (7,), 0x08, K_REGS, ins=(1, 0), p=[0x04000504, 0, 2, 0x04000504, 2],
         isolated=True, expect=dict(extra={"io_after": 0x200}, basis=G_SOUND + " (SoundBias)",
                                    note="delay 0 is not described by GBATEK"))
-    for r2 in [0, 0xDEADBEEF]:
-        add("GetBootProcs r2=%X (hash only)" % r2, (7,), 0x1D, K_REGS, ins=(0, 0, r2), flags=F_HASHONLY,
-            expect=dict(basis=G_MISC + " (GetBootProcs returns BIOS addresses: compared by hash only)"))
+    for r2, other in [(0, 0x12345678), (0xDEADBEEF, 0)]:
+        add("GetBootProcs r2=%X, then r2=%X (flags only)" % (r2, other), (7,), 0x1D, K_PROCS, ins=(0, 0, r2),
+            flags=F_HASHONLY, p=[r2, other],
+            expect=dict(basis=G_MISC + " (GetBootProcs returns BIOS addresses: only behavior flags are kept)"))
+
+
+WONT_MATCH_TABLE = ("out-of-range table indices read whatever the BIOS has there; FreeBIOS is never "
+                    "tuned to match them (that would rebuild BIOS content by trial)")
 
 
 def table_tests():
+    """Hash only, salted per test. DSi mode drops the "16 past the end" and
+    "-16..-1" sets; what is left outside the documented range is marked as
+    won't match."""
     for swi, name, n in [(0x1A, "GetSineTable", 0x40), (0x1B, "GetPitchTable", 0x300), (0x1C, "GetVolumeTable", 0x2D4)]:
-        for label, start, count, step in [("all %d entries" % n, 0, n, 1), ("16 past the end", n, 16, 1),
-                                          ("-16..-1", 0xFFFFFFF0, 16, 1), ("far indices", 0x1000, 8, 0x800)]:
+        sets = [("all %d entries" % n, 0, n, 1, False)]
+        if TWL and swi == 0x1B:
+            # GBATEK: bugged on DSi7. 0-3Fh is documented range; from 40h up the DSi7
+            # BIOS returns something else, which is not matched
+            sets = [("entries 0-3Fh", 0, 0x40, 1, False), ("entries 40h-2FFh", 0x40, 0x2C0, 1, True)]
+        if not TWL:
+            sets += [("16 past the end", n, 16, 1, True), ("-16..-1", 0xFFFFFFF0, 16, 1, True)]
+        sets += [("far indices", 0x1000, 8, 0x800, True)]
+        for label, start, count, step, wont in sets:
+            e = dict(basis=G_MISC + " (%s; table SWIs are compared by a salted hash only)" % name)
+            if wont:
+                e["wont_match"] = WONT_MATCH_TABLE if "entries" not in label else (
+                    "GBATEK: GetPitchTable is bugged on DSi7; what it returns from 40h up is BIOS content, "
+                    "not matched")
             add("%s %s (hash only)" % (name, label), (7,), swi, K_TABLE, flags=F_HASHONLY, p=[start, count, step],
-                expect=dict(basis=G_MISC + " (%s; table SWIs are compared by hash only)" % name))
+                expect=e)
+    if TWL:
+        # the redacted spec says the real table starts at index -46Ah on DSi7
+        add("GetPitchTable 300h entries from -46Ah (hash only)", (7,), 0x1B, K_TABLE, flags=F_HASHONLY,
+            p=[E.u32(-0x46A), 0x300, 1],
+            expect=dict(basis=G_SUMMARY + " (GetPitchTable: bugged on DSi7; compared by a salted hash only)",
+                        wont_match="negative indices of the bugged DSi7 GetPitchTable; not matched"))
 
 
 # ---------------------------------------------------------------------------
 # IntrWait / VBlankIntrWait / Halt / CustomHalt
 
+TWL_IRQ_NOTE = ("GBATEK marks IntrWait/VBlankIntrWait as 'DSi7/DSi9=bugged?' (DSi9 tries to halt through "
+                "4000301h, DSi7 ignores old IF flags and only works with new IF2 IRQs); DSi mode runs every "
+                "IRQ test on its own since any of them may hang")
+
+
+def twl_irq_model(swi, cpu, r1, r2):
+    """What GBATEK says for DSi mode: IntrWait/VBlankIntrWait set IME=1 and
+    reset the selected flags in the BIOS IF check bits on return (r2: the DSi7
+    IF2 check bits too); DSi7 ignores old IF IRQs and works only with new IF2
+    IRQs, so a DSi7 wait with no r2 bits never returns."""
+    if swi == 0x05:
+        r1, r2 = 1, 0
+    if cpu == 7 and not r2:
+        return dict(hangs="GBATEK: DSi7 IntrWait ignores the IF IRQs and only works with new IF2 IRQs")
+    bits = {"IME_after": [0xFFFFFFFF, 1], "flags_after": [r1, 0]}
+    if cpu == 7:
+        bits["IF2_flags_after"] = [r2, 0]
+    return dict(extra_bits=bits)
+
+
+def twl_irq_expect(e, swi=None, ins=()):
+    """DSi mode: keep only what GBATEK says for DSi too (IME forced to 1, the
+    selected flags reset, DSi7 IF waits hang, Halt registers)."""
+    def f(cpu):
+        x = e(cpu) if callable(e) else dict(e or {})
+        out = dict(basis=x.get("basis", G_HALT), note=TWL_IRQ_NOTE)
+        if swi in (0x04, 0x05):
+            out.update(twl_irq_model(swi, cpu, ins[1] if len(ins) > 1 else 0, ins[2] if len(ins) > 2 else 0))
+        if "regs" in x:
+            out["regs"] = x["regs"]
+        if swi == 0x06 and cpu == 9 and "IME=0" in str(x.get("note", "")):
+            out["hangs"] = "GBATEK: the DSi9 CP15 halt hangs if IME=0"
+        return out
+    return f
+
+
+def irq_add(name, cpus, swi, ins=(), flags=0, p=(), expect=None, isolated=False):
+    if TWL:
+        # DSi7 IntrWait takes the IF2 mask in r2 (GBATEK); 0 unless the test says otherwise
+        ins = tuple(ins) + (0,) * (3 - len(ins)) if swi in (0x04, 0x05) else ins
+        add(name, cpus, swi, K_IRQ, ins=ins, flags=flags, p=p, expect=twl_irq_expect(expect, swi, ins), isolated=True)
+    else:
+        add(name, cpus, swi, K_IRQ, ins=ins, flags=flags, p=p, expect=expect, isolated=isolated)
+
+
 def irq_tests():
     def iw(name, r0, r1, flags, ie, ime, d2, d3, expect, thumb=False, cpus=BOTH):
-        add("IntrWait " + name + (" (Thumb SWI)" if thumb else ""), cpus, 0x04, K_IRQ, ins=(r0, r1),
-            flags=F_THUMB if thumb else 0, p=[flags, ie, ime, d2, d3, 0], expect=expect)
+        irq_add("IntrWait " + name + (" (Thumb SWI)" if thumb else ""), cpus, 0x04, ins=(r0, r1),
+                flags=F_THUMB if thumb else 0, p=[flags, ie, ime, d2, d3, 0], expect=expect)
 
     def ex(cpu, arm7, arm9, note=""):
         e = dict(basis=G_HALT + " (IntrWait)", extra=dict(arm7 if cpu == 7 else arm9))
@@ -690,7 +851,7 @@ def irq_tests():
        lambda c: ex(c, {"irqs_taken": 1, "flags_after": 0}, {"irqs_taken": 1, "flags_after": 0}), thumb=True)
 
     def vb(name, r0, r1, flags, ie, d2, extra):
-        add("VBlankIntrWait " + name, BOTH, 0x05, K_IRQ, ins=(r0, r1), p=[flags, ie, 1, d2, 0, 1],
+        irq_add("VBlankIntrWait " + name, BOTH, 0x05, ins=(r0, r1), p=[flags, ie, 1, d2, 0, 1],
             expect=dict(basis=G_HALT + " (VBlankIntrWait: no parameters, no return value; it sets r0=1, r1=1"
                         " and runs IntrWait, so r0/r1 after are not documented results)", extra=extra))
     vb("basic", 0x12345678, 0x9ABCDEF0, 0, VB, 0, {"flags_after": 0})
@@ -698,7 +859,7 @@ def irq_tests():
     vb("timer 2 IRQs while waiting", 0, 0, 0, VB | T2, 0x100, {"flags_after": T2})
 
     def halt(name, cpus, ime, isolated=False, note=""):
-        add("Halt " + name, cpus, 0x06, K_IRQ, ins=(0x12345678, 0x11111111), p=[0, T2, ime, 0x100, 0, 0],
+        irq_add("Halt " + name, cpus, 0x06, ins=(0x12345678, 0x11111111), p=[0, T2, ime, 0x100, 0, 0],
             isolated=isolated, expect=lambda c: dict(
                 basis=G_HALT + " (Halt: NDS9 destroys r0; the CP15 halt hangs if IME=0)",
                 regs={} if c == 9 else {0: 0x12345678, 1: 0x11111111}, note=note))
@@ -708,7 +869,7 @@ def irq_tests():
 
     for r2, name in [(0x80, "r2=80h (halt)"), (0x00, "r2=00h")]:
         # isolated: a wrong HALTCNT value (40h = GBA mode) stops the emulator
-        add("CustomHalt " + name, (7,), 0x1F, K_IRQ, ins=(0x12345678, 0x11111111, r2), p=[0, T2, 1, 0x100, 0, 0],
+        irq_add("CustomHalt " + name, (7,), 0x1F, ins=(0x12345678, 0x11111111, r2), p=[0, T2, 1, 0x100, 0, 0],
             isolated=True, expect=dict(basis=G_HALT + " (CustomHalt writes the 8-bit r2 to HALTCNT)"))
 
 
@@ -716,6 +877,8 @@ def irq_tests():
 # SWI numbers GBATEK lists as invalid (isolated: they jump to 0 or crash)
 
 def invalid_tests():
+    if TWL:
+        return twl_invalid_tests()
     lists = {9: [0x01, 0x02, 0x07, 0x08, 0x0A, 0x17, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x20, 0x2A, 0x3F, 0x49, 0xFF],
              7: [0x01, 0x02, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1E, 0x20, 0x2A, 0x3F, 0x49, 0xFF]}
     for cpu, nums in lists.items():
@@ -724,6 +887,375 @@ def invalid_tests():
                     if n >= 0x20 else "GBATEK: invalid NDS SWIs jump to 0")
             add("invalid SWI %02Xh" % n, (cpu,), n, K_REGS, ins=(100, 7), isolated=True,
                 expect=dict(basis=G_SUMMARY + " (Invalid Functions)", note=note))
+
+
+# ---------------------------------------------------------------------------
+# DSi mode only
+
+def twl_invalid_tests():
+    """GBATEK "BIOS Function Summary": unlisted DSi SWIs hang in an endless loop
+    (IRQs still run), 12h and 2Bh are ignored, 40h-FFh mirror 00h-3Fh."""
+    hang = {9: [0x00, 0x07, 0x08, 0x0A, 0x0F, 0x17, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x2A, 0x2C, 0x3F, 0x40, 0x7F, 0xFF],
+            7: [0x00, 0x0A, 0x0F, 0x16, 0x17, 0x18, 0x1E, 0x2A, 0x2C, 0x3F, 0x40, 0x7F, 0xFF]}
+    for cpu, nums in hang.items():
+        for n in nums:
+            add("invalid SWI %02Xh" % n, (cpu,), n, K_REGS, ins=(100, 7), isolated=True,
+                expect=dict(basis=G_SUMMARY + " (DSi: invalid functions)", hangs="GBATEK: endless loop",
+                            note="GBATEK: unlisted DSi SWIs hang in an endless loop" +
+                                 ("; 40h-FFh mirror 00h-3Fh" if n >= 0x40 else "")))
+    keep = {0: 100, 1: 7, 2: 0x22222222, 3: 0x33333333}
+    for n in (0x12, 0x2B, 0x52):
+        add("ignored SWI %02Xh" % n, BOTH, n, K_REGS, ins=(100, 7, 0x22222222, 0x33333333), isolated=True,
+            expect=dict(regs=keep, basis=G_SUMMARY + " (DSi: SWI 12h and 2Bh are ignored, no function; "
+                                                     "40h-FFh mirror 00h-3Fh)"))
+    q, r, a = E.div_model(100, 7)
+    add("SWI 49h (mirror of 09h Div), 100 / 7", BOTH, 0x49, K_REGS, ins=(100, 7), isolated=True,
+        expect=dict(regs={0: q, 1: r, 3: a}, basis=G_SUMMARY + " (DSi: 40h-FFh mirror 00h-3Fh)"))
+    add("SWI CDh (mirror of 0Dh Sqrt), 10000", BOTH, 0xCD, K_REGS, ins=(10000,), isolated=True,
+        expect=dict(regs={0: 100}, basis=G_SUMMARY + " (DSi: 40h-FFh mirror 00h-3Fh)"))
+
+
+def dsi_irq_tests():
+    """The DSi IntrWait rules: GBATEK (DSi7 ignores old IF flags, waits on new IF2
+    IRQs given in r2) and the redacted spec's hypotheses (return only when the
+    check bits hold a wanted bit and a bit outside the mask)."""
+    F2A, F2B = 1 << 3, 1 << 4      # IF2 check bits preset by the test (no IF2 source enabled)
+    AES2 = 1 << 12                  # IF2 bit of the AES engine, a real IF2 IRQ
+    KICK = 0x80000000               # p[7] bit 31: the IRQ handler starts the AES on the first timer 3 IRQ
+
+    def iw(name, cpus, r0, r1, r2, flags, ie, d2, d3, flags2=0, ie2=0, note=""):
+        def exp(cpu):
+            e = dict(basis=G_HALT + " (IntrWait, DSi7/DSi9=bugged?)", note=note)
+            e.update(twl_irq_model(0x04, cpu, r1, r2))
+            return e
+        add("IntrWait DSi: " + name, cpus, 0x04, K_IRQ, ins=(r0, r1, r2), p=[flags, ie, 1, d2, d3, 0, flags2, ie2],
+            isolated=True, expect=exp)
+    iw("wait for a new AES IF2 IRQ (r0=1)", (7,), 1, 0, AES2, 0, T3, 0, 0x100, ie2=AES2 | KICK,
+       note="the IRQ handler feeds the AES one block on the first timer 3 IRQ; the AES IRQ is IF2 bit 12")
+    iw("wait for a new AES IF2 IRQ (r0=0)", (7,), 0, 0, AES2, 0, T3, 0, 0x100, ie2=AES2 | KICK,
+       note="the IRQ handler feeds the AES one block on the first timer 3 IRQ; the AES IRQ is IF2 bit 12")
+    iw("AES IF2 IRQ while also waiting for T2 (r1=T2, r2=AES)", (7,), 1, T2, AES2, 0, T3, 0, 0x100,
+       ie2=AES2 | KICK, note="timer 2 is not enabled, so only the AES IF2 IRQ can end the wait")
+    iw("r0=0, wanted flag and another flag set", BOTH, 0, T2, 0, T2 | T3, T2, 0x100, 0,
+       note="redacted spec: returns at once when a wanted bit and a bit outside r1 are set (flags_after = T3)")
+    iw("r0=1, another flag pending, wanted IRQ arrives", BOTH, 1, T2, 0, T3, T2, 0x100, 0,
+       note="redacted spec: returns when timer 2 fires since T3 is left over")
+    iw("r0=1, nothing else pending, wanted IRQ arrives", BOTH, 1, T2, 0, 0, T2, 0x100, 0,
+       note="redacted spec: never returns (no leftover bit); GBATEK NDS behavior: returns after one IRQ")
+    iw("r0=0, old wanted flag only, new IRQ arrives", (7,), 0, T2, 0, T2, T2, 0x100, 0,
+       note="GBATEK: DSi7 ignores old IF flags (so it waits for the new IRQ)")
+    iw("IF2 wait, r2 bit already set alone", (7,), 0, 0, F2A, 0, T2, 0x100, 0, flags2=F2A,
+       note="redacted spec: never returns (needs an IF2 bit outside r2 too); timer 2 wakes the CPU")
+    iw("IF2 wait, r2 bit and another IF2 bit set", (7,), 0, 0, F2A, 0, T2, 0x100, 0, flags2=F2A | F2B,
+       note="redacted spec: returns at once, IF2_flags_after = the other bit")
+    iw("IF2 wait with r1=T2 too, IF2 bits set", (7,), 0, T2, F2A, 0, T2, 0x100, 0, flags2=F2A | F2B,
+       note="checks whether the IF side (r1) changes the IF2 result")
+    def vbexp(cpu):
+        e = dict(basis=G_HALT + " (VBlankIntrWait, DSi7/DSi9=bugged?)",
+                 note="redacted spec: DSi9 returns at VBlank when other bits are pending; DSi7 only via IF2")
+        e.update(twl_irq_model(0x05, cpu, 1, 0))
+        return e
+    add("VBlankIntrWait DSi: VBlank with timer 2 flags pending", BOTH, 0x05, K_IRQ, ins=(0, 0, 0),
+        p=[T2, VB | T2, 1, 0x100, 0, 1, 0, 0], isolated=True, expect=vbexp)
+
+
+SHA_DATA = E.Rng(0x5A1).bytes(0x4100)
+SHA_CTX = DST_OFS               # 64h-byte context in the output region
+SHA_DIG = DST_OFS + 0x70        # 20-byte digest
+SHA_LEN = round4(SHA_DIG + 0x14 + MARGIN)
+SHA_CB_MARKER = 0x5AC0C0B0      # what the ROM stores in place of our own callback's address
+
+
+def sha_seq(name, chunks, finish=1, src=SHA_DATA, src_at=0, cb=0, thumb=False):
+    """Init, Update per (offset, length) chunk, then Finish 'finish' times.
+    cb: 0 = callback field 0 before Init (the BIOS installs its default),
+    1 = our own callback in the field (it does nothing, so H stays the IV)."""
+    script = [seq_store((R_DST, SHA_CTX + 0x60), (R_FN, 0) if cb else 0),
+              seq_call(0x24, (R_DST, SHA_CTX), thumb=thumb)]
+    for off, n in chunks:
+        script.append(seq_call(0x25, (R_DST, SHA_CTX), (R_SRC, src_at + off), n, thumb=thumb))
+    for _ in range(finish):
+        script.append(seq_call(0x26, (R_DST, SHA_DIG), (R_DST, SHA_CTX), thumb=thumb))
+    reg = bytearray(prefill(SHA_LEN))
+    c = E.Sha1Ctx(buf=reg[SHA_CTX + 0x1C:SHA_CTX + 0x5C], callback=SHA_CB_MARKER if cb else 0)
+    dig = None
+    for off, n in chunks:
+        c.update(src[off:off + n])
+    for _ in range(finish):
+        dig = c.finish()
+    if cb:
+        c.h = E.SHA1_IV
+        dig = struct.pack(">5I", *E.SHA1_IV) if finish else None
+    reg[SHA_CTX:SHA_CTX + 0x64] = c.raw()
+    if dig is not None:
+        reg[SHA_DIG:SHA_DIG + 20] = dig
+    e = dict(out=bytes(reg), extra={"ctx_callback": 2 if cb else 1}, basis=G_SHA1,
+             note="the context's callback field (+60h) is stored as 0 when it holds a BIOS address "
+                  "(ctx_callback 1), as %08Xh for our own callback (2)" % SHA_CB_MARKER)
+    if finish > 1:
+        e["note"] += "; Finish again without Init: GBATEK restores the bit length, so the model pads again"
+    add("SHA1 " + name + (" (Thumb SWIs)" if thumb else ""), BOTH, script[-1][0] & 0xFF, K_SEQ, src=src,
+        src_at=src_at, out_len=SHA_LEN, p=[0, SHA_CTX + 0x60 + 1], script=script, expect=e)
+
+
+def find_src_with_digest_end(last):
+    for k in range(100000):
+        d = struct.pack("<I", k) + b"seed"
+        if E.sha1(d)[19] == last:
+            return d
+    raise RuntimeError("no source found")
+
+
+def sha1_tests():
+    sha_seq("Init only", [], finish=0)
+    sha_seq("Init with our own callback in +60h (kept)", [], finish=0, cb=1)
+    sha_seq("Init + Update 23h bytes, no Finish", [(0, 0x23)], finish=0)
+    sha_seq("Init + Update 40h + Update 41h, no Finish", [(0, 0x40), (0x40, 0x41)], finish=0)
+    sha_seq("empty message", [])
+    sha_seq("'abc' (FIPS 180 example)", [(0, 3)], src=b"abc")
+    for n in (1, 0x37, 0x38, 0x3F, 0x40, 0x41, 0x7F, 0x80):
+        sha_seq("%Xh bytes" % n, [(0, n)])
+    sha_seq("30h + 30h bytes (crossing a block)", [(0, 0x30), (0x30, 0x30)])
+    sha_seq("5 updates of 0Dh bytes", [(k * 0xD, 0xD) for k in range(5)])
+    sha_seq("20h + 0 + 20h bytes (length-0 update)", [(0, 0x20), (0x20, 0), (0x20, 0x20)])
+    sha_seq("100h bytes from an unaligned source", [(0, 0x100)], src_at=1)
+    sha_seq("3 bytes, then 3Fh bytes from an odd address", [(0, 3), (3, 0x3F)], src_at=1)
+    sha_seq("4000h bytes (large)", [(0, 0x4000)])
+    sha_seq("4000h bytes in 1000h updates", [(k * 0x1000, 0x1000) for k in range(4)])
+    sha_seq("10h bytes, Finish twice", [(0, 0x10)], finish=2)
+    sha_seq("80h bytes through our own callback", [(0, 0x80)], cb=1)
+    sha_seq("41h bytes", [(0, 0x41)], thumb=True)
+
+    # 27h one-shot
+    out_len = round4(DST_OFS + 0x14 + MARGIN)
+    for n, at in [(0, 0), (3, 0), (0x40, 0), (0x41, 0), (0x1000, 0), (0x55, 1)]:
+        src = b"abc" if n == 3 else SHA_DATA
+        add("SHA1 one-shot %Xh bytes%s" % (n, ", unaligned source" if at else ""), BOTH, 0x27, K_MEM,
+            ins=((R_DST, DST_OFS), (R_SRC, at), n), src=src, src_at=at, out_len=out_len,
+            expect=dict(regs={0: 1}, out=region(out_len, data=E.sha1(src[:n])),
+                        basis=G_SHA1 + " (27h: always returns r0=1)"))
+    add("SHA1 one-shot, source 0 with length 0", BOTH, 0x27, K_MEM, ins=((R_DST, DST_OFS), 0, 0), out_len=out_len,
+        expect=dict(regs={0: 1}, out=region(out_len, data=E.sha1(b"")), basis=G_SHA1))
+    add("SHA1 one-shot 41h bytes (Thumb SWI)", BOTH, 0x27, K_MEM, ins=((R_DST, DST_OFS), (R_SRC, 0), 0x41),
+        src=SHA_DATA, out_len=out_len, flags=F_THUMB,
+        expect=dict(regs={0: 1}, out=region(out_len, data=E.sha1(SHA_DATA[:0x41])), basis=G_SHA1))
+
+    # 28h compare
+    a = E.sha1(b"compare")
+    b = a[:19] + bytes([a[19] ^ 1])
+    c = bytes([a[0] ^ 0x80]) + a[1:]
+    blob = a + a + b + c
+    for name, x, y, r in [("equal", (R_SRC, 0), (R_SRC, 20), 1), ("last byte differs", (R_SRC, 0), (R_SRC, 40), 0),
+                          ("first byte differs", (R_SRC, 0), (R_SRC, 60), 0), ("first pointer 0", 0, (R_SRC, 0), 0),
+                          ("second pointer 0", (R_SRC, 0), 0, 0), ("same pointer", (R_SRC, 0), (R_SRC, 0), 1)]:
+        add("SHA1 compare, " + name, BOTH, 0x28, K_REGS, ins=(x, y), src=blob,
+            expect=dict(regs={0: r}, basis=G_SHA1 + " (28h: 1 = match, 0 = mismatch or a pointer is 0)"))
+    for t in TESTS:
+        if t.name == "SHA1 compare, first pointer 0":
+            t.expect["companion"] = "SHA1 compare, equal"
+    add("SHA1 compare, equal (Thumb SWI)", BOTH, 0x28, K_REGS, ins=((R_SRC, 0), (R_SRC, 20)), src=blob,
+        flags=F_THUMB, expect=dict(regs={0: 1}, basis=G_SHA1))
+
+    # 29h
+    end00 = find_src_with_digest_end(0x00)
+    endff = find_src_with_digest_end(0xFF)
+    for dstlen, src, srclen, label in [(0x14, b"abc", 3, "'abc'"), (0x15, SHA_DATA, 0x20, "20h bytes"),
+                                       (1, SHA_DATA, 0x20, "20h bytes"), (0x28, SHA_DATA, 0x40, "40h bytes"),
+                                       (0x64, SHA_DATA, 0x10, "10h bytes"), (0x14, SHA_DATA, 0, "length 0"),
+                                       (0x3C, end00, len(end00), "a source whose SHA1 ends in 00h (carry quirk)"),
+                                       (0x3C, endff, len(endff), "a source whose SHA1 ends in FFh (carry quirk)")]:
+        o = round4(DST_OFS + dstlen + MARGIN)
+        add("SHA1 29h, %Xh bytes out of %s" % (dstlen, label), BOTH, 0x29, K_MEM,
+            ins=((R_DST, DST_OFS), dstlen, (R_SRC, 0), srclen), src=src, out_len=o,
+            expect=dict(regs={0: 1}, out=region(o, data=E.sha1_mess(dstlen, src[:srclen])),
+                        basis=G_SHA1 + " (29h SHA1_Init_Update_Finish_Mess pseudocode: carry only while the "
+                                       "byte just incremented is 01h)"))
+    for name, ins, r0, data in [("destination length 0", ((R_DST, DST_OFS), 0, (R_SRC, 0), 0x20), 1, b""),
+                                ("destination 0", (0, 0x14, (R_SRC, 0), 0x20), 1, b""),
+                                ("source 0 with length 0", ((R_DST, DST_OFS), 0x14, 0, 0), 1,
+                                 E.sha1_mess(0x14, b""))]:
+        add("SHA1 29h, " + name, BOTH, 0x29, K_MEM, ins=ins, src=SHA_DATA, out_len=out_len,
+            expect=dict(regs={0: r0}, out=region(out_len, data=data),
+                        basis=G_SHA1 + " (29h: dst 0 returns 1, src 0 with srclen > 0 returns 0)"))
+    # the source would be read from address 0 (the ARM7 BIOS), so only flags are kept:
+    # GBATEK says r0 = 0 (bit 5) and nothing is written (bit 0)
+    add("SHA1 29h, source 0 with length 20h (flags only)", BOTH, 0x29, K_MEM,
+        ins=((R_DST, DST_OFS), 0x14, 0, 0x20), out_len=out_len, flags=F_FLAGSONLY,
+        expect=dict(extra_bits={"flags": [0x21, 0x21]},
+                    basis=G_SHA1 + " (29h: src 0 with srclen > 0 returns 0)"))
+    o = round4(DST_OFS + 0x15 + MARGIN)
+    add("SHA1 29h, 15h bytes out of 20h bytes (Thumb SWI)", BOTH, 0x29, K_MEM,
+        ins=((R_DST, DST_OFS), 0x15, (R_SRC, 0), 0x20), src=SHA_DATA, out_len=o, flags=F_THUMB,
+        expect=dict(regs={0: 1}, out=region(o, data=E.sha1_mess(0x15, SHA_DATA[:0x20])), basis=G_SHA1))
+
+
+# RSA: heap descriptor, parameter struct (21h), length word and destination in the output region
+RSA_DESC = DST_OFS
+RSA_PS = DST_OFS + 0x10
+RSA_LENW = DST_OFS + 0x1C
+RSA_OUT = DST_OFS + 0x20
+RSA_LEN = round4(RSA_OUT + 0x80 + MARGIN)
+RSA_HEAP = 0x1000
+KEY_A = E.rsa_key(0x5A01, top_bit0=0)
+KEY_B = E.rsa_key(0x5A02, top_bit0=1)
+
+
+def openpgp(digest, tag0=0x30, oid=bytes([0x2B, 0x0E, 0x03, 0x02, 0x1A]), lastlen=0x14):
+    body = bytes([tag0, 0x21, 0x30, 0x09, 0x06, 0x05]) + oid + bytes([0x05, 0x00, 0x04, lastlen]) + digest
+    return E.pkcs1_type1(body)
+
+
+def rsa_tests():
+    # 20h alone
+    for at, size in [(1, 0x1000), (2, 0x1003), (0, 0x1000)]:
+        def exp(cpu, at=at, size=size):
+            s = BUFS[cpu]["tmp"] + at
+            st, en = (s + 3) & ~3, (s + size) & ~3
+            o = round4(DST_OFS + 12 + MARGIN)
+            return dict(out=region(o, data=struct.pack("<3I", st, en, en - st)),
+                        basis=G_RSA + " (20h: start rounded up, end = start+size rounded down, adjusted size)")
+        add("RSA heap init, start +%d, size %Xh" % (at, size), BOTH, 0x20, K_MEM,
+            ins=((R_DST, DST_OFS), (R_TMP, at), size), out_len=round4(DST_OFS + 12 + MARGIN),
+            tmp_len=RSA_HEAP + 0x10, expect=exp)
+    add("RSA heap init, descriptor 0", BOTH, 0x20, K_MEM, ins=(0, (R_TMP, 0), RSA_HEAP), tmp_len=RSA_HEAP + 0x10,
+        isolated=True, expect=dict(basis=G_RSA, note="redacted spec: nothing happens; GBATEK does not say",
+                                   companion="RSA heap init, start +0, size 1000h"))
+
+    def init():
+        return seq_call(0x20, (R_DST, RSA_DESC), (R_TMP, 0), RSA_HEAP)
+
+    def model(cpu, out, lenw=None, struct_ptrs=True):
+        b = BUFS[cpu]
+        reg = bytearray(prefill(RSA_LEN))
+        reg[RSA_DESC:RSA_DESC + 12] = struct.pack("<3I", b["tmp"], b["tmp"] + RSA_HEAP, RSA_HEAP)
+        if struct_ptrs:
+            reg[RSA_PS:RSA_PS + 12] = struct.pack("<3I", b["dst"] + RSA_OUT, b["src"], b["src"] + 0x80)
+        if lenw is not None:
+            reg[RSA_LENW:RSA_LENW + 4] = struct.pack("<I", lenw)
+        reg[RSA_OUT:RSA_OUT + len(out)] = out
+        return bytes(reg)
+
+    def decrypt(name, key, msg, ps=None, swi=0x21, thumb=False, ok=True, note="", flagsonly=False):
+        n, d = key
+        src = E.rsa_sign(msg, n, d) + n.to_bytes(0x80, "big")
+        if swi == 0x21:
+            std_ps = ps is None
+            ps = ps or ((R_DST, RSA_OUT), (R_SRC, 0), (R_SRC, 0x80))
+            script = [init(), seq_store((R_DST, RSA_PS), ps[0]), seq_store((R_DST, RSA_PS + 4), ps[1]),
+                      seq_store((R_DST, RSA_PS + 8), ps[2]),
+                      seq_call(0x21, (R_DST, RSA_DESC), (R_DST, RSA_PS), (R_DST, RSA_LENW), thumb=thumb)]
+            out = msg.lstrip(b"\0")
+            basis = G_RSA + " (21h: textbook RSA, leading 00h bytes stripped, length to len_dest)"
+        else:
+            std_ps = False
+            script = [init(), seq_call(swi, (R_DST, RSA_DESC), (R_DST, RSA_OUT), (R_SRC, 0), (R_SRC, 0x80),
+                                       thumb=thumb)]
+            body = msg.lstrip(b"\0")
+            out = body[body.index(b"\0", 1) + 1:] if b"\0" in body[1:] else b""
+            basis = G_RSA + " (22h: strips 01h, min eight FFh, 00h)"
+            if swi == 0x23:
+                out = out[-0x14:]
+                basis = G_RSA + " (23h: five DER chunks 30h 30h 06h 05h 04h, the 04h chunk of 14h bytes is copied)"
+
+        def exp(cpu):
+            if flagsonly:
+                return dict(basis=basis, note=note)
+            e = dict(regs={0: 1 if ok else 0}, basis=basis)
+            if ok:
+                e["out"] = model(cpu, out, lenw=len(out) if swi == 0x21 else None, struct_ptrs=std_ps)
+            if note:
+                e["note"] = note
+            return e
+        add("RSA %02Xh %s%s" % (swi, name, " (Thumb SWIs)" if thumb else ""), BOTH, swi, K_SEQ, src=src,
+            out_len=RSA_LEN, tmp_len=RSA_HEAP + 0x10, script=script, expect=exp,
+            flags=F_FLAGSONLY if flagsonly else 0)
+
+    pay = E.sha1(b"payload")
+    std = E.pkcs1_type1(pay)
+    decrypt("key A (first key byte bit 0 = 0), 14h-byte payload", KEY_A, std)
+    decrypt("key B (first key byte bit 0 = 1), 14h-byte payload", KEY_B, std,
+            note="GBATEK: bit 0 of the first key byte selects one of two RSA core modes (unknown difference)")
+    decrypt("message without a leading 00h (length 80h)", KEY_A, bytes([0x55]) + E.Rng(0x77).bytes(0x7F))
+    decrypt("message with two leading 00h (length 7Eh)", KEY_A, b"\0\0" + E.Rng(0x78).bytes(0x7E))
+    decrypt("destination pointer 0", KEY_A, std, ps=(0, (R_SRC, 0), (R_SRC, 0x80)), ok=False,
+            note="redacted spec: r0 = 0 when a struct word is 0; GBATEK does not say")
+    decrypt("key pointer 0 (flags only)", KEY_A, std, ps=((R_DST, RSA_OUT), (R_SRC, 0), 0), ok=False, flagsonly=True,
+            note="the key would be read from address 0 (the ARM7 BIOS), so only flags are kept; "
+                 "redacted spec: r0 = 0 when a struct word is 0; GBATEK does not say")
+    decrypt("key B, message without a leading 00h", KEY_B, bytes([0x23]) + E.Rng(0x79).bytes(0x7F), thumb=True)
+
+    decrypt("key A, 14h-byte payload", KEY_A, std, swi=0x22)
+    decrypt("key B, 14h-byte payload", KEY_B, std, swi=0x22)
+    decrypt("40h-byte payload", KEY_A, E.pkcs1_type1(E.Rng(0x7A).bytes(0x40)), swi=0x22)
+    decrypt("exactly eight FFh (75h-byte payload)", KEY_A, E.pkcs1_type1(E.Rng(0x7B).bytes(0x75), nff=8), swi=0x22)
+    decrypt("seven FFh", KEY_A, E.pkcs1_type1(E.Rng(0x7C).bytes(0x76), nff=7), swi=0x22, ok=False,
+            note="GBATEK: the padding has at least eight FFh")
+    decrypt("block type 02h", KEY_A, E.pkcs1_type1(pay, btype=2), swi=0x22, ok=False,
+            note="GBATEK: the padding is 01h, FFh..., 00h")
+    decrypt("no 00h separator", KEY_A, bytes([0, 1]) + b"\xFF" * 0x7E, swi=0x22, ok=False,
+            note="GBATEK: the padding ends with 00h")
+    decrypt("key A, 14h-byte payload", KEY_A, std, swi=0x22, thumb=True)
+
+    decrypt("OpenPGP SHA1 (GBATEK layout)", KEY_A, openpgp(pay), swi=0x23)
+    decrypt("OpenPGP SHA1, key B", KEY_B, openpgp(pay), swi=0x23)
+    decrypt("OpenPGP, other OID bytes (contents are skipped)", KEY_A, openpgp(pay, oid=b"\x11\x22\x33\x44\x55"),
+            swi=0x23, note="GBATEK: the other four chunks are skipped, their content is not checked")
+    decrypt("OpenPGP, last chunk length 13h", KEY_A, openpgp(pay[:19] + b"\0", lastlen=0x13), swi=0x23, ok=False,
+            note="GBATEK: the 04h chunk must be 14h bytes")
+    decrypt("OpenPGP, first tag 31h", KEY_A, openpgp(pay, tag0=0x31), swi=0x23, ok=False,
+            note="GBATEK: the chunk tags are 30h, 30h, 06h, 05h, 04h")
+
+
+def srccheck_tests():
+    """GBATEK "BIOS Memory Copy": the NDS7/DSi7 CpuSet/CpuFastSet silently reject
+    sources in the BIOS area, NDS9/DSi9 don't check. The redacted spec adds a
+    rule (start and end must have one of address bits 25-27 set) and the same
+    check for BitUnPack. Results are flags only: output unchanged, r0-r3 kept;
+    BIOS-range sources never put a byte, hash or register value in the record."""
+    def t(name, cpus, swi, ins, out_bytes, aux=b"", model=None, note=""):
+        out_len = round4(DST_OFS + out_bytes + MARGIN)
+        e = dict(basis=G_COPY + " (NDS7/DSi7 BIOS-area source check; flags only)")
+        if note:
+            e["note"] = note
+        if model is not None:
+            e["extra_bits"] = {"flags": [1, model]}
+        add("source check: " + name, cpus, swi, K_SRCCHK, ins=ins, aux=aux, out_len=out_len, expect=e)
+
+    t("CpuSet 32-bit, 4 words from 00000100h (BIOS)", (7,), 0x0B, (0x100, (R_DST, DST_OFS), (1 << 26) | 4), 16, model=1)
+    t("CpuSet 16-bit, 4 halfwords from 00000100h (BIOS)", (7,), 0x0B, (0x100, (R_DST, DST_OFS), 4), 8, model=1)
+    t("CpuFastSet 8 words from 00000100h (BIOS)", (7,), 0x0C, (0x100, (R_DST, DST_OFS), 8), 32, model=1)
+    t("CpuSet 32-bit fill from 00000100h (BIOS)", (7,), 0x0B, (0x100, (R_DST, DST_OFS), (5 << 24) | 4), 16, model=1)
+    t("BitUnPack 2 bytes from 00000100h (BIOS)", (7,), 0x10, (0x100, (R_DST, DST_OFS), (R_AUX, 0)), 16,
+      aux=struct.pack("<HBBI", 2, 1, 4, 0), note="GBATEK only names CpuSet/CpuFastSet")
+    t("CpuSet 32-bit, 4 words from 00003FF8h (crosses the NDS BIOS end)", (7,), 0x0B,
+      (0x3FF8, (R_DST, DST_OFS), (1 << 26) | 4), 16, model=1)
+    # no BIOS involved: unmapped space below 10000000h reads as 0
+    t("CpuSet 32-bit, 8 words from 0FFFFFF0h (end 10000010h)", BOTH, 0x0B,
+      (0x0FFFFFF0, (R_DST, DST_OFS), (1 << 26) | 8), 32, model=0,
+      note="redacted spec: rejected on DSi7 (end has none of address bits 25-27); GBATEK: only the BIOS area is rejected")
+    t("CpuSet 32-bit, 2 words from 0FFFFFF0h (end 0FFFFFF8h)", BOTH, 0x0B,
+      (0x0FFFFFF0, (R_DST, DST_OFS), (1 << 26) | 2), 8, model=0)
+    t("CpuSet 16-bit, 4 halfwords from 0FFFFFF0h (end 0FFFFFF8h, 10000000h at 4 bytes per unit)", BOTH, 0x0B,
+      (0x0FFFFFF0, (R_DST, DST_OFS), 4), 8, model=0,
+      note="redacted spec: DSi7 checks 4 bytes per unit even in 16-bit mode")
+    t("CpuSet 16-bit, 3 halfwords from 0FFFFFF0h", BOTH, 0x0B, (0x0FFFFFF0, (R_DST, DST_OFS), 3), 8, model=0)
+    t("CpuFastSet 8 words from 0FFFFFF0h (end 10000010h)", BOTH, 0x0C, (0x0FFFFFF0, (R_DST, DST_OFS), 8), 32,
+      model=0)
+    t("CpuFastSet 3 words from 0FFFFFF0h (end 0FFFFFFCh)", BOTH, 0x0C, (0x0FFFFFF0, (R_DST, DST_OFS), 3), 12,
+      model=0)
+    t("BitUnPack 20h bytes from 0FFFFFF0h (end 10000010h)", BOTH, 0x10, (0x0FFFFFF0, (R_DST, DST_OFS), (R_AUX, 0)),
+      0x20, aux=struct.pack("<HBBI", 0x20, 8, 8, 1 << 31 | 1),
+      note="zero-data flag with offset 1, so a copy of the 00h source bytes shows up as 01h")
+    t("CpuSet 32-bit, 4 words from 01FFFF00h (no address bit 25-27, not BIOS)", (7,), 0x0B,
+      (0x01FFFF00, (R_DST, DST_OFS), (1 << 26) | 4), 16, model=0,
+      note="redacted spec: rejected on DSi7; GBATEK: not the BIOS area")
+
+
+def twl_tests():
+    sha1_tests()
+    rsa_tests()
+    srccheck_tests()
+    dsi_irq_tests()
 
 
 SOFTRESET = [
@@ -756,6 +1288,8 @@ def build():
     table_tests()
     irq_tests()
     invalid_tests()
+    if TWL:
+        twl_tests()
     for n, t in enumerate(TESTS):
         t.id = n + 1
 
@@ -830,6 +1364,8 @@ def manifest():
                 ins.append(bufs["tmp"] + v)
             elif r == R_CB:
                 ins.append("callbacks %d" % v)
+            elif r == R_FN:
+                ins.append("our SHA1 callback")
             else:
                 ins.append(v & 0xFFFFFFFF)
         e = dict(t.expect)
@@ -837,17 +1373,44 @@ def manifest():
             e["out"] = e["out"].hex()
         if "regs" in e:
             e["regs"] = {str(k): v for k, v in e["regs"].items()}
-        out.append(dict(id=t.id, cpu=t.cpu, name=t.name, swi=t.swi, swi_name="invalid" if t.name.startswith("invalid SWI") else SWI_NAMES.get(t.swi, "invalid"),
+        if TWL:
+            names = SWI_NAMES_TWL
+            if t.name.startswith("invalid SWI"):
+                swi_name = "invalid"
+            elif t.swi == 0x1F:
+                swi_name = "CustomPost" if t.cpu == 9 else "CustomHalt"
+            elif t.swi >= 0x40:
+                swi_name = names.get(t.swi & 0x3F, "invalid") + " (mirror)"
+            else:
+                swi_name = names.get(t.swi, "invalid")
+            extras = EXTRAS_IRQ_TWL if t.kind == K_IRQ else EXTRAS[t.kind]
+        else:
+            swi_name = "invalid" if t.name.startswith("invalid SWI") else SWI_NAMES.get(t.swi, "invalid")
+            extras = EXTRAS[t.kind]
+        if t.flags & F_FLAGSONLY:
+            extras = ["flags"]
+        if "companion" in e:
+            e["companion"] = next(c.id for c in TESTS if c.cpu == t.cpu and c.name == e["companion"])
+        out.append(dict(id=t.id, cpu=t.cpu, name=t.name, swi=t.swi, swi_name=swi_name, flags_only=bool(t.flags & F_FLAGSONLY),
                         kind=KIND_NAMES[t.kind], flags=t.flags, isolated=bool(t.flags & F_ISOLATED),
                         thumb=bool(t.flags & F_THUMB), hash_only=bool(t.flags & F_HASHONLY),
                         vram=bool(t.flags & F_VRAM), inputs=ins, out_len=t.out_len, dst_ofs=DST_OFS,
-                        extras=EXTRAS[t.kind], expect=e, note=t.note,
+                        extras=extras, expect=e, note=t.note,
                         doc_regs=sorted(documented_regs(t))))
+        if t.script is not None:
+            out[-1]["seq_doc0"] = [bool(doc0) for op, _, doc0 in t.script if not op & SEQ_STORE]
+    if TWL:
+        return dict(version=1, platform="twl", tests=out, softreset=[])
     return dict(version=1, tests=out, softreset=SOFTRESET)
 
 
 def main():
-    outdir = sys.argv[1]
+    global TWL
+    args = sys.argv[1:]
+    if "--twl" in args:
+        TWL = True
+        args.remove("--twl")
+    outdir = args[0]
     os.makedirs(outdir, exist_ok=True)
     build()
     for cpu in (9, 7):
@@ -858,7 +1421,8 @@ def main():
     n9 = sum(1 for t in TESTS if t.cpu == 9)
     n7 = len(TESTS) - n9
     iso = sum(1 for t in TESTS if t.flags & F_ISOLATED)
-    print("tests: %d ARM9, %d ARM7 (%d isolated), %d SoftReset variants" % (n9, n7, iso, len(SOFTRESET)))
+    print("%s tests: %d ARM9, %d ARM7 (%d isolated), %d SoftReset variants"
+          % ("DSi-mode" if TWL else "DS-mode", n9, n7, iso, 0 if TWL else len(SOFTRESET)))
 
 
 if __name__ == "__main__":
