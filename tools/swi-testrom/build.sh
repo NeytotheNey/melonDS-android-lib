@@ -5,7 +5,9 @@
 #
 # Usage: ./build.sh [OUTDIR]
 #   OUTDIR  where everything goes (default: ./build, git-ignored)
-#           result: OUTDIR/swi-testrom.nds and OUTDIR/tests.json
+#           result: OUTDIR/swi-testrom.nds and OUTDIR/tests.json (DS mode),
+#           OUTDIR/twl/swi-testrom-twl.nds and OUTDIR/twl/tests.json (DSi
+#           mode: TWL header, built with -DTWL)
 #
 # Toolchain: the NDK's LLVM if NDK_LLVM (default
 # C:/Tools/android-sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/windows-x86_64/bin)
@@ -33,13 +35,11 @@ fi
 # Windows Python does not understand MSYS paths
 native() { if command -v cygpath > /dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
 
-"$PYTHON" -I "$(native "$HERE/gen_tests.py")" "$(native "$OUT")"
-
-CFLAGS="--target=arm-none-eabi -marm -O2 -ffreestanding -nostdlib -fno-builtin -fno-pic
+CFLAGS0="--target=arm-none-eabi -marm -O2 -ffreestanding -nostdlib -fno-builtin -fno-pic
   -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables -mfloat-abi=soft
-  -Wall -Werror -I$HERE/src -I$OUT"
+  -Wall -Werror -I$HERE/src"
 
-build() { # cpu arch mcpu loadaddr
+build() { # cpu arch mcpu loadaddr (uses OUT and CFLAGS)
   cpu=$1; arch=$2; mcpu=$3; addr=$4
   # shellcheck disable=SC2086
   "$CC" $CFLAGS -DARM$cpu -march="$arch" -mcpu="$mcpu" -x assembler-with-cpp -c "$HERE/src/crt.S" -o "$OUT/crt$cpu.o"
@@ -50,7 +50,19 @@ build() { # cpu arch mcpu loadaddr
   printf 'arm%s.bin: %d bytes at %s\n' "$cpu" "$(wc -c < "$OUT/arm$cpu.bin" | tr -d ' ')" "$addr"
 }
 
+# DS mode
+"$PYTHON" -I "$(native "$HERE/gen_tests.py")" "$(native "$OUT")"
+CFLAGS="$CFLAGS0 -I$OUT"
 build 9 armv5te arm946e-s 0x02000000
 build 7 armv4t arm7tdmi 0x02380000
-
 "$PYTHON" -I "$(native "$HERE/mkrom.py")" "$(native "$OUT/arm9.bin")" "$(native "$OUT/arm7.bin")" "$(native "$OUT/swi-testrom.nds")"
+
+# DSi mode
+DS_OUT=$OUT
+OUT=$DS_OUT/twl
+mkdir -p "$OUT"
+"$PYTHON" -I "$(native "$HERE/gen_tests.py")" --twl "$(native "$OUT")"
+CFLAGS="$CFLAGS0 -DTWL -I$OUT"
+build 9 armv5te arm946e-s 0x02000000
+build 7 armv4t arm7tdmi 0x02380000
+"$PYTHON" -I "$(native "$HERE/mkrom.py")" --twl "$(native "$OUT/arm9.bin")" "$(native "$OUT/arm7.bin")" "$(native "$OUT/swi-testrom-twl.nds")"

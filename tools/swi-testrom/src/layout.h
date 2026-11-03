@@ -3,6 +3,10 @@
     hand) gen_tests.py / report.py. Everything the harness reads back is in
     main RAM; the ARM9 binary loads at 02000000h, the ARM7 binary at
     02380000h.
+
+    -DTWL builds the DSi-mode ROM: bigger results areas, the DSi addresses of
+    the ARM9 debug vector and the ARM7 IF2 check bits, and an ARM7 svc stack
+    below them.
 */
 
 #ifndef SWITESTROM_LAYOUT_H
@@ -20,8 +24,13 @@
 
 /* results: a 100h-byte header, then 100h-byte records */
 #define RES9_BASE       0x02200000
+#if defined(TWL)
+#define RES7_BASE       0x02220000
+#define RES_SIZE        0x20000
+#else
 #define RES7_BASE       0x02210000
 #define RES_SIZE        0x10000
+#endif
 #define REC_SIZE        0x100
 #define RES_MAGIC       0x52545753  /* "SWTR" */
 #define RES_DONE        0x454E4F44  /* "DONE" */
@@ -59,7 +68,11 @@
 #define STACK7_SYS      0x0237F000
 /* svc at GBATEK's SoftReset value; irq lower than GBATEK's so the
    callback decompressors (which keep variables on the svc stack) have room */
+#if defined(TWL)
+#define STACK7_SVC      0x0380FFC0  /* GBATEK's NDS value; the DSi7 IF2 check bits are at 0380FFC0h */
+#else
 #define STACK7_SVC      0x0380FFDC
+#endif
 #define STACK7_IRQ      0x0380FE00
 #define DTCM_SVC_SP     0x3FC0      /* ARM9: DTCM-relative */
 #define DTCM_IRQ_SP     0x3D00
@@ -67,8 +80,13 @@
 /* BIOS RAM locations (GBATEK "BIOS RAM Usage" / "DS Interrupts") */
 #define ARM7_IRQ_FLAGS  0x0380FFF8
 #define ARM7_IRQ_VECTOR 0x0380FFFC
+#define ARM7_IRQ_FLAGS2 0x0380FFC0  /* DSi7 IF2 check bits */
 #define ARM7_DEBUG_VEC  0x0380FFDC
+#if defined(TWL)
+#define ARM9_DEBUG_VEC  0x02FFFD9C
+#else
 #define ARM9_DEBUG_VEC  0x027FFD9C
+#endif
 #define ENTRY9_ADDR     0x027FFE24
 #define ENTRY7_ADDR     0x027FFE34
 

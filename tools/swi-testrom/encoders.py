@@ -395,3 +395,186 @@ def bitunpack_model(src, srcw, dstw, offset, zeroflag):
 
 def isqrt(n):
     return math.isqrt(n)
+
+
+# ---------------------------------------------------------------------------
+# SHA-1 (DSi SWIs 24h-29h). The hash itself is FIPS 180-4; the context layout
+# and the Finish/29h details are GBATEK's ("BIOS SHA1 Functions (DSi only)"):
+#   +00h H0-H4 (32-bit words), +14h/+18h total length in bits (low/high),
+#   +1Ch 40h-byte fragment buffer, +5Ch fragment size, +60h callback.
+# Finish appends 80h, zeros up to fragment size 38h and the big-endian bit
+# length, then restores the bit length (the padding does not count).
+
+SHA1_IV = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0)
+
+
+def _rol(x, n):
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+
+
+def sha1_block(h, block):
+    w = list(struct.unpack(">16I", block))
+    for t in range(16, 80):
+        w.append(_rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1))
+    a, b, c, d, e = h
+    for t in range(80):
+        if t < 20:
+            f, k = (b & c) | (~b & d), 0x5A827999
+        elif t < 40:
+            f, k = b ^ c ^ d, 0x6ED9EBA1
+        elif t < 60:
+            f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
+        else:
+            f, k = b ^ c ^ d, 0xCA62C1D6
+        a, b, c, d, e = (_rol(a, 5) + (f & 0xFFFFFFFF) + e + k + w[t]) & 0xFFFFFFFF, a, _rol(b, 30), c, d
+    return tuple((x + y) & 0xFFFFFFFF for x, y in zip(h, (a, b, c, d, e)))
+
+
+class Sha1Ctx:
+    """The 64h-byte DSi SHA-1 context as GBATEK describes it."""
+
+    def __init__(self, buf=None, callback=0):
+        self.h = SHA1_IV
+        self.bits = 0
+        self.buf = bytearray(buf if buf is not None else bytes(0x40))   # Init leaves it as it was
+        self.frag = 0
+        self.callback = callback
+
+    def update(self, data):
+        """GBATEK: a pending fragment is topped up and processed, whole blocks
+        go to the callback straight from the source (the buffer keeps its old
+        bytes), and only the rest is copied to the buffer."""
+        self.bits = (self.bits + len(data) * 8) & 0xFFFFFFFFFFFFFFFF
+        data = bytes(data)
+        if self.frag:
+            n = min(0x40 - self.frag, len(data))
+            self.buf[self.frag:self.frag + n] = data[:n]
+            self.frag += n
+            data = data[n:]
+            if self.frag < 0x40:
+                return
+            self.h = sha1_block(self.h, bytes(self.buf))
+            self.frag = 0
+        while len(data) >= 0x40:
+            self.h = sha1_block(self.h, data[:0x40])
+            data = data[0x40:]
+        self.buf[:len(data)] = data
+        self.frag = len(data)
+
+    def finish(self):
+        bits = self.bits
+        self.update(b"\x80")
+        while self.frag != 0x38:
+            self.update(b"\0")
+        self.update(struct.pack(">Q", bits))
+        self.bits = bits
+        return struct.pack(">5I", *self.h)
+
+    def raw(self):
+        return (struct.pack("<5I", *self.h) + struct.pack("<II", self.bits & 0xFFFFFFFF, self.bits >> 32)
+                + bytes(self.buf) + struct.pack("<II", self.frag, self.callback))
+
+
+def sha1(data):
+    c = Sha1Ctx()
+    c.update(data)
+    return c.finish()
+
+
+def sha1_mess(dstlen, src):
+    """SWI 29h as GBATEK's pseudocode: hash src, then per round increment the
+    20-byte value (carry only while the byte just incremented is 01h), hash it
+    in the same context without Init, and copy up to 14h bytes."""
+    c = Sha1Ctx()
+    c.update(src)
+    first = bytearray(c.finish())
+    out = bytearray()
+    while dstlen:
+        i = 0x13
+        while True:
+            first[i] = (first[i] + 1) & 0xFF
+            i -= 1
+            if not (i >= 0 and first[i + 1] == 0x01):
+                break
+        c.update(bytes(first))
+        second = c.finish()
+        n = min(0x14, dstlen)
+        out += second[:n]
+        dstlen -= n
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# RSA (DSi SWIs 20h-23h): textbook RSA with our own 1024-bit keys, generated
+# here from a fixed seed (Miller-Rabin primes, e = 10001h, the usual public
+# exponent). Numbers are big-endian byte strings of 80h bytes, as in the
+# signature layouts GBATEK shows (00h, 01h, FFh..., 00h, payload).
+
+RSA_E = 0x10001
+
+
+def _is_probable_prime(n, rng):
+    if n < 2:
+        return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0:
+            return n == p
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for _ in range(40):
+        a = 2 + rng.big(n.bit_length()) % (n - 3)
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+class BigRng(Rng):
+    def big(self, bits):
+        v = 0
+        for _ in range((bits + 15) // 16):
+            v = (v << 16) | self.next()
+        return v & ((1 << bits) - 1)
+
+
+def rsa_key(seed, top_bit0=None):
+    """(n, d) for a 1024-bit modulus. top_bit0 forces bit 0 of the first
+    (most significant) modulus byte, which GBATEK says selects a mode."""
+    rng = BigRng(seed)
+    while True:
+        ps = []
+        while len(ps) < 2:
+            p = rng.big(512) | (3 << 510) | 1
+            if (p - 1) % RSA_E and _is_probable_prime(p, rng):
+                ps.append(p)
+        n = ps[0] * ps[1]
+        if n.bit_length() != 1024:
+            continue
+        if top_bit0 is not None and ((n >> 1016) & 1) != top_bit0:
+            continue
+        phi = (ps[0] - 1) * (ps[1] - 1)
+        return n, pow(RSA_E, -1, phi)
+
+
+def rsa_sign(m_bytes, n, d):
+    """Raw RSA of a 80h-byte big-endian block: the 'signature' the SWIs decrypt."""
+    m = int.from_bytes(m_bytes, "big")
+    assert m < n
+    return pow(m, d, n).to_bytes(0x80, "big")
+
+
+def pkcs1_type1(payload, nff=None, btype=1, sep=True):
+    """00h, block type, FFh padding, 00h, payload (80h bytes in all)."""
+    if nff is None:
+        nff = 0x80 - 3 - len(payload)
+    body = bytes([0, btype]) + b"\xFF" * nff + (b"\0" if sep else b"") + payload
+    assert len(body) <= 0x80
+    return body + bytes(0x80 - len(body)) if len(body) < 0x80 else body

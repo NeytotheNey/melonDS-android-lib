@@ -386,7 +386,54 @@ Cycle differences: ARM9 WaitByLoop is about 1.5x slower (GBATEK: the NDS
 BIOS runs it in Thumb), ARM9 Div 1.3x and Sqrt 1.26x slower. CpuFastSet is
 faster because the official BIOS has its documented slow path.
 
-Not covered yet: DSi (TWL) mode, ARM7 Sleep, the ARM7 BIOS-range source check.
+Not covered yet: ARM7 Sleep, and the NTR ARM7 BIOS-range source check.
+
+## SWI test ROM, DSi mode (2026-11-02)
+
+`build.sh` also builds `build/twl/swi-testrom-twl.nds` (TWL header, `-DTWL`),
+and `run.sh` runs it in DSi mode with the official DSi BIOS and with our TWL
+FreeBIOS (`--dsi-bios free`), writing `logs/swi/testrom/report-dsi.txt`.
+The DSi direct boot still needs the NAND and DSi firmware; in free mode the
+harness passes the official bios7.bin to the NAND code for its ES key only,
+the same way the app does. All DSi runs share one read-only NAND copy
+(`--nand-readonly`), deleted at the end. The ROM clears every area direct
+boot fills from the BIOS or NAND, hashes are salted per test and platform so
+they can't be compared across tests, and pointer-0, source-check and
+GetBootProcs tests are flags only. The DSi BIOS holds console keys, so SHA-1
+and RSA only ever see our own data and keys (FIPS 180, textbook RSA).
+
+666 tests (125 isolated). The official BIOS matched the GBATEK/FIPS/RSA model
+everywhere except the source-check boundary cases, where it follows the
+address-bit rule below. 239 mismatches, all against our TWL build:
+- SHA-1 24h-29h and RSA 20h-23h are stubs (most of the mismatches).
+- SWIs 2Ah and up go to table entry 01h, which on TWL is LZ77 Callback8, so
+  they crash or hang. GBATEK: 40h-FFh mirror 00h-3Fh (49h = Div, CDh = Sqrt),
+  12h and 2Bh are ignored. Fix: mask with 3Fh, send 2Ah-3Fh to swi_invalid.
+- DSi7 CpuSet, CpuFastSet and BitUnPack reject a source whose start or end
+  has none of address bits 25-27 set (end counted at 4 bytes per unit even
+  for 16-bit CpuSet); the output is untouched and r0-r2 kept. DSi9 has no
+  check. FreeBIOS has none.
+- DSi9 IntrWait with r0=0 and the flag already set returns at once; FreeBIOS
+  still waits for one IRQ (the NDS9 rule).
+- DSi7 IntrWait/VBlankIntrWait waiting only on IF bits (r2=0) never return
+  on the official BIOS (GBATEK's DSi7 bug); a real IF2 IRQ (AES) does end the
+  wait on both. FreeBIOS returns. Decision needed; returning is harmless.
+- IntrWait registers: official returns r0=1, keeps r2, flags left in r3.
+- DSi7 GetPitchTable 0-3Fh returns sine values (GBATEK: bugged on DSi7).
+  Entries from 40h up, out-of-range indices and the -46Ah case are marked
+  "won't match, keep": matching them would mean reconstructing BIOS content.
+- GetBootProcs: official XORs with r2 (GBATEK), FreeBIOS doesn't.
+- GetCRC16 length 0/1: the DSi BIOS sets r3=0.
+- Scratch: the official BIOS keeps r2 in every one-call SWI; FreeBIOS
+  changes it in Div, Sqrt, BitUnPack, CRC and the decompressors.
+- Same as DS mode: x/0, invalid SWIs below 2Ah, CustomPost, the Close
+  source+1 quirk.
+
+Redacted-spec claims confirmed: the mirrors and ignored numbers, the bits
+25-27 source check, IntrWait r0=1 and r3 = flags, DSi9 Halt r0=0, CRC r3=0,
+and the SHA-1/RSA edge cases. Refuted: the IntrWait "leftover bits" exit
+rule, the DSi9 "r0=0 discard bug", "Finish leaves the length big-endian",
+and "a rejected call leaves r0-r3 untouched" (CpuSet changes r3).
 
 Next testing ideas (not started):
 - A debug-build log line on the phone when a game calls SWI 0x00, to see
