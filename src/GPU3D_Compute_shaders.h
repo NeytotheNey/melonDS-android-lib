@@ -1102,6 +1102,21 @@ layout (binding = 0) uniform usampler2DArray CurrentTexture;
 
 layout (location = 0) uniform uint CurVariant;
 layout (location = 1) uniform vec2 InvTextureSize;
+// ComputeRenderer::SetColorDither, not hardware behaviour
+layout (location = 2) uniform uint ColorDither;
+
+// the vertex colors are interpolated with 3 bits below the 6 the polygon gets, which the
+// hardware drops. with ColorDither they pick between the two nearest 6 bit values with a
+// 4x4 ordered pattern over the framebuffer pixels instead, so gradients don't band. a vertex's
+// own color is (c << 4) | 0xF or 0, which minus 7 has those 3 bits clear, so it lands on the
+// same 6 bit value as without (flat polygons don't get the pattern) and the result never goes
+// past 63
+const int DitherThresholds[16] = int[16](0, 4, 1, 5, 6, 2, 7, 3, 1, 5, 0, 4, 7, 3, 6, 2);
+
+int DitherColor(int c, int threshold)
+{
+    return (max(c - 7, 0) + threshold) >> 3;
+}
 
 void RasteriseTile(uint workIdx)
 {
@@ -1202,9 +1217,23 @@ void RasteriseTile(uint workIdx)
             }
 
 #ifndef ShadowMask
-            vr >>= 3;
-            vg >>= 3;
-            vb >>= 3;
+            // toon and highlight look the 6 bit red up in the toon table, so they keep the
+            // hardware's steps
+#if !defined(Toon) && !defined(Highlight)
+            if (ColorDither != 0U)
+            {
+                int threshold = DitherThresholds[((position.y & 3) << 2) | (position.x & 3)];
+                vr = DitherColor(vr, threshold);
+                vg = DitherColor(vg, threshold);
+                vb = DitherColor(vb, threshold);
+            }
+            else
+#endif
+            {
+                vr >>= 3;
+                vg >>= 3;
+                vb >>= 3;
+            }
 
             uint r, g, b, a;
             uint polyalpha = bitfieldExtract(polygon.Attr, 16, 5);

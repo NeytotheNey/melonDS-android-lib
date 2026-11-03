@@ -45,6 +45,9 @@ public:
     void Reset(GPU& gpu) override;
 
     void SetRenderSettings(int scale, bool highResolutionCoordinates);
+    // dithers the polygons' interpolated vertex colors to 6 bits instead of dropping the low bits
+    // (see the Rasterise shader). not something the DS does, so it's off by default
+    void SetColorDither(bool dither) noexcept;
 
     // WideMelon: same rules as GLRenderer's (see GPU3D_OpenGL.h). the work buffers and shaders are
     // built for the width, so a change of GetOutputWidth recompiles every shader, at RenderFrame
@@ -192,6 +195,7 @@ private:
 
     static constexpr int UniformIdxCurVariant = 0;
     static constexpr int UniformIdxTextureSize = 1;
+    static constexpr int UniformIdxColorDither = 2;
 
     static constexpr int MaxFullscreenLayers = 16;
 
@@ -267,6 +271,8 @@ private:
     // the next frame is drawn even if it's the same: ResizeTargets made a new, empty Framebuffer,
     // or the hi-res coordinates setting changed how the polygons are set up
     bool ForceRender = true;
+
+    bool ColorDither = false;
 
     int RequestedViewWidth = 256;
     int ViewWidth = 256;

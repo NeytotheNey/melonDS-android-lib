@@ -522,6 +522,15 @@ void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinate
     ResizeTargets(scale, highResolutionCoordinates, targetWidth);
 }
 
+void ComputeRenderer::SetColorDither(bool dither) noexcept
+{
+    if (dither != ColorDither)
+    {
+        ColorDither = dither;
+        ForceRender = true;
+    }
+}
+
 void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth)
 {
     CurGLCompositor.SetRenderSettings(scale, targetWidth);
@@ -1395,6 +1404,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
                 }
 
                 glUniform1ui(UniformIdxCurVariant, i);
+                glUniform1ui(UniformIdxColorDither, ColorDither ? 1 : 0);
                 glUniform2f(UniformIdxTextureSize, 1.f / variants[i].Width, 1.f / variants[i].Height);
                 if (directDispatch)
                 {
