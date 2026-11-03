@@ -25,7 +25,15 @@
 # Environment: HARNESS (swi-harness.exe), BIOSDIR (bios9.bin + bios7.bin),
 # DSIDIR (DSi bios9.bin, bios7.bin, firmware.bin, nand.bin), BUILD (build.sh
 # output dir), PYTHON, MODES ("ds dsi" by default; "ds" or "dsi" for one),
-# NORMAL_FRAMES / ISO_FRAMES / SR_FRAMES / DSI_NORMAL_FRAMES.
+# NORMAL_FRAMES / ISO_FRAMES / SR_FRAMES / DSI_NORMAL_FRAMES,
+# BIOSES ("official free" by default; add free-exp for the experimental
+# FreeBIOS files in EXPDIR, default freebios/build/experimental: bios9.bin and
+# bios7.bin for DS mode, dsi/ for DSi mode). Each FreeBIOS variant gets its
+# own report against official: report.txt / report-dsi.txt for free,
+# report-<variant>.txt / report-dsi-<variant>.txt for the others. Only the
+# runs of the BIOSes in BIOSES are redone; without official in BIOSES the
+# earlier official runs are reused (they must exist and come from the same
+# ROM build).
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -35,6 +43,8 @@ BIOSDIR=${BIOSDIR:-C:/Dev/swi-harness-data/bios}
 DSIDIR=${DSIDIR:-C:/Dev/swi-harness-data/dsi}
 BUILD=${BUILD:-$HERE/build}
 MODES=${MODES:-ds dsi}
+BIOSES=${BIOSES:-official free}
+EXPDIR=${EXPDIR:-$HERE/../../freebios/build/experimental}
 NORMAL_FRAMES=${NORMAL_FRAMES:-300}
 DSI_NORMAL_FRAMES=${DSI_NORMAL_FRAMES:-600}
 ISO_FRAMES=${ISO_FRAMES:-120}
@@ -55,9 +65,15 @@ run() { # console bios name frames [harness options...]
   if [ "$console" = dsi ]; then dir=$OUT/runs-dsi/$bios/$name; else dir=$OUT/runs/$bios/$name; fi
   rm -rf "$dir"
   mkdir -p "$dir"
-  if [ "$bios" = official ]; then set -- --bios official "$BIOSDIR" "$@"; else set -- --bios free "$@"; fi
+  case $bios in
+    official) set -- --bios official "$BIOSDIR" "$@"; dsibios=official; dsibiosdir= ;;
+    free) set -- --bios free "$@"; dsibios=free; dsibiosdir= ;;
+    free-exp) set -- --bios file "$(native "$EXPDIR")" "$@"; dsibios=file; dsibiosdir=$(native "$EXPDIR/dsi") ;;
+    *) echo "unknown BIOS $bios in BIOSES" >&2; exit 1 ;;
+  esac
   if [ "$console" = dsi ]; then
-    set -- "$@" --console dsi --dsi "$DSIDIR" --dsi-bios "$bios" --nand "$(native "$NAND")" --nand-readonly
+    set -- "$@" --console dsi --dsi "$DSIDIR" --dsi-bios "$dsibios" ${dsibiosdir:+"$dsibiosdir"} \
+      --nand "$(native "$NAND")" --nand-readonly
     rom=$ROM_TWL; range=0x40000
   else
     rom=$ROM; range=0x20000
@@ -70,6 +86,24 @@ run() { # console bios name frames [harness options...]
   rm -f "$dir"/frame_*.bmp "$dir/frames.tsv"
 }
 
+# Without official in BIOSES the reports compare against the earlier official
+# runs in $1 (runs or runs-dsi); refuse before anything is deleted if they
+# are missing.
+need_official() {
+  case " $BIOSES " in *" official "*) return 0 ;; esac
+  if [ ! -d "$OUT/$1/official/normal" ]; then
+    echo "BIOSES ($BIOSES) has no official and $OUT/$1/official has no earlier runs;" >&2
+    echo "add official to BIOSES" >&2
+    exit 1
+  fi
+}
+
+# clear only the runs that are redone
+clear_runs() { # runs dir
+  mkdir -p "$OUT/$1"
+  for bios in $BIOSES; do rm -rf "$OUT/$1/$bios"; done
+}
+
 ids() { # manifest: isolated test ids
   "$PYTHON" -I -c "import json,sys; print(' '.join(str(t['id']) for t in json.load(open(sys.argv[1]))['tests'] if t['isolated']))" "$1"
 }
@@ -80,11 +114,11 @@ for console in $MODES; do
     ROM=$(native "$BUILD/swi-testrom.nds")
     MANIFEST=$(native "$BUILD/tests.json")
     [ -f "$BUILD/swi-testrom.nds" ] || { echo "no ROM in $BUILD, run build.sh first" >&2; exit 1; }
-    rm -rf "$OUT/runs"
-    mkdir -p "$OUT/runs"
+    need_official runs
+    clear_runs runs
     ISO=$(ids "$MANIFEST")
     SR=$("$PYTHON" -I -c "import json,sys; print(' '.join(str(v['variant']) for v in json.load(open(sys.argv[1]))['softreset']))" "$MANIFEST")
-    for bios in official free; do
+    for bios in $BIOSES; do
       echo "DS $bios: normal"
       run ds "$bios" normal "$NORMAL_FRAMES"
       echo "DS $bios: $(echo "$ISO" | wc -w | tr -d ' ') isolated tests"
@@ -96,18 +130,22 @@ for console in $MODES; do
         run ds "$bios" "sr-$v" "$SR_FRAMES" --poke 0x02300000=2 --poke 0x02300004="$v"
       done
     done
-    "$PYTHON" -I "$(native "$HERE/report.py")" "$MANIFEST" "$(native "$OUT/runs")" --out "$(native "$OUT/report.txt")"
+    for bios in $BIOSES; do
+      [ "$bios" = official ] && continue
+      if [ "$bios" = free ]; then rep=report.txt; else rep=report-$bios.txt; fi
+      "$PYTHON" -I "$(native "$HERE/report.py")" "$MANIFEST" "$(native "$OUT/runs")" --b "$bios" --out "$(native "$OUT/$rep")"
+    done
     ;;
   dsi)
     ROM_TWL=$(native "$BUILD/twl/swi-testrom-twl.nds")
     MANIFEST=$(native "$BUILD/twl/tests.json")
     [ -f "$BUILD/twl/swi-testrom-twl.nds" ] || { echo "no DSi ROM in $BUILD/twl, run build.sh first" >&2; exit 1; }
     [ -f "$DSIDIR/nand.bin" ] || { echo "no nand.bin in $DSIDIR" >&2; exit 1; }
+    need_official runs-dsi
     cp "$DSIDIR/nand.bin" "$NAND"
-    rm -rf "$OUT/runs-dsi"
-    mkdir -p "$OUT/runs-dsi"
+    clear_runs runs-dsi
     ISO=$(ids "$MANIFEST")
-    for bios in official free; do
+    for bios in $BIOSES; do
       echo "DSi $bios: normal"
       run dsi "$bios" normal "$DSI_NORMAL_FRAMES"
       echo "DSi $bios: $(echo "$ISO" | wc -w | tr -d ' ') isolated tests"
@@ -118,7 +156,11 @@ for console in $MODES; do
     if cmp -s "$DSIDIR/nand.bin" "$NAND"; then echo "DSi: NAND copy unchanged by the runs"
     else echo "DSi: WARNING, the NAND copy changed during the runs" >&2; fi
     rm -f "$NAND"
-    "$PYTHON" -I "$(native "$HERE/report.py")" "$MANIFEST" "$(native "$OUT/runs-dsi")" --out "$(native "$OUT/report-dsi.txt")"
+    for bios in $BIOSES; do
+      [ "$bios" = official ] && continue
+      if [ "$bios" = free ]; then rep=report-dsi.txt; else rep=report-dsi-$bios.txt; fi
+      "$PYTHON" -I "$(native "$HERE/report.py")" "$MANIFEST" "$(native "$OUT/runs-dsi")" --b "$bios" --out "$(native "$OUT/$rep")"
+    done
     ;;
   *)
     echo "unknown mode $console in MODES" >&2; exit 1 ;;

@@ -24,6 +24,106 @@ is the backlog.
   below. Upstream commit 1124603 (Apr 2026) only undid a regression in the
   IntrWait path from #2523; its message says the code is still broken.
 
+## Accurate and experimental FreeBIOS (2026-11-02)
+
+Rule since 2026-11-02: FreeBIOS matches the official BIOS everywhere the SWI
+test ROM can see, hangs included. The only exceptions are cases where
+matching would mean reproducing BIOS content: out-of-range table indices,
+the jumps to garbage addresses that the official BIOS does for some invalid
+SWI numbers (those become deliberate hangs, see below), GetBootProcs
+addresses, and the unexplained Close source+1 quirk (Open items).
+
+Two variants are built from the same source, `freebios/src/bios_common.s`.
+They differ only in the `#ifdef FREEBIOS_EXPERIMENTAL` blocks (marked
+"EXPERIMENTAL" in the source), so every other fix lands in both:
+
+| | accurate (default) | experimental (`-DFREEBIOS_EXPERIMENTAL`) |
+|---|---|---|
+| x/0, x != 0 | hangs (`hang_div_by_zero`) | returns r0=0, r1=x, r3=0 |
+| absent SWI, NDS | jumps to 0 (ARM9 20h+, ARM7 21h and 23h+: `hang_swi_crash`) | returns, registers unchanged |
+| absent SWI, DSi | hangs (`hang_swi_invalid`) | returns, registers unchanged |
+| DSi7 IntrWait/VBlankIntrWait | only IF2 bits (r2) end the wait, r1 IF bits are only cleared; r2 = 0 waits forever (`hang_dsi7_intrwait_if`) | IF (r1) or IF2 (r2) bits end the wait |
+| ARM9 SoftReset stacks | fixed 00803FC0h/00803FA0h/00803EC0h | DTCM+3FC0h/3FA0h/3EC0h |
+
+Both have the DSi dispatcher fix (40h-FFh mirror 00h-3Fh, 12h and 2Bh
+ignored) and 0/0 = 1, 0, 1.
+
+Build: `sh freebios/build.sh` (clang, ld.lld, llvm-objcopy and llvm-nm on
+PATH, for example the NDK's
+`/c/Tools/android-sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/windows-x86_64/bin`)
+builds both. The accurate images go to `freebios/build/bios_*.bin` and into
+`src/FreeBIOS_Data.h`, which is what the core embeds; only that header is
+in git. None of the .bin files are in git (`freebios/build/` is ignored):
+to get the experimental files, run `sh freebios/build.sh` in the core repo
+(`melonDS-android-lib`). They are not embedded; they land in
+`freebios/build/experimental/`:
+`bios9.bin` (4096 bytes) and `bios7.bin` (16384 bytes) for DS mode, and
+`dsi/bios9.bin` and `dsi/bios7.bin` (65536 bytes each) for DSi mode, padded
+to the sizes the app checks (`FileSystemConfigurationDirectoryVerifier`).
+`sh freebios/check.sh` verifies the header and the hang table below.
+
+Using the experimental build on the phone (DS mode): copy
+`freebios/build/experimental/bios9.bin` and `bios7.bin` into a folder that
+also holds a `firmware.bin` (a 128, 256 or 512 KB firmware dump: the app's
+custom-BIOS mode loads all three from the folder and has no generated
+firmware), turn on the custom BIOS setting and point the DS BIOS folder at
+that folder. The core sees a non-native BIOS, so it always boots the game
+directly, whatever the boot screen setting. To go back, point the folder at
+the native dumps again or turn the custom BIOS setting off (that uses the
+embedded accurate build). DSi mode runs DS games with these DS-mode files
+too. The `dsi/` files can't replace the DSi BIOS on the phone: the app
+decrypts `nand.bin` with keys from the real DSi ARM7 BIOS, which FreeBIOS
+doesn't have, so DSi mode needs the real `bios9.bin`/`bios7.bin` in the DSi
+folder (plus `firmware.bin` and `nand.bin`). The `dsi/` files are for the PC
+harness, which hands the NAND code the real key separately.
+
+Test ROM: `BIOSES="official free free-exp" sh tools/swi-testrom/run.sh` also
+runs the experimental files (DS: `--bios file`, DSi: `--dsi-bios file`) and
+writes `report-free-exp.txt` / `report-dsi-free-exp.txt` next to the usual
+reports. The experimental variant differs from the accurate one only in the
+cases in the table above (checked 2026-11-02: no other test differs).
+
+### Where FreeBIOS hangs on purpose
+
+Every deliberate hang is a `b .` at its own label, except
+`halt_arm9_cp15` (the hardware halt) and `hang_dsi7_intrwait_if` (a halt
+loop, three instructions from the label, since the official BIOS keeps
+waiting with IRQs on). `build.sh` prints the addresses and writes them
+to `build/hangs.txt` and `build/experimental/hangs.txt`; `check.sh` fails if
+this table doesn't match. Addresses are what the CPU sees (ARM9 BIOS at
+FFFF0000h). A log's r15 may read 8 more than the address (ARM pipeline).
+"-" means the variant has no such hang.
+
+| Image | Accurate | Experimental | Label | Cause | What the game did |
+|---|---|---|---|---|---|
+| bios_ntr_arm9 | FFFF0100 | FFFF0100 | `hang_reset` | reset vector (not implemented) | a reset into the BIOS; melonDS boots directly, so normally never |
+| bios_ntr_arm9 | FFFF0104 | FFFF0104 | `hang_exception` | undefined instruction, prefetch/data abort or FIQ | crashed (bad jump, bad pointer), or an absent SWI (01h, 02h, 07h, 08h, 0Ah, 17h, 19h, 1Ah-1Eh) jumped to 0 where the PU blocks execution (normal SDK games), giving a prefetch abort (accurate only) |
+| bios_ntr_arm9 | FFFF01E0 | - | `hang_swi_crash` | official BIOS jumps to a garbage address | SWI 20h or higher |
+| bios_ntr_arm9 | FFFF01EC | FFFF01DC | `halt_arm9_cp15` | CP15 halt that never wakes (GBATEK) | SWI 06h Halt with IME=0 |
+| bios_ntr_arm9 | FFFF02E0 | - | `hang_div_by_zero` | official BIOS loops forever | SWI 09h Div with r1=0 and r0 != 0 |
+| bios_ntr_arm7 | 00001078 | 00001078 | `hang_reset` | reset vector (not implemented) | an absent SWI (01h, 02h, 0Ah, 16h-19h, 1Eh, 20h, 22h) jumps to 0 here (accurate only), or a reset |
+| bios_ntr_arm7 | 0000107C | 0000107C | `hang_exception` | undefined instruction, prefetch/data abort or FIQ | crashed (bad jump, bad pointer) |
+| bios_ntr_arm7 | 00001164 | - | `hang_swi_crash` | official BIOS jumps to a garbage address | SWI 21h, or 23h and higher |
+| bios_ntr_arm7 | 000012B8 | - | `hang_div_by_zero` | official BIOS loops forever | SWI 09h Div with r1=0 and r0 != 0 |
+| bios_twl_arm9 | FFFF0100 | FFFF0100 | `hang_reset` | reset vector (not implemented) | a reset into the BIOS; normally never |
+| bios_twl_arm9 | FFFF0104 | FFFF0104 | `hang_exception` | undefined instruction, prefetch/data abort or FIQ | crashed (bad jump, bad pointer) |
+| bios_twl_arm9 | FFFF0250 | - | `hang_swi_invalid` | GBATEK: absent DSi SWIs hang | SWI 00h, 07h, 08h, 0Ah, 0Fh, 17h, 1Ah-1Eh, 2Ah, 2Ch-3Fh (or a 40h-FFh mirror of them) |
+| bios_twl_arm9 | FFFF025C | FFFF0258 | `halt_arm9_cp15` | CP15 halt that never wakes (GBATEK) | SWI 06h Halt with IME=0 |
+| bios_twl_arm9 | FFFF0350 | - | `hang_div_by_zero` | official BIOS loops forever | SWI 09h Div with r1=0 and r0 != 0 |
+| bios_twl_arm7 | 00001078 | 00001078 | `hang_reset` | reset vector (not implemented) | a reset into the BIOS; normally never |
+| bios_twl_arm7 | 0000107C | 0000107C | `hang_exception` | undefined instruction, prefetch/data abort or FIQ | crashed (bad jump, bad pointer) |
+| bios_twl_arm7 | 000011C8 | - | `hang_swi_invalid` | GBATEK: absent DSi SWIs hang | SWI 00h, 0Ah, 0Fh, 16h-18h, 1Eh, 2Ah, 2Ch-3Fh (or a 40h-FFh mirror of them) |
+| bios_twl_arm7 | 00001284 | - | `hang_dsi7_intrwait_if` | GBATEK DSi7 bug: IF-only waits never end; a halt loop with IME=1, so IRQ handlers keep running | SWI 04h IntrWait with r2=0, or SWI 05h VBlankIntrWait |
+| bios_twl_arm7 | 00001368 | - | `hang_div_by_zero` | official BIOS loops forever | SWI 09h Div with r1=0 and r0 != 0 |
+
+On the NDS9 an absent SWI (01h, 02h, 07h, 08h, 0Ah, 17h, 19h, 1Ah-1Eh)
+jumps to 0 in system mode with the flags clear and lr = `swi_complete`
+(accurate build only). What happens next depends on the game's protection
+unit setup: in a normal SDK game the PU blocks execution at 0, so `mov pc,
+#0` gets a prefetch abort and the CPU ends in `hang_exception` (FFFF0104h).
+Only when address 0 is executable (the game's ITCM mapped there with
+execution allowed, as in the SWI test ROM) does code at 0 run.
+
 ## Confirmed bugs
 
 Items 1, 2, 3 and 6 are fixed (Phase 1); items 4 and 5 are fixed (Phase 2).
@@ -70,7 +170,9 @@ bit widths (existing TODO).
   reaches `swi_custom_halt_post`.
 - [x] `swi_divide` no longer hangs. Decisions:
   - Denominator 0 (hangs/undefined on real hardware): returns r0 = 0,
-    r1 = numerator, r3 = 0.
+    r1 = numerator, r3 = 0. (Changed 2026-11-02: 0/0 returns 1, 0, 1 and
+    x/0 hangs as on the official BIOS; the experimental build keeps
+    0, x, 0 for x/0.)
   - The alignment loop stops once the denominator's bit 31 is set, so
     numerator `INT_MIN` works. `INT_MIN / -1` wraps to r0 = `0x80000000`,
     r3 = `0x80000000`.
@@ -142,7 +244,9 @@ bit widths (existing TODO).
     DTCM-relative with the same offsets, which gives exactly those values
     with the default DTCM base `0x00800000` and stays valid when a game has
     moved the DTCM (most do). With fixed addresses the stacks would then hit
-    unmapped memory, since the ITCM is off after 12078h.
+    unmapped memory, since the ITCM is off after 12078h. (Changed
+    2026-11-02: the accurate build uses the fixed stacks, as the official
+    BIOS does; the experimental build keeps the DTCM-relative ones.)
   - GBATEK is not precise about the cache step ("flushes caches and write
     buffer": which caches, and clean or invalidate, is not said, nor is the
     order of the steps). Clean + invalidate of the whole 4KB 4-way DCache
@@ -208,14 +312,19 @@ bit widths (existing TODO).
     numbers the DSi BIOS does not list hang in an endless loop (0x12 and
     0x2B are "ignored"); every absent TWL entry here, 0x00 included, returns
     at once instead, as upstream does for the others. `swi_soft_reset` is
-    not assembled in the TWL build.
+    not assembled in the TWL build. (Changed 2026-11-02: the TWL table has
+    40h entries, 40h-FFh mirror them, 12h/2Bh return, absent numbers hang
+    at `hang_swi_invalid` in the accurate build and return in the
+    experimental one; 20h-29h (RSA, SHA-1) are still unimplemented stubs
+    that return.)
 - [x] Phase 1/2 fixes carried over. NTR and TWL both get the SWI 0x1E
   entry, Divide, RLE-to-VRAM, HuffUnComp and CpuFastSet; the IntrWait r0 = 0
   immediate return is ARM7 only (NTR and TWL), and SoftReset is NTR only.
   Conflicts with upstream and what was kept:
   - SWI table: upstream's TWL table also lacks 0x1E, so its 0x1F..0x29 are
     shifted by one and SWI 0x29 reads past the table. With our 0x1E entry the
-    TWL table has exactly 0x2A entries.
+    TWL table had exactly 0x2A entries; since 2026-11-02 it has 40h entries
+    (40h-FFh mirror them, see "Accurate and experimental FreeBIOS").
   - IntrWait: upstream (after 1124603) halts at least once for r0 = 0 and
     discards for r0 != 0, which is the original behavior. The ARM9 now does
     the same, because GBATEK says the real NDS9 BIOS always waits for at
@@ -226,7 +335,9 @@ bit widths (existing TODO).
     either is set (GBATEK: r2 holds extra flags). This is done by a
     `check_irq_flags` macro used at all three check points; it keeps the first
     result in r4. GBATEK's note that the real DSi7 BIOS ignores old IF flags
-    is not emulated.
+    is not emulated. (Changed 2026-11-02: this is now the experimental
+    behavior. The accurate build only ends the wait on IF2 bits, still
+    clearing the requested IF check bits, as the official DSi BIOS does.)
   - SoftReset: upstream still has the old stub. NTR only (see above); GBATEK
     lists no SWI 0x00 on DSi7/DSi9.
   - Upstream removed the `.org` padding at the end; so do we.
@@ -287,11 +398,18 @@ Suggested test order on the phone:
 
 Open items:
 - `check.sh` is not wired into CI.
-- Divide by zero: 0/0 matches the official BIOS (r0=1, r1=0, r3=1); x/0
-  returns r0=0, r1=x, r3=0 where the official BIOS hangs (SWI test ROM).
+- Divide by zero matches the official BIOS in the accurate build (0/0 =
+  1, 0, 1; x/0 hangs at `hang_div_by_zero`); the experimental build returns
+  0, x, 0 for x/0.
 - The ARM9 SoftReset cache step and step order are an interpretation of
-  GBATEK (see Phase 2). SoftReset has not run in a real game, but the SWI test ROM matches the official BIOS except the ARM9 stack placement.
-- Absent DSi SWIs return instead of hanging as GBATEK describes.
+  GBATEK (see Phase 2). SoftReset has not run in a real game; the SWI test
+  ROM matches the official BIOS on every SoftReset value (accurate build).
+- NDS7 absent SWIs jump to 0 as on the official BIOS, but our reset vector
+  is a loop (`hang_reset`), while the official reset code ends in the debug
+  vector at 0380FFDCh (test ROM: "CPU exception", CPSR=200000DFh). GBATEK
+  only says invalid calls are "redirected to the debug handler, if any".
+  Not matched; it would need a reset handler that calls the debug vector.
+- The DSi SHA-1 (24h-29h) and RSA (20h-23h) SWIs are stubs that return.
 - After a failed Open, the official LZ77 (12h) and RLE (15h) callback SWIs
   pass source+1 to Close (Huffman passes source+0); FreeBIOS passes source+0
   for all three. Not matched, since there is no explanation for the +1
@@ -325,8 +443,10 @@ FreeBIOS bugs it found (all against GBATEK; all fixed 2026-11-02, see
 - ARM7 Halt changes r0 and r2 (GBATEK: all registers unchanged).
 - IsDebugger doesn't destroy the halfword at 27FFFF8h/27FFFFAh. Harmless.
 
-Official behavior GBATEK doesn't cover (decide keep or match): 0/0 returns
-r0=1, r1=0, r3=1; x/0 hangs (FreeBIOS returns on purpose); LZ77 and RLE write
+Official behavior GBATEK doesn't cover (all matched since 2026-11-02 in the
+accurate build, except the garbage jumps, which hang; see "Accurate and
+experimental FreeBIOS"): 0/0 returns
+r0=1, r1=0, r3=1; x/0 hangs; LZ77 and RLE write
 the whole last block past the size; Diff16 rounds an odd size up; RLE-to-VRAM
 drops a trailing odd byte and aligns an odd destination down; ARM9 SoftReset
 uses fixed stacks at 803FC0h/803FA0h/803EC0h whatever the DTCM base; invalid
@@ -377,6 +497,11 @@ source directly.
   one quirk not matched: after a failed Open the official LZ77/RLE pass
   source+1 to Close (Huffman passes source+0; ours passes source+0 for
   all). SoftReset results unchanged (ARM9 stacks DTCM-relative on purpose).
+  Superseded the same day by the accurate build: x/0 hangs, invalid SWIs
+  jump to 0 or hang, fixed SoftReset stacks and flags; DS mode then has 25
+  mismatches (the ARM7 jump-to-0 cases end in our reset loop instead of the
+  debug vector, CustomPost, GetBootProcs, out-of-range tables and the
+  Close source+1 quirk).
 - Sizes: NTR ARM9 2552 (was 2352) of 4096, NTR ARM7 8916 (was 8672),
   TWL ARM9 2428 (was 2228), TWL ARM7 8936 (was 8692).
 - Dragon Quest IX, 600 frames, official vs FreeBIOS: no data-SWI result
@@ -409,6 +534,8 @@ address-bit rule below. 239 mismatches, all against our TWL build:
 - SWIs 2Ah and up go to table entry 01h, which on TWL is LZ77 Callback8, so
   they crash or hang. GBATEK: 40h-FFh mirror 00h-3Fh (49h = Div, CDh = Sqrt),
   12h and 2Bh are ignored. Fix: mask with 3Fh, send 2Ah-3Fh to swi_invalid.
+  (Fixed 2026-11-02: mask with 3Fh; absent numbers hang, as the official
+  BIOS does, in the accurate build.)
 - DSi7 CpuSet, CpuFastSet and BitUnPack reject a source whose start or end
   has none of address bits 25-27 set (end counted at 4 bytes per unit even
   for 16-bit CpuSet); the output is untouched and r0-r2 kept. DSi9 has no
@@ -418,6 +545,12 @@ address-bit rule below. 239 mismatches, all against our TWL build:
 - DSi7 IntrWait/VBlankIntrWait waiting only on IF bits (r2=0) never return
   on the official BIOS (GBATEK's DSi7 bug); a real IF2 IRQ (AES) does end the
   wait on both. FreeBIOS returns. Decision needed; returning is harmless.
+  (Decided 2026-11-02: the accurate build waits forever at
+  `hang_dsi7_intrwait_if` when r2 = 0, the experimental build returns.
+  Follow-up tests #665/#666: with r1=T2 and r2=AES, an enabled timer 2 IRQ
+  that fires first does not end the wait and an old T2 check bit doesn't
+  either; the AES IF2 IRQ does, and the T2 check bit is cleared. The
+  accurate build matches both.)
 - IntrWait registers: official returns r0=1, keeps r2, flags left in r3.
 - DSi7 GetPitchTable 0-3Fh returns sine values (GBATEK: bugged on DSi7).
   Entries from 40h up, out-of-range indices and the -46Ah case are marked
@@ -427,7 +560,8 @@ address-bit rule below. 239 mismatches, all against our TWL build:
 - Scratch: the official BIOS keeps r2 in every one-call SWI; FreeBIOS
   changes it in Div, Sqrt, BitUnPack, CRC and the decompressors.
 - Same as DS mode: x/0, invalid SWIs below 2Ah, CustomPost, the Close
-  source+1 quirk.
+  source+1 quirk. (x/0 and the invalid SWIs match since 2026-11-02, accurate
+  build: 239 -> 184 mismatches, none of them a hang or a mirror case.)
 
 Redacted-spec claims confirmed: the mirrors and ignored numbers, the bits
 25-27 source check, IntrWait r0=1 and r3 = flags, DSi9 Halt r0=0, CRC r3=0,

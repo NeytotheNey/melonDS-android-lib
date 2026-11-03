@@ -409,9 +409,11 @@ void Usage()
         "                 can be repeated\n"
         "  --console dsi  DSi mode, set up like the app: --bios picks the DS-mode (NTR) BIOS, and\n"
         "                 --dsi <dir> holds the DSi bios9.bin, bios7.bin and firmware.bin\n"
-        "  --dsi-bios official|free  the DSi (TWL) BIOS in DSi mode: the dumps in --dsi <dir>\n"
-        "                 (default) or our TWL FreeBIOS build. With free, bios7.bin in --dsi <dir>\n"
-        "                 is still read, only to hand the NAND code its ES key\n"
+        "  --dsi-bios official|free|file <dir>  the DSi (TWL) BIOS in DSi mode: the dumps in\n"
+        "                 --dsi <dir> (default), our embedded TWL FreeBIOS build, or bios9.bin and\n"
+        "                 bios7.bin from <dir> (e.g. freebios/build/experimental/dsi). With free or\n"
+        "                 file, bios7.bin in --dsi <dir> is still read, only to hand the NAND code\n"
+        "                 its ES key\n"
         "  --nand <file>  DSi NAND image; it is written to (touch calibration patch), so pass a copy\n"
         "  --nand-readonly  open the NAND read-only and skip the touch calibration patch\n"
         "                 (for programs that don't use the touch screen or the NAND)\n"
@@ -583,7 +585,7 @@ int main(int argc, char** argv)
     u64 blobtotal = 2ull * 1024 * 1024 * 1024;
     bool jit = false;
     std::vector<Tap> taps;
-    std::string console = "ds", dsidir, nandpath, dsibios = "official";
+    std::string console = "ds", dsidir, nandpath, dsibios = "official", dsibiosdir;
     bool nandreadonly = false;
     int rtc[6] = {2026, 1, 1, 12, 0, 0};
     bool dumpmainram = false;
@@ -651,7 +653,11 @@ int main(int argc, char** argv)
         else if (arg == "--no-core-log") CoreLogEnabled = false;
         else if (arg == "--dsi") dsidir = next();
         else if (arg == "--nand") nandpath = next();
-        else if (arg == "--dsi-bios") dsibios = next();
+        else if (arg == "--dsi-bios")
+        {
+            dsibios = next();
+            if (dsibios == "file") dsibiosdir = next();
+        }
         else if (arg == "--nand-readonly") nandreadonly = true;
         else if (arg == "--rtc")
         {
@@ -669,7 +675,7 @@ int main(int argc, char** argv)
 
     if (rompath.empty() || outdir.empty() || frames == 0 || (biosmode != "official" && biosmode != "file" && biosmode != "free")
         || (console != "ds" && console != "dsi") || (console == "dsi" && (dsidir.empty() || nandpath.empty()))
-        || (dsibios != "official" && dsibios != "free"))
+        || (dsibios != "official" && dsibios != "free" && dsibios != "file"))
     {
         Usage();
         return 1;
@@ -757,6 +763,15 @@ int main(int argc, char** argv)
             *(u32*)arm9ibios->data() = 0xEAFFFFFE;
             *(u32*)arm7ibios->data() = 0xEAFFFFFE;
         }
+        else if (dsibios == "file")
+        {
+            // FreeBIOS image files, e.g. the experimental build (LoadDSiBIOS parks the reset vector)
+            if (!LoadDSiBIOS(dsibiosdir + "/bios9.bin", *arm9ibios) || !LoadDSiBIOS(dsibiosdir + "/bios7.bin", *arm7ibios))
+            {
+                fprintf(stderr, "can't read the DSi BIOS files in %s\n", dsibiosdir.c_str());
+                return 1;
+            }
+        }
         else if (!LoadDSiBIOS(dsidir + "/bios9.bin", *arm9ibios) || !LoadDSiBIOS(dsidir + "/bios7.bin", *arm7ibios))
         {
             fprintf(stderr, "can't read the DSi BIOS files in %s\n", dsidir.c_str());
@@ -790,7 +805,7 @@ int main(int argc, char** argv)
         biosmode.c_str(), biosdir.c_str(),
         nds->IsLoadedARM9BIOSKnownNative(), nds->IsLoadedARM7BIOSKnownNative(), jit ? "on" : "off");
     if (dsimode)
-        printf("DSi BIOS: %s\n", dsibios == "free" ? "TWL FreeBIOS" : "official dumps");
+        printf("DSi BIOS: %s\n", dsibios == "free" ? "TWL FreeBIOS" : dsibios == "file" ? dsibiosdir.c_str() : "official dumps");
 
     u32 romlen = (u32)rom.size();
     auto romdata = std::make_unique<u8[]>(romlen);

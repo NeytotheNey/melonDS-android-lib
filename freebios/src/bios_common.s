@@ -53,29 +53,49 @@ b unhandled_exception                 // 0x1C FIQ
 #endif
 
 
-// TODO: This needs to be implemented. Not needed for emulators that HLE bootup.
+// Deliberate hangs. Every place where FreeBIOS stops on purpose is its own
+// "b ." at a hang_* label (hang_dsi7_intrwait_if is a halt loop), so the PC
+// of a frozen game names the cause.
+// build.sh prints the address of every hang_* label per image, and the
+// "Where FreeBIOS hangs on purpose" table in UPGRADE_PLAN.md lists them
+// (check.sh verifies the table against the build).
+
+// Reset vector. Not needed for emulators that HLE bootup. On the NDS7 an
+// invalid SWI also ends up here (it jumps to 0).
 boot_handler:
- 0:
-  b 0b
+hang_reset:
+  b hang_reset
 
-// Not sure what this should do, it's probably best to be pretty visible though.
+// Undefined instruction, aborts and FIQ.
 unhandled_exception:
- 0:
-  b 0b
+hang_exception:
+  b hang_exception
 
+
+#ifdef FREEBIOS_EXPERIMENTAL
+  // EXPERIMENTAL (safe choice): absent SWI numbers return with the
+  // registers unchanged, on NDS and DSi.
+  #define swi_absent swi_invalid_return
+#elif defined(PLATFORM_TWL)
+  // DSi: SWI numbers the BIOS does not list hang (GBATEK)
+  #define swi_absent hang_swi_invalid
+#else
+  // NDS: SWI numbers the BIOS does not list jump to 0 (GBATEK)
+  #define swi_absent swi_invalid_jump0
+#endif
 
 #ifdef TARGET_ARM7
   #define swi_label(function) .word function
   #define swi_label_arm7_only(function) swi_label(function)
 #else
-  #define swi_label_arm7_only(function) swi_label(swi_invalid)
+  #define swi_label_arm7_only(function) swi_label(swi_absent)
 #endif
 
 #ifdef TARGET_ARM9
   #define swi_label(function) .word (function + 0xFFFF0000)
   #define swi_label_arm9_only(function) swi_label(function)
 #else
-  #define swi_label_arm9_only(function) swi_label(swi_invalid)
+  #define swi_label_arm9_only(function) swi_label(swi_absent)
 #endif
 
 // SWI calling convention:
@@ -108,33 +128,36 @@ swi_handler:
   // We have to now save system-mode lr register as well
   stmdb sp!, { lr }
 
-  // Not sure if this should be here or not, but it probably doesn't
-  // hurt, and is better than flooding the table with 256 entries..
-  // This will move in the known entry of an invalid SWI.
+  // Numbers past the table (GBATEK "Invalid Functions"):
+  //   DSi: 40h-FFh mirror 00h-3Fh, and the table covers 00h-3Fh.
+  //   NDS9: 20h and up crash (they jump to garbage addresses).
+  //   NDS7: 20h and 22h jump to 0 like the other absent numbers, 21h and
+  //         23h and up crash (SWI test ROM, every number 20h-2Ah tested).
+  // A crash cannot be reproduced without the official BIOS content, so it
+  // becomes a deliberate hang (hang_swi_crash).
 #ifdef PLATFORM_TWL
-  cmp swi_comment, #0x2A
+  and swi_comment, swi_comment, #0x3F
 #else
   cmp swi_comment, #0x20
+  bhs swi_past_table
 #endif
-  movge swi_comment, #0x01
 
   // Branch to SWI handler
   ldr pc, [ pc, swi_comment, lsl #2 ]
   nop
 
   // SWI table begins here
-  // If there's no entry just go straight to swi_complete
 #ifdef PLATFORM_TWL
-  swi_label(swi_invalid)                                     // 00
+  swi_label(swi_absent)                                      // 00
   swi_label(swi_lz77_decompress_callback8)                   // 01
 #else
   swi_label(swi_soft_reset)                                  // 00
-  swi_label(swi_invalid)                                     // 01
+  swi_label(swi_absent)                                      // 01
 #endif
 #ifdef PLATFORM_TWL
   swi_label(swi_lz77_decompress_vram)                        // 02
 #else
-  swi_label(swi_invalid)                                     // 02
+  swi_label(swi_absent)                                      // 02
 #endif
   swi_label(swi_wait_by_loop)                                // 03
   swi_label(swi_interrupt_wait)                              // 04
@@ -143,20 +166,20 @@ swi_handler:
   swi_label_arm7_only(swi_stop)                              // 07
   swi_label_arm7_only(swi_sound_bias)                        // 08
   swi_label(swi_divide)                                      // 09
-  swi_label(swi_invalid)                                     // 0A
+  swi_label(swi_absent)                                      // 0A
   swi_label(swi_cpu_set)                                     // 0B
   swi_label(swi_cpu_fast_set)                                // 0C
   swi_label(swi_sqrt)                                        // 0D
   swi_label(swi_get_crc16)                                   // 0E
 #ifdef PLATFORM_TWL
-  swi_label(swi_invalid)                                     // 0F
+  swi_label(swi_absent)                                      // 0F
 #else
   swi_label(swi_is_debugger)                                 // 0F
 #endif
   swi_label(swi_bit_unpack)                                  // 10
   swi_label(swi_lz77_decompress_wram)                        // 11
 #ifdef PLATFORM_TWL
-  swi_label(swi_invalid)                                     // 12
+  swi_label(swi_ignored)                                     // 12
 #else
   swi_label(swi_lz77_decompress_vram)                        // 12
 #endif
@@ -164,34 +187,40 @@ swi_handler:
   swi_label(swi_runlength_decompress_wram)                   // 14
   swi_label(swi_runlength_decompress_vram)                   // 15
   swi_label_arm9_only(swi_diff_8bit_unfilter_wram)           // 16
-  swi_label(swi_invalid)                                     // 17
+  swi_label(swi_absent)                                      // 17
   swi_label_arm9_only(swi_diff_16bit_unfilter)               // 18
 #ifdef PLATFORM_TWL
   swi_label(swi_lz77_decompress_vram)                        // 19
 #else
-  swi_label(swi_invalid)                                     // 19
+  swi_label(swi_absent)                                      // 19
 #endif
   swi_label_arm7_only(swi_get_sine_table)                    // 1A
   swi_label_arm7_only(swi_get_pitch_table)                   // 1B
   swi_label_arm7_only(swi_get_volume_table)                  // 1C
   swi_label_arm7_only(swi_get_boot_procs)                    // 1D
-  swi_label(swi_invalid)                                     // 1E
+  swi_label(swi_absent)                                      // 1E
   swi_label(swi_custom_halt_post)                            // 1F
 #ifdef PLATFORM_TWL
-  swi_label(swi_invalid)                                     // 20
-  swi_label(swi_invalid)                                     // 21
-  swi_label(swi_invalid)                                     // 22
-  swi_label(swi_invalid)                                     // 23
-  swi_label(swi_invalid)                                     // 24
-  swi_label(swi_invalid)                                     // 25
-  swi_label(swi_invalid)                                     // 26
-  swi_label(swi_invalid)                                     // 27
-  swi_label(swi_invalid)                                     // 28
-  swi_label(swi_invalid)                                     // 29
+  // 20h-29h: RSA and SHA-1, not implemented (they return)
+  .rept 10
+  swi_label(swi_unimplemented)                               // 20-29
+  .endr
+  swi_label(swi_absent)                                      // 2A
+  swi_label(swi_ignored)                                     // 2B
+  .rept 0x14
+  swi_label(swi_absent)                                      // 2C-3F
+  .endr
 #endif
 
-swi_invalid:
-  // This just passes through to completion.
+// TWL 20h-29h (RSA, SHA-1) are not implemented and just return.
+swi_unimplemented:
+#ifdef FREEBIOS_EXPERIMENTAL
+// EXPERIMENTAL: absent SWI numbers (and NDS numbers past the table) return.
+swi_invalid_return:
+swi_past_table:
+#endif
+// TWL 12h and 2Bh: "no function (ignored)" (GBATEK).
+swi_ignored:
 
 // SWI returns here
 swi_complete:
@@ -210,7 +239,42 @@ swi_complete:
   ldmia sp!, { r4, r12, lr }
 
   // Return from exception handler
-  movs pc, lr  
+  movs pc, lr
+
+
+#if defined(FREEBIOS_EXPERIMENTAL)
+// (EXPERIMENTAL: no invalid-SWI hang or jump to 0, see swi_invalid_return)
+#elif defined(PLATFORM_TWL)
+// DSi: absent SWI numbers hang (GBATEK), the table points here.
+hang_swi_invalid:
+  b hang_swi_invalid
+#else
+// NDS: an absent SWI jumps to 0 (GBATEK): on the NDS9 that is the ITCM
+// (a debug handler, if the game put one there; when the protection unit
+// blocks execution at 0, as in normal SDK games, the jump gets a prefetch
+// abort and ends in hang_exception), on the NDS7 the reset vector
+// (hang_reset). As the SWI test ROM saw on the official BIOS, the
+// jump is made in system mode with the condition flags clear and lr pointing
+// into the BIOS; lr = swi_complete, so code at 0 that returns ends the SWI
+// normally.
+swi_invalid_jump0:
+  msr CPSR_f, #0
+  adr lr, swi_complete
+  mov pc, #0
+
+// Numbers past the NDS table: the NDS7 sends 20h and 22h to 0 as well; the
+// rest crash on the official BIOS (a jump to a garbage address read from
+// BIOS memory, GBATEK), which cannot be reproduced, so they hang here
+// instead.
+swi_past_table:
+#ifdef TARGET_ARM7
+  cmp swi_comment, #0x20
+  cmpne swi_comment, #0x22
+  beq swi_invalid_jump0
+#endif
+hang_swi_crash:
+  b hang_swi_crash
+#endif
 
 
 padding_a:
@@ -224,8 +288,10 @@ swi_halt:
   mov r4, #0x80
   strb r4, [ r12, #0x301 ]
 #else
-  // GBATEK: NDS9 Halt destroys r0
+  // GBATEK: NDS9 Halt destroys r0. With IME=0 the CP15 halt never wakes
+  // up (GBATEK), so the PC then stays here (halt_arm9_cp15).
   mov r0, #0x0
+halt_arm9_cp15:
   mcr p15, 0, r0, cr7, cr0, 4
 #endif
   b swi_complete
@@ -311,16 +377,27 @@ interrupt_check_aux:
 #define halt_value        r12
 
 // Check and acknowledge the requested IRQ flags; Z is clear if one was set.
-// The DSi ARM7 also takes the IE2/IF2 flags in irq_wait_aux_mask (GBATEK:
-// r2, BIOS flags at 0380FFC0h) and returns if a flag in either word was
-// set. r4 (stacked by the SWI entry) keeps the first result.
+// The DSi ARM7 takes the IE2/IF2 flags in irq_wait_aux_mask (GBATEK: r2,
+// BIOS flags at 0380FFC0h). GBATEK: the DSi7 BIOS "ignores the old IF
+// interrupts, and works only with new IF2 ones", so in the accurate TWL
+// ARM7 build only the IF2 flags end the wait. The requested IF flags (r1)
+// are still cleared in the BIOS IF check bits, but they never end the wait
+// (official DSi BIOS, SWI test ROM: an enabled timer 2 IRQ with r1=T2 does
+// not end a wait for an AES IF2 IRQ, and its check bit is cleared).
+// EXPERIMENTAL: either word ends the wait; r4 (stacked by the SWI entry)
+// keeps the first result.
 .macro check_irq_flags
+#if defined(TARGET_ARM7) && defined(PLATFORM_TWL) && !defined(FREEBIOS_EXPERIMENTAL)
+  bl interrupt_check
+  bl interrupt_check_aux
+#else
   bl interrupt_check
 #if defined(TARGET_ARM7) && defined(PLATFORM_TWL)
   movne r4, #1
   moveq r4, #0
   bl interrupt_check_aux
   teqeq r4, #0
+#endif
 #endif
 .endm
 
@@ -336,6 +413,14 @@ swi_vblank_interrupt_wait:
 
 swi_interrupt_wait:
   mov io_base, #0x4000000
+#if defined(TARGET_ARM7) && defined(PLATFORM_TWL) && !defined(FREEBIOS_EXPERIMENTAL)
+  // Since the IF flags are ignored (see check_irq_flags), a wait with no IF2
+  // bits (r2 = 0, which includes VBlankIntrWait) can never end, as on the
+  // official DSi BIOS (SWI test ROM): dsi7_intrwait_forever.
+  // (EXPERIMENTAL: returns on the IF bits as well.)
+  cmp irq_wait_aux_mask, #0
+  beq dsi7_intrwait_forever
+#endif
 
   // r0 != 0: discard the requested flags, then wait for a new one.
   // r0 == 0, ARM7: return at once if a requested flag is already set.
@@ -376,6 +461,19 @@ swi_interrupt_check_first:
 
   // If not wait for interrupt.
   b 0b
+#endif
+
+#if defined(TARGET_ARM7) && defined(PLATFORM_TWL) && !defined(FREEBIOS_EXPERIMENTAL)
+// A DSi7 wait that never ends: IME=1 as IntrWait sets it (GBATEK), then
+// halt forever, so the game's IRQ handlers keep running. The PC stays in
+// the halt loop at hang_dsi7_intrwait_if.
+dsi7_intrwait_forever:
+  mov const_0x1, #0x1
+  str const_0x1, [ io_base, #0x208 ]
+hang_dsi7_intrwait_if:
+  mov halt_value, #0x80
+  strb halt_value, [ io_base, #0x301 ]
+  b hang_dsi7_intrwait_if
 #endif
 
 
@@ -445,9 +543,8 @@ swi_sound_bias:
 
 swi_divide:
   // Division by zero: GBATEK says the BIOS is usually caught in an endless
-  // loop. The official BIOS returns r0 = 1, r1 = 0, r3 = 1 for 0/0 (SWI
-  // test ROM), which is matched. For a non-zero numerator it hangs; return
-  // a safe, non-hanging result instead: r0 = 0, r1 = numerator, r3 = 0.
+  // loop. As on the official BIOS (SWI test ROM), 0/0 returns r0 = 1,
+  // r1 = 0, r3 = 1 and a non-zero numerator hangs (hang_div_by_zero).
   cmp denominator, #0
   beq div_by_zero
 
@@ -500,11 +597,25 @@ swi_divide:
   b swi_complete
 
  div_by_zero:
-  movs remainder, numerator
-  moveq result, #1
+  cmp numerator, #0
+#ifdef FREEBIOS_EXPERIMENTAL
+  // EXPERIMENTAL (safe choice): x/0 returns r0 = 0, r1 = x, r3 = 0
+  movne remainder, numerator
   movne result, #0
-  mov result_abs, result
+  movne result_abs, #0
+  bne swi_complete
+#else
+  bne hang_div_by_zero
+#endif
+  mov result, #1
+  mov remainder, #0
+  mov result_abs, #1
   b swi_complete
+
+#ifndef FREEBIOS_EXPERIMENTAL
+hang_div_by_zero:
+  b hang_div_by_zero
+#endif
 
 
 #define source        r0
@@ -1608,11 +1719,11 @@ swi_get_volume_table:
 //         write buffer and sets the CP15 control register to 12078h
 //         (GBATEK only says "flushes caches and write buffer"; clean +
 //         invalidate is used because it cannot lose data). Then clears
-//         DTCM+3E00h-DTCM+3FFFh and sets sp_svc = DTCM+3FC0h,
-//         sp_irq = DTCM+3FA0h, sp_sys = DTCM+3EC0h. GBATEK calls the stacks
-//         hardcoded (0803FC0h/0803FA0h/0803EC0h, the same values with the
-//         default DTCM base 0800000h); they are kept DTCM-relative so they
-//         stay valid when a game has moved the DTCM. Entry from [027FFE24h].
+//         DTCM+3E00h-DTCM+3FFFh and sets the stacks GBATEK calls
+//         hardcoded, whatever the DTCM base (as the official BIOS does):
+//         sp_svc = 00803FC0h, sp_irq = 00803FA0h, sp_sys = 00803EC0h.
+//         Entry from [027FFE24h]. (EXPERIMENTAL: DTCM+3FC0h/3FA0h/3EC0h.)
+// Both CPUs enter with Z and C set, as the official BIOS leaves them.
 // The DSi BIOS has no SWI 00h (GBATEK), so the TWL build leaves it out.
 
 #ifdef TARGET_ARM7
@@ -1667,8 +1778,16 @@ swi_soft_reset:
 
   // r1 = sp_svc
 #ifdef TARGET_ARM9
-  // DTCM+3FC0h; r0 = DTCM+3E00h
+#ifdef FREEBIOS_EXPERIMENTAL
+  // EXPERIMENTAL (safe choice): DTCM-relative stacks, DTCM+3FC0h, so they
+  // stay valid when a game has moved the DTCM. r0 = DTCM+3E00h.
   add r1, r0, #0x1C0
+#else
+  // GBATEK: the NDS9 stacks are hardcoded, 00803FC0h whatever the DTCM base
+  // (the official BIOS does the same, SWI test ROM). r0 = DTCM+3E00h.
+  mov r1, #0x00800000
+  orr r1, r1, #0x3FC0
+#endif
 #else
   ldr r1, stack_pointer_svc
 #endif
@@ -1684,7 +1803,7 @@ swi_soft_reset:
   mov r3, #0xd2
   msr CPSR_fsxc, r3
 #ifdef TARGET_ARM9
-  // sp_irq = DTCM+3FA0h
+  // sp_irq = sp_svc - 20h (00803FA0h)
   sub sp, r1, #0x20
 #else
   // sp_irq = 0x0380FFB0
@@ -1693,11 +1812,13 @@ swi_soft_reset:
   mov lr, r2
   msr SPSR_fsxc, r2
 
-  // System mode, interrupts enabled
+  // System mode, interrupts enabled; Z and C set, as the official BIOS
+  // leaves them (SWI test ROM)
   mov r3, #0x5f
+  orr r3, r3, #0x60000000
   msr CPSR_fsxc, r3
 #ifdef TARGET_ARM9
-  // sp_sys = DTCM+3EC0h
+  // sp_sys = sp_svc - 100h (00803EC0h)
   sub sp, r1, #0x100
   // Entry address at 0x027FFE24
   mov r3, #0x02800000
