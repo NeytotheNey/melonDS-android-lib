@@ -915,13 +915,17 @@ ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds) : NDS(nds)
         Log(LogLevel::Error, "Failed to open memory using shm_open! (%s)", strerror(errno));
     }
     shm_unlink(fastmemPidName);
-#endif
+    // Both Android paths above size the region when they create it, and ashmem rejects ftruncate with EINVAL
     if (ftruncate(MemoryFile, MemoryTotalSize) < 0)
     {
         Log(LogLevel::Error, "Failed to allocate memory using ftruncate! (%s)", strerror(errno));
     }
+#endif
 
-    mmap(MemoryBase, MemoryTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, MemoryFile, 0);
+    if (mmap(MemoryBase, MemoryTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, MemoryFile, 0) == MAP_FAILED)
+    {
+        Log(LogLevel::Error, "Failed to map the fastmem memory! (%s)", strerror(errno));
+    }
 #endif
     FastMem9Start = MemoryBase+MemoryTotalSize;
     FastMem7Start = static_cast<u8*>(FastMem9Start)+AddrSpaceSize;
