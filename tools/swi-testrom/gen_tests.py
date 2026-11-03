@@ -959,6 +959,33 @@ def dsi_irq_tests():
         p=[T2, VB | T2, 1, 0x100, 0, 1, 0, 0], isolated=True, expect=vbexp)
 
 
+def late_tests():
+    """Added after the first DS/DSi runs; kept last so the earlier test ids stay
+    the same."""
+    if not TWL:
+        # NDS7 21h-29h: only 20h (jumps to 0) and 2Ah (crash) were tested before
+        for n in range(0x21, 0x2A):
+            add("invalid SWI %02Xh" % n, (7,), n, K_REGS, ins=(100, 7), isolated=True,
+                expect=dict(basis=G_SUMMARY + " (Invalid Functions)",
+                            note="GBATEK: SWI 20h+ crash (jump to garbage addresses); 20h jumps to 0 (SWI test ROM)"))
+        return
+    AES2 = 1 << 12
+    KICK = 0x80000000
+
+    def iw(name, r0, r1, r2, flags, ie, d2, d3, note):
+        def exp(cpu):
+            e = dict(basis=G_HALT + " (IntrWait, DSi7/DSi9=bugged?)", note=note)
+            e.update(twl_irq_model(0x04, cpu, r1, r2))
+            return e
+        add("IntrWait DSi: " + name, (7,), 0x04, K_IRQ, ins=(r0, r1, r2),
+            p=[flags, ie, 1, d2, d3, 0, 0, AES2 | KICK], isolated=True, expect=exp)
+    iw("timer 2 IRQ before the AES IF2 IRQ (r1=T2, r2=AES)", 1, T2, AES2, 0, T2 | T3, 0x40, 0x100,
+       note="GBATEK: DSi7 ignores the IF IRQs, so timer 2 (enabled, fires first) should not end the wait; "
+            "the AES IF2 IRQ (after the first timer 3 IRQ) should")
+    iw("r0=0, old T2 flag set, waiting for AES (r1=T2, r2=AES)", 0, T2, AES2, T2, T3, 0, 0x100,
+       note="GBATEK: DSi7 ignores old IF flags, so the old T2 flag should not end the wait at once")
+
+
 SHA_DATA = E.Rng(0x5A1).bytes(0x4100)
 SHA_CTX = DST_OFS               # 64h-byte context in the output region
 SHA_DIG = DST_OFS + 0x70        # 20-byte digest
@@ -1290,6 +1317,7 @@ def build():
     invalid_tests()
     if TWL:
         twl_tests()
+    late_tests()
     for n, t in enumerate(TESTS):
         t.id = n + 1
 
