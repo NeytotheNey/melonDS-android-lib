@@ -1110,8 +1110,11 @@ layout (location = 2) uniform uint ColorDither;
 // 4x4 ordered pattern over the framebuffer pixels instead, so gradients don't band. a vertex's
 // own color is (c << 4) | 0xF or 0, which minus 7 has those 3 bits clear, so it lands on the
 // same 6 bit value as without (flat polygons don't get the pattern) and the result never goes
-// past 63
-const int DitherThresholds[16] = int[16](0, 4, 1, 5, 6, 2, 7, 3, 1, 5, 0, 4, 7, 3, 6, 2);
+// past 63. the table is 7 minus a 4x4 Bayer matrix halved, so (0, 0) has 7, which gives exactly
+// the hardware's c >> 3: the low-res copy (LowResFB, what capture and GetLine read) only takes
+// the hi-res pixels at multiples of the scale, all (0, 0) in the pattern at scale 4 and 8, so
+// it stays as on hardware there instead of a level darker
+const int DitherThresholds[16] = int[16](7, 3, 6, 2, 1, 5, 0, 4, 6, 2, 7, 3, 0, 4, 1, 5);
 
 int DitherColor(int c, int threshold)
 {
