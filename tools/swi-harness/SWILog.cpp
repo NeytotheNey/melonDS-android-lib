@@ -337,8 +337,27 @@ void WriteRecord(ARM* cpu, const PendingCall& call, bool returned)
 
     u32 out[13];
     for (int i = 0; i < 13; i++) out[i] = cpu->R[i];
-    WriteRegs("out", out, 4, line);
-    WriteRegs("out_r4_r12", &out[4], 9, line);
+    if (num == 1 && call.SWI >= 0x1A && call.SWI <= 0x1D)
+    {
+        // GetSineTable/GetPitchTable/GetVolumeTable return BIOS table data and
+        // GetBootProcs returns BIOS addresses: never log what they return (clean room)
+        // r4-r12 only as "kept" (the input value) or "changed"
+        line += ",\"out\":[\"hidden\",\"hidden\",\"hidden\",\"hidden\"],\"out_hidden\":true,\"out_r4_r12\":[";
+        for (int i = 0; i < 9; i++)
+        {
+            if (out[4 + i] == call.InHigh[i])
+                snprintf(tmp, sizeof(tmp), "%s\"%08X\"", i ? "," : "", call.InHigh[i]);
+            else
+                snprintf(tmp, sizeof(tmp), "%s\"changed\"", i ? "," : "");
+            line += tmp;
+        }
+        line += "]";
+    }
+    else
+    {
+        WriteRegs("out", out, 4, line);
+        WriteRegs("out_r4_r12", &out[4], 9, line);
+    }
 
     snprintf(tmp, sizeof(tmp), ",\"cpsr_out\":\"%08X\",\"frame_end\":%u,\"cycles\":%llu",
         cpu->CPSR, CurFrame, (unsigned long long)(Timestamp(cpu) - call.T0));
@@ -380,6 +399,8 @@ void WriteRecord(ARM* cpu, const PendingCall& call, bool returned)
 
 void OnEntry(ARM* cpu, u32 comment, bool thumb)
 {
+    if (!LogFile) return; // --no-swi-log
+
     int num = cpu->Num;
     u32 ret = cpu->R[15] - (thumb ? 2 : 4);
     u32 caller = ret - (thumb ? 2 : 4);

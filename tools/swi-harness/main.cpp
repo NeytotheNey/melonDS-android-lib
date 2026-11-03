@@ -57,6 +57,7 @@ using namespace melonDS;
 namespace
 {
 FILE* CoreLog = nullptr;
+bool CoreLogEnabled = true; // --no-core-log
 bool StopRequested = false;
 }
 
@@ -211,6 +212,7 @@ u64 FileLength(FileHandle* file)
 
 void Log(LogLevel level, const char* fmt, ...)
 {
+    if (!CoreLogEnabled) return;
     va_list args;
     va_start(args, fmt);
     vfprintf(CoreLog ? CoreLog : stderr, fmt, args);
@@ -408,7 +410,14 @@ void Usage()
         "                 --dsi <dir> holds the DSi bios9.bin, bios7.bin and firmware.bin\n"
         "  --nand <file>  DSi NAND image; it is written to (touch calibration patch), so pass a copy\n"
         "  --rtc Y,M,D,h,m,s  RTC date and time (default 2026,1,1,12,0,0)\n"
-        "  --dump-mainram   write main RAM (game memory only) to mainram.bin at the end\n");
+        "  --dump-mainram   write main RAM (game memory only) to mainram.bin at the end\n"
+        "  --dump-range ADDR LEN  write LEN bytes of main RAM from ADDR (02000000h-02FFFFFFh)\n"
+        "                 to range.bin at the end\n"
+        "  --poke ADDR=VAL  write the 32-bit VAL to main RAM at ADDR after direct boot, before\n"
+        "                 the first frame (for test ROM modes), can be repeated\n"
+        "  --no-swi-log   don't write swi.jsonl and outputs.bin\n"
+        "  --no-core-log  drop all core log output (no core.log); the core's unknown-I/O\n"
+        "                 messages can carry values the BIOS loaded\n");
 }
 
 const char* ConsoleModeName(u16 scfgbios)
@@ -568,6 +577,9 @@ int main(int argc, char** argv)
     std::string console = "ds", dsidir, nandpath;
     int rtc[6] = {2026, 1, 1, 12, 0, 0};
     bool dumpmainram = false;
+    u32 dumpaddr = 0, dumplen = 0;
+    std::vector<std::pair<u32, u32>> pokes;
+    bool swilog = true;
 
     for (int i = 1; i < argc; i++)
     {
@@ -603,6 +615,30 @@ int main(int argc, char** argv)
         }
         else if (arg == "--console") console = next();
         else if (arg == "--dump-mainram") dumpmainram = true;
+        else if (arg == "--dump-range")
+        {
+            dumpaddr = strtoul(next().c_str(), nullptr, 0);
+            dumplen = strtoul(next().c_str(), nullptr, 0);
+            if ((dumpaddr >> 24) != 0x02 || dumplen == 0 || dumplen > 0x1000000 - (dumpaddr & 0xFFFFFF))
+            {
+                fprintf(stderr, "bad --dump-range, must be inside 02000000h-02FFFFFFh\n");
+                return 1;
+            }
+        }
+        else if (arg == "--poke")
+        {
+            std::string val = next();
+            size_t eq = val.find('=');
+            u32 addr = strtoul(val.substr(0, eq).c_str(), nullptr, 0);
+            if (eq == std::string::npos || (addr >> 24) != 0x02 || (addr & 3))
+            {
+                fprintf(stderr, "bad --poke %s, must be ADDR=VAL with an aligned main RAM address\n", val.c_str());
+                return 1;
+            }
+            pokes.push_back({addr, (u32)strtoul(val.substr(eq + 1).c_str(), nullptr, 0)});
+        }
+        else if (arg == "--no-swi-log") swilog = false;
+        else if (arg == "--no-core-log") CoreLogEnabled = false;
         else if (arg == "--dsi") dsidir = next();
         else if (arg == "--nand") nandpath = next();
         else if (arg == "--rtc")
@@ -628,7 +664,8 @@ int main(int argc, char** argv)
     bool dsimode = (console == "dsi");
 
     std::filesystem::create_directories(outdir);
-    CoreLog = fopen((outdir + "/core.log").c_str(), "w");
+    if (CoreLogEnabled)
+        CoreLog = fopen((outdir + "/core.log").c_str(), "w");
 
     std::vector<u8> rom;
     if (!ReadFile(rompath, rom))
@@ -760,7 +797,11 @@ int main(int argc, char** argv)
         printf("cart unit code %02X, after direct boot: %s\n", header.UnitCode, SCFGState(dsi).c_str());
     }
 
-    if (!SWILog::Open(outdir, blobmax, blobtotal))
+    // main RAM only, written straight into the array like the direct boot does
+    for (auto& poke : pokes)
+        *(u32*)&nds->MainRAM[poke.first & nds->MainRAMMask] = poke.second;
+
+    if (swilog && !SWILog::Open(outdir, blobmax, blobtotal))
     {
         fprintf(stderr, "can't open log files in %s\n", outdir.c_str());
         return 1;
@@ -818,6 +859,16 @@ int main(int argc, char** argv)
         if (f)
         {
             fwrite(nds->MainRAM, 1, nds->MainRAMMask + 1, f);
+            fclose(f);
+        }
+    }
+    if (dumplen)
+    {
+        FILE* f = fopen((outdir + "/range.bin").c_str(), "wb");
+        if (f)
+        {
+            for (u32 i = 0; i < dumplen; i++)
+                fputc(nds->MainRAM[(dumpaddr + i) & nds->MainRAMMask], f);
             fclose(f);
         }
     }

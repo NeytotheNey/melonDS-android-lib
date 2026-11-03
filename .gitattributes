@@ -19,3 +19,6 @@ src/net/libslirp/src/glib/**                 -linguist-vendored
 
 ## FreeBIOS build scripts run under sh, so keep LF on Windows checkouts
 freebios/*.sh text eol=lf
+
+## SWI test ROM scripts run under sh too
+tools/swi-testrom/*.sh text eol=lf

@@ -89,8 +89,9 @@ bit widths (existing TODO).
 - [x] `swi_runlength_decompress_vram` is a separate routine that only does
   halfword stores (buffers the even byte in r5, stores on the odd byte).
   An odd start address keeps the existing low byte, and an odd final
-  address is flushed with the existing high byte. A zero length returns
-  at once. The WRAM routine is unchanged.
+  address is flushed with the existing high byte (changed 2026-11-02, see
+  Test ROM fixes). A zero length returns at once. The WRAM routine is
+  unchanged.
 
 ### Phase 2: missing features (done)
 - [x] Huffman decompression (SWI 0x13, `swi_huffman_decompress`) per GBATEK
@@ -160,7 +161,8 @@ bit widths (existing TODO).
     CPUs and ARM/Thumb entries: cleared range, banked sp/lr, SPSRs, r0-r12.
 - [x] CpuFastSet (SWI 0x0C) uses `ldmia`/`stmia` of 8 registers (r3-r10,
   r5-r10 stacked); fill mode stores 8 copies per iteration. The 21-bit
-  length is rounded up to a multiple of 8 words; a length of 0 now returns
+  length is rounded up to a multiple of 8 words (changed 2026-11-02, see
+  Test ROM fixes); a length of 0 now returns
   at once (it used to loop 2^32 times). Checked for lengths 0-39, 0x1FFFF9
   and 0x1FFFFF, copy and fill, with junk in bits 21-31.
 - After Phase 2 the ARM9 image used 0x90C of 0x1000 bytes and the ARM7
@@ -197,10 +199,11 @@ bit widths (existing TODO).
   `interrupt_check_aux` for the IE2/IF2 BIOS flags at `0x0380FFC0`; r2 is the
   IE2/IF2 mask and VBlankIntrWait sets it to 0, as GBATEK says.
 - [x] Deviations from upstream's TWL table, both from GBATEK's DSi SWI list:
-  - 0x01 is `swi_lz77_decompress_wram` (GBATEK: LZ77UnCompReadByCallback
-    Write8bit on DSi7/DSi9); upstream has `swi_invalid`. Like 0x02/0x19 it
-    reuses the existing routine, which reads the source directly, not
-    through callbacks.
+  - 0x01 is LZ77UnCompReadByCallbackWrite8bit (GBATEK, DSi7/DSi9);
+    upstream has `swi_invalid`. Since 2026-11-02 it is
+    `swi_lz77_decompress_callback8`, which reads through the callbacks like
+    0x02/0x19 but writes bytes (see Test ROM fixes); before, all three
+    reused routines that read the source directly.
   - 0x00 is `swi_invalid`: the DSi BIOS has no SoftReset. GBATEK says SWI
     numbers the DSi BIOS does not list hang in an endless loop (0x12 and
     0x2B are "ignored"); every absent TWL entry here, 0x00 included, returns
@@ -284,18 +287,108 @@ Suggested test order on the phone:
 
 Open items:
 - `check.sh` is not wired into CI.
-- Divide-by-zero return values are a safe choice, not hardware-verified.
+- Divide by zero: 0/0 matches the official BIOS (r0=1, r1=0, r3=1); x/0
+  returns r0=0, r1=x, r3=0 where the official BIOS hangs (SWI test ROM).
 - The ARM9 SoftReset cache step and step order are an interpretation of
-  GBATEK (see Phase 2), and SoftReset has not run in a real game.
+  GBATEK (see Phase 2). SoftReset has not run in a real game, but the SWI test ROM matches the official BIOS except the ARM9 stack placement.
 - Absent DSi SWIs return instead of hanging as GBATEK describes.
+- After a failed Open, the official LZ77 (12h) and RLE (15h) callback SWIs
+  pass source+1 to Close (Huffman passes source+0); FreeBIOS passes source+0
+  for all three. Not matched, since there is no explanation for the +1
+  (SWI test ROM #243/#244, #319/#320).
+
+## SWI test ROM (DS mode, 2026-11-02)
+
+`tools/swi-testrom/` is our own DS program that calls every DS-mode SWI with
+known inputs (436 tests, 72 isolated hang-prone cases, 7 SoftReset variants)
+and stores the results in main RAM. `sh tools/swi-testrom/build.sh` builds it
+reproducibly; `sh tools/swi-testrom/run.sh` runs it in the swi-harness with
+the official BIOS and with FreeBIOS and writes
+`logs/swi/testrom/report.txt` in the app repo. Results store no BIOS bytes or
+BIOS addresses (table SWIs by hash, BIOS-range register values as flags), and
+the runs pass `--no-swi-log --no-core-log`. The official BIOS matched the
+GBATEK model on every test that has one.
+
+FreeBIOS bugs it found (all against GBATEK; all fixed 2026-11-02, see
+"Test ROM fixes" below):
+- Sqrt: signed compare, so inputs >= 80000000h return 0 (GBATEK: unsigned).
+- CpuFastSet: rounds the count up to 8 words; NDS takes any word count.
+- CpuSet count 0, BitUnPack length 0, RLE Wram size 0 and Diff8/16 size 0
+  wrap around and overwrite all of main RAM (official: no writes, Diff writes
+  one unit).
+- The callback decompressors (12h, 13h, 15h) never call Open/Get8/Get32/
+  Close, ignore Open's header and errors, and return the source pointer in r0
+  instead of the length. Output is only right for plain memory sources.
+- ARM7 CustomHalt writes r0 to HALTCNT instead of r2 (r0=12345678h selects GBA
+  mode and stops the emulator).
+- SoundBias ignores r0 and the r1 delay.
+- ARM7 Halt changes r0 and r2 (GBATEK: all registers unchanged).
+- IsDebugger doesn't destroy the halfword at 27FFFF8h/27FFFFAh. Harmless.
+
+Official behavior GBATEK doesn't cover (decide keep or match): 0/0 returns
+r0=1, r1=0, r3=1; x/0 hangs (FreeBIOS returns on purpose); LZ77 and RLE write
+the whole last block past the size; Diff16 rounds an odd size up; RLE-to-VRAM
+drops a trailing odd byte and aligns an odd destination down; ARM9 SoftReset
+uses fixed stacks at 803FC0h/803FA0h/803EC0h whatever the DTCM base; invalid
+SWIs jump to 0 or crash (FreeBIOS returns). SoftReset otherwise matches
+(DTCM+3E00h-3FFFh cleared, CP15 control, r0-r12, lr, mode). Not FreeBIOS
+bugs: CustomPost r0=3 (melonDS ignores 32-bit POSTFLG writes), out-of-range
+table indices and GetBootProcs (garbage/addresses by design).
+
+### Test ROM fixes (2026-11-02)
+
+All bugs above are fixed, and these official behaviors are now matched too:
+0/0 returns r0=1, r1=0, r3=1 (x/0 with x != 0 still returns r0=0,
+r1=x, r3=0 instead of hanging); LZ77 (11h/12h) and RLE (14h/15h) write the
+whole last block past the size (block at a time while the signed remaining
+size is above 0; size 0 writes nothing); Diff8/Diff16 always write the first
+unit (also for size 0) and Diff16 rounds an odd size up; VBlankIntrWait
+returns r0 = r1 = 1 (IntrWait keeps r0/r1; its flags moved to r12).
+RLE-to-VRAM (15h) now drops a trailing odd byte and aligns an odd
+destination down without reading back the low byte. This reverses the
+Phase 1 design (odd start kept the existing low byte, odd end was flushed
+with the existing high byte). Other earlier decisions that changed: Phase 1
+Div by zero (0/0 only), Phase 2 CpuFastSet rounding (now 8-word blocks then
+single words, as GBATEK says for NDS) and Phase 2 HuffUnComp reading the
+source directly.
+- 12h/13h/15h use GBATEK's callback interface (Open, Close, Get8, Get16,
+  Get32 at r3+0..10h, ARM or Thumb). Open(r0=source, r1=dest, r2=param)
+  gives the header; a negative value aborts with no writes. Get8/Get32 get
+  the current source address (header+4 on). Huffman copies the
+  (byte+1)*2-byte tree table into the r2 temp buffer with Get8 (also for
+  size 0) and reads the bitstream with Get32. Close (if non-zero) gets the
+  current source address; r0 = Open error, else Close error, else the size.
+  As on the official BIOS, Close is also called after a failed Open. Shared
+  code: `cb_decompress` / `cb_finish` / `cb_read8` / `cb_read32` and the
+  `vram_put_byte` macro. LZ77 to VRAM aligns an odd destination down, like
+  RLE. In the TWL build the LZ77 entries 01h (8-bit writes, disp 0 works),
+  02h and 19h are callback-based too (as GBATEK lists them); the LZ77 body
+  is one macro (`lz77_callback_body`) used with `vram_put_byte` or
+  `byte_put_8bit`, and the 8-bit copy is only assembled for TWL.
+- `interrupt_check`/`interrupt_check_aux` set IME=0 before reading the IRQ
+  flags, so an IRQ between the read and the write-back cannot lose its bit.
+- Sqrt compares unsigned; ARM7 Halt keeps all registers; ARM7 CustomHalt
+  writes r2; SoundBias steps the level by 1 toward 000h/200h with an r1
+  countdown between steps (GBATEK gives no delay unit) and keeps bits 10-15;
+  IsDebugger writes 0 to the halfword at 27FFFF8h/27FFFFAh; CpuSet,
+  BitUnPack and RLE Wram return at once for a count/size of 0.
+- Result: 211 mismatches before, 52 after. Left: x/0 hangs, invalid SWIs,
+  CustomPost, GetBootProcs, out-of-range table indices (all expected), and
+  one quirk not matched: after a failed Open the official LZ77/RLE pass
+  source+1 to Close (Huffman passes source+0; ours passes source+0 for
+  all). SoftReset results unchanged (ARM9 stacks DTCM-relative on purpose).
+- Sizes: NTR ARM9 2552 (was 2352) of 4096, NTR ARM7 8916 (was 8672),
+  TWL ARM9 2428 (was 2228), TWL ARM7 8936 (was 8692).
+- Dragon Quest IX, 600 frames, official vs FreeBIOS: no data-SWI result
+  differences.
+
+Cycle differences: ARM9 WaitByLoop is about 1.5x slower (GBATEK: the NDS
+BIOS runs it in Thumb), ARM9 Div 1.3x and Sqrt 1.26x slower. CpuFastSet is
+faster because the official BIOS has its documented slow path.
+
+Not covered yet: DSi (TWL) mode, ARM7 Sleep, the ARM7 BIOS-range source check.
 
 Next testing ideas (not started):
-- A small test ROM of our own (built with the NDK clang, like the BIOS) that
-  calls SoftReset, HuffUnComp, RLE-to-VRAM, LZ77, IntrWait r0=0 and the Div
-  edge cases with known GBATEK-format data and stores the results. The
-  swi-harness runs it with the official BIOS and with FreeBIOS and diffs the
-  outputs, so the functions no game here uses get a black-box check, and it
-  stays as a regression test.
 - A debug-build log line on the phone when a game calls SWI 0x00, to see
   whether games that return to their title (Dragon Quest IX after a
   quicksave) use the BIOS SoftReset or their own reset code.
