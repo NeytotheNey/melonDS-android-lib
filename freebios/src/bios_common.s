@@ -126,7 +126,7 @@ swi_handler:
   // If there's no entry just go straight to swi_complete
 #ifdef PLATFORM_TWL
   swi_label(swi_invalid)                                     // 00
-  swi_label(swi_lz77_decompress_wram)                        // 01
+  swi_label(swi_lz77_decompress_callback8)                   // 01
 #else
   swi_label(swi_soft_reset)                                  // 00
   swi_label(swi_invalid)                                     // 01
@@ -218,10 +218,13 @@ padding_a:
 
 swi_halt:
 #ifdef TARGET_ARM7
-  mov r0, #0x04000000
-  mov r2, #0x80
-  strb r2, [ r0, #0x301 ]
+  // GBATEK: NDS7 Halt keeps all registers, so only use r4 and r12 (both
+  // restored by swi_complete)
+  mov r12, #0x04000000
+  mov r4, #0x80
+  strb r4, [ r12, #0x301 ]
 #else
+  // GBATEK: NDS9 Halt destroys r0
   mov r0, #0x0
   mcr p15, 0, r0, cr7, cr0, 4
 #endif
@@ -249,7 +252,10 @@ swi_wait_by_loop:
 #define io_base           r3
 #define const_0x1         r12
 
-#define irq_flags         r0
+// The flags are written back before const_0x1 is needed, so both share r12.
+// This keeps r0 and r1, so VBlankIntrWait returns r0 = r1 = 1 (GBATEK: it
+// sets them and then runs IntrWait).
+#define irq_flags         r12
 
 interrupt_check:
 #ifdef TARGET_ARM9
@@ -261,11 +267,12 @@ interrupt_check:
   add irq_flag_base, irq_flag_base, #0x4000
 #endif
 
+  // Set IME (0x04000208) to 0 before reading the flags, so an IRQ cannot
+  // set a bit between the read and the write-back
+  str io_base, [ io_base, #0x208 ]
+
   // Load software IRQ flag
   ldr irq_flags, [ irq_flag_base, #-8 ]
-
-  // Set IME (0x04000208) to 0
-  str io_base, [ io_base, #0x208 ]
 
   // Check if IRQs were risen, to see if the loop can exit
   tst irq_wait_mask, irq_flags
@@ -281,11 +288,12 @@ interrupt_check:
 
 #if defined(TARGET_ARM7) && defined(PLATFORM_TWL)
 interrupt_check_aux:
+  // Set IME (0x04000208) to 0 before reading the flags, so an IRQ cannot
+  // set a bit between the read and the write-back
+  str io_base, [ io_base, #0x208 ]
+
   // Load software IRQ flag
   ldr irq_flags, [ irq_flag_base, #-64 ]
-
-  // Set IME (0x04000208) to 0
-  str io_base, [ io_base, #0x208 ]
 
   // Check if IRQs were risen, to see if the loop can exit
   tst irq_wait_aux_mask, irq_flags
@@ -300,7 +308,7 @@ interrupt_check_aux:
   bx lr
 #endif
 
-#define halt_value        r0
+#define halt_value        r12
 
 // Check and acknowledge the requested IRQ flags; Z is clear if one was set.
 // The DSi ARM7 also takes the IE2/IF2 flags in irq_wait_aux_mask (GBATEK:
@@ -333,7 +341,7 @@ swi_interrupt_wait:
   // r0 == 0, ARM7: return at once if a requested flag is already set.
   // r0 == 0, ARM9: always halt at least once, even if a requested flag is
   // already set, as the real NDS9 BIOS does (GBATEK).
-  // interrupt_check overwrites r0, so test it first.
+  // r0 and r1 are not changed.
   cmp check_immediately, #0
 #ifdef TARGET_ARM7
   beq swi_interrupt_check_first
@@ -379,20 +387,45 @@ swi_stop:
   strb r1, [ r0, #0x301 ]
   b swi_complete
 
-#define bias_ptr        r0
-#define bias_value      r1
+// SoundBias (GBATEK): r0 = 0 moves the level (SOUNDBIAS bits 0-9) to 000h,
+// any other value to 200h, one step at a time with r1 as the delay count
+// between steps; the upper bits of the register are kept. GBATEK gives no
+// unit for the delay, so it is a plain countdown loop of r1 iterations
+// (r1 = 0: no delay).
+#define bias_target     r0
+#define bias_delay      r1
+#define bias_value      r2
+#define bias_ptr        r3
+#define bias_tmp        r12
 
 swi_sound_bias:
   mov bias_ptr, #0x4000000
   add bias_ptr, bias_ptr, #0x500
-  ldr bias_value, [ bias_ptr, #0x4 ]
-  cmp bias_value, #0
-  movne bias_value, #0x200
-  str bias_value, [ bias_ptr, #0x4 ]
+  cmp bias_target, #0
+  movne bias_target, #0x200
 
-  // TODO: Needs to add delay
-  b swi_complete
-  
+ 0:
+  ldrh bias_value, [ bias_ptr, #4 ]
+  bic bias_tmp, bias_value, #0xFC00
+  cmp bias_tmp, bias_target
+  beq swi_complete
+  // The level stays within 000h-3FFh, so +-1 never touches bits 10-15
+  addlo bias_value, bias_value, #1
+  subhi bias_value, bias_value, #1
+  strh bias_value, [ bias_ptr, #4 ]
+
+  movs bias_tmp, bias_delay
+ 1:
+  subsne bias_tmp, bias_tmp, #1
+  bne 1b
+  b 0b
+
+#undef bias_target
+#undef bias_delay
+#undef bias_value
+#undef bias_ptr
+#undef bias_tmp
+
 #endif
 
 
@@ -411,13 +444,12 @@ swi_sound_bias:
 #define result_abs          r3
 
 swi_divide:
-  // Division by zero hangs or is undefined on real hardware. Return a
-  // safe, non-hanging result instead: r0 = 0, r1 = numerator, r3 = 0.
+  // Division by zero: GBATEK says the BIOS is usually caught in an endless
+  // loop. The official BIOS returns r0 = 1, r1 = 0, r3 = 1 for 0/0 (SWI
+  // test ROM), which is matched. For a non-zero numerator it hangs; return
+  // a safe, non-hanging result instead: r0 = 0, r1 = numerator, r3 = 0.
   cmp denominator, #0
-  moveq remainder, numerator
-  moveq result, #0
-  moveq result_abs, #0
-  beq swi_complete
+  beq div_by_zero
 
   // Set if numerator is signed, and abs numerator
   ands numerator_signed, numerator, #0x80000000
@@ -467,6 +499,13 @@ swi_divide:
 
   b swi_complete
 
+ div_by_zero:
+  movs remainder, numerator
+  moveq result, #1
+  movne result, #0
+  mov result_abs, result
+  b swi_complete
+
 
 #define source        r0
 #define dest          r1
@@ -476,9 +515,10 @@ swi_divide:
 #define length        r12
 
 swi_cpu_set:
-  // Only take 21 bits for length.
+  // Only take 21 bits for length. A count of 0 writes nothing.
   bic length, copy_control, #0xFF000000
-  bic length, length, #0x00E00000
+  bics length, length, #0x00E00000
+  beq swi_complete
 
   tst copy_control, #(1 << 26)
   bne copy_32bit
@@ -532,8 +572,13 @@ swi_cpu_set:
   b swi_complete
 
 
-// Length is in words and is rounded up to a multiple of 8 (GBATEK); each
-// iteration moves 8 words with ldm/stm. r5-r10 are stacked for the burst.
+// Length is in words (bits 0-20). Only the GBA rounds it up to a multiple of
+// 8 words; GBATEK: on the NDS the length may be any number of words, and the
+// words left after the 32-byte blocks are processed as 4-byte blocks. So
+// count/8 blocks of 8 words are moved with ldm/stm, then the rest one word
+// at a time (GBATEK's slow-path bug of the real NDS BIOS only costs time and
+// is not copied). A count of 0 writes nothing. r5-r10 are stacked for the
+// burst.
 #define fast_count    r12
 
 swi_cpu_fast_set:
@@ -541,23 +586,31 @@ swi_cpu_fast_set:
   bic fast_count, copy_control, #0xFF000000
   bic fast_count, fast_count, #0x00E00000
 
-  // Round up to a multiple of 8 words and count 8-word blocks
-  add fast_count, fast_count, #7
-  movs fast_count, fast_count, lsr #3
-  beq swi_complete
-
   stmdb sp!, { r5 - r10 }
   tst copy_control, #(1 << 24)
   bic source, #0x3
   bic dest, #0x3
   bne fast_set_32bit
 
+  subs fast_count, fast_count, #8
+  blo 1f
  0:
   ldmia source!, { r3 - r10 }
-  subs fast_count, fast_count, #1
   stmia dest!, { r3 - r10 }
-  bne 0b
+  subs fast_count, fast_count, #8
+  bhs 0b
 
+  // 0-7 words left
+ 1:
+  adds fast_count, fast_count, #8
+  beq 9f
+ 2:
+  ldr r4, [ source ], #4
+  str r4, [ dest ], #4
+  subs fast_count, fast_count, #1
+  bne 2b
+
+ 9:
   ldmia sp!, { r5 - r10 }
   b swi_complete
 
@@ -571,13 +624,21 @@ swi_cpu_fast_set:
   mov r9, r3
   mov r10, r3
 
+  subs fast_count, fast_count, #8
+  blo 1f
  0:
   stmia dest!, { r3 - r10 }
-  subs fast_count, fast_count, #1
-  bne 0b
+  subs fast_count, fast_count, #8
+  bhs 0b
 
-  ldmia sp!, { r5 - r10 }
-  b swi_complete
+ 1:
+  adds fast_count, fast_count, #8
+  beq 9b
+ 2:
+  str r3, [ dest ], #4
+  subs fast_count, fast_count, #1
+  bne 2b
+  b 9b
 
 #undef fast_count
 
@@ -592,6 +653,8 @@ swi_cpu_fast_set:
 #define root            r2
 #define root_check      r3
 
+// r0 is an unsigned 32-bit value (GBATEK: Sqrt(FFFFFFFFh) = FFFFh), so the
+// compare is unsigned.
 swi_sqrt:
   mov square_index, #0x40000000
   mov root, #0x0
@@ -599,9 +662,9 @@ swi_sqrt:
  0:
   orr root_check, square_index, root
   cmp remainder, root_check
-  subge remainder, remainder, root_check
+  subhs remainder, remainder, root_check
   mov root, root, lsr #1
-  orrge root, root, square_index
+  orrhs root, root, square_index
   movs square_index, square_index, lsr #2
   bne 0b
 
@@ -663,8 +726,16 @@ swi_get_crc16:
   b swi_complete
 
 
+// IsDebugger: 0 = normal 4MB console. GBATEK says it destroys the halfword
+// at 27FFFF8h (NDS9) / 27FFFFAh (NDS7); the official BIOS leaves 0 there.
 swi_is_debugger:
   mov r0, #0
+  mov r12, #0x02800000
+#ifdef TARGET_ARM9
+  strh r0, [ r12, #-8 ]
+#else
+  strh r0, [ r12, #-6 ]
+#endif
   b swi_complete
 
 
@@ -692,6 +763,10 @@ swi_bit_unpack:
   ldrb source_bit_width, [ unpack_data, #2 ]
   ldrb dest_bit_width, [ unpack_data, #3 ]
   ldr data_offset, [ unpack_data, #4 ]
+
+  // A source length of 0 writes nothing
+  cmp length, #0
+  beq 1f
 
   // TODO: Check that bits are <= 32 and a power of 2?
   mov offset_zero, data_offset, lsr #31
@@ -741,12 +816,18 @@ swi_bit_unpack:
   subs length, length, #1
   bne 0b
 
+ 1:
   ldmia sp!, { r5 - r9 }
   b swi_complete
 
 
 #undef length
- 
+
+// Decompressors. LZ77 and RLE work a block at a time: a block that runs past
+// the size in the header is still written in full (as the official BIOS
+// does: a run of 10 with size 5 writes 10 bytes), and the routine stops once
+// the signed remaining size is 0 or less. A size of 0 writes nothing.
+
 #define source            r0
 #define dest              r1
 #define length            r2
@@ -754,7 +835,6 @@ swi_bit_unpack:
 
 #define lz77_control      r3
 #define lz77_value        r4
-#define lz77_vram_tmp     r5
 #define lz77_value_b      r14
 #define window_length     r14
 #define window_offset     r12
@@ -784,238 +864,355 @@ swi_lz77_decompress_wram:
   // Get length and offset from lz77 value
   mov window_length, lz77_value, lsr #12
   bic window_offset, lz77_value, #0xF000
-  
+
   add window_length, window_length, #3
   sub window_ptr, dest, window_offset
   sub window_ptr, window_ptr, #1
+  sub length, length, window_length
 
  3:
   ldrb lz77_value, [ window_ptr ], #1
-  subs length, length, #1
-  strb lz77_value, [ dest ], #1
-  beq swi_complete
-
   subs window_length, window_length, #1
+  strb lz77_value, [ dest ], #1
   bne 3b
-
-  movs lz77_control, lz77_control, lsl #1
-  bpl 1b
-  b 0b
+  b 4f
 
   // Load a single value
  2:
   ldrb lz77_value, [ source ], #1
-  subs length, length, #1
+  sub length, length, #1
   strb lz77_value, [ dest ], #1
-  beq swi_complete
 
+ 4:
+  cmp length, #0
+  ble swi_complete
   movs lz77_control, lz77_control, lsl #1
   bpl 1b
   b 0b
-  
 
-swi_lz77_decompress_vram:
-  ldr header, [ source ], #4
-  movs length, header, lsr #8
-  beq swi_complete
-  
-  stmdb sp!, { r5 }
-  mov r5, #0
+#undef lz77_control
+#undef lz77_value
+#undef lz77_value_b
+#undef window_length
+#undef window_offset
+#undef window_ptr
+
+
+// Decompression callbacks (GBATEK "NDS/DSi Decompression Callbacks"), used
+// by SWI 12h (LZ77), 13h (Huffman) and 15h (RLE); in the TWL build also by
+// the LZ77 entries 01h (8-bit writes), 02h and 19h.
+// r3 points to five function pointers: Open, Close (optional, 0 = none),
+// Get8, Get16 (not used) and Get32 (Huffman only); each may be ARM or Thumb
+// (address bit 0). Open(r0 = source, r1 = dest, r2 = user parameter)
+// returns the header word, or a negative error code that aborts before
+// anything is written. The data is then read through Get8/Get32, each
+// called with the current source address in r0; that address starts after
+// the 4-byte header and moves on by 1 or 4 per call. At the end Close is
+// called (if present) with the current source address; a negative result is
+// returned in r0, otherwise r0 = the decompressed size from the header. The
+// official BIOS also calls Close after a failed Open (with the original
+// source address); then the Open error is returned.
+// Callbacks follow the ARM calling convention and may change r0-r3, r12 and
+// lr, so the state lives in r4-r11 (r5-r11 are stacked here, r4 by the SWI
+// entry): r4 current source, r5 dest, r6 remaining size, r7 callbacks,
+// r8 user parameter (Huffman temp buffer) or buffered VRAM byte, r9 header
+// (or the Open error), r10 per-format state, r11 return address of
+// cb_read8/cb_read32.
+// The format routine starts right after "bl cb_decompress" in each SWI and
+// ends with a branch to cb_finish.
+
+// Call the function at the address in reg (bit 0 set = Thumb)
+.macro call_reg reg
+#ifdef TARGET_ARM9
+  blx \reg
+#else
+  mov lr, pc
+  bx \reg
+#endif
+.endm
+
+cb_decompress:
+  stmdb sp!, { r5 - r11 }
+  mov r4, r0
+  mov r5, r1
+  mov r7, r3
+  mov r8, r2
+  mov r10, lr
+
+  // Open(source, dest, user parameter): r0-r2 are still the SWI arguments
+  ldr r12, [ r3 ]
+  call_reg r12
+  movs r9, r0
+  bmi cb_finish
+
+  add r4, r4, #4
+  mov r6, r9, lsr #8
+  bx r10
+
+cb_finish:
+  ldr r12, [ r7, #4 ]
+  movs r6, r12
+  beq 1f
+  mov r0, r4
+  call_reg r12
+  mov r6, r0
+ 1:
+  // r0 = size, or the Close error, or the Open error
+  mov r0, r9, lsr #8
+  cmp r6, #0
+  movlt r0, r6
+  cmp r9, #0
+  movlt r0, r9
+  ldmia sp!, { r5 - r11 }
+  b swi_complete
+
+// r0 = Get8(current source), source + 1
+cb_read8:
+  mov r11, lr
+  mov r0, r4
+  add r4, r4, #1
+  ldr r12, [ r7, #8 ]
+  call_reg r12
+  and r0, r0, #0xFF
+  bx r11
+
+// r0 = Get32(current source), source + 4
+cb_read32:
+  mov r11, lr
+  mov r0, r4
+  add r4, r4, #4
+  ldr r12, [ r7, #16 ]
+  call_reg r12
+  bx r11
+
+// Store the byte in r0 at r5 with halfword writes only (VRAM ignores 8-bit
+// writes): a byte for an even address is kept in r8 and stored together
+// with the following odd byte. An output that ends on an even address
+// leaves that last byte unwritten (as the official BIOS does). Uses r1.
+.macro vram_put_byte
+  tst r5, #1
+  moveq r8, r0
+  orrne r1, r8, r0, lsl #8
+  strhne r1, [ r5, #-1 ]
+  add r5, r5, #1
+.endm
+
+
+// Store the byte in r0 at r5 with an 8-bit write (TWL SWI 01h).
+.macro byte_put_8bit
+  strb r0, [ r5 ], #1
+.endm
+
+// LZ77 by callback (GBATEK LZ77UnCompReadByCallback...), same format as the
+// WRAM routine. "put" is the macro that stores the byte in r0 at r5 and
+// moves r5 on (r1 is free for it); the window is read back from the
+// destination.
+.macro lz77_callback_body put
+  cmp r6, #0
+  ble cb_finish
 
  0:
-  ldrb lz77_control, [ source ], #1
+  bl cb_read8
   // This will hit the MSB after 8 iterations
-  orr lz77_control, lz77_control, #(1 << 23)
+  orr r10, r0, #(1 << 23)
 
  1:
-  tst lz77_control, #0x80
+  tst r10, #0x80
   beq 2f
 
-  // Load a window of data that was loaded before
+  // Window block: 16-bit value, high byte first
+  bl cb_read8
+  str r0, [ sp, #-4 ]!
+  bl cb_read8
+  ldr r1, [ sp ], #4
+  orr r0, r0, r1, lsl #8
 
-  // Read 16-bit unaligned value
-  ldrb lz77_value, [ source ], #1
-  ldrb lz77_value_b, [ source ], #1
-  orr lz77_value, lz77_value_b, lz77_value, lsl #8
-
-  // Get length and offset from lz77 value
-  mov window_length, lz77_value, lsr #12
-  bic window_offset, lz77_value, #0xF000
-  
-  add window_length, window_length, #3
-  sub window_ptr, dest, window_offset
-  sub window_ptr, window_ptr, #1
+  // r2 = length, r3 = window pointer
+  mov r2, r0, lsr #12
+  add r2, r2, #3
+  bic r0, r0, #0xF000
+  sub r3, r5, r0
+  sub r3, r3, #1
+  sub r6, r6, r2
 
  3:
-  tst dest, #1
-  ldrbeq lz77_vram_tmp, [ window_ptr ], #1
-  ldrbne lz77_value, [ window_ptr ], #1
-  orrne lz77_value, lz77_vram_tmp, lz77_value, lsl #8
-  strhne lz77_value, [ dest, #-1 ]
-  add dest, dest, #1
-  
-  subs length, length, #1
-  ldmiaeq sp!, { r5 }
-  beq swi_complete
-
-  subs window_length, window_length, #1
+  ldrb r0, [ r3 ], #1
+  \put
+  subs r2, r2, #1
   bne 3b
+  b 4f
 
-  movs lz77_control, lz77_control, lsl #1
-  bpl 1b
-  b 0b
-
-  // Load a single value
+  // Single byte
  2:
-  tst dest, #1
-  ldrbeq lz77_vram_tmp, [ source ], #1
-  ldrbne lz77_value, [ source ], #1
-  orrne lz77_value, lz77_vram_tmp, lz77_value, lsl #8
-  strhne lz77_value, [ dest, #-1 ]
-  add dest, dest, #1
-  
-  subs length, length, #1
-  ldmiaeq sp!, { r5 }
-  beq swi_complete
+  bl cb_read8
+  \put
+  sub r6, r6, #1
 
-  movs lz77_control, lz77_control, lsl #1
+ 4:
+  cmp r6, #0
+  ble cb_finish
+  movs r10, r10, lsl #1
   bpl 1b
   b 0b
- 
+.endm
 
-// Huffman decompression (GBATEK HuffUnComp).
+// LZ77UnCompReadByCallbackWrite16bit (NTR 12h, TWL 02h/19h). GBATEK wants a
+// halfword-aligned destination; an odd one is aligned down, as RLE does. A
+// displacement of 0 does not work here (GBATEK), since the byte it refers
+// to may still be buffered in r8.
+swi_lz77_decompress_vram:
+  bl cb_decompress
+  bic r5, r5, #1
+  lz77_callback_body vram_put_byte
+
+#ifdef PLATFORM_TWL
+// LZ77UnCompReadByCallbackWrite8bit (TWL 01h): byte writes, so a
+// displacement of 0 works.
+swi_lz77_decompress_callback8:
+  bl cb_decompress
+  lz77_callback_body byte_put_8bit
+#endif
+
+
+// HuffUnCompReadByCallback (GBATEK HuffUnComp).
 // Header: bits 0-3 data size in bits (4 or 8), bits 4-7 type (2), bits 8-31
 // decompressed size in bytes. Then the tree: a tree-size byte (table length
 // (byte+1)*2, counted from that byte), the root node, and the rest of the
-// nodes. Node: bits 0-5 offset, bit 6 node1 end flag, bit 7 node0 end flag;
-// the children of a node at A are at (A & ~1) + 2 + offset*2 (+1 for node1).
-// The bitstream follows the tree as 32-bit words, read MSB first.
+// nodes. The table is copied with Get8 into the temp buffer (r2 of the SWI,
+// 200h bytes) and the tree is walked there. Node: bits 0-5 offset, bit 6
+// node1 end flag, bit 7 node0 end flag; the children of a node at A are at
+// (A & ~1) + 2 + offset*2 (+1 for node1). The bitstream follows the tree as
+// 32-bit words read with Get32, MSB first.
 // Output is written in 32-bit units filled LSB first. A word is only written
 // once 32 bits are collected, and the remaining size is decreased by 4 per
 // word, so a size that is not a multiple of 4 is rounded up to the next word
 // (the stream has to carry the padding symbols, as with the real BIOS). A size
-// of 0, or a data size of 0, writes nothing.
-
-#define huff_source       r0
-#define huff_dest         r1
-#define huff_size         r2
-#define huff_data_shift   r3
-#define huff_root         r4
-#define huff_node_addr    r12
-#define huff_node         lr
-#define huff_bits         r5
-#define huff_bits_left    r6
-#define huff_out          r7
-#define huff_out_left     r8
-#define huff_data_bits    r9
-#define huff_tmp          r10
+// of 0, or a data size of 0, writes nothing (the tree is still copied).
+// Registers in the decode loop: r0 bits, r1 bits left in r0, r2 node
+// address, r3 node, r8 root, r10 output word, r12 bits left to fill in r10,
+// lr scratch; r2 and r12 are stacked around Get32.
 
 swi_huffman_decompress:
-  stmdb sp!, { r5 - r10 }
-  ldr huff_size, [ huff_source ], #4
+  bl cb_decompress
 
-  ands huff_data_bits, huff_size, #0xF
-  beq 9f
-  rsb huff_data_shift, huff_data_bits, #32
-  movs huff_size, huff_size, lsr #8
-  beq 9f
+  // Copy the tree table, the tree-size byte first
+  mov r10, #0
+ 0:
+  bl cb_read8
+  strb r0, [ r8, r10 ]
+  add r10, r10, #1
+  ldrb r0, [ r8 ]
+  add r0, r0, #1
+  cmp r10, r0, lsl #1
+  blo 0b
 
-  // huff_source points at the tree-size byte; the root follows it and the
-  // bitstream starts (byte+1)*2 bytes after it.
-  ldrb huff_tmp, [ huff_source ]
-  add huff_root, huff_source, #1
-  add huff_source, huff_source, huff_tmp, lsl #1
-  add huff_source, huff_source, #2
+  ands r0, r9, #0xF
+  cmpne r6, #0
+  beq cb_finish
 
-  mov huff_node_addr, huff_root
-  ldrb huff_node, [ huff_root ]
-  mov huff_out_left, #32
+  add r8, r8, #1
+  mov r2, r8
+  mov r12, #32
 
   // Load the next 32 bits of the stream
  0:
-  ldr huff_bits, [ huff_source ], #4
-  mov huff_bits_left, #32
+  stmdb sp!, { r2, r12 }
+  bl cb_read32
+  ldmia sp!, { r2, r12 }
+  ldrb r3, [ r2 ]
+  mov r1, #32
 
   // Step to the child picked by the next bit
  1:
-  bic huff_node_addr, huff_node_addr, #1
-  and huff_tmp, huff_node, #0x3F
-  add huff_node_addr, huff_node_addr, huff_tmp, lsl #1
-  add huff_node_addr, huff_node_addr, #2
-  movs huff_bits, huff_bits, lsl #1
-  addcs huff_node_addr, huff_node_addr, #1
+  bic r2, r2, #1
+  and lr, r3, #0x3F
+  add r2, r2, lr, lsl #1
+  add r2, r2, #2
+  movs r0, r0, lsl #1
+  addcs r2, r2, #1
   // Z is cleared if the child taken is a data node
-  tstcs huff_node, #0x40
-  tstcc huff_node, #0x80
-  ldrb huff_node, [ huff_node_addr ]
+  tstcs r3, #0x40
+  tstcc r3, #0x80
+  ldrb r3, [ r2 ]
   beq 2f
 
   // Data node: shift the symbol into the top of the output word
-  mov huff_out, huff_out, lsr huff_data_bits
-  orr huff_out, huff_out, huff_node, lsl huff_data_shift
-  subs huff_out_left, huff_out_left, huff_data_bits
+  and lr, r9, #0xF
+  mov r10, r10, lsr lr
+  rsb lr, lr, #32
+  orr r10, r10, r3, lsl lr
+  rsb lr, lr, #32
+  subs r12, r12, lr
   bgt 3f
 
-  str huff_out, [ huff_dest ], #4
-  subs huff_size, huff_size, #4
-  ble 9f
-  mov huff_out_left, #32
+  str r10, [ r5 ], #4
+  subs r6, r6, #4
+  ble cb_finish
+  mov r12, #32
 
   // Back to the root for the next symbol
  3:
-  mov huff_node_addr, huff_root
-  ldrb huff_node, [ huff_root ]
+  mov r2, r8
+  ldrb r3, [ r8 ]
 
  2:
-  subs huff_bits_left, huff_bits_left, #1
+  subs r1, r1, #1
   bne 1b
   b 0b
 
- 9:
-  ldmia sp!, { r5 - r10 }
-  b swi_complete
 
-#undef huff_source
-#undef huff_dest
-#undef huff_size
-#undef huff_data_shift
-#undef huff_root
-#undef huff_node_addr
-#undef huff_node
-#undef huff_bits
-#undef huff_bits_left
-#undef huff_out
-#undef huff_out_left
-#undef huff_data_bits
-#undef huff_tmp
+// RLUnCompReadByCallbackWrite16bit. GBATEK wants a halfword-aligned
+// destination; an odd one is aligned down, as the official BIOS does (the
+// first byte goes to dest & ~1, nothing is read back). Writes are halfwords
+// only (see vram_put_byte), so an odd size leaves the last byte unwritten.
 
-  
-#define source        r0
-#define dest          r1
-#define length        r2
-#define header        r3
+swi_runlength_decompress_vram:
+  bl cb_decompress
+  cmp r6, #0
+  ble cb_finish
+  bic r5, r5, #1
+
+ 0:
+  bl cb_read8
+  and r10, r0, #0x7F
+  tst r0, #0x80
+  beq 1f
+
+  // Run: flag + 3 copies of the next byte
+  add r10, r10, #3
+  sub r6, r6, r10
+  bl cb_read8
+ 2:
+  vram_put_byte
+  subs r10, r10, #1
+  bne 2b
+  b 3f
+
+  // Literal block: flag + 1 bytes
+ 1:
+  add r10, r10, #1
+  sub r6, r6, r10
+ 4:
+  bl cb_read8
+  vram_put_byte
+  subs r10, r10, #1
+  bne 4b
+
+ 3:
+  cmp r6, #0
+  bgt 0b
+  b cb_finish
+
 
 #define rle_control   r3
 #define run_length    r3
 #define rle_value     r12
- 
-#define rle_vram_low  r5
-#define rle_vram_tmp  r4
 
-// VRAM ignores 8-bit writes, so only halfword stores are done: a byte for
-// an even address is buffered in rle_vram_low and written together with the
-// following odd byte. An odd start or end address keeps the byte already in
-// memory next to it.
-
-swi_runlength_decompress_vram:
+swi_runlength_decompress_wram:
   ldr header, [ source ], #4
   movs length, header, lsr #8
   beq swi_complete
 
-  stmdb sp!, { r5 }
-  tst dest, #1
-  ldrbne rle_vram_low, [ dest, #-1 ]
-
  0:
   ldrb rle_control, [ source ], #1
   tst rle_control, #0x80
@@ -1024,93 +1221,33 @@ swi_runlength_decompress_vram:
 
   ldrb rle_value, [ source ], #1
   add run_length, run_length, #3
+  sub length, length, run_length
 
  2:
-  tst dest, #1
-  moveq rle_vram_low, rle_value
-  orrne rle_vram_tmp, rle_vram_low, rle_value, lsl #8
-  strhne rle_vram_tmp, [ dest, #-1 ]
-  add dest, dest, #1
-
-  subs length, length, #1
-  beq 3f
-
+  strb rle_value, [ dest ], #1
   subs run_length, run_length, #1
   bne 2b
-
-  b 0b
+  b 3f
 
  1:
   add run_length, run_length, #1
+  sub length, length, run_length
 
- 2:
+ 4:
   ldrb rle_value, [ source ], #1
-  tst dest, #1
-  moveq rle_vram_low, rle_value
-  orrne rle_vram_tmp, rle_vram_low, rle_value, lsl #8
-  strhne rle_vram_tmp, [ dest, #-1 ]
-  add dest, dest, #1
-
-  subs length, length, #1
-  beq 3f
-
   subs run_length, run_length, #1
-  bne 2b
-
-  b 0b
+  strb rle_value, [ dest ], #1
+  bne 4b
 
  3:
-  // Flush a trailing buffered byte (output ended on an odd address)
-  tst dest, #1
-  ldrbne rle_vram_tmp, [ dest ]
-  orrne rle_vram_tmp, rle_vram_low, rle_vram_tmp, lsl #8
-  strhne rle_vram_tmp, [ dest, #-1 ]
-
-  ldmia sp!, { r5 }
+  cmp length, #0
+  bgt 0b
   b swi_complete
 
-#undef rle_vram_low
-#undef rle_vram_tmp
+#undef rle_control
+#undef run_length
+#undef rle_value
 
-swi_runlength_decompress_wram:
-  ldr header, [ source ], #4
-
-  mov length, header, lsr #8
-
- 0:
-  ldrb rle_control, [ source ], #1
-  tst rle_control, #0x80
-  and run_length, rle_control, #0x7F
-  beq 1f
-
-  ldrb rle_value, [ source ], #1
-  add run_length, run_length, #3
-
- 2:
-  strb rle_value, [ dest ], #1
-  subs length, length, #1
-  beq swi_complete
-
-  subs run_length, run_length, #1
-  bne 2b
-
-  b 0b
-
- 1:
-  add run_length, run_length, #1
-  
- 2:
-  ldrb rle_value, [ source ], #1
-  subs length, length, #1
-  strb rle_value, [ dest ], #1
-
-  beq swi_complete
-
-  subs run_length, run_length, #1
-  bne 2b
-
-  b 0b
-  
 
 #ifdef TARGET_ARM9
 
@@ -1125,6 +1262,11 @@ swi_runlength_decompress_wram:
 #define accumulator   r12
 #define current_value r3
 
+// The first unit is always written, also for a size of 0 (as the official
+// BIOS does); after that units are written while the signed remaining size
+// is above 0, so Diff16 rounds an odd size up to a whole halfword (also as
+// the official BIOS does).
+
 swi_diff_8bit_unfilter_wram:
   ldr header, [ source ], #4
 
@@ -1132,14 +1274,15 @@ swi_diff_8bit_unfilter_wram:
   mov length, header, lsr #8
 
   strb accumulator, [ dest ], #1
-  sub length, length, #1
+  subs length, length, #1
+  ble swi_complete
 
  0:
   ldrb current_value, [ source ], #1
-  subs length, length, #1
   add accumulator, accumulator, current_value
   strb accumulator, [ dest ], #1
-  bne 0b
+  subs length, length, #1
+  bgt 0b
 
   b swi_complete
 
@@ -1151,16 +1294,15 @@ swi_diff_16bit_unfilter:
   mov length, header, lsr #8
 
   strh accumulator, [ dest ], #2
-  bic length, length, #0x1
-
-  sub length, length, #2
+  subs length, length, #2
+  ble swi_complete
 
  0:
   ldrh current_value, [ source ], #2
-  subs length, length, #2
   add accumulator, accumulator, current_value
   strh accumulator, [ dest ], #2
-  bne 0b
+  subs length, length, #2
+  bgt 0b
 
   b swi_complete
 
@@ -1401,12 +1543,14 @@ swi_get_boot_procs:
   b swi_complete
 #endif
 
+// ARM9 CustomPost writes r0 to POSTFLG. ARM7 CustomHalt writes the 8-bit
+// parameter in r2 to HALTCNT (GBATEK) and keeps the other registers.
 swi_custom_halt_post:
-  mov r1, #0x4000000
-
 #ifdef TARGET_ARM7
-  strb r0, [ r1, #0x301 ]
+  mov r12, #0x4000000
+  strb r2, [ r12, #0x301 ]
 #else
+  mov r1, #0x4000000
   strb r0, [ r1, #0x300 ]
 #endif
 
