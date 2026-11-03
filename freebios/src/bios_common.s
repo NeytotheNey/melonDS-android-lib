@@ -23,9 +23,9 @@
 #  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 #  POSSIBILITY OF SUCH DAMAGE.
 
+// Upstream uses "axR" (retain) for its --gc-sections link; clang rejects
+// changing the flags of .text, and build.sh does not gc sections.
 .section .text
-
-.org 0x00000000
 
 // Vector table
 
@@ -38,14 +38,14 @@ b unhandled_exception                 // 0x14 Reserved
 b interrupt_handler                   // 0x18 IRQ
 b unhandled_exception                 // 0x1C FIQ
 
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
 // ARM9 BIOS has a logo here (0x9C bytes), we don't want to include the logo
 // but we'll leave a space for it.
 
 .fill 0xe0, 0x1, 0x0
 #endif
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
 // ARM7 BIOS has encryption stuff at 0x30, we don't want to include it but we'll
 // leave a space for it.
 
@@ -64,14 +64,14 @@ unhandled_exception:
   b 0b
 
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
   #define swi_label(function) .word function
   #define swi_label_arm7_only(function) swi_label(function)
 #else
   #define swi_label_arm7_only(function) swi_label(swi_invalid)
 #endif
 
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
   #define swi_label(function) .word (function + 0xFFFF0000)
   #define swi_label_arm9_only(function) swi_label(function)
 #else
@@ -111,7 +111,11 @@ swi_handler:
   // Not sure if this should be here or not, but it probably doesn't
   // hurt, and is better than flooding the table with 256 entries..
   // This will move in the known entry of an invalid SWI.
+#ifdef PLATFORM_TWL
+  cmp swi_comment, #0x2A
+#else
   cmp swi_comment, #0x20
+#endif
   movge swi_comment, #0x01
 
   // Branch to SWI handler
@@ -120,9 +124,18 @@ swi_handler:
 
   // SWI table begins here
   // If there's no entry just go straight to swi_complete
+#ifdef PLATFORM_TWL
+  swi_label(swi_invalid)                                     // 00
+  swi_label(swi_lz77_decompress_wram)                        // 01
+#else
   swi_label(swi_soft_reset)                                  // 00
   swi_label(swi_invalid)                                     // 01
+#endif
+#ifdef PLATFORM_TWL
+  swi_label(swi_lz77_decompress_vram)                        // 02
+#else
   swi_label(swi_invalid)                                     // 02
+#endif
   swi_label(swi_wait_by_loop)                                // 03
   swi_label(swi_interrupt_wait)                              // 04
   swi_label(swi_vblank_interrupt_wait)                       // 05
@@ -135,23 +148,47 @@ swi_handler:
   swi_label(swi_cpu_fast_set)                                // 0C
   swi_label(swi_sqrt)                                        // 0D
   swi_label(swi_get_crc16)                                   // 0E
+#ifdef PLATFORM_TWL
+  swi_label(swi_invalid)                                     // 0F
+#else
   swi_label(swi_is_debugger)                                 // 0F
+#endif
   swi_label(swi_bit_unpack)                                  // 10
   swi_label(swi_lz77_decompress_wram)                        // 11
+#ifdef PLATFORM_TWL
+  swi_label(swi_invalid)                                     // 12
+#else
   swi_label(swi_lz77_decompress_vram)                        // 12
+#endif
   swi_label(swi_huffman_decompress)                          // 13
   swi_label(swi_runlength_decompress_wram)                   // 14
   swi_label(swi_runlength_decompress_vram)                   // 15
   swi_label_arm9_only(swi_diff_8bit_unfilter_wram)           // 16
   swi_label(swi_invalid)                                     // 17
   swi_label_arm9_only(swi_diff_16bit_unfilter)               // 18
+#ifdef PLATFORM_TWL
+  swi_label(swi_lz77_decompress_vram)                        // 19
+#else
   swi_label(swi_invalid)                                     // 19
+#endif
   swi_label_arm7_only(swi_get_sine_table)                    // 1A
   swi_label_arm7_only(swi_get_pitch_table)                   // 1B
   swi_label_arm7_only(swi_get_volume_table)                  // 1C
   swi_label_arm7_only(swi_get_boot_procs)                    // 1D
   swi_label(swi_invalid)                                     // 1E
   swi_label(swi_custom_halt_post)                            // 1F
+#ifdef PLATFORM_TWL
+  swi_label(swi_invalid)                                     // 20
+  swi_label(swi_invalid)                                     // 21
+  swi_label(swi_invalid)                                     // 22
+  swi_label(swi_invalid)                                     // 23
+  swi_label(swi_invalid)                                     // 24
+  swi_label(swi_invalid)                                     // 25
+  swi_label(swi_invalid)                                     // 26
+  swi_label(swi_invalid)                                     // 27
+  swi_label(swi_invalid)                                     // 28
+  swi_label(swi_invalid)                                     // 29
+#endif
 
 swi_invalid:
   // This just passes through to completion.
@@ -180,7 +217,7 @@ padding_a:
   .word 0x0
 
 swi_halt:
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
   mov r0, #0x04000000
   mov r2, #0x80
   strb r2, [ r0, #0x301 ]
@@ -200,7 +237,10 @@ swi_wait_by_loop:
 #define check_immediately r0
 #define irq_wait_mask     r1
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
+  #ifdef PLATFORM_TWL
+    #define irq_wait_aux_mask r2
+  #endif
   #define irq_flag_base   r3
 #else
   #define irq_flag_base   r2
@@ -212,7 +252,7 @@ swi_wait_by_loop:
 #define irq_flags         r0
 
 interrupt_check:
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
   // Get DTCM base
   mrc p15, 0, irq_flag_base, cr9, cr1, 0
   bic irq_flag_base, irq_flag_base, #0xFF
@@ -239,29 +279,72 @@ interrupt_check:
   str const_0x1, [ io_base, #0x208 ]
   bx lr
 
+#if defined(TARGET_ARM7) && defined(PLATFORM_TWL)
+interrupt_check_aux:
+  // Load software IRQ flag
+  ldr irq_flags, [ irq_flag_base, #-64 ]
+
+  // Set IME (0x04000208) to 0
+  str io_base, [ io_base, #0x208 ]
+
+  // Check if IRQs were risen, to see if the loop can exit
+  tst irq_wait_aux_mask, irq_flags
+
+  // Clear IRQs that were risen and write back
+  bic irq_flags, irq_flags, irq_wait_aux_mask
+  str irq_flags, [ irq_flag_base, #-64 ]
+
+  mov const_0x1, #0x1
+  // Set IME (0x04000208) to 1 and return
+  str const_0x1, [ io_base, #0x208 ]
+  bx lr
+#endif
 
 #define halt_value        r0
+
+// Check and acknowledge the requested IRQ flags; Z is clear if one was set.
+// The DSi ARM7 also takes the IE2/IF2 flags in irq_wait_aux_mask (GBATEK:
+// r2, BIOS flags at 0380FFC0h) and returns if a flag in either word was
+// set. r4 (stacked by the SWI entry) keeps the first result.
+.macro check_irq_flags
+  bl interrupt_check
+#if defined(TARGET_ARM7) && defined(PLATFORM_TWL)
+  movne r4, #1
+  moveq r4, #0
+  bl interrupt_check_aux
+  teqeq r4, #0
+#endif
+.endm
 
 swi_vblank_interrupt_wait:
   // Check immediately for VBLANK interrupt
   mov check_immediately, #1
   mov irq_wait_mask, #1
+#if defined(TARGET_ARM7) && defined(PLATFORM_TWL)
+  mov irq_wait_aux_mask, #0
+#endif
 
   // Fall through
 
 swi_interrupt_wait:
   mov io_base, #0x4000000
 
-  // r0 == 0: return at once if a requested flag is already set.
   // r0 != 0: discard the requested flags, then wait for a new one.
+  // r0 == 0, ARM7: return at once if a requested flag is already set.
+  // r0 == 0, ARM9: always halt at least once, even if a requested flag is
+  // already set, as the real NDS9 BIOS does (GBATEK).
   // interrupt_check overwrites r0, so test it first.
   cmp check_immediately, #0
+#ifdef TARGET_ARM7
   beq swi_interrupt_check_first
-  bl interrupt_check
+  check_irq_flags
+#else
+  blne interrupt_check
+#endif
 
   // Perform this loop until the interrupt is risen
  0:
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
   // Halt ARM9 via coprocessor instruction
   mov halt_value, #0
   mcr p15, 0, halt_value, cr7, cr0, 4
@@ -271,22 +354,24 @@ swi_interrupt_wait:
   strb halt_value, [ io_base, #0x301 ]
 #endif
 
-  bl interrupt_check
+  check_irq_flags
   beq 0b
 
   b swi_complete
 
+#ifdef TARGET_ARM7
 swi_interrupt_check_first:
   // Check for IRQ (and acknowledge it)
-  bl interrupt_check
+  check_irq_flags
   // If set exit.
   bne swi_complete
 
   // If not wait for interrupt.
   b 0b
+#endif
 
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
 
 swi_stop:
   mov r0, #0x04000000
@@ -1027,7 +1112,7 @@ swi_runlength_decompress_wram:
   b 0b
   
 
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
 
 #undef accumulator
 #undef length
@@ -1082,7 +1167,7 @@ swi_diff_16bit_unfilter:
 #endif
 
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
 sine_table:
   .hword 0x0000, 0x0324, 0x0648, 0x096A, 0x0C8C, 0x0FAB, 0x12C8, 0x15E2
   .hword 0x18F9, 0x1C0B, 0x1F1A, 0x2223, 0x2528, 0x2826, 0x2B1F, 0x2E11
@@ -1319,7 +1404,7 @@ swi_get_boot_procs:
 swi_custom_halt_post:
   mov r1, #0x4000000
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
   strb r0, [ r1, #0x301 ]
 #else
   strb r0, [ r1, #0x300 ]
@@ -1333,7 +1418,7 @@ interrupt_handler:
   // saving.
   stmdb sp!, { r0 - r3, r12, lr }
 
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
   // Get DTCM base
   mrc p15, 0, r0, cr9, cr1, 0
   bic r0, r0, #0xFF
@@ -1353,7 +1438,7 @@ interrupt_handler:
   ldmia sp!, { r0 - r3, r12, lr }
   subs pc, lr, #4
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
 swi_get_volume_table:
   adr r1, volume_table
   // Should some protection be here?
@@ -1361,27 +1446,63 @@ swi_get_volume_table:
   b swi_complete
 #endif
 
-// SoftReset (GBATEK, NDS): clears the 200h bytes at the top of the stack
-// area (stacks, IRQ handler pointer and IRQ check flags), sets up the svc,
-// irq and sys stacks, zeroes r0-r12 and jumps to the entry address in
+#ifndef PLATFORM_TWL
+
+// SoftReset (GBATEK, NDS7/NDS9): clears the 200h bytes at the top of the
+// stack area (stacks, IRQ handler pointer and IRQ check flags), sets up the
+// svc, irq and sys stacks, zeroes r0-r12 and jumps to the entry address in
 // system mode with IRQs enabled. bx is used so a Thumb entry works.
+// lr_svc, lr_irq and the svc/irq SPSRs are cleared; lr_sys holds the entry.
+// Both CPUs mask IRQ/FIQ first: the SWI keeps the caller's I bit, and an IRQ
+// during the clear would call the zeroed IRQ handler pointer.
 //   ARM7: clears 0380FE00h-0380FFFFh (via the 03FFFExxh mirror),
 //         sp_svc = 0380FFDCh, sp_irq = 0380FFB0h, sp_sys = 0380FF00h,
 //         entry from [027FFE34h].
-//   ARM9: clears DTCM+3E00h-DTCM+3FFFh,
-//         sp_svc = DTCM+3FC0h, sp_irq = DTCM+3F80h, sp_sys = DTCM+2F7Ch,
-//         entry from [027FFE24h]. These are the values melonDS's direct
-//         boot (NDS::SetupDirectBoot) sets with DTCM at 03000000h, used here
-//         because GBATEK could not be checked when this was written.
-// lr_svc, lr_irq and the svc/irq SPSRs are cleared; lr_sys holds the entry.
+//   ARM9: (with IRQs masked, which also matters because the ITCM, where
+//         games keep their IRQ handler, goes off below) cleans and
+//         invalidates the DCache, invalidates the ICache, drains the
+//         write buffer and sets the CP15 control register to 12078h
+//         (GBATEK only says "flushes caches and write buffer"; clean +
+//         invalidate is used because it cannot lose data). Then clears
+//         DTCM+3E00h-DTCM+3FFFh and sets sp_svc = DTCM+3FC0h,
+//         sp_irq = DTCM+3FA0h, sp_sys = DTCM+3EC0h. GBATEK calls the stacks
+//         hardcoded (0803FC0h/0803FA0h/0803EC0h, the same values with the
+//         default DTCM base 0800000h); they are kept DTCM-relative so they
+//         stay valid when a game has moved the DTCM. Entry from [027FFE24h].
+// The DSi BIOS has no SWI 00h (GBATEK), so the TWL build leaves it out.
 
-#ifdef BIOS_ARM7
+#ifdef TARGET_ARM7
 stack_pointer_svc:
   .word 0x0380ffdc
 #endif
 
 swi_soft_reset:
-#ifdef BIOS_ARM9
+  // System mode, IRQ and FIQ off until the jump to the entry
+  msr CPSR_c, #0xdf
+
+#ifdef TARGET_ARM9
+  // Clean and invalidate the 4KB, 4-way DCache by segment/index:
+  // segment in bits 30-31, line index (32 lines of 32 bytes) in bits 5-9
+  mov r1, #0
+ 1:
+  mcr p15, 0, r1, cr7, cr14, 2
+  add r1, r1, #0x20
+  tst r1, #0x400
+  beq 1b
+  bic r1, r1, #0x400
+  adds r1, r1, #0x40000000
+  bne 1b
+
+  // Invalidate the ICache, drain the write buffer
+  mcr p15, 0, r1, cr7, cr5, 0
+  mcr p15, 0, r1, cr7, cr10, 4
+
+  // Control register = 12078h: MPU, caches and ITCM off, DTCM on,
+  // exception vectors at FFFF0000h
+  mov r1, #0x12000
+  orr r1, r1, #0x78
+  mcr p15, 0, r1, cr1, cr0, 0
+
   // r0 = DTCM base + 0x4000
   mrc p15, 0, r0, cr9, cr1, 0
   mov r0, r0, lsr #12
@@ -1401,7 +1522,8 @@ swi_soft_reset:
   bne 0b
 
   // r1 = sp_svc
-#ifdef BIOS_ARM9
+#ifdef TARGET_ARM9
+  // DTCM+3FC0h; r0 = DTCM+3E00h
   add r1, r0, #0x1C0
 #else
   ldr r1, stack_pointer_svc
@@ -1417,9 +1539,9 @@ swi_soft_reset:
   // IRQ mode, interrupts disabled
   mov r3, #0xd2
   msr CPSR_fsxc, r3
-#ifdef BIOS_ARM9
-  // sp_irq = DTCM+3F80h
-  sub sp, r1, #0x40
+#ifdef TARGET_ARM9
+  // sp_irq = DTCM+3FA0h
+  sub sp, r1, #0x20
 #else
   // sp_irq = 0x0380FFB0
   sub sp, r1, #(0xdc - 0xb0)
@@ -1430,10 +1552,9 @@ swi_soft_reset:
   // System mode, interrupts enabled
   mov r3, #0x5f
   msr CPSR_fsxc, r3
-#ifdef BIOS_ARM9
-  // sp_sys = DTCM+2F7Ch
-  sub sp, r1, #0x1000
-  sub sp, sp, #0x44
+#ifdef TARGET_ARM9
+  // sp_sys = DTCM+3EC0h
+  sub sp, r1, #0x100
   // Entry address at 0x027FFE24
   mov r3, #0x02800000
   ldr lr, [ r3, #-0x1DC ]
@@ -1449,13 +1570,4 @@ swi_soft_reset:
   ldmia r0, { r0 - r12 }
   bx lr
 
-// Pad out
-
-#ifdef BIOS_ARM7
-.org 16384
 #endif
-
-#ifdef BIOS_ARM9
-.org 4096
-#endif
-

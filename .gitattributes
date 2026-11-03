@@ -16,3 +16,6 @@ src/net/libslirp/src/CMakeLists.txt          -linguist-vendored
 
 ## glib stub
 src/net/libslirp/src/glib/**                 -linguist-vendored
+
+## FreeBIOS build scripts run under sh, so keep LF on Windows checkouts
+freebios/*.sh text eol=lf
