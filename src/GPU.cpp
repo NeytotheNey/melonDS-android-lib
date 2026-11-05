@@ -46,22 +46,27 @@ enum
 
 // threaded 2D (how it works is explained above GPU::SetThreaded2D)
 
-// a frame queues 193 jobs at most (line 262's sprites, then lines 0-191) before the barrier at
-// VCount 192, so the ring is only full if a game rewrites VCount to stay in the visible lines
+// a frame queues 193 jobs at most (line 262's sprites, usually drawn inline instead, then lines 0-191) before the frame-end
+// barrier, so the ring is only full if a game rewrites VCount to stay in the visible lines
 static constexpr u32 Ring2DSize = 256;
+
+// copies of palette and OAM that queued jobs read (see Start2DJob). a new one is only made after
+// a CPU write, so a game that writes them once a frame uses two at a time
+static constexpr u32 PalOAMCopies = 32;
 
 // how long each side spins before it sleeps. while a frame is drawn, lines arrive every few dozen
 // microseconds, so the 2D thread spins through the gaps (waking it costs the emulator thread a
-// syscall per line). after line 191 it has nothing to do until line 262, and after line 262's
-// job nothing until the next frame starts, so it sleeps soon.
+// syscall per line). after line 191 it has nothing to do until the next frame starts (line 262's
+// sprites are usually drawn inline), so it sleeps soon.
 // the barrier waits for lines that are being drawn, usually only one or two
 static constexpr u32 Spin2DWorkFrameUs = 100;
 static constexpr u32 Spin2DWorkVBlankUs = 10;
 // experiment ovh3 (10-29): hardware counters on the Z Fold showed the emulator thread's effective
 // clock dropping from 1.26 GHz to 1.0 GHz with threaded 2D on, because it sleeps on the barrier
 // about two extra times a frame, and a thread that idles in short bursts gets 20-30% less clock
-// than the governor reports. the barrier wait at frame end is only 0.1-0.3 ms, so spinning
-// through it keeps the core awake. the right value is still to be tuned
+// than the governor reports. the frame-end wait measured 0.8-1.06 ms at line 192, so spinning
+// through it keeps the core awake. with LateBlit it moves to line 215 and mostly overlaps VBlank
+// emulation. the right value is still to be tuned
 static constexpr u32 Spin2DSyncUs = 2000;
 
 // only exists while threaded 2D is on
@@ -84,6 +89,17 @@ struct GPU::Threaded2DState
     // the job count the sleepers wait for (the lowest one, if there are several). only written
     // under the mutex, by sleepers; see Wait2DJobs
     std::atomic<u32> SyncTarget {0};
+
+    // emulator thread only: the palette and OAM copies, used in turn. PalOAMUntil is the
+    // Jobs2DDone count at which the last job reading a copy is drawn
+    struct PalOAMCopy
+    {
+        alignas(u64) u8 Palette[2*1024];
+        alignas(u64) u8 OAM[2*1024];
+    };
+    PalOAMCopy PalOAM[PalOAMCopies];
+    u32 PalOAMUntil[PalOAMCopies] {};
+    u32 PalOAMCur = 0;
 };
 
 
@@ -179,6 +195,7 @@ void GPU::Reset() noexcept
 
     memset(Palette, 0, 2*1024);
     memset(OAM, 0, 2*1024);
+    PalOAMWritten = true;
 
     memset(VRAM_A, 0, 128*1024);
     memset(VRAM_B, 0, 128*1024);
@@ -318,6 +335,8 @@ void GPU::DoSavestate(Savestate* file) noexcept
 
     if (!file->Saving)
     {
+        PalOAMWritten = true;
+
         for (int i = 0; i < 0x20; i++)
             VRAMPtr_ABG[i] = GetUniqueBankPtr(VRAMMap_ABG[i], i << 14);
         for (int i = 0; i < 0x10; i++)
@@ -416,6 +435,25 @@ void GPU::HiresCaptureBlitDone() noexcept
     HiresCapWritesInCapture = 0;
 }
 
+// the Blit StartScanline(192) left for later (see LateBlit), from Sync2D once every line is drawn
+void GPU::RunLateBlit() noexcept
+{
+    BlitPending = false;
+
+    // the compositor gets the bank writes as of line 192, and the ones made since stay for the
+    // next Blit, as they would have after a Blit at line 192
+    u8 writes = HiresCapWrites;
+    u8 writesInCapture = HiresCapWritesInCapture;
+    HiresCapWrites = LateBlitCapWrites;
+    HiresCapWritesInCapture = LateBlitCapWritesInCapture;
+
+    GPU3D.Blit(*this);
+    HiresCaptureBlitDone();
+
+    HiresCapWrites = writes;
+    HiresCapWritesInCapture = writesInCapture;
+}
+
 void GPU::AssignFramebuffers() noexcept
 {
     int backbuf = FrontBuffer ? 0 : 1;
@@ -510,8 +548,9 @@ const u8* GPU::GetUniqueBankPtr(u32 mask, u32 offset) const noexcept
     return &VRAM[num][offset & VRAMMask[num]];
 }
 
-// a mapping change syncs the 2D thread first: queued lines may still read a bank that was in LCDC
-// mode when they were built, and the flat copies are rebuilt from the new mappings
+// a mapping change syncs the 2D thread first while queued lines may still read a bank that was in
+// LCDC mode when they were built (Sync2DForLCDC). otherwise they only read the job's snapshot and
+// the flat copies, and those sync before they're rebuilt from the new mappings (MakeVRAMFlat_2DBGCoherent)
 #define MAP_RANGE(map, base, n)    for (int i = 0; i < n; i++) VRAMMap_##map[(base)+i] |= bankmask;
 #define UNMAP_RANGE(map, base, n)  for (int i = 0; i < n; i++) VRAMMap_##map[(base)+i] &= ~bankmask;
 
@@ -528,7 +567,7 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2D();
+    Sync2DForLCDC();
 
     // the bank may have been written while it was mapped elsewhere
     NoteHiresCaptureWrite(bank);
@@ -594,7 +633,7 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
     VRAMSTAT &= ~(1 << (bank-2));
 
     if (oldcnt == cnt) return;
-    Sync2D();
+    Sync2DForLCDC();
 
     // the bank may have been written while it was mapped elsewhere
     NoteHiresCaptureWrite(bank);
@@ -683,7 +722,7 @@ void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2D();
+    Sync2DForLCDC();
 
     u32 bankmask = 1 << bank;
 
@@ -748,7 +787,7 @@ void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2D();
+    Sync2DForLCDC();
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -849,7 +888,7 @@ void GPU::MapVRAM_H(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2D();
+    Sync2DForLCDC();
 
     u32 bankmask = 1 << bank;
 
@@ -912,7 +951,7 @@ void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2D();
+    Sync2DForLCDC();
 
     u32 bankmask = 1 << bank;
 
@@ -1076,6 +1115,11 @@ void GPU::StartHBlank(u32 line) noexcept
     }
     else if (VCount == 215)
     {
+        // the late barrier and Blit (see StartScanline), before the 3D render replaces the 3D
+        // frame the compositor reads
+        if (BlitPending)
+            Sync2D();
+
         // lines still held for display capture (a VCount write skipped line 192) read the GL
         // readback buffer, which the 3D render can reallocate, so they're drawn first. only the
         // held lines: nothing is queued while lines are held, and software 3D needs no ring sync here
@@ -1132,6 +1176,36 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     // so the record copy and the display flags would be wasted. the copies are dropped on every
     // scale change and a new renderer starts without any, so none can be valid when this turns on
     job.HiresCapture = job.Accelerated && HiresCapture && GPU3D.GetCurrentRenderer().RunsHiresCapture(HiresCaptureDebug);
+
+    // a queued job reads palette and OAM from a copy made when it's built, so CPU writes don't wait
+    // for the 2D thread. the other jobs are drawn before any write (see WritePalette)
+    if (!Is2DJobQueued(job) || Is2DJobDeferred(job))
+    {
+        job.Palette = Palette;
+        job.OAM = OAM;
+        return;
+    }
+
+    Threaded2DState& state = *Threaded2D;
+    u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
+    if (PalOAMWritten)
+    {
+        // the next copy, the oldest, once the jobs that read it are drawn. its last job is
+        // still queued if it's between the drawn ones and this one
+        u32 next = (state.PalOAMCur + 1) % PalOAMCopies;
+        u32 done = Jobs2DDone.load(std::memory_order_acquire);
+        if (state.PalOAMUntil[next] - done - 1 < queued - done)
+            Wait2DJobs(state.PalOAMUntil[next]);
+
+        memcpy(state.PalOAM[next].Palette, Palette, sizeof(Palette));
+        memcpy(state.PalOAM[next].OAM, OAM, sizeof(OAM));
+        state.PalOAMCur = next;
+        PalOAMWritten = false;
+    }
+
+    state.PalOAMUntil[state.PalOAMCur] = queued + 1;
+    job.Palette = state.PalOAM[state.PalOAMCur].Palette;
+    job.OAM = state.PalOAM[state.PalOAMCur].OAM;
 }
 
 // for DrawScanline(line): call after PreDrawScanline, before PostDrawScanline
@@ -1237,11 +1311,12 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 //
 // when it's on, StartHBlank queues each line's job in a ring and the 2D thread draws them in order.
 // the emulator thread still does everything that changes state, so a queued job only needs the
-// memory it reads to stay as it was: whatever writes palette, OAM, LCDC banks, VRAM mappings, the
-// flat copies, the framebuffers or the renderer runs Sync2D first. with an accelerated 3D renderer
-// the frame's lines are all drawn by the end of StartScanline(192), where the GL compositor reads
-// them, and the thread is idle between frames (FinishFrame and NDS::RunFrame sync), so the frontend
-// can read the framebuffers and save states as before.
+// memory it reads to stay as it was: whatever writes LCDC banks it may read, the flat copies, the
+// framebuffers or the renderer runs Sync2D first. palette and OAM are copied into the job instead
+// (see Start2DJob). with an accelerated 3D renderer the frame's lines are all drawn by the GL
+// compositor's Blit, at line 192, or with LateBlit just before the 3D render at line 215, and the
+// thread is idle between frames (FinishFrame and NDS::RunFrame sync), so the frontend can read the
+// framebuffers and save states as before.
 // while display capture is armed, lines are drawn on the emulator thread instead, after a Sync2D:
 // DoCapture writes VRAM and VRAMDirty, and the GL renderers' GetLine needs the GL context. capture
 // is armed at line 0 and stays on until VBlank, so a frame that captures goes back to drawing here
@@ -1250,7 +1325,8 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 //
 // display capture with an accelerated 3D renderer (and DeferCapture2D): the lines aren't drawn at
 // their HBlank but held in Deferred2DJobs, and drawn in order on the emulator thread by
-// Flush2DDeferred, at the latest by the Sync2D before the GL compositor at line 192. the 3D frame
+// Flush2DDeferred, at the latest by the Sync2D before the GL compositor at line 192 (capture frames
+// keep the Blit there). the 3D frame
 // is submitted at line 215 and read back into a GL buffer at line 0, and the first captured line
 // maps that buffer (GetLine(0)), which waits for the GPU. drawing it at line 192 instead gives the
 // GPU the whole frame to finish. this works with threaded 2D on or off: the ring is drained when
@@ -1308,6 +1384,7 @@ void GPU::Start2DThread() noexcept
 {
     // the counts are equal here (nothing is queued while threaded 2D is off), so the thread starts idle
     Threaded2D = std::make_unique<Threaded2DState>();
+    PalOAMWritten = true;
     Threaded2D->Thread = Platform::Thread_Create([this]() { Run2DThread(); }, "GPU2DThread");
     if (!Threaded2D->Thread)
     {
@@ -1354,8 +1431,8 @@ void GPU::Run2DThread() noexcept
         {
             const GPU2D::LineJob& job = state.Jobs[done % Ring2DSize];
             GPU2D_Renderer->RunJob(job);
-            // after line 191 the next job is line 262's (sprites only), and after that one the
-            // next frame's line 0, with the frontend's frame gap in between
+            // after line 191 the next job is the next frame's line 0 (line 262's sprites are
+            // usually drawn inline), with the frontend's frame gap in between
             frameDone = !job.DrawBG || job.Line == 191;
             done++;
 
@@ -1450,6 +1527,11 @@ void GPU::Wait2DJobs(u32 count) noexcept
 
 GPU2D::LineJob& GPU::Begin2DJob() noexcept
 {
+    // a VCount write can bring back visible lines before line 215, so the late Blit reads this
+    // frame's lines first
+    if (BlitPending)
+        Sync2D();
+
     GPU2D::LineJob* job = &Job2D;
 
     if (GPU2D_A.CaptureLatch && DeferCapture2D && GPU3D.IsRendererAccelerated())
@@ -1465,7 +1547,12 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
 
         if (Threaded2D)
         {
-            if (!GPU2D_A.CaptureLatch)
+            if (VCount == 262 && !Is2DRingBusy())
+            {
+                // line 262's sprites: drawn here while the thread is idle, as it usually is after
+                // the frame-end barrier, which saves FinishFrame's wait and a wake
+            }
+            else if (!GPU2D_A.CaptureLatch)
             {
                 // the next ring slot, once the thread is done with the job that used it last
                 u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
@@ -1723,10 +1810,10 @@ void GPU::StartScanline(u32 line) noexcept
         if (VCount == 192)
         {
             // the last lines are usually still being drawn here, and nothing below needs them until
-            // the GL compositor reads the 2D back buffers (the Blit at the end), so the wait is there.
-            // the VBlank DMAs and the CPU only reach what a queued line reads through the write
-            // barriers (palette, OAM, LCDC banks, the mappings and the flat copies; LCDC reads too,
-            // for the lines held for display capture), the 3D renderers
+            // the GL compositor reads the 2D back buffers (the Blit at the end, or at line 215), so
+            // the wait is there. the VBlank DMAs and the CPU only reach what a queued line reads
+            // through the write barriers (LCDC banks, the mappings and the flat copies; LCDC reads
+            // too, for the lines held for display capture; palette and OAM are copied), the 3D renderers
             // don't touch the 2D output, and with software 3D nothing reads it before FinishFrame,
             // which syncs
 
@@ -1755,7 +1842,19 @@ void GPU::StartScanline(u32 line) noexcept
             GPU3D.VBlank();
 
             // Need a better way to identify the openGL renderer in particular
-            if (GPU3D.IsRendererAccelerated())
+            if (GPU3D.IsRendererAccelerated() && Threaded2D && LateBlit && !BlitPending
+                && !Deferred2DPending && !CaptureHeldThisFrame && !(HiresCapRecord && HiresCapRecord->DstMask))
+            {
+                // the Blit only waits until the 3D render at line 215 replaces the 3D frame it reads,
+                // so the 2D thread's last lines overlap VBlank emulation (see LateBlit). of the
+                // hi-res capture state it reads, only the bank write masks can change until then
+                LateBlitCapWrites = HiresCapWrites;
+                LateBlitCapWritesInCapture = HiresCapWritesInCapture;
+                HiresCapWrites = 0;
+                HiresCapWritesInCapture = 0;
+                BlitPending = true;
+            }
+            else if (GPU3D.IsRendererAccelerated())
             {
                 // the compositor uploads this frame's 2D back buffers, so every line must be drawn.
                 // this is where the lines held for display capture are usually drawn

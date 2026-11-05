@@ -146,16 +146,19 @@ public:
     /// The 2D thread while threaded 2D is on, otherwise null (so the frontend can find it, e.g. for CPU hints)
     [[nodiscard]] Platform::Thread* Get2DThread() const noexcept;
 
-    /// The 2D barrier: waits until the 2D thread has drawn every line it was given, and draws the
-    /// lines held back for display capture (see Begin2DJob). Call it before changing anything a
-    /// queued line reads: palette, OAM, LCDC VRAM banks, VRAM mappings, the flat VRAM copies, the
-    /// framebuffers or the 2D renderer. It's only a check while no line is waiting
+    /// The 2D barrier: waits until the 2D thread has drawn every line it was given, draws the
+    /// lines held back for display capture (see Begin2DJob) and runs a Blit left for later (see
+    /// LateBlit). Call it before changing anything a queued line reads: LCDC VRAM banks, VRAM
+    /// mappings, the flat VRAM copies, the framebuffers or the 2D renderer. It's only a check while
+    /// no line is waiting
     void Sync2D() noexcept
     {
         if (Is2DRingBusy())
             Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
         if (Deferred2DPending)
             Flush2DDeferred();
+        if (BlitPending)
+            RunLateBlit();
     }
 
     /// The barrier for writes to LCDC banks. A queued line only reads them in VRAM display mode,
@@ -584,11 +587,14 @@ public:
     template<typename T>
     void WritePalette(u32 addr, T val)
     {
-        Sync2D();
+        // queued lines read a copy (see Start2DJob), so only the held ones are drawn first
+        if (Deferred2DPending)
+            Flush2DDeferred();
         addr &= 0x7FF;
 
         *(T*)&Palette[addr] = val;
         PaletteDirty |= 1 << (addr / VRAMDirtyGranularity);
+        PalOAMWritten = true;
     }
 
     template<typename T>
@@ -600,11 +606,14 @@ public:
     template<typename T>
     void WriteOAM(u32 addr, T val)
     {
-        Sync2D();
+        // as WritePalette
+        if (Deferred2DPending)
+            Flush2DDeferred();
         addr &= 0x7FF;
 
         *(T*)&OAM[addr] = val;
         OAMDirty |= 1 << (addr / 1024);
+        PalOAMWritten = true;
     }
 
     template <typename T>
@@ -721,6 +730,12 @@ public:
     // idle (after the capture map) until the line-215 flush, instead of ahead of the 3D there.
     // only turned off by a debug switch, to compare
     bool BlitFlushCapture = true;
+    // threaded 2D with an accelerated 3D renderer: the frame-end 2D barrier and the Blit move from
+    // line 192 to just before the 3D render at line 215, which is the first thing after them that
+    // changes what the compositor reads, so the 2D thread's last lines overlap VBlank emulation.
+    // not in frames that hold capture lines or record any for hi-res capture. only turned off by a
+    // debug switch, to compare
+    bool LateBlit = true;
     // compute renderer: before mapping the capture readback, poll a fence for up to this many µs
     // (yielding in between) instead of sleeping in the driver's map, which keeps the emulator
     // thread's clock up. 0 = no fence, no poll. only changed by a debug switch
@@ -792,6 +807,7 @@ private:
     void ResetVRAMCache() noexcept;
     void ResetHiresCapture() noexcept;
     void HiresCaptureBlitDone() noexcept;
+    void RunLateBlit() noexcept;
     void AssignFramebuffers() noexcept;
     void InitFramebuffers() noexcept;
     void LogHash2D() noexcept;
@@ -937,6 +953,14 @@ private:
     // set when this frame holds a line that reads 3D (Snapshot2DScanline), cleared at line 215
     // (see StartHBlank)
     bool CaptureHeldThisFrame = false;
+    // the Blit StartScanline(192) left for line 215 (see LateBlit). Sync2D runs it, so whatever
+    // syncs before reading or changing the 2D output, the 3D frame or the renderer gets it first
+    bool BlitPending = false;
+    // HiresCapWrites and HiresCapWritesInCapture as of line 192, for the late Blit (see RunLateBlit)
+    u8 LateBlitCapWrites = 0;
+    u8 LateBlitCapWritesInCapture = 0;
+    // palette or OAM written since queued jobs last got a copy of them (see Start2DJob)
+    bool PalOAMWritten = true;
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;

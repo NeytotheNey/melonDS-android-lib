@@ -898,8 +898,8 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
     }
 
     u64 backdrop;
-    if (CurUnit->Num) backdrop = *(u16*)&GPU.Palette[0x400];
-    else     backdrop = *(u16*)&GPU.Palette[0];
+    if (CurUnit->Num) backdrop = *(u16*)&CurJob->Palette[0x400];
+    else     backdrop = *(u16*)&CurJob->Palette[0];
 
     {
         u8 r = (backdrop & 0x001F) << 1;
@@ -1153,14 +1153,14 @@ void SoftRenderer::DrawBG_Text(u32 line, u32 bgnum)
         tilesetaddr = ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0x400];
+        pal = (u16*)&CurJob->Palette[0x400];
     }
     else
     {
         tilesetaddr = ((CurUnit->DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((CurUnit->DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0];
+        pal = (u16*)&CurJob->Palette[0];
     }
 
     // adjust Y position in tilemap
@@ -1324,14 +1324,14 @@ void SoftRenderer::DrawBG_Affine(u32 line, u32 bgnum)
         tilesetaddr = ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0x400];
+        pal = (u16*)&CurJob->Palette[0x400];
     }
     else
     {
         tilesetaddr = ((CurUnit->DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((CurUnit->DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0];
+        pal = (u16*)&CurJob->Palette[0];
     }
 
     u16 curtile;
@@ -1467,8 +1467,8 @@ void SoftRenderer::DrawBG_Extended(u32 line, u32 bgnum)
         {
             // 256-color bitmap
 
-            if (CurUnit->Num) pal = (u16*)&GPU.Palette[0x400];
-            else              pal = (u16*)&GPU.Palette[0];
+            if (CurUnit->Num) pal = (u16*)&CurJob->Palette[0x400];
+            else              pal = (u16*)&CurJob->Palette[0];
 
             u8 color;
 
@@ -1526,14 +1526,14 @@ void SoftRenderer::DrawBG_Extended(u32 line, u32 bgnum)
             tilesetaddr = ((bgcnt & 0x003C) << 12);
             tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-            pal = (u16*)&GPU.Palette[0x400];
+            pal = (u16*)&CurJob->Palette[0x400];
         }
         else
         {
             tilesetaddr = ((CurUnit->DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
             tilemapaddr = ((CurUnit->DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-            pal = (u16*)&GPU.Palette[0];
+            pal = (u16*)&CurJob->Palette[0];
         }
 
         u16 curtile;
@@ -1633,8 +1633,8 @@ void SoftRenderer::DrawBG_Large(u32 line) // BG is always BG2
 
     // 256-color bitmap
 
-    if (CurUnit->Num) pal = (u16*)&GPU.Palette[0x400];
-    else     pal = (u16*)&GPU.Palette[0];
+    if (CurUnit->Num) pal = (u16*)&CurJob->Palette[0x400];
+    else     pal = (u16*)&CurJob->Palette[0];
 
     u8 color;
 
@@ -1723,7 +1723,7 @@ template <SoftRenderer::DrawPixel drawPixel>
 void SoftRenderer::InterleaveSprites(u32 prio)
 {
     u32* objLine = OBJLine[CurUnit->Num];
-    u16* pal = (u16*)&GPU.Palette[CurUnit->Num ? 0x600 : 0x200];
+    u16* pal = (u16*)&CurJob->Palette[CurUnit->Num ? 0x600 : 0x200];
 
     if (CurUnit->DispCnt & 0x80000000)
     {
@@ -1794,7 +1794,7 @@ void SoftRenderer::DrawSprites(u32 line, const UnitState* unit)
     // OBJ enable as latched for this line's sprite pass (see Unit::PreDrawScanline)
     if (!CurUnit->OBJEnable) return;
 
-    u16* oam = (u16*)&GPU.OAM[CurUnit->Num ? 0x400 : 0];
+    u16* oam = (u16*)&CurJob->OAM[CurUnit->Num ? 0x400 : 0];
 
     const s32 spritewidth[16] =
     {
@@ -1915,7 +1915,7 @@ void SoftRenderer::DrawSpritePixel(u32* objLine, u8* objWindow, int color, u32 p
 template<bool window>
 void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos)
 {
-    u16* oam = (u16*)&GPU.OAM[CurUnit->Num ? 0x400 : 0];
+    u16* oam = (u16*)&CurJob->OAM[CurUnit->Num ? 0x400 : 0];
     u16* attrib = &oam[num * 4];
     u16* rotparams = &oam[(((attrib[1] >> 9) & 0x1F) * 16) + 3];
 
@@ -2100,7 +2100,7 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
 template<bool window>
 void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos)
 {
-    u16* oam = (u16*)&GPU.OAM[CurUnit->Num ? 0x400 : 0];
+    u16* oam = (u16*)&CurJob->OAM[CurUnit->Num ? 0x400 : 0];
     u16* attrib = &oam[num * 4];
 
     u32 pixelattr = ((attrib[2] & 0x0C00) << 6) | 0xC0000;

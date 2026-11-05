@@ -149,7 +149,7 @@ private:
 
 // one HBlank's worth of 2D drawing: the BG/OBJ pass of the current line and the sprites of the
 // next one, for both Units. GPU::StartHBlank builds it on the emulator thread, and the renderer
-// draws only from it plus VRAM (and its flat copies), palette and OAM.
+// draws only from it plus VRAM (and its flat copies), and palette and OAM through its pointers.
 // with threaded 2D, jobs wait in a ring until the 2D thread draws them, and display capture lines
 // with an accelerated 3D renderer wait until line 192 (see GPU::Begin2DJob)
 struct LineJob
@@ -170,6 +170,8 @@ struct LineJob
     u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks
     bool ScreensEnabled;    // POWCNT1 bit 0 as latched at the frame start: clear = both screens black
     bool HiresCapture;      // Accelerated, GPU::HiresCapture and the compositor's pass would run: capture lines fill the record, VRAM display lines get the flag
+    const u8* Palette;      // palette and OAM as they were when the job was built: a copy for a queued job (see GPU::Start2DJob)
+    const u8* OAM;
 
     UnitState BG[2];        // after PreDrawScanline, before PostDrawScanline
     UnitState OBJ[2];       // after PostDrawScanline (line 0: after ResetOBJMosaicCounters)
