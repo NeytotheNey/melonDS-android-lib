@@ -30,6 +30,7 @@
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL.h"
+#include "GPU_HiresStream.h"
 #include "OpenGLSupport.h"
 #include "Platform.h"
 #include "GPU_OpenGL_shaders.h"
@@ -76,7 +77,8 @@ GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
     glUniform1i(screenTextureUniform, 0);
     GLuint _3dTextureUniform = glGetUniformLocation(CompShader, "_3DTex");
     glUniform1i(_3dTextureUniform, 1);
-    glUniform1i(glGetUniformLocation(CompShader, "HiresBankTex"), 3);
+    glUniform1i(glGetUniformLocation(CompShader, "HiresBankTex"), HiresBankUnit);
+    glUniform1i(glGetUniformLocation(CompShader, "HiresStreamTex"), HiresStreamUnit);
 
     // all this mess is to prevent bleeding
 #define SETVERTEX(i, x, y, offset) \
@@ -299,7 +301,8 @@ bool GLCompositor::PrepareWide() noexcept
     glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
     glUniform1i(glGetUniformLocation(CompShaderWide, "_3DTex"), 1);
     glUniform1i(glGetUniformLocation(CompShaderWide, "HeldWingsTex"), 2);
-    glUniform1i(glGetUniformLocation(CompShaderWide, "HiresBankTex"), 3);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "HiresBankTex"), HiresBankUnit);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "HiresStreamTex"), HiresStreamUnit);
 
     return true;
 }
@@ -370,7 +373,13 @@ void GLCompositor::ResetWingHold() noexcept
 void GLCompositor::ResetHiresCapture() noexcept
 {
     HiresCap.Banks = {};
+    for (HiresNativeRows& native : HiresCap.BankNative)
+        native.State = {};
+    HiresCap.ScratchNative.State = {};
     HiresCap.ShowBank = -1;
+    HiresCap.StreamSource = -1;
+    HiresCap.LastScreenSwap = -1;
+    HiresCap.StreamMissed = false;
 }
 
 // decides, from the control words of the frame being composited, which wing lines are held
@@ -557,10 +566,16 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
     }
 
-    if (hiresDisplay)
+    if (hiresDisplay && HiresCap.ShowBank >= 0)
     {
-        glActiveTexture(GL_TEXTURE3);
+        glActiveTexture(GL_TEXTURE0 + HiresBankUnit);
         glBindTexture(GL_TEXTURE_2D, HiresCap.BankTex[HiresCap.ShowBank]);
+    }
+    if (hiresDisplay && HiresCap.StreamSource >= 0)
+    {
+        glActiveTexture(GL_TEXTURE0 + HiresStreamUnit);
+        glBindTexture(GL_TEXTURE_2D, HiresCap.StreamSource == HiresStreamScratch
+                                     ? HiresCap.ScratchTex : HiresCap.BankTex[HiresCap.StreamSource]);
     }
 
     glActiveTexture(GL_TEXTURE0);
@@ -574,7 +589,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
                         GL_UNSIGNED_BYTE, gpu.Framebuffer[backbuf][1].get());
 
         // the control words again, with the held lines flagged (see PrepareWingHold) and the
-        // hi-res capture flag only on the lines that show a copy (see PrepareHiresDisplay)
+        // hi-res capture flag only on the lines that show an image (see PrepareHiresDisplay)
         if (wingHold || hiresDisplay)
             glTexSubImage2D(GL_TEXTURE_2D, 0, 256*3, 0, 1, 384, GL_RGBA_INTEGER,
                             GL_UNSIGNED_BYTE, CtrlWords.data());
@@ -605,11 +620,22 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 // - this frame doesn't capture into the bank at a non-zero offset. at offset 0, display line L
 //   reads row L before capture line L writes it, so it sees the last pass's copy, as native does.
 // one copy is bound (unit 3), the bank of the first candidate line: other banks stay native.
-// bits 5-7 are cleared on every other line too, in case stale ones got through. returns whether
-// any line shows a copy, and then CtrlWords is what the shader gets
+// bits 5-7 are cleared on every other line too, in case stale ones got through. bits 5-6 are
+// cleared on the lines that stay too, as the shader reads bit 5 as the stream flag.
+// regular display lines can then show a hi-res image as well (see PrepareHiresStream).
+// a game with 3D on both screens can send one captured image to a screen twice in a row: by VRAM
+// display, then, once the screens swapped, on unit B some way the stream can't see (a scaled BG,
+// say). if regular display lines don't match a stream, the VRAM display lines of a frame that
+// swapped stay native too, or a screen would alternate between hi-res and native. a frame whose
+// regular display lines are all one color says nothing, so it goes by the last one that did: with
+// one screen black, unit B has nothing to match every other frame, and the other screen still
+// needs the same answer on both. without a swap the other frame shows that screen the same way,
+// so there's no reason to give the hi-res image up.
+// returns whether any line shows a hi-res image, and then CtrlWords is what the shader gets
 bool GLCompositor::PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCopied) noexcept
 {
     HiresCap.ShowBank = -1;
+    HiresCap.StreamSource = -1;
     // without the pass no copy is valid (they're dropped on a scale change), and the 2D renderer
     // flags no lines (GPU::Start2DJob)
     if (!gpu.HiresCapture || !RunsHiresCapture(gpu.HiresCaptureDebug))
@@ -646,13 +672,79 @@ bool GLCompositor::PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCop
             {
                 HiresCap.ShowBank = bank;
                 HiresCap.LinesShown++;
+                ctrl &= ~(HiresDisplayBits & ~HiresDisplayFlag);
             }
             else
                 ctrl &= ~HiresDisplayBits;
         }
     }
 
-    return HiresCap.ShowBank >= 0;
+    PrepareHiresStream(gpu, backbuf);
+
+    bool swapped = HiresCap.LastScreenSwap >= 0 && HiresCap.LastScreenSwap != (int)gpu.ScreenSwap;
+    HiresCap.LastScreenSwap = gpu.ScreenSwap;
+    if (swapped && HiresCap.ShowBank >= 0 && HiresCap.StreamMissed)
+    {
+        for (u32& ctrl : CtrlWords)
+        {
+            if (ctrl & HiresDisplayFlag)
+            {
+                ctrl &= ~HiresDisplayBits;
+                HiresCap.LinesShown--;
+                HiresCap.LinesSwapNative++;
+            }
+        }
+        HiresCap.ShowBank = -1;
+    }
+
+    return HiresCap.ShowBank >= 0 || HiresCap.StreamSource >= 0;
+}
+
+// hi-res display capture, regular display lines: a line that's byte for byte a row of a capture
+// shows that capture's hi-res image, however the pixels got there (see GPU_HiresStream.h). what
+// matches is one image per frame, the one most lines match, its row L on line L only, and the lines
+// that don't stay native.
+// the images are the banks' copies and the scratch one, the capture before them: as the pass runs
+// after the draw, frame F sees captures F-1 and F-2 of a bank that's captured into every frame.
+// CtrlWords has the frame's control words, with bits 5-7 already rewritten for VRAM display
+void GLCompositor::PrepareHiresStream(const GPU& gpu, int backbuf) noexcept
+{
+    auto source = [](const HiresNativeRows& native, GLuint tex) -> HiresStream::Source
+    {
+        if (!tex || !native.State.Valid)
+            return {};
+        return {native.Words.data(), native.State.RowStart, native.State.Rows};
+    };
+
+    HiresStream::Source sources[5];
+    for (int i = 0; i < 4; i++)
+        sources[i] = source(HiresCap.BankNative[i], HiresCap.BankTex[i]);
+    sources[HiresStreamScratch] = source(HiresCap.ScratchNative, HiresCap.ScratchTex);
+
+    const u32* const screens[2] = {gpu.Framebuffer[backbuf][0].get(), gpu.Framebuffer[backbuf][1].get()};
+    bool anyDetail;
+    int found = HiresStream::FindSource(screens, sources, 5, anyDetail);
+    if (found < 0)
+    {
+        if (anyDetail)
+            HiresCap.StreamMissed = true;
+        return;
+    }
+
+    HiresCap.StreamMissed = false;
+    HiresCap.StreamSource = found;
+    for (int half = 0; half < 2; half++)
+    {
+        for (int line = 0; line < 192; line++)
+        {
+            const u32* fbline = &screens[half][line * HiresStream::LineWords];
+            if (HiresStream::IsRegularDisplay(fbline) && sources[found].MatchesLine(fbline, line))
+            {
+                CtrlWords[half * 192 + line] |= HiresDisplayFlag | HiresStreamBit;
+                HiresCap.LinesStream++;
+            }
+        }
+    }
 }
 
 // the capture pass: redoes this frame's display capture at the 3D scale, from the record the 2D
@@ -779,9 +871,11 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
 
     glActiveTexture(GL_TEXTURE6);
     glBindTexture(GL_TEXTURE_2D, bankB >= 0 ? HiresCap.BankTex[bankB] : 0);
-    // unit 3 can still have the scratch texture from an earlier frame's draw. the capture program
-    // doesn't read it, but no texture the pass draws into stays bound
-    glActiveTexture(GL_TEXTURE3);
+    // units 3 and 8 can still have the scratch texture from an earlier frame's draw. the capture
+    // program doesn't read them, but no texture the pass draws into stays bound
+    glActiveTexture(GL_TEXTURE0 + HiresBankUnit);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0 + HiresStreamUnit);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     // the captured rows only, with the viewport: classic GL leaves the scissor test off and
@@ -798,7 +892,19 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
     glUniform1i(HiresCap.DstRowLoc, dstRow);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
+    // the destination's old image becomes the scratch one, and stays usable for the next frame's
+    // stream with the rows it covered, until the next pass draws over it. the native capture is
+    // finished: every capture line is drawn before the Blit (GPU::StartScanline at line 192), and
+    // a write to the bank during it skipped this pass (HiresCapSkip_Written)
     std::swap(HiresCap.BankTex[dst], HiresCap.ScratchTex);
+    std::swap(HiresCap.BankNative[dst], HiresCap.ScratchNative);
+    HiresNativeRows& native = HiresCap.BankNative[dst];
+    native.State = {true, dstRow, rows};
+    native.Words.resize(256 * 192);
+    if (dstRow < 192)
+        memcpy(&native.Words[dstRow * 256], &gpu.VRAM[dst][dstRow * 512],
+               (std::min(dstRow + rows, 192) - dstRow) * 512);
+
     HiresCap.Banks[dst] = {true, dstRow, rows};
     HiresCap.Passes++;
 
@@ -867,6 +973,8 @@ void GLCompositor::FreeHiresBanks() noexcept
     glDeleteTextures(1, &HiresCap.ScratchTex);
     HiresCap.BankTex = {};
     HiresCap.ScratchTex = 0;
+    HiresCap.BankNative = {};
+    HiresCap.ScratchNative = {};
     ResetHiresCapture();
 }
 
@@ -884,8 +992,9 @@ void GLCompositor::FreeHiresCapture() noexcept
 }
 
 // debug only (GPU::HiresCaptureDebug): once a second, how many captures there were and passes
-// ran, how many VRAM display lines were candidates and showed a copy, how many capture lines took
-// source B from a copy or the native words, and why captures were skipped
+// ran, how many VRAM display lines were candidates and showed a copy, how many regular display
+// lines showed a stream image, how many VRAM display lines a screen swap kept native, how many
+// capture lines took source B from a copy or the native words, and why captures were skipped
 void GLCompositor::LogHiresCapture() noexcept
 {
     static_assert(HiresCapSkipCount == HiresCapSkip_Count);
@@ -898,15 +1007,17 @@ void GLCompositor::LogHiresCapture() noexcept
         return;
 
     const std::array<u32, HiresCapSkipCount>& s = HiresCap.Skips;
-    Log(LogLevel::Info, "HIRESCAP scale=%d captures=%u passes=%u shown=%u/%u srcb=%u/%u skip "
+    Log(LogLevel::Info, "HIRESCAP scale=%d captures=%u passes=%u shown=%u/%u stream=%u swapnative=%u srcb=%u/%u skip "
         "layout=%u vcount=%u abort=%u nolcdc=%u size=%u wrap=%u missing=%u written=%u 1x=%u shader=%u\n",
         Scale, HiresCap.Captures, HiresCap.Passes, HiresCap.LinesShown, HiresCap.LinesCandidate,
+        HiresCap.LinesStream, HiresCap.LinesSwapNative,
         HiresCap.LinesHiresB, HiresCap.LinesHiresB + HiresCap.LinesNativeB,
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]);
 
     HiresCap.LogStartNs = now;
     HiresCap.Captures = HiresCap.Passes = 0;
     HiresCap.LinesShown = HiresCap.LinesCandidate = 0;
+    HiresCap.LinesStream = HiresCap.LinesSwapNative = 0;
     HiresCap.LinesHiresB = HiresCap.LinesNativeB = 0;
     HiresCap.Skips = {};
 }

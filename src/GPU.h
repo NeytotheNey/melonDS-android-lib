@@ -743,7 +743,8 @@ public:
 
     // hi-res display capture, OpenGL and compute renderers: the GL compositor keeps an upscaled
     // shadow copy of the banks (A-D) display capture writes, redone each capture frame from the
-    // 2D planes and the hi-res 3D (GLCompositor::RunHiresCapture), and VRAM display shows it.
+    // 2D planes and the hi-res 3D (GLCompositor::RunHiresCapture), and VRAM display shows it, as
+    // do regular display lines that are pixel for pixel a captured row (PrepareHiresStream).
     // native capture and what the game reads stay as they were. set with SetHiresCapture
     bool HiresCapture = false;
     // debug only: 1 logs a HIRESCAP line once a second, 2 also runs the pass at 1x and compares
@@ -760,6 +761,11 @@ public:
     u8 NativeCapturedSincePass = 0;
     // this frame's capture lines, made the first time one is recorded (~680 KB)
     std::unique_ptr<HiresCaptureRecord> HiresCapRecord;
+    // POWCNT1 bit 15 (screen swap), latched at the start of each frame like ScreensEnabled: the
+    // compositor compares it between frames (GLCompositor::PrepareHiresDisplay), and the register
+    // itself can have the next frame's value by then. not savestated, the compositor starts over
+    // after a load
+    bool ScreenSwap = false;
 
     void SetHiresCapture(bool enable) noexcept;
     // DoCapture, on every capture line it draws with HiresCapture on: the line's record entry

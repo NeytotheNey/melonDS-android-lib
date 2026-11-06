@@ -1070,6 +1070,7 @@ void GPU::DisplayFIFO(u32 x) noexcept
 void GPU::StartFrame() noexcept
 {
     ScreensEnabled = !!(NDS.PowerControl9 & (1<<0));
+    ScreenSwap = !!(NDS.PowerControl9 & (1<<15));
 
     // only run the display FIFO if needed:
     // * if it is used for display or capture

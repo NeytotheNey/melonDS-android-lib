@@ -23,6 +23,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace melonDS
 {
@@ -80,6 +81,10 @@ private:
     GLuint CompScaleLoc = 0;
     GLuint CompHiresCapLoc = 0;
 
+    // the texture units of the images hi-res lines show (see PrepareHiresDisplay)
+    static constexpr int HiresBankUnit = 3;
+    static constexpr int HiresStreamUnit = 8;
+
     GLuint CompShaderWide {};
     bool CompShaderWideFailed = false;
     GLuint CompWideScaleLoc = 0;
@@ -107,9 +112,12 @@ private:
     // the held lines and cleared on the others, and HiresDisplayBits cleared on the lines that
     // don't show a hi-res copy. the master brightness field only uses bits 0-4 and 14-15 there:
     // bits 5-7 are the 2D renderer's hi-res capture flag (bit 7) and bank (5-6), 8-12 the wings'
-    // fade EVY, and 13 was free
+    // fade EVY, and 13 was free. once PrepareHiresDisplay rewrote them, bit 7 means the line shows
+    // a hi-res image, and bit 5 that it's the stream's (HiresStreamTex) instead of the VRAM display
+    // bank's (HiresBankTex)
     static constexpr u32 WingHeldBit = 1u << 13;
     static constexpr u32 HiresDisplayFlag = 1u << 7;
+    static constexpr u32 HiresStreamBit = 1u << 5;
     static constexpr u32 HiresDisplayBits = 0xE0;
     std::array<u32, 384> CtrlWords {};
     GLuint HeldWingsTex = 0;
@@ -123,7 +131,9 @@ private:
     // capture targets), GL_R16UI, 256 x 256 bank rows at Scale, holding the bank's words. a copy
     // only counts over the rows its last capture pass wrote (anything else is native, with no
     // rows kept from older passes), and only while nothing else wrote the bank. the textures are
-    // made the first time a pass needs them and freed when the scale changes
+    // made the first time a pass needs them and freed when the scale changes.
+    // each texture, the scratch one too, is half of a pair with the native words of the capture it
+    // holds (see HiresNativeRows), which regular display lines are compared with
     struct HiresBankState
     {
         bool Valid = false;
@@ -131,6 +141,16 @@ private:
         int Rows = 0;
 
         bool Covers(int row) const noexcept { return Valid && row >= RowStart && row < RowStart + Rows; }
+    };
+    // the native words of the capture a texture holds, as the pass found them in VRAM (256 per bank
+    // row, for the rows below 192), and the rows that capture covered. nothing but the pass that
+    // redoes the texture changes them: unlike the bank state, which says whether VRAM display can
+    // still show the copy, a later write to the bank doesn't matter here, as a line that equals
+    // these words proves by its pixels that it's this image
+    struct HiresNativeRows
+    {
+        HiresBankState State;
+        std::vector<u16> Words;
     };
     // HiresCapSkip_Count in GPU.h (checked in GPU_OpenGL.cpp)
     static constexpr int HiresCapSkipCount = 10;
@@ -141,6 +161,8 @@ private:
         // the pass draws here, then swaps it with the destination's texture, so a capture that
         // reads its own destination as source B reads the old copy with no copy made
         GLuint ScratchTex = 0;
+        std::array<HiresNativeRows, 4> BankNative {};
+        HiresNativeRows ScratchNative {};
         GLuint PassFB = 0;
         GLuint PlanesTex = 0;   // GL_RGBA8UI 770x192: the record's planes, then 2 control texels per line
         GLuint SrcBTex = 0;     // GL_R16UI 256x192: the record's native source B words
@@ -151,17 +173,27 @@ private:
 
         // the bank the frame's VRAM display lines show from (bound on unit 3), or -1
         int ShowBank = -1;
+        // the image the frame's regular display lines show from (bound on unit 8): a bank's, the
+        // scratch one's (HiresStreamScratch), or -1
+        int StreamSource = -1;
+        // GPU::ScreenSwap of the last frame, or -1 after a reset
+        int LastScreenSwap = -1;
+        // the last frame with regular display lines to tell by had no image that most of them match
+        bool StreamMissed = false;
 
         // the HIRESCAP log, GPU::HiresCaptureDebug only
         s64 LogStartNs = 0;
         u32 Passes = 0, Captures = 0, LinesShown = 0, LinesCandidate = 0, LinesHiresB = 0, LinesNativeB = 0;
+        u32 LinesStream = 0, LinesSwapNative = 0;
         std::array<u32, HiresCapSkipCount> Skips {};
         u32 CheckCount = 0;
     };
+    static constexpr int HiresStreamScratch = 4;
     HiresCaptureState HiresCap {};
     std::array<u32, 192*2> HiresCapCtrl {};
 
     bool PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCopied) noexcept;
+    void PrepareHiresStream(const GPU& gpu, int backbuf) noexcept;
     void RunHiresCapture(const GPU& gpu, int backbuf) noexcept;
     bool PrepareHiresCaptureShader() noexcept;
     static GLuint MakeHiresTexture(GLenum format, int width, int height) noexcept;

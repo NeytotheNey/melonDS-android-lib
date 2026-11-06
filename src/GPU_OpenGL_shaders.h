@@ -145,11 +145,13 @@ uniform mediump sampler2D HeldWingsTex;
 uniform usampler2D ScreenTex;
 uniform sampler2D _3DTex;
 
-// hi-res display capture (see GLCompositor::PrepareHiresDisplay): VRAM display lines flagged in
-// the control word (bit 7) show this bank copy instead. it holds bank words, so it's highp:
+// hi-res display capture (see GLCompositor::PrepareHiresDisplay): lines flagged in the control word
+// (bit 7) show one of these images instead, HiresStreamTex if bit 5 is set too: VRAM display lines
+// the bank copy, regular display lines the stream's. they hold bank words, so they're highp:
 // 0x8000 doesn't fit a mediump int
 uniform int uHiresCap;
 uniform highp usampler2D HiresBankTex;
+uniform highp usampler2D HiresStreamTex;
 
 smooth in vec2 fTexcoord;
 
@@ -252,7 +254,29 @@ void main()
     // mbright.b bit7 == HOFS bit8 (sign)
     float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
 
-    if (dispmode == 1)
+    if (uHiresCap != 0 && (mbright.r & 0x80) != 0)
+    {
+        // from a hi-res image, whose rows are the bank rows (display line L shows row L). the
+        // output has 2 padding lines between the halves, so the second half's rows start at 194
+        // lines, and the wide output's wing comes before the middle
+        highp ivec2 coord = ivec2(gl_FragCoord.xy);
+        int scale = int(u3DScale);
+        if (coord.y >= 194 * scale)
+            coord.y -= 194 * scale;
+#ifdef WIDE
+        coord.x -= uWideOffset * scale;
+#endif
+        coord = clamp(coord, ivec2(0), ivec2(256 * scale - 1, 192 * scale - 1));
+
+        // unpacked to 6 bits like the native VRAM display line (GPU2D::SoftRenderer::DrawScanline)
+        highp uint word;
+        if ((mbright.r & 0x20) != 0)
+            word = texelFetch(HiresStreamTex, coord, 0).r;
+        else
+            word = texelFetch(HiresBankTex, coord, 0).r;
+        pixel = ivec4(int(word & 0x1Fu) << 1, int((word >> 5) & 0x1Fu) << 1, int((word >> 10) & 0x1Fu) << 1, 0);
+    }
+    else if (dispmode == 1)
     {
         ivec4 val2 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(256,0), 0));
         ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(512,0), 0));
@@ -264,24 +288,6 @@ void main()
 
         bool opaque;
         pixel = CompositePixel(pixel, val2, val3, _3dpix, opaque);
-    }
-    else if (dispmode == 2 && uHiresCap != 0 && (mbright.r & 0x80) != 0)
-    {
-        // VRAM display from the bank's hi-res copy, whose rows are the bank rows (display line L
-        // shows row L). the output has 2 padding lines between the halves, so the second half's
-        // rows start at 194 lines, and the wide output's wing comes before the middle
-        highp ivec2 coord = ivec2(gl_FragCoord.xy);
-        int scale = int(u3DScale);
-        if (coord.y >= 194 * scale)
-            coord.y -= 194 * scale;
-#ifdef WIDE
-        coord.x -= uWideOffset * scale;
-#endif
-        coord = clamp(coord, ivec2(0), ivec2(256 * scale - 1, 192 * scale - 1));
-
-        // unpacked to 6 bits like the native VRAM display line (GPU2D::SoftRenderer::DrawScanline)
-        highp uint word = texelFetch(HiresBankTex, coord, 0).r;
-        pixel = ivec4(int(word & 0x1Fu) << 1, int((word >> 5) & 0x1Fu) << 1, int((word >> 10) & 0x1Fu) << 1, 0);
     }
 
     if (dispmode != 0)
@@ -471,7 +477,9 @@ void main()
         }
     }
 
-    oWord = uvec4(word, 0u, 0u, 0u);
+    // the mask is for Adreno 840 (driver 0842.19.11): without it, a word with bit 15 set has high
+    // bits set by here, which the R16UI target saturates to 0xFFFF, so anything opaque came out white
+    oWord = uvec4(word & 0xFFFFu, 0u, 0u, 0u);
 }
 )";
 
