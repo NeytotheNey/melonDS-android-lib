@@ -148,6 +148,11 @@ GPU3D::GPU3D(melonDS::NDS& nds, std::unique_ptr<Renderer3D>&& renderer) noexcept
 {
 }
 
+GPU3D::GPU3D(melonDS::NDS& nds, ShadowTag) noexcept :
+    NDS(nds)
+{
+}
+
 void Vertex::DoSavestate(Savestate* file) noexcept
 {
     file->VarArray(Position, sizeof(Position));
@@ -168,6 +173,18 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
 
     // software only does 256, so don't keep squeezing geometry for it
     ViewWidth = CurrentRenderer->GetViewWidth();
+}
+
+void GPU3D::SetVertexIdLogging(int mode) noexcept
+{
+    VertexIdLog = mode > 0 ? std::make_unique<VertexIdLogger>(mode) : nullptr;
+}
+
+void GPU3D::SetHalfCamera(int mode) noexcept
+{
+    // set again by a new game's start only, with no 3D frame in progress
+    if (HalfCam) HalfCam->Invalidate();
+    HalfCam = mode > 0 ? std::make_unique<HalfCamera>(*this, mode) : nullptr;
 }
 
 void GPU3D::ResetRenderingState() noexcept
@@ -191,6 +208,9 @@ void GPU3D::ResetRenderingState() noexcept
 
 void GPU3D::Reset() noexcept
 {
+    if (VertexIdLog) VertexIdLog->Invalidate();
+    if (HalfCam) HalfCam->Invalidate();
+
     CmdFIFO.Clear();
     CmdPIPE.Clear();
 
@@ -513,14 +533,27 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         ClipMatrixDirty = true;
         UpdateClipMatrix();
 
+        if (VertexIdLog) VertexIdLog->Invalidate();
+
         CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
         CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
     }
 
-    file->Var32(&RenderNumPolygons);
+    // never the in-between scene, the state has the scene itself. first on a load, where the state
+    // replaces the list it would put back
+    if (HalfCam && !file->Saving)
+        HalfCam->Invalidate();
+    const std::array<Polygon*,2048>* renderList = &RenderPolygonRAM;
+    u32 renderNumPolygons = RenderNumPolygons;
+    if (HalfCam && file->Saving)
+        HalfCam->GetRealRenderList(renderList, renderNumPolygons);
+
+    file->Var32(&renderNumPolygons);
+    if (!file->Saving)
+        RenderNumPolygons = renderNumPolygons;
     if (file->Saving)
     {
-        for (const Polygon* p : RenderPolygonRAM)
+        for (const Polygon* p : *renderList)
         {
             u32 index = p ? (p - &PolygonRAM[0]) : UINT32_MAX;
 
@@ -1101,6 +1134,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     if (NumPolygons >= 2048 || NumVertices+nverts > 6144)
     {
+        if (VertexIdLog) VertexIdLog->OnPolygonRejected();
         LastStripPolygon = NULL;
         DispCnt |= (1<<13);
         return;
@@ -1226,6 +1260,7 @@ void GPU3D::SubmitPolygon() noexcept
     }
 
     Polygon* poly = &CurPolygonRAM[NumPolygons++];
+    if (VertexIdLog) VertexIdLog->OnPolygon(NumPolygons - 1, *this);
     poly->NumVertices = 0;
 
     poly->Attr = CurPolygonAttr;
@@ -1377,6 +1412,8 @@ void GPU3D::SubmitPolygon() noexcept
 
 void GPU3D::SubmitVertex() noexcept
 {
+    if (VertexIdLog) VertexIdLog->OnVertex(*this);
+
     s64 vertex[4] = {(s64)CurVertex[0], (s64)CurVertex[1], (s64)CurVertex[2], 0x1000};
     Vertex* vertextrans = &TempVertexBuffer[VertexNumInPoly];
 
@@ -1780,10 +1817,9 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
     return ret;
 }
 
-void GPU3D::ExecuteCommand() noexcept
+// inlined into both of its callers, so that the emulator's only cost from replay is ExecuteCommand's check
+[[gnu::always_inline]] inline void GPU3D::RunCommand(CmdFIFOEntry entry) noexcept
 {
-    CmdFIFOEntry entry = CmdFIFORead();
-
     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());
 
     // each FIFO entry takes 1 cycle to be processed
@@ -1805,6 +1841,7 @@ void GPU3D::ExecuteCommand() noexcept
             break;
 
         case 0x11: // push matrix
+            if (VertexIdLog) VertexIdLog->OnMatrixCommand(entry.Command, &entry.Param, *this);
             VertexPipelineCmdDelayed4();
             NumPushPopCommands--;
             if (MatrixMode == 0)
@@ -1836,6 +1873,7 @@ void GPU3D::ExecuteCommand() noexcept
             break;
 
         case 0x12: // pop matrix
+            if (VertexIdLog) VertexIdLog->OnMatrixCommand(entry.Command, &entry.Param, *this);
             VertexPipelineCmdDelayed4();
             NumPushPopCommands--;
             if (MatrixMode == 0)
@@ -1873,6 +1911,7 @@ void GPU3D::ExecuteCommand() noexcept
             break;
 
         case 0x13: // store matrix
+            if (VertexIdLog) VertexIdLog->OnMatrixCommand(entry.Command, &entry.Param, *this);
             VertexPipelineCmdDelayed4();
             if (MatrixMode == 0)
             {
@@ -1894,6 +1933,7 @@ void GPU3D::ExecuteCommand() noexcept
             break;
 
         case 0x14: // restore matrix
+            if (VertexIdLog) VertexIdLog->OnMatrixCommand(entry.Command, &entry.Param, *this);
             VertexPipelineCmdDelayed4();
             if (MatrixMode == 0)
             {
@@ -1919,6 +1959,7 @@ void GPU3D::ExecuteCommand() noexcept
             break;
 
         case 0x15: // identity
+            if (VertexIdLog) VertexIdLog->OnMatrixCommand(entry.Command, &entry.Param, *this);
             VertexPipelineCmdDelayed4();
             if (MatrixMode == 0)
             {
@@ -2177,6 +2218,8 @@ void GPU3D::ExecuteCommand() noexcept
 
                 ExecParamCount = 0;
 
+                if (VertexIdLog) VertexIdLog->OnMatrixCommand(entry.Command, ExecParams, *this);
+
                 switch (entry.Command)
                 {
                 case 0x16: // load 4x4
@@ -2374,6 +2417,7 @@ void GPU3D::ExecuteCommand() noexcept
                 case 0x70: // box test
                     NumTestCommands -= 3;
                     BoxTest(ExecParams);
+                    if (VertexIdLog) VertexIdLog->OnBoxTest(GXStat & (1<<1));
                     break;
 
                 default:
@@ -2382,6 +2426,26 @@ void GPU3D::ExecuteCommand() noexcept
             }
         }
     }
+}
+
+void GPU3D::ExecuteCommand() noexcept
+{
+    CmdFIFOEntry entry = CmdFIFORead();
+    if (HalfCam) HalfCam->Record(entry.Command, entry.Param);
+    RunCommand(entry);
+}
+
+void GPU3D::ReplayEntry(u8 command, u32 param) noexcept
+{
+    CmdFIFOEntry entry {};
+    entry.Command = command;
+    entry.Param = param;
+    RunCommand(entry);
+}
+
+u32 GPU3D::NumCommandParams(u8 command) noexcept
+{
+    return CmdNumParams[command];
 }
 
 s32 GPU3D::CyclesToRunFor() const noexcept
@@ -2489,6 +2553,11 @@ bool YSort(Polygon* a, Polygon* b)
 
 void GPU3D::VBlank() noexcept
 {
+    if (VertexIdLog) VertexIdLog->OnVBlank();
+
+    // the in-between scene was last frame's, this one draws the scene itself unless a new one replaces it
+    bool isAfterMidScene = HalfCam && HalfCam->OnVBlank();
+
     if (GeometryEnabled)
     {
         if (RenderingEnabled)
@@ -2552,6 +2621,9 @@ void GPU3D::VBlank() noexcept
 
         if (FlushRequest)
         {
+            if (VertexIdLog) VertexIdLog->OnSwap(*this);
+            if (HalfCam) HalfCam->OnSwap();
+
             CurRAMBank = CurRAMBank?0:1;
             CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
             CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
@@ -2564,6 +2636,8 @@ void GPU3D::VBlank() noexcept
 
             // the width only changes between frames of geometry: right after a swap...
             ViewWidth = CurrentRenderer->GetViewWidth();
+
+            if (HalfCam) HalfCam->OnSceneStart();
         }
     }
     else if (NumVertices == 0 && NumPolygons == 0 && VertexNumInPoly == 0)
@@ -2571,10 +2645,16 @@ void GPU3D::VBlank() noexcept
         // ...or while the geometry engine is off with nothing half-built
         ViewWidth = CurrentRenderer->GetViewWidth();
     }
+
+    // the renderers skip a frame that's the same as the last one, which would keep the in-between scene up
+    if (isAfterMidScene)
+        RenderFrameIdentical = false;
 }
 
 void GPU3D::VCount215(GPU& gpu) noexcept
 {
+    if (HalfCam) HalfCam->BeforeRender();
+
     CurrentRenderer->RenderFrame(gpu);
 }
 

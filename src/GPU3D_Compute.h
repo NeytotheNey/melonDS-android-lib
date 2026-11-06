@@ -69,6 +69,7 @@ public:
     void PrepareCaptureFrame() override;
     void FlushCommands() override;
     bool FlushAfterCaptureBlit() const override { return true; }
+    [[nodiscard]] bool CanDrawReplayedScene() const noexcept override { return true; }
 
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
