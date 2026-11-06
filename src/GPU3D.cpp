@@ -184,7 +184,15 @@ void GPU3D::SetHalfCamera(int mode) noexcept
 {
     // set again by a new game's start only, with no 3D frame in progress
     if (HalfCam) HalfCam->Invalidate();
-    HalfCam = mode > 0 ? std::make_unique<HalfCamera>(*this, mode) : nullptr;
+    HalfCam = mode > 0 ? std::make_unique<HalfCamera>(*this, mode, false) : nullptr;
+}
+
+void GPU3D::SetHalfCameraSmoothing(bool isEnabled) noexcept
+{
+    if (!HalfCam && isEnabled)
+        HalfCam = std::make_unique<HalfCamera>(*this, 4, true);
+    if (HalfCam)
+        HalfCam->SetPaused(!isEnabled);
 }
 
 void GPU3D::ResetRenderingState() noexcept

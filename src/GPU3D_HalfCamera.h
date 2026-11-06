@@ -32,7 +32,8 @@ class GPU;
 class GPU3D;
 struct Polygon;
 
-// experiment, debug only (debug.melonade.halfcam, see DebugProperties.h). for games that draw a new
+// experiment, behind the Smooth 30 FPS setting (mode 4, quiet) and, in debug builds, debug.melonade.halfcam
+// (see DebugProperties.h). for games that draw a new
 // 3D scene every other frame: the frame a new scene B arrives shows scene B's own geometry seen from a
 // camera halfway between scene A's and B's, and the next frame shows real B, so only the 3D is a frame
 // late. the shelved polygon matching (docs/shelved/frame-interpolation.md) isn't needed for geometry
@@ -61,6 +62,9 @@ struct Polygon;
 // on screen and with close rotation words, and the paired ones get the average of the MTX_MULT_4x3's 12
 // words. their scale and vertices stay B's. the others stay at B's placement. static geometry is never
 // paired, its words are the same in both scenes.
+//
+// the lines below are the logging of modes 1 to 5. a quiet HalfCamera, which is what the setting uses, logs none of
+// them, and otherwise behaves the same as that mode.
 //
 // HALFCAM sec, once a second:
 //   vb scenes interp      VBlanks, swaps, in-between scenes drawn
@@ -125,7 +129,7 @@ struct Polygon;
 class HalfCamera
 {
 public:
-    HalfCamera(GPU3D& gpu, int mode);
+    HalfCamera(GPU3D& gpu, int mode, bool isQuiet);
     ~HalfCamera();
 
     [[nodiscard]] int GetMode() const noexcept { return Mode; }
@@ -133,6 +137,8 @@ public:
     // a FIFO word as it starts executing
     void Record(u8 command, u32 param) noexcept
     {
+        if (IsPaused)
+            return;
         if (NumRecords < MaxRecords)
             Records[NumRecords++] = { param, command };
         else
@@ -159,6 +165,9 @@ public:
 
     // a reset or a state load: nothing recorded so far can be trusted
     void Invalidate();
+    // between frames: while paused, nothing is recorded or analyzed and only real scenes are shown. pausing goes
+    // through Invalidate, so it ends an in-between frame the same way a state load does
+    void SetPaused(bool isPaused);
     // what a savestate has to contain: never the in-between scene
     void GetRealRenderList(const std::array<Polygon*, 2048>*& list, u32& numPolygons) const noexcept;
 
@@ -236,6 +245,10 @@ private:
 
     GPU3D& Main;
     int Mode;
+    // no logging, no timers and no CountDiagnostics. the plain counters in Total still run, spread through the
+    // analysis and the replay, but nothing reads them, and the 32-bit ones just wrap
+    bool IsQuiet;
+    bool IsPaused = false;
 
     // only ever used on the emulator thread, and not freed until the emulator goes away or the switch
     // is set again before a game starts, never from VBlank

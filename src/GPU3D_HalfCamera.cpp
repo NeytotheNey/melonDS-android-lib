@@ -246,9 +246,10 @@ struct HalfCamera::SceneInfo
     }
 };
 
-HalfCamera::HalfCamera(GPU3D& gpu, int mode) :
+HalfCamera::HalfCamera(GPU3D& gpu, int mode, bool isQuiet) :
     Main(gpu),
     Mode(mode),
+    IsQuiet(isQuiet),
     Shadow(new GPU3D(gpu.NDS, GPU3D::ShadowTag {})),
     Records(new RecordEntry[MaxRecords]),
     Start(new GeometryState),
@@ -297,16 +298,25 @@ bool HalfCamera::OnVBlank()
         History = 0;
 
     Total.VBlanks++;
-    Clock::time_point now = Clock::now();
-    if (now - LastLog >= std::chrono::seconds(1))
-        LogSecond(now);
+    if (!IsQuiet)
+    {
+        Clock::time_point now = Clock::now();
+        if (now - LastLog >= std::chrono::seconds(1))
+            LogSecond(now);
+    }
 
     return wasMid;
 }
 
 void HalfCamera::OnSwap()
 {
-    Clock::time_point start = Clock::now();
+    if (IsPaused)
+        return;
+
+    // the timers are only for the HALFCAM sec line
+    Clock::time_point start {};
+    if (!IsQuiet)
+        start = Clock::now();
     SceneInfo& current = *Scenes[Bank];
     const SceneInfo& previous = *Scenes[Bank ^ 1];
 
@@ -328,8 +338,12 @@ void HalfCamera::OnSwap()
         Total.MinShare = std::min(Total.MinShare, topVertices * 100.0f / current.NumVertices);
     }
 
-    Clock::time_point replayStart = Clock::now();
-    Total.AnalysisNs += std::chrono::duration_cast<std::chrono::nanoseconds>(replayStart - start).count();
+    Clock::time_point replayStart {};
+    if (!IsQuiet)
+    {
+        replayStart = Clock::now();
+        Total.AnalysisNs += std::chrono::duration_cast<std::chrono::nanoseconds>(replayStart - start).count();
+    }
 
     Reason reason = Decide(current, previous);
     if (reason == Reason_None)
@@ -343,20 +357,23 @@ void HalfCamera::OnSwap()
         else
             reason = Reason_Full;
 
-        s64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - replayStart).count();
-        Total.ReplayNs += ns;
-        Total.MaxReplayNs = std::max(Total.MaxReplayNs, ns);
+        if (!IsQuiet)
+        {
+            s64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - replayStart).count();
+            Total.ReplayNs += ns;
+            Total.MaxReplayNs = std::max(Total.MaxReplayNs, ns);
+        }
     }
 
     if (reason != Reason_None)
         Total.Skipped[reason]++;
 
-    if (Mode >= 3)
+    if (!IsQuiet && Mode >= 3)
     {
         CountDiagnostics(current, previous);
         LogScene(current, previous, reason);
     }
-    if (Mode >= 5 && Total.Replays != 0 && (reason == Reason_None || reason == Reason_Full))
+    if (!IsQuiet && Mode >= 5 && Total.Replays != 0 && (reason == Reason_None || reason == Reason_Full))
         LogPairs(current, previous);
 
     Bank ^= 1;
@@ -364,6 +381,9 @@ void HalfCamera::OnSwap()
 
 void HalfCamera::OnSceneStart()
 {
+    if (IsPaused)
+        return;
+
     CopyGeometry(*Start, Main);
     HasStart = true;
     NumRecords = 0;
@@ -1380,6 +1400,13 @@ void HalfCamera::Invalidate()
     NumMovingPrevious = 0;
     // a game that was capturing before may well be again
     FramesSinceCapture = 0;
+}
+
+void HalfCamera::SetPaused(bool isPaused)
+{
+    if (isPaused && !IsPaused)
+        Invalidate();
+    IsPaused = isPaused;
 }
 
 void HalfCamera::GetRealRenderList(const std::array<Polygon*, 2048>*& list, u32& numPolygons) const noexcept
