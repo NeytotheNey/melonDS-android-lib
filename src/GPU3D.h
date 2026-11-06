@@ -147,10 +147,13 @@ public:
     void SetVertexIdLogging(int mode) noexcept;
     [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
 
-    // debug only: an in-between 3D scene from a halfway camera (see GPU3D_HalfCamera.h). 0 is off, 1
-    // the camera only, 2 characters too, 3 logs the camera per scene as well, 4 also moves billboards
-    // with the camera, 5 also logs every pair. set before the game runs
+    // the debug switch for an in-between 3D scene from a halfway camera (see GPU3D_HalfCamera.h). 0 is
+    // off, 1 the camera only, 2 characters too, 3 logs the camera per scene as well, 4 also moves
+    // billboards with the camera, 5 also logs every pair. set before the game runs
     void SetHalfCamera(int mode) noexcept;
+    // the setting: the behavior of mode 4 with no logging, between frames at any time. nothing is
+    // allocated until the first time it's on, and after that off only pauses it. not with the debug switch
+    void SetHalfCameraSmoothing(bool isEnabled) noexcept;
     [[nodiscard]] int GetHalfCamera() const noexcept { return HalfCam ? HalfCam->GetMode() : 0; }
     // from GPU::StartScanline
     void NoteDisplayCapture(u32 captureCnt) noexcept { if (HalfCam) HalfCam->NoteCapture(captureCnt); }
