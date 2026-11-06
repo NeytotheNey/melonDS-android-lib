@@ -22,6 +22,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <vector>
 
 #include "types.h"
 
@@ -85,8 +86,42 @@ struct Polygon;
 //   anaus replayus maxus  average analysis time per scene, average and worst replay time
 //   subv poly             average vertices submitted and polygons kept per replay
 //
-// HALFCAM cam, per scene in mode 3: the top load's translation, its delta from the last scene's, the
+// HALFCAM cam, per scene in mode 3 and up: the top load's translation, its delta from the last scene's, the
 // largest change in a rotation word, its hash and share, and what was done with the scene
+//
+// billboards (mode 4 is mode 3 plus this): NitroSystem's SBC BB and BBY commands read the position matrix back
+// on the CPU and send it as an MTX_LOAD_4x3 (see NextReadbackStep). replay can't see that read, so those words
+// carry scene B's camera, and modes 1 to 3 draw the object at B's view position in a world that's halfway: half
+// a camera step off, every in-between frame. an object the camera follows, like the player, hardly moves in view
+// space, so it doesn't show on those. mode 4 reads the shadow's matrix at that point instead of using the sent
+// translation, and keeps the batch open through that load, so walking objects are paired by their placement as
+// well. the loads themselves aren't paired. their rotation and scale stay B's. a pair now moves the object for
+// real, so mode 4 doesn't pair by order either (see MatchMoving): in modes 2 and 3 the load hides a wrong pair.
+//
+// HALFCAM diag, once a second in mode 3 and up, as batches/vertices:
+//   dom same chg noload   runs of vertices under the top load, under another load also in the last scene, under
+//                         another load that isn't; and vertices under no load of this scene
+//   pair unp              moving batches paired and not
+//   pairid pairpos        mode 4: of pair, with the same palette and texture format, and with only the format
+//   pairfar pairmax       mode 4: the nearest partner was still too far on screen, and the longest pair, in the
+//                         units of the batch's matrix (world units if nothing scaled it)
+//   bb                    readback loads
+//   bbcam bbstill bbother of those matched by order in the last scene with a moved camera: moved exactly like the
+//                         camera (a world position from B's camera, which is what mode 4 fixes), didn't move
+//                         (following the camera), or anything else (walking, or culling shifted the order)
+//   bbfix bbmax           mode 4: translations replaced, and the largest change to a word, in view units. it
+//                         should be about half the camera step plus half the object's own step, and it's capped
+//                         at half the camera step plus 6
+//   bbunp bbrej           mode 4: left at B's because the object moved and has no partner, and because they were
+//                         over that cap, which means it probably isn't what was read back
+//   bbflush bbovf         the billboard path of the other flush types, where the load isn't the read back matrix
+//                         and nothing is fixed, and loads over the table size
+//
+// HALFCAM pair, mode 5, per in-between scene with anything moving: n=<scene> m=<moving in B>/<moving in A>, then per
+// moving batch of B (at most 8): v<vertices>g<billboard loads>@<x,y,z of its placement, in its matrix's units>, then
+// :<tier><index in A>,d<distance> for a pair, tier a same palette and texture address, p same palette, i only the same
+// texture format, or :far :rot :none for none. then after | the moving batches of A nobody took (at most 4), the ones
+// that vanished: <index in A>v<vertices>g<billboard loads>@<x,y,z>
 class HalfCamera
 {
 public:
@@ -172,6 +207,12 @@ private:
         u32 NearLoads, NearStatic, Paired, Unpaired, PairRotation;
         s64 AnalysisNs, ReplayNs, MaxReplayNs;
         u64 ReplayVertices, ReplayPolygons;
+        u32 TopGroups, SameLoadGroups, SameLoadVertices, ChangedLoadGroups, ChangedLoadVertices, NoLoadVerticesTotal;
+        u32 PairedVertices, UnpairedVertices;
+        u32 ReadbackLoads, ReadbackWithCamera, ReadbackStill, ReadbackOther, ReadbackFixed, ReadbackUnpaired, ReadbackRejected, ReadbackFlushPath, ReadbackOverflows;
+        s64 ReadbackMaxDistance;
+        u32 PairedByIdentity, PairedByPosition, PairTooFar;
+        s64 PairMaxDistance;
     };
 
     void Analyze(SceneInfo& scene);
@@ -179,8 +220,15 @@ private:
     [[nodiscard]] Reason Decide(const SceneInfo& current, const SceneInfo& previous) const;
     bool Replay(const SceneInfo& current, const SceneInfo& previous);
     void PatchCamera(const SceneInfo& current, const SceneInfo& previous);
-    void PairBatch(u32 movingIndex, const SceneInfo& current, const SceneInfo& previous);
-    [[nodiscard]] bool IsNearOnScreen(const s32* wordsA, const s32* wordsB) const;
+    u32 FindExtraBatches(const SceneInfo& scene, const SceneInfo& other, u16* moving);
+    void ResetShadow();
+    void CaptureBatchClips(const SceneInfo& current);
+    void LogPairs(const SceneInfo& current, const SceneInfo& previous) const;
+    void MatchMoving(const SceneInfo& current, const SceneInfo& previous);
+    bool PairBatch(u32 movingIndex, const SceneInfo& current, const SceneInfo& previous);
+    void FixReadbackLoad(u32 recordIndex);
+    void CountDiagnostics(const SceneInfo& current, const SceneInfo& previous);
+    [[nodiscard]] bool IsNearOnScreen(const s32* clip, const s32* wordsA, const s32* wordsB, double maxX, double maxY) const;
     void ShowReplayedScene();
     void RestoreRealScene();
     void LogScene(const SceneInfo& current, const SceneInfo& previous, Reason reason) const;
@@ -210,6 +258,29 @@ private:
     u32 NumMovingCurrent = 0;
     u32 NumMovingPrevious = 0;
     u32 PairCursor = 0;
+    // mode 4: per moving batch of the current scene, its partner in MovingPrevious or -1, the tier that found it, and
+    // whether a candidate was only left out for its rotation. worked out before each replay
+    struct PairCandidate
+    {
+        s64 Distance;
+        u16 Current;
+        u16 Previous;
+    };
+    std::unique_ptr<s16[]> PartnerCurrent;
+    std::unique_ptr<u8[]> PartnerTier;
+    std::unique_ptr<bool[]> PartnerRotationFar;
+    std::unique_ptr<bool[]> PartnerTooFar;
+    std::unique_ptr<std::array<s32, 16>[]> BatchClips;
+    struct KeyEntry
+    {
+        u64 Key;
+        u16 Index;
+    };
+    std::vector<KeyEntry> KeyOrder;
+    std::unique_ptr<bool[]> IsExtra;
+    std::unique_ptr<bool[]> IsPartnerUsed;
+    std::vector<PairCandidate> PairCandidates;
+    s64 ReadbackBound = 0;
 
     u32 History = 0;
     u32 FramesSinceCapture = 0;

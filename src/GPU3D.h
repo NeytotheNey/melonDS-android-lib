@@ -148,7 +148,8 @@ public:
     [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
 
     // debug only: an in-between 3D scene from a halfway camera (see GPU3D_HalfCamera.h). 0 is off, 1
-    // the camera only, 2 characters too, 3 logs the camera per scene as well. set before the game runs
+    // the camera only, 2 characters too, 3 logs the camera per scene as well, 4 also moves billboards
+    // with the camera, 5 also logs every pair. set before the game runs
     void SetHalfCamera(int mode) noexcept;
     [[nodiscard]] int GetHalfCamera() const noexcept { return HalfCam ? HalfCam->GetMode() : 0; }
     // from GPU::StartScanline
