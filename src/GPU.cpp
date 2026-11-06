@@ -1790,6 +1790,17 @@ void GPU::StartScanline(u32 line) noexcept
                 }
             }
 
+            // a capture armed since the render at line 215, which may have drawn HalfCamera's in-between
+            // scene: VBlankEnd is about to read the 3D back, and that can't go into VRAM. same order as line 215
+            if (GPU3D.NeedsRealSceneRedraw())
+            {
+                if (BlitPending)
+                    Sync2D();
+                if (Deferred2DPending)
+                    Flush2DDeferred();
+                GPU3D.RedrawRealScene(*this);
+            }
+
             GPU2D_Renderer->VBlankEnd(&GPU2D_A, &GPU2D_B);
             GPU2D_A.VBlankEnd();
             GPU2D_B.VBlankEnd();
@@ -1837,6 +1848,10 @@ void GPU::StartScanline(u32 line) noexcept
 
             if (DispStat[0] & (1<<3)) NDS.SetIRQ(0, IRQ_VBlank);
             if (DispStat[1] & (1<<3)) NDS.SetIRQ(1, IRQ_VBlank);
+
+            // before GPU2D_A.VBlank() ends the capture
+            if (GPU2D_A.CaptureLatch)
+                GPU3D.NoteDisplayCapture(GPU2D_A.CaptureCnt);
 
             GPU2D_A.VBlank();
             GPU2D_B.VBlank();

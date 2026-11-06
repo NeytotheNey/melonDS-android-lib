@@ -24,6 +24,8 @@
 
 #include "Savestate.h"
 #include "FIFO.h"
+#include "GPU3D_VertexId.h"
+#include "GPU3D_HalfCamera.h"
 
 namespace melonDS
 {
@@ -89,6 +91,9 @@ class GPU3D
 {
 public:
     GPU3D(melonDS::NDS& nds, std::unique_ptr<Renderer3D>&& renderer = nullptr) noexcept;
+    // a GPU3D that only runs replayed commands for HalfCamera: no renderer, and nothing reaches the NDS
+    struct ShadowTag {};
+    GPU3D(melonDS::NDS& nds, ShadowTag) noexcept;
     ~GPU3D() noexcept = default;
     void Reset() noexcept;
 
@@ -136,7 +141,24 @@ public:
     void Write16(u32 addr, u16 val) noexcept;
     void Write32(u32 addr, u32 val) noexcept;
     void Blit(const GPU& gpu) noexcept;
+
+    // debug only: logs VERTEXID lines (see GPU3D_VertexId.h). 0 is off, 1 a line per second, 2 a line
+    // per scene as well. set before the game runs
+    void SetVertexIdLogging(int mode) noexcept;
+    [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
+
+    // debug only: an in-between 3D scene from a halfway camera (see GPU3D_HalfCamera.h). 0 is off, 1
+    // the camera only, 2 characters too, 3 logs the camera per scene as well, 4 also moves billboards
+    // with the camera, 5 also logs every pair. set before the game runs
+    void SetHalfCamera(int mode) noexcept;
+    [[nodiscard]] int GetHalfCamera() const noexcept { return HalfCam ? HalfCam->GetMode() : 0; }
+    // from GPU::StartScanline
+    void NoteDisplayCapture(u32 captureCnt) noexcept { if (HalfCam) HalfCam->NoteCapture(captureCnt); }
+    [[nodiscard]] bool NeedsRealSceneRedraw() const noexcept { return HalfCam && HalfCam->NeedsRedraw(); }
+    void RedrawRealScene(GPU& gpu) noexcept { HalfCam->Redraw(gpu); }
 private:
+    friend class HalfCamera;
+
     melonDS::NDS& NDS;
     typedef union
     {
@@ -162,6 +184,10 @@ private:
     void VecTest(u32 param) noexcept;
     void CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept;
     CmdFIFOEntry CmdFIFORead() noexcept;
+    void RunCommand(CmdFIFOEntry entry) noexcept;
+    // one FIFO word of a replayed scene. only for the shadow, it does what ExecuteCommand does without the FIFO
+    void ReplayEntry(u8 command, u32 param) noexcept;
+    [[nodiscard]] static u32 NumCommandParams(u8 command) noexcept;
     void FinishWork(s32 cycles) noexcept;
     void VertexPipelineSubmitCmd() noexcept
     {
@@ -199,6 +225,10 @@ private:
 
     u16 RenderXPos = 0;
     int ViewWidth = 256;
+
+    // only allocated while the logging is on, not serialized
+    std::unique_ptr<VertexIdLogger> VertexIdLog;
+    std::unique_ptr<HalfCamera> HalfCam;
 
 public:
     FIFO<CmdFIFOEntry, 256> CmdFIFO {};
@@ -366,6 +396,9 @@ public:
     // submits the queued GPU work without waiting for it, so the GPU starts on what display
     // capture will read back (see GPU::StartHBlank at line 215 and SoftRenderer::VBlankEnd)
     virtual void FlushCommands() {}
+    // whether RenderFrame can be given polygons from HalfCamera's buffers: it only reads them during the
+    // call, on the emulator thread, so they can change after it returns
+    [[nodiscard]] virtual bool CanDrawReplayedScene() const noexcept { return false; }
     // whether GPU::BlitFlushCapture flushes right after the line-192 Blit in capture frames. only
     // the compute renderer gains from it; with classic OpenGL it cost ~9% more GPU cycles for no fps
     virtual bool FlushAfterCaptureBlit() const { return false; }

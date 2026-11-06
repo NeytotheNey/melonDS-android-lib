@@ -40,6 +40,10 @@ add_library(core STATIC
     GPU3D_Soft.cpp
     GPU3D_Texcache.cpp
     GPU3D_Texcache.h
+    GPU3D_HalfCamera.cpp
+    GPU3D_HalfCamera.h
+    GPU3D_VertexId.cpp
+    GPU3D_VertexId.h
     melonDLDI.h
     Mic.cpp
     NDS.cpp
