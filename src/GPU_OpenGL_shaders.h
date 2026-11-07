@@ -128,8 +128,8 @@ void main()
 // kCompositorFS_Nearest_Main (see GLCompositor::CompositorFS)
 const char* kCompositorFS_Nearest_Head = R"(#version 320 es
 
-#ifdef WIDE
-// wide coordinates need more precision than mediump (which can be fp16) has
+#if defined(WIDE) || defined(FILTER2D)
+// wide and filtered coordinates need more precision than mediump (which can be fp16) has
 precision highp float;
 #else
 precision mediump float;
@@ -153,7 +153,21 @@ uniform int uHiresCap;
 uniform highp usampler2D HiresBankTex;
 uniform highp usampler2D HiresStreamTex;
 
+#ifdef FILTER2D
+// filtered 2D (see GLCompositor::RunFilter2D): for each sub-pixel, the native pixel of its screen
+// to read planes 0-2 from. uFilterMapScale is how many map texels a native pixel has.
+// uFilterIdentity is debug.melonade.filter2d 3, see FilterRowCoord
+uniform int uFilterMapScale;
+uniform int uFilterIdentity;
+uniform highp usampler2D FilterMapTex;
+#endif
+
+#if defined(FILTER2D) && !defined(WIDE)
+// as with the filter off, for the identity mode, which has to round the same way
+smooth in mediump vec2 fTexcoord;
+#else
 smooth in vec2 fTexcoord;
+#endif
 
 layout(location = 0) out vec4 oColor;
 )";
@@ -216,6 +230,67 @@ ivec4 WingPixel()
 }
 #endif
 
+#ifdef FILTER2D
+// this sub-pixel's position in the map's rows, which have no gap between the screens, unlike the
+// output, in sub-pixels of the middle 256. fTexcoord can't give it: as fp16 it can round a
+// sub-pixel into the next native pixel
+highp ivec2 FilterSubPixel()
+{
+    highp ivec2 coord = ivec2(gl_FragCoord.xy);
+    highp int scale = int(u3DScale);
+    if (coord.y >= 194 * scale)
+        coord.y -= 2 * scale;
+#ifdef WIDE
+    coord.x -= uWideOffset * scale;
+#endif
+    return clamp(coord, ivec2(0), ivec2(256 * scale - 1, 384 * scale - 1));
+}
+
+// what the sub-pixel reads when the map doesn't move it. the real native pixel, except in the
+// identity mode, which has to match the filter off to the byte, rounding included
+ivec2 FilterRowCoord(highp ivec2 native)
+{
+    return uFilterIdentity != 0 ? ivec2(fTexcoord) : native;
+}
+
+// where the sub-pixel reads planes 0-2: the map's entry, unless that's on a line with another
+// display mode, as not every mode writes planes 1 and 2
+ivec2 FilterPlaneCoord(highp ivec2 subPixel, highp ivec2 native, ivec2 rowCoord, int dispmode)
+{
+    // by the sub-pixel's center, so at scales the map doesn't divide evenly every sub-pixel still
+    // lands in its own native pixel. the mask is for Adreno, see the end of kHiresCaptureFS_Main
+    highp ivec2 mapCoord = (2 * subPixel + 1) * uFilterMapScale / (2 * int(u3DScale));
+    highp uint entry = texelFetch(FilterMapTex, mapCoord, 0).r;
+    highp ivec2 source = ivec2(int(entry & 0xFFu), int((entry >> 8) & 0xFFu) + (native.y >= 192 ? 192 : 0));
+
+    if (source == native)
+        return rowCoord;
+    if (source.y != native.y && (int(texelFetch(ScreenTex, ivec2(256*3, source.y), 0).b) & 0x3) != dispmode)
+        return rowCoord;
+    return source;
+}
+
+// the 3D pixel at this sub-pixel. in the middle-only program, from its exact position, except that
+// the identity mode repeats the filter off's maths at mediump. the wide program is already highp
+ivec4 FilterFetch3D(float xscroll, highp ivec2 subPixel)
+{
+#ifdef WIDE
+    return Fetch3D(fTexcoord.x + xscroll, mod(fTexcoord.y, 192.0));
+#else
+    if (uFilterIdentity != 0)
+    {
+        mediump float scroll = xscroll;
+        mediump float scale = float(u3DScale);
+        mediump vec2 pos = vec2(fTexcoord.x + scroll, mod(fTexcoord.y, 192.0)) * scale;
+        return ivec4(texelFetch(_3DTex, ivec2(pos), 0).bgra * vec4(63,63,63,31));
+    }
+
+    highp vec2 pos = (vec2(subPixel) + 0.5) / float(u3DScale);
+    return Fetch3D(pos.x + xscroll, mod(pos.y, 192.0));
+#endif
+}
+#endif
+
 void main()
 {
 #ifdef WIDE
@@ -245,10 +320,19 @@ void main()
     }
 #endif
 
-    ivec4 pixel = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord), 0));
-
+#ifdef FILTER2D
+    highp ivec2 subPixel = FilterSubPixel();
+    highp ivec2 native = subPixel / int(u3DScale);
+    ivec2 rowCoord = FilterRowCoord(native);
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, rowCoord.y), 0));
+    int dispmode = mbright.b & 0x3;
+    ivec2 planeCoord = FilterPlaneCoord(subPixel, native, rowCoord, dispmode);
+#else
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
+    ivec2 planeCoord = ivec2(fTexcoord);
+#endif
+    ivec4 pixel = ivec4(texelFetch(ScreenTex, planeCoord, 0));
 
     // mbright.a == HOFS bit0..7
     // mbright.b bit7 == HOFS bit8 (sign)
@@ -278,13 +362,17 @@ void main()
     }
     else if (dispmode == 1)
     {
-        ivec4 val2 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(256,0), 0));
-        ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(512,0), 0));
+        ivec4 val2 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(256,0), 0));
+        ivec4 val3 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(512,0), 0));
 
         // the 3D pixel, for the compmodes that show 3D (0-4)
         ivec4 _3dpix = ivec4(0);
         if ((val3.a & 0xF) <= 4)
+#ifdef FILTER2D
+            _3dpix = FilterFetch3D(_3dxpos, subPixel);
+#else
             _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
+#endif
 
         bool opaque;
         pixel = CompositePixel(pixel, val2, val3, _3dpix, opaque);
@@ -480,6 +568,252 @@ void main()
     // the mask is for Adreno 840 (driver 0842.19.11): without it, a word with bit 15 set has high
     // bits set by here, which the R16UI target saturates to 0xFFFF, so anything opaque came out white
     oWord = uvec4(word & 0xFFFFu, 0u, 0u, 0u);
+}
+)";
+
+// filtered 2D (GLCompositor::RunFilter2D). both programs draw kHiresCaptureVS's triangle over their
+// target, and write a texel of two words:
+// - r: the native pixel it shows, as x | (y << 8), y counted from the top of its screen, since a
+//   map entry never leaves the sub-pixel's screen. this keeps a map in R16UI.
+// - g: the key MMPX compares, the color in 6 bits per channel (bits 0-17) and:
+//     bit 18: a 3D slot, where the color is what shows if the 3D is transparent there;
+//     bit 19: a line that stays as it is. the rest of the key is then the pixel's position,
+//             so no two pixels on such lines compare equal and MMPX can't pick them or change them.
+const char* kFilter2DKeyFS = R"(#version 320 es
+
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+uniform usampler2D ScreenTex;
+uniform int uHiresCap;
+
+layout(location = 0) out uvec4 oTexel;
+
+void main()
+{
+    ivec2 pos = ivec2(gl_FragCoord.xy);
+    uvec4 ctrl = texelFetch(ScreenTex, ivec2(256*3, pos.y), 0);
+    uint dispmode = ctrl.b & 0x3u;
+
+    uint key;
+    if (dispmode >= 2u || (uHiresCap != 0 && (ctrl.r & 0x80u) != 0u))
+    {
+        key = 0x80000u | uint(pos.x) | (uint(pos.y) << 8);
+    }
+    else
+    {
+        // dispmode 0 only reads plane 0
+        uvec4 color = texelFetch(ScreenTex, pos, 0);
+        uint slot3D = 0u;
+        if (dispmode == 1u && (texelFetch(ScreenTex, pos + ivec2(512, 0), 0).a & 0xFu) <= 4u)
+        {
+            color = texelFetch(ScreenTex, pos + ivec2(256, 0), 0);
+            slot3D = 0x40000u;
+        }
+
+        key = (color.r & 0x3Fu) | ((color.g & 0x3Fu) << 6) | ((color.b & 0x3Fu) << 12) | slot3D;
+    }
+
+    oTexel = uvec4(uint(pos.x) | (uint(pos.y % 192) << 8), key, 0u, 0u);
+}
+)";
+
+// MMPX
+// by Morgan McGuire and Mara Gagiu
+// https://casual-effects.com/research/McGuire2021PixelArt/
+// License: MIT
+//
+// Copyright 2020 Morgan McGuire & Mara Gagiu
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+// adapted for glsl by hunterk
+//
+// the rules are the same as the app's MmpxPrePassShader (ShaderProgramSource.kt), which only ever
+// assigns a neighbor to J, K, L or M and never blends. here a "color" is a texel from the previous
+// pass (see above): the comparisons and the luminances use its key, and what gets picked carries
+// the native pixel with it. the output is twice the size of SrcTex.
+const char* kFilter2DMmpxFS = R"(#version 320 es
+
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+uniform usampler2D SrcTex;
+uniform int uSrcW;      // SrcTex's width, 256 or 512
+uniform int uScreenH;   // the rows one screen has in SrcTex, half its height
+uniform int uIdentity;  // write every sub-pixel's own native pixel (debug.melonade.filter2d 3)
+
+layout(location = 0) out uvec4 oTexel;
+
+ivec2 gFrag;    // this texel in the output
+ivec2 gPos;     // this texel's pixel in SrcTex
+int gRowMin;    // SrcTex's first row of this pixel's screen
+
+// the source texel x, y texels away from this one (y grows downwards, rows are DS lines), kept
+// inside this pixel's screen. x is the native pixel, y the key
+uvec2 src(int x, int y)
+{
+    ivec2 pos = clamp(gPos + ivec2(x, y), ivec2(0, gRowMin), ivec2(uSrcW - 1, gRowMin + uScreenH - 1));
+    return texelFetch(SrcTex, pos, 0).rg;
+}
+
+// BT.709 scaled to integers. a line that stays as it is never counts as darker, so the rules that
+// pick a darker neighbor without comparing it to anything else (the tips below) can't pick it
+int luma(uvec2 c)
+{
+    if ((c.y & 0x80000u) != 0u)
+        return 0x7FFFFFFF;
+    return int(c.y & 0x3Fu) * 2126 + int((c.y >> 6) & 0x3Fu) * 7152 + int((c.y >> 12) & 0x3Fu) * 722;
+}
+
+bool same(uvec2 B, uvec2 A0) { return B.y == A0.y; }
+bool notsame(uvec2 B, uvec2 A0) { return B.y != A0.y; }
+bool all_eq2(uvec2 B, uvec2 A0, uvec2 A1) { return same(B, A0) && same(B, A1); }
+bool all_eq3(uvec2 B, uvec2 A0, uvec2 A1, uvec2 A2) { return same(B, A0) && same(B, A1) && same(B, A2); }
+bool all_eq4(uvec2 B, uvec2 A0, uvec2 A1, uvec2 A2, uvec2 A3) { return same(B, A0) && same(B, A1) && same(B, A2) && same(B, A3); }
+bool any_eq3(uvec2 B, uvec2 A0, uvec2 A1, uvec2 A2) { return same(B, A0) || same(B, A1) || same(B, A2); }
+bool none_eq2(uvec2 B, uvec2 A0, uvec2 A1) { return notsame(B, A0) && notsame(B, A1); }
+bool none_eq4(uvec2 B, uvec2 A0, uvec2 A1, uvec2 A2, uvec2 A3) { return notsame(B, A0) && notsame(B, A1) && notsame(B, A2) && notsame(B, A3); }
+
+void writeTexel(uvec2 picked)
+{
+    uint coord = picked.x;
+    if (uIdentity != 0)
+    {
+        ivec2 native = gFrag / (uSrcW / 128);
+        coord = uint(native.x) | (uint(native.y % 192) << 8);
+    }
+
+    // the mask for the R16UI maps: see the Adreno note at the end of kHiresCaptureFS_Main
+    oTexel = uvec4(coord & 0xFFFFu, picked.y, 0u, 0u);
+}
+
+void main()
+{
+    gFrag = ivec2(gl_FragCoord.xy);
+    gPos = gFrag >> 1;
+    gRowMin = gPos.y >= uScreenH ? uScreenH : 0;
+
+    // Our current pixel
+    uvec2 E = src(0, 0);
+
+    // Input: A-I central 3x3 grid
+    uvec2 A = src(-1, -1);
+    uvec2 B = src(0, -1);
+    uvec2 C = src(1, -1);
+
+    uvec2 D = src(-1, 0);
+    uvec2 F = src(1, 0);
+
+    uvec2 G = src(-1, 1);
+    uvec2 H = src(0, 1);
+    uvec2 I = src(1, 1);
+
+    // Default to nearest magnification
+    uvec2 J = E;
+    uvec2 K = E;
+    uvec2 L = E;
+    uvec2 M = E;
+
+    // Skip constant 3x3 centers and just use nearest-neighbor them
+    if (same(E, A) && same(E, B) && same(E, C) && same(E, D) && same(E, F) && same(E, G) && same(E, H) && same(E, I))
+    {
+        writeTexel(E);
+        return;
+    }
+
+    // Read additional values at the tips of the diamond pattern
+    uvec2 P = src(0, -2);
+    uvec2 Q = src(-2, 0);
+    uvec2 R = src(2, 0);
+    uvec2 S = src(0, 2);
+
+    // Precompute luminances
+    int Bl = luma(B);
+    int Dl = luma(D);
+    int El = luma(E);
+    int Fl = luma(F);
+    int Hl = luma(H);
+
+    // Round some corners and fill in 1:1 slopes, but preserve sharp right angles. In each expression the 1st clause is from EPX, the 2nd
+    // avoids double diagonal filling on 1:1 slopes (luminance breaks the tie for thick features), the 3rd preserves square corners and the
+    // 4th keeps 1-pixel bumps on straight lines that are darker than their background (like the tail of a pixel art 4)
+    if (((same(D, B) && notsame(D, H) && notsame(D, F))) && ((El >= Dl) || same(E, A)) && any_eq3(E, A, C, G) && ((El < Dl) || notsame(A, D) || notsame(E, P) || notsame(E, Q))) J = D;
+    if (((same(B, F) && notsame(B, D) && notsame(B, H))) && ((El >= Bl) || same(E, C)) && any_eq3(E, A, C, I) && ((El < Bl) || notsame(C, B) || notsame(E, P) || notsame(E, R))) K = B;
+    if (((same(H, D) && notsame(H, F) && notsame(H, B))) && ((El >= Hl) || same(E, G)) && any_eq3(E, A, G, I) && ((El < Hl) || notsame(G, H) || notsame(E, S) || notsame(E, Q))) L = H;
+    if (((same(F, H) && notsame(F, B) && notsame(F, D))) && ((El >= Fl) || same(E, I)) && any_eq3(E, C, G, I) && ((El < Fl) || notsame(I, H) || notsame(E, R) || notsame(E, S))) M = F;
+
+    // Clean up disconnected line intersections. The 1st clause recognizes being on the inside of a diagonal corner, the 2nd makes sure
+    // that it is not a notch at the edge of a checkerboard dithering pattern
+    if ((notsame(E, F) && all_eq4(E, C, I, D, Q) && all_eq2(F, B, H)) && notsame(F, src(3, 0))) K = M = F;
+    if ((notsame(E, D) && all_eq4(E, A, G, F, R) && all_eq2(D, B, H)) && notsame(D, src(-3, 0))) J = L = D;
+    if ((notsame(E, H) && all_eq4(E, G, I, B, P) && all_eq2(H, D, F)) && notsame(H, src(0, 3))) L = M = H;
+    if ((notsame(E, B) && all_eq4(E, A, C, H, S) && all_eq2(B, D, F)) && notsame(B, src(0, -3))) J = K = B;
+
+    // Remove tips of bright triangles on dark backgrounds
+    if ((Bl < El) && all_eq4(E, G, H, I, S) && none_eq4(E, A, D, C, F)) J = K = B;
+    if ((Hl < El) && all_eq4(E, A, B, C, P) && none_eq4(E, D, G, I, F)) L = M = H;
+    if ((Fl < El) && all_eq4(E, A, D, G, Q) && none_eq4(E, B, C, I, H)) K = M = F;
+    if ((Dl < El) && all_eq4(E, C, F, I, R) && none_eq4(E, B, A, G, H)) J = L = D;
+
+    // Further neighborhood peeking to identify 2:1 and 1:2 slopes of constant color. These extend a color assigned by the rules above
+    // instead of drawing from the source image
+    if (notsame(H, B))
+    {
+        // Above a 2:1 slope or -2:1 slope
+        if (notsame(H, A) && notsame(H, E) && notsame(H, C))
+        {
+            if (all_eq3(H, G, F, R) && none_eq2(H, D, src(2, -1))) L = M;
+            if (all_eq3(H, I, D, Q) && none_eq2(H, F, src(-2, -1))) M = L;
+        }
+
+        // Below a 2:1 or -2:1 slope (the above patterns reflected vertically)
+        if (notsame(B, I) && notsame(B, G) && notsame(B, E))
+        {
+            if (all_eq3(B, A, F, R) && none_eq2(B, D, src(2, 1))) J = K;
+            if (all_eq3(B, C, D, Q) && none_eq2(B, F, src(-2, 1))) K = J;
+        }
+    }
+
+    if (notsame(F, D))
+    {
+        // Right of a -1:2 or 1:2 slope (the left patterns below reflected horizontally)
+        if (notsame(D, I) && notsame(D, E) && notsame(D, C))
+        {
+            if (all_eq3(D, A, H, S) && none_eq2(D, B, src(1, 2))) J = L;
+            if (all_eq3(D, G, B, P) && none_eq2(D, H, src(1, -2))) L = J;
+        }
+
+        // Left of a 1:2 or -1:2 slope (the 2:1 patterns above transposed)
+        if (notsame(F, E) && notsame(F, A) && notsame(F, G))
+        {
+            if (all_eq3(F, C, H, S) && none_eq2(F, B, src(-1, 2))) K = M;
+            if (all_eq3(F, I, B, P) && none_eq2(F, H, src(-1, -2))) M = K;
+        }
+    }
+
+    // Determine which of our 4 output pixels we need to use
+    bool left = (gFrag.x & 1) == 0;
+    bool top = (gFrag.y & 1) == 0;
+    writeTexel(left ? (top ? J : L) : (top ? K : M));
 }
 )";
 

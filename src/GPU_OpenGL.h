@@ -204,6 +204,44 @@ private:
     void CheckHiresCapture(const GPU& gpu, int bank, int rowStart, int rows) noexcept;
 #endif
 
+    // filtered 2D (see GPU::Filter2D and RunFilter2D). everything here is made the first time a
+    // frame needs it, and the textures go at a scale change or when the filter goes off. the
+    // compositor programs are the usual ones with FILTER2D defined, one for each of the view's
+    // widths, so a frame without the filter runs exactly what it would without this
+    static constexpr int Filter2DMapUnit = 9;
+    struct Filter2DProgram
+    {
+        GLuint Program = 0;
+        GLuint ScaleLoc = 0, RatioLoc = 0, OffsetLoc = 0, HiresCapLoc = 0, MapScaleLoc = 0, IdentityLoc = 0;
+    };
+    struct Filter2DState
+    {
+        GLuint KeyTex = 0, KeyFB = 0;       // GL_RG32UI 256x384: each native pixel's texel
+        GLuint Map2xTex = 0, Map2xFB = 0;   // GL_RG32UI 512x768: the first pass's, when a second one reads it
+        GLuint MapTex = 0, MapFB = 0;       // GL_R16UI 256x384 at MapScale: what the compositor reads
+        int MapScale = 0;
+
+        bool Failed = false;                // a program didn't build or a target isn't complete
+        GLuint KeyShader = 0;
+        GLuint KeyHiresCapLoc = 0;
+        GLuint MmpxShader = 0;
+        GLuint MmpxSrcWLoc = 0, MmpxScreenHLoc = 0, MmpxIdentityLoc = 0;
+        std::array<Filter2DProgram, 2> Comp {}; // middle only, wide
+
+        // the FILTER2D log, GPU::Filter2DLogging only
+        s64 LogStartNs = 0;
+        u32 LogFrames = 0;
+    };
+    Filter2DState Filter2D {};
+
+    int PrepareFilter2D(const GPU& gpu, bool hasFramebuffers) noexcept;
+    bool PrepareFilter2DShaders(bool wide) noexcept;
+    bool MakeFilter2DTarget(GLuint& texture, GLuint& fb, GLenum format, int width, int height) noexcept;
+    void RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, int passes) noexcept;
+    void FreeFilter2DTextures() noexcept;
+    void FreeFilter2D() noexcept;
+    void LogFilter2D(const GPU& gpu, int passes) noexcept;
+
     GLuint CompVertexBufferID = 0;
     GLuint CompVertexArrayID = 0;
 

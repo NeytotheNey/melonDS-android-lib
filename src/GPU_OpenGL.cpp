@@ -152,6 +152,7 @@ GLCompositor::~GLCompositor()
     glDeleteFramebuffers(1, &HeldWingsFB);
     glDeleteTextures(1, &HeldWingsTex);
     FreeHiresCapture();
+    FreeFilter2D();
 
     glDeleteVertexArrays(1, &CompVertexArrayID);
     glDeleteBuffers(1, &CompVertexBufferID);
@@ -182,6 +183,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     HeldWingsW(other.HeldWingsW),
     HeldWingsH(other.HeldWingsH),
     HiresCap(other.HiresCap),
+    Filter2D(other.Filter2D),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -193,6 +195,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     other.HeldWingsTex = {};
     other.HeldWingsFB = {};
     other.HiresCap = {};
+    other.Filter2D = {};
     other.CompScreenOutputFB = {};
     other.CompScreenInputTex = {};
     other.CompScreenOutputTex = {};
@@ -255,9 +258,13 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         FreeHiresCapture();
         HiresCap = other.HiresCap;
 
+        FreeFilter2D();
+        Filter2D = other.Filter2D;
+
         other.HeldWingsTex = {};
         other.HeldWingsFB = {};
         other.HiresCap = {};
+        other.Filter2D = {};
         other.CompScreenOutputFB = {};
         other.CompScreenInputTex = {};
         other.CompScreenOutputTex = {};
@@ -320,7 +327,10 @@ void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
 
     // the hi-res capture copies are at the scale, a view width change keeps them
     if (scale != Scale)
+    {
         FreeHiresBanks();
+        FreeFilter2DTextures();
+    }
 
     Scale = scale;
     ViewWidth = viewWidth;
@@ -538,6 +548,10 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // after the wing hold, which fills CtrlWords when it runs
     bool hiresDisplay = hasFramebuffers && PrepareHiresDisplay(gpu, backbuf, wingHold);
 
+    // before the output is bound too, as this can set up the filter's framebuffers
+    int filterPasses = PrepareFilter2D(gpu, hasFramebuffers);
+    const Filter2DProgram& filterComp = Filter2D.Comp[ViewWidth != 256];
+
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
 
@@ -549,7 +563,20 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     glViewport(0, 0, ScreenW, ScreenH);
 
     // TODO: select more shaders (filtering, etc)
-    if (ViewWidth == 256)
+    if (filterPasses > 0)
+    {
+        glUseProgram(filterComp.Program);
+        glUniform1ui(filterComp.ScaleLoc, Scale);
+        glUniform1i(filterComp.HiresCapLoc, hiresDisplay);
+        glUniform1i(filterComp.MapScaleLoc, Filter2D.MapScale);
+        glUniform1i(filterComp.IdentityLoc, gpu.Filter2D == 3);
+        if (ViewWidth != 256)
+        {
+            glUniform1f(filterComp.RatioLoc, ViewWidth / 256.0f);
+            glUniform1i(filterComp.OffsetLoc, (ViewWidth - 256) / 2);
+        }
+    }
+    else if (ViewWidth == 256)
     {
         glUseProgram(CompShader);
         glUniform1ui(CompScaleLoc, Scale);
@@ -562,7 +589,10 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1f(CompWideRatioLoc, ViewWidth / 256.0f);
         glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
         glUniform1i(CompWideHiresCapLoc, hiresDisplay);
+    }
 
+    if (ViewWidth != 256)
+    {
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
     }
@@ -596,6 +626,13 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
                             GL_UNSIGNED_BYTE, CtrlWords.data());
     }
 
+    // after the upload: the pre-pass reads the frame's planes and the final control words
+    if (filterPasses > 0)
+    {
+        RunFilter2D(gpu, backbuf, hiresDisplay, filterPasses);
+        glUseProgram(filterComp.Program);
+    }
+
     glActiveTexture(GL_TEXTURE1);
     renderer.SetupAccelFrame();
 
@@ -611,6 +648,228 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         RunHiresCapture(gpu, backbuf);
     if (gpu.HiresCaptureDebug)
         LogHiresCapture();
+    if (gpu.Filter2DLogging)
+        LogFilter2D(gpu, filterPasses);
+}
+
+// filtered 2D: how many MMPX passes this frame gets, 0 for none, and everything they need is made.
+// there's nothing to filter at scale 1, and without the frame's lines the screen texture is stale
+int GLCompositor::PrepareFilter2D(const GPU& gpu, bool hasFramebuffers) noexcept
+{
+    if (gpu.Filter2D == 0 || Scale < 2)
+    {
+        FreeFilter2DTextures();
+        return 0;
+    }
+    if (!hasFramebuffers || Filter2D.Failed || !PrepareFilter2DShaders(ViewWidth != 256))
+        return 0;
+
+    // scales above 4 read the 4x map, and scale 3 the 2x one
+    int passes = (Scale >= 4 && gpu.Filter2D != 2) ? 2 : 1;
+    int mapScale = passes == 2 ? 4 : 2;
+    if (Filter2D.MapScale != mapScale)
+    {
+        FreeFilter2DTextures();
+        bool made = MakeFilter2DTarget(Filter2D.KeyTex, Filter2D.KeyFB, GL_RG32UI, 256, 384);
+        if (made && passes == 2)
+            made = MakeFilter2DTarget(Filter2D.Map2xTex, Filter2D.Map2xFB, GL_RG32UI, 512, 768);
+        if (made)
+            made = MakeFilter2DTarget(Filter2D.MapTex, Filter2D.MapFB, GL_R16UI, 256 * mapScale, 384 * mapScale);
+        if (!made)
+        {
+            Log(LogLevel::Error, "FILTER2D: incomplete framebuffer, staying off\n");
+            FreeFilter2DTextures();
+            Filter2D.Failed = true;
+            return 0;
+        }
+        Filter2D.MapScale = mapScale;
+    }
+
+    return passes;
+}
+
+bool GLCompositor::PrepareFilter2DShaders(bool wide) noexcept
+{
+    if (!Filter2D.KeyShader)
+    {
+        GLuint shader {};
+        if (!OpenGL::CompileVertexFragmentProgram(shader, kHiresCaptureVS, kFilter2DKeyFS,
+                "Filter2DKeyShader", {}, {{"oTexel", 0}}))
+        {
+            Filter2D.Failed = true;
+            return false;
+        }
+
+        Filter2D.KeyShader = shader;
+        Filter2D.KeyHiresCapLoc = glGetUniformLocation(shader, "uHiresCap");
+        glUseProgram(shader);
+        glUniform1i(glGetUniformLocation(shader, "ScreenTex"), 0);
+    }
+
+    if (!Filter2D.MmpxShader)
+    {
+        GLuint shader {};
+        if (!OpenGL::CompileVertexFragmentProgram(shader, kHiresCaptureVS, kFilter2DMmpxFS,
+                "Filter2DMmpxShader", {}, {{"oTexel", 0}}))
+        {
+            Filter2D.Failed = true;
+            return false;
+        }
+
+        Filter2D.MmpxShader = shader;
+        Filter2D.MmpxSrcWLoc = glGetUniformLocation(shader, "uSrcW");
+        Filter2D.MmpxScreenHLoc = glGetUniformLocation(shader, "uScreenH");
+        Filter2D.MmpxIdentityLoc = glGetUniformLocation(shader, "uIdentity");
+        glUseProgram(shader);
+        glUniform1i(glGetUniformLocation(shader, "SrcTex"), Filter2DMapUnit);
+    }
+
+    Filter2DProgram& comp = Filter2D.Comp[wide];
+    if (!comp.Program)
+    {
+        // which has to come after the #version line, as in PrepareWide
+        std::string vs = kCompositorVS;
+        std::string fs = CompositorFS();
+        if (wide)
+            vs.insert(vs.find('\n') + 1, "#define WIDE\n");
+        fs.insert(fs.find('\n') + 1, wide ? "#define WIDE\n#define FILTER2D\n" : "#define FILTER2D\n");
+
+        GLuint shader {};
+        if (!OpenGL::CompileVertexFragmentProgram(shader, vs, fs,
+                wide ? "CompositorShaderWideFilter2D" : "CompositorShaderFilter2D",
+                {{"vPosition", 0}, {"vTexcoord", 1}},
+                {{"oColor", 0}}))
+        {
+            Filter2D.Failed = true;
+            return false;
+        }
+
+        comp.Program = shader;
+        comp.ScaleLoc = glGetUniformLocation(shader, "u3DScale");
+        comp.RatioLoc = glGetUniformLocation(shader, "uWideRatio");
+        comp.OffsetLoc = glGetUniformLocation(shader, "uWideOffset");
+        comp.HiresCapLoc = glGetUniformLocation(shader, "uHiresCap");
+        comp.MapScaleLoc = glGetUniformLocation(shader, "uFilterMapScale");
+        comp.IdentityLoc = glGetUniformLocation(shader, "uFilterIdentity");
+
+        glUseProgram(shader);
+        glUniform1i(glGetUniformLocation(shader, "ScreenTex"), 0);
+        glUniform1i(glGetUniformLocation(shader, "_3DTex"), 1);
+        glUniform1i(glGetUniformLocation(shader, "HeldWingsTex"), 2);
+        glUniform1i(glGetUniformLocation(shader, "HiresBankTex"), HiresBankUnit);
+        glUniform1i(glGetUniformLocation(shader, "HiresStreamTex"), HiresStreamUnit);
+        glUniform1i(glGetUniformLocation(shader, "FilterMapTex"), Filter2DMapUnit);
+    }
+
+    return true;
+}
+
+bool GLCompositor::MakeFilter2DTarget(GLuint& texture, GLuint& fb, GLenum format, int width, int height) noexcept
+{
+    texture = MakeHiresTexture(format, width, height);
+    glGenFramebuffers(1, &fb);
+
+    GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture, 0);
+    glDrawBuffers(1, fbassign);
+    return glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+// filtered 2D: fills the map the compositor reads planes 0-2 through, from the planes and control
+// words just uploaded. a key per native pixel, then MMPX to 2x, then at scale 4 and up to 4x. all
+// of it is the frame's own data, so what a target held before doesn't matter, and tiled GPUs are
+// told so. each pass leaves its texture for the next one on the map's unit, and the last leaves
+// the map. RenderFrame's state is back afterwards except for the program, which it sets
+void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, int passes) noexcept
+{
+    const GLenum attachment = GL_COLOR_ATTACHMENT0;
+
+    // kHiresCaptureVS needs no attributes, but the VAO may be the 3D renderer's
+    glBindVertexArray(CompVertexArrayID);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Filter2D.KeyFB);
+    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
+    glViewport(0, 0, 256, 384);
+    glUseProgram(Filter2D.KeyShader);
+    glUniform1i(Filter2D.KeyHiresCapLoc, hiresDisplay);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glUseProgram(Filter2D.MmpxShader);
+    glUniform1i(Filter2D.MmpxIdentityLoc, gpu.Filter2D == 3);
+    glActiveTexture(GL_TEXTURE0 + Filter2DMapUnit);
+
+    glBindTexture(GL_TEXTURE_2D, Filter2D.KeyTex);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, passes == 2 ? Filter2D.Map2xFB : Filter2D.MapFB);
+    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
+    glViewport(0, 0, 512, 768);
+    glUniform1i(Filter2D.MmpxSrcWLoc, 256);
+    glUniform1i(Filter2D.MmpxScreenHLoc, 192);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    if (passes == 2)
+    {
+        glBindTexture(GL_TEXTURE_2D, Filter2D.Map2xTex);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Filter2D.MapFB);
+        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
+        glViewport(0, 0, 1024, 1536);
+        glUniform1i(Filter2D.MmpxSrcWLoc, 512);
+        glUniform1i(Filter2D.MmpxScreenHLoc, 384);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, Filter2D.MapTex);
+    glActiveTexture(GL_TEXTURE0);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+    glViewport(0, 0, ScreenW, ScreenH);
+}
+
+void GLCompositor::FreeFilter2DTextures() noexcept
+{
+    if (!Filter2D.KeyTex)
+        return;
+
+    glDeleteFramebuffers(1, &Filter2D.KeyFB);
+    glDeleteFramebuffers(1, &Filter2D.Map2xFB);
+    glDeleteFramebuffers(1, &Filter2D.MapFB);
+    glDeleteTextures(1, &Filter2D.KeyTex);
+    glDeleteTextures(1, &Filter2D.Map2xTex);
+    glDeleteTextures(1, &Filter2D.MapTex);
+    Filter2D.KeyTex = Filter2D.KeyFB = 0;
+    Filter2D.Map2xTex = Filter2D.Map2xFB = 0;
+    Filter2D.MapTex = Filter2D.MapFB = 0;
+    Filter2D.MapScale = 0;
+}
+
+void GLCompositor::FreeFilter2D() noexcept
+{
+    FreeFilter2DTextures();
+    glDeleteProgram(Filter2D.KeyShader);
+    glDeleteProgram(Filter2D.MmpxShader);
+    for (Filter2DProgram& comp : Filter2D.Comp)
+        glDeleteProgram(comp.Program);
+    Filter2D.KeyShader = 0;
+    Filter2D.MmpxShader = 0;
+    Filter2D.Comp = {};
+}
+
+// debug only (GPU::Filter2DLogging): the mode, the scale and how many passes frames run, once a second
+void GLCompositor::LogFilter2D(const GPU& gpu, int passes) noexcept
+{
+    s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (Filter2D.LogStartNs == 0)
+        Filter2D.LogStartNs = now;
+    Filter2D.LogFrames++;
+    if (now - Filter2D.LogStartNs < 1000000000)
+        return;
+
+    Log(LogLevel::Info, "FILTER2D mode=%d scale=%d passes=%d mapscale=%d frames=%u failed=%d\n",
+        gpu.Filter2D, Scale, passes, Filter2D.MapScale, Filter2D.LogFrames, Filter2D.Failed ? 1 : 0);
+
+    Filter2D.LogStartNs = now;
+    Filter2D.LogFrames = 0;
 }
 
 // hi-res display capture: decides which VRAM display lines show a hi-res bank copy. the 2D

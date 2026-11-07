@@ -842,6 +842,13 @@ public:
     // debug only: 1 logs a HIRESCAP line once a second, 2 also runs the pass at 1x and compares
     // the copy with the native capture every 30 passes
     int HiresCaptureDebug = 0;
+    // filtered 2D, OpenGL and compute renderers, at 3D scale 2 and up: the GL compositor smooths 2D
+    // edges with MMPX, for the screen only (GLCompositor::RunFilter2D). read at each Blit.
+    // 0 off, 1 on. debug.melonade.filter2d adds 2: stop at the 2x map at every scale, and
+    // 3: run every pass but write identity coordinates, which has to look exactly like off
+    int Filter2D = 0;
+    // debug only: logs a FILTER2D line once a second
+    bool Filter2DLogging = false;
     // banks A-D written (by the CPU, DMA or a VRAMCNT change) since the last Blit, and of those the
     // ones written while this frame's capture was armed. both only live one frame: the compositor
     // folds them into its bank state at every Blit, then they're cleared (HiresCaptureBlitDone)
