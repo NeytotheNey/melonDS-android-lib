@@ -28,6 +28,7 @@
 #include "GPU2D_Soft.h"
 #include "GPU3D.h"
 #include "GPU_CaptureReads.h"
+#include "GPU_2DStats.h"
 
 namespace melonDS
 {
@@ -262,6 +263,8 @@ void GPU::Reset() noexcept
     ResetHiresCapture();
     if (CapReads)
         CapReads->DropAll();
+    if (Stats2D)
+        Stats2D->Reset();
 
     OAMDirty = 0x3;
     PaletteDirty = 0xF;
@@ -364,6 +367,8 @@ void GPU::DoSavestate(Savestate* file) noexcept
         ResetHiresCapture();
         if (CapReads)
             CapReads->DropAll();
+        if (Stats2D)
+            Stats2D->Reset();
         GPU3D.GetCurrentRenderer().SavestateLoaded();
     }
 }
@@ -374,6 +379,14 @@ void GPU::SetCaptureReadLogging(bool enable) noexcept
         CapReads = std::make_unique<CaptureReadCounter>();
     else if (!enable)
         CapReads.reset();
+}
+
+void GPU::Set2DStatsLogging(bool enable) noexcept
+{
+    if (enable && !Stats2D)
+        Stats2D = std::make_unique<GPU2DStats>();
+    else if (!enable)
+        Stats2D.reset();
 }
 
 // out of line because GPU.h can't see NDS. the CPU doesn't run while an ARM9 DMA holds it stopped
@@ -1315,6 +1328,10 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
     job.BG[0] = GPU2D_A.State();
     job.BG[1] = GPU2D_B.State();
 
+    // debug only, see GPU_2DStats.h
+    if (Stats2D)
+        Stats2D->NoteLine(job);
+
     // debug only, see GPU_CaptureReads.h. counted here as the line may be drawn on the 2D thread
     if (CapReads && ((job.BG[0].DispCnt >> 16) & 0x3) == 2 && (job.VRAMMap_LCDC & (1 << ((job.BG[0].DispCnt >> 18) & 0x3))))
         CapReads->NoteDisplayLine((job.BG[0].DispCnt >> 18) & 0x3, job.VCount);
@@ -1366,6 +1383,10 @@ void GPU::Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept
     job.SpriteLine = line;
     job.OBJ[0] = GPU2D_A.State();
     job.OBJ[1] = GPU2D_B.State();
+
+    // debug only, see GPU_2DStats.h
+    if (Stats2D)
+        Stats2D->NoteSprites(job);
 }
 
 // the 2D renderer reads the flat VRAM copies. making them coherent consumes the shared VRAMDirty
@@ -1399,6 +1420,13 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
         NoteCaptureFlatCheck(dirty, 6);
     }
 
+    // debug only, see GPU_2DStats.h
+    if (Stats2D)
+    {
+        Stats2D->NoteBGDirty(0, bgDirtyA.Data, bgDirtyA.DataLength, bgExtPalDirtyA.Data, bgExtPalDirtyA.DataLength, objExtPalDirtyA.Data, objExtPalDirtyA.DataLength);
+        Stats2D->NoteBGDirty(1, bgDirtyB.Data, bgDirtyB.DataLength, bgExtPalDirtyB.Data, bgExtPalDirtyB.DataLength, objExtPalDirtyB.Data, objExtPalDirtyB.DataLength);
+    }
+
     // with EngineBNoHold, held lines have no engine B part left to read engine B's copies
     bool dirtyA = bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA;
     bool dirtyB = bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB;
@@ -1426,6 +1454,13 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
             {CapTrack_BOBJ, objDirtyB.Data, objDirtyB.DataLength},
         };
         NoteCaptureFlatCheck(dirty, 2);
+    }
+
+    // debug only, see GPU_2DStats.h
+    if (Stats2D)
+    {
+        Stats2D->NoteOBJDirty(0, objDirtyA.Data, objDirtyA.DataLength);
+        Stats2D->NoteOBJDirty(1, objDirtyB.Data, objDirtyB.DataLength);
     }
 
     if (EngineBNoHold ? ((objDirtyA && Is2DThreadBusy()) || (objDirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (objDirtyA || objDirtyB)))
@@ -1804,6 +1839,8 @@ void GPU::FinishFrame(u32 lines) noexcept
 
     if (CapReads)
         CapReads->EndFrame();
+    if (Stats2D)
+        Stats2D->EndFrame();
 
     if (Hash2DLogging)
         LogHash2D();

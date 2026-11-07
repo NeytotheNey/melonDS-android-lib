@@ -770,6 +770,7 @@ private:
         return false;
     }
 
+public:
     enum { Layer_None, Layer_Text, Layer_Affine, Layer_Extended, Layer_Large };
 
     // as SoftRenderer::DrawScanlineBGMode, Mode6 and Mode7 pick them. a 3D BG0 reads no VRAM
@@ -794,6 +795,7 @@ private:
         }
     }
 
+private:
     // a held line's BG pass reading a dirty page of the engine's BG copy. the whole of each layer, see the top
     static bool BGReads(const GPU2D::UnitState& u, bool engineB, const u64* bits, s8& layerOut, char& kindOut) noexcept
     {

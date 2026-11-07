@@ -36,6 +36,7 @@ static constexpr u32 VRAMDirtyGranularity = 512;
 class GPU;
 struct CaptureReadCounter;
 struct CaptureFlatDirty;
+struct GPU2DStats;
 
 // debug only (GPU_CaptureReads.h): the flat VRAM copies' trackers, as GPU::MakeVRAMFlat_2DBG/OBJCoherent check them
 enum : u32
@@ -869,6 +870,12 @@ public:
     void NoteCaptureDMA(u32 channel, bool ndma, u32 mode, u32 src, u32 dst, u32 words, u32 wordSize, bool repeat) noexcept;
     void NoteCaptureDMARun(u32 channel, bool ndma, u32 mode, u32 src, u32 dst, u32 words, u32 wordSize, bool repeat) noexcept;
     void NoteCaptureFlatWrite(u32 tracker, u32 offset, u32 size, bool changed) noexcept;
+
+    // debug only: counts what a GPU 2D renderer would have to deal with and logs a GPU2DSTATS line per
+    // engine once a second (GPU_2DStats.h). null while it's off, the default, so that's all it costs.
+    // emulator thread only, and nothing in it goes into emulation or savestates
+    std::unique_ptr<GPU2DStats> Stats2D;
+    void Set2DStatsLogging(bool enable) noexcept;
 
     void SetHiresCapture(bool enable) noexcept;
     // DoCapture, on every capture line it draws with HiresCapture on: the line's record entry
