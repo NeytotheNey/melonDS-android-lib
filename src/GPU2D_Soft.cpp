@@ -19,6 +19,7 @@
 #include "GPU2D_Soft.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "GPU_CaptureReads.h"
 
 namespace melonDS
 {
@@ -469,6 +470,8 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
     {
         if (record)
             record->Skip |= HiresCapSkip_NoLCDC;
+        if (GPU.CapReads)
+            GPU.CapReads->NoteNoLCDCLine();
         return;
     }
 
@@ -571,6 +574,14 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
 
     dstaddr &= 0xFFFF;
     srcBaddr &= 0xFFFF;
+
+    // debug only, see GPU_CaptureReads.h. the addresses are in halfwords, so 256 of them make a row
+    if (GPU.CapReads)
+    {
+        bool readsBank = capmode != 0 && srcB && !(captureCnt & (1<<25));
+        GPU.CapReads->NoteCaptureLine(line, captureCnt, dstaddr >> 8,
+                                      readsBank ? (s32)((CurUnit->DispCnt >> 18) & 0x3) : -1, srcBaddr >> 8);
+    }
 
     if (record && capmode != 0)
     {

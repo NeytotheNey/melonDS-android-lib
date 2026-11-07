@@ -34,6 +34,48 @@ namespace Platform { struct Thread; }
 
 static constexpr u32 VRAMDirtyGranularity = 512;
 class GPU;
+struct CaptureReadCounter;
+struct CaptureFlatDirty;
+
+// debug only (GPU_CaptureReads.h): the flat VRAM copies' trackers, as GPU::MakeVRAMFlat_2DBG/OBJCoherent check them
+enum : u32
+{
+    CapTrack_ABG = 0,
+    CapTrack_ABGExtPal,
+    CapTrack_AOBJExtPal,
+    CapTrack_BBG,
+    CapTrack_BBGExtPal,
+    CapTrack_BOBJExtPal,
+    CapTrack_AOBJ,
+    CapTrack_BOBJ,
+    CapTrack_Count,
+};
+
+// debug only (GPU_CaptureReads.h): what asked for the lines held for display capture to be drawn.
+// passed along with the barriers, and only looked at while the counter is on
+enum : u8
+{
+    CapFlush_Other = 0,     // anything not named below
+    CapFlush_Read,          // ReadVRAM_LCDC, split into the next two when it's counted
+    CapFlush_ReadARM9,
+    CapFlush_ReadDMA,
+    CapFlush_Write,         // WriteVRAM_LCDC
+    CapFlush_VRAMCNT,       // MapVRAM_*
+    CapFlush_Palette,       // WritePalette
+    CapFlush_OAM,           // WriteOAM
+    CapFlush_FlatBG,        // a flat VRAM copy is about to change: BG or extended palettes (MakeVRAMFlat_2DBGCoherent)
+    CapFlush_FlatOBJ,       // or OBJ (MakeVRAMFlat_2DOBJCoherent)
+    CapFlush_Line192,       // the usual one: the frame-end barrier before the Blit
+    CapFlush_Line215,       // lines still held at the 3D render (a VCount write skipped line 192)
+    CapFlush_LateBlit,      // a late Blit is due (Sync2D with BlitPending)
+    CapFlush_Savestate,     // GPU::DoSavestate
+    CapFlush_NotHeld,       // a line that isn't held comes next (GPU::Begin2DJob)
+    CapFlush_Full,          // the held line buffer is full (a VCount write)
+    CapFlush_FrameEnd,      // GPU::FinishFrame (a VCount write skipped lines 192 and 215)
+    CapFlush_PowCnt,        // GPU::SetPowerCnt
+    CapFlush_HalfCam,       // HalfCamera's real scene redraw at line 0
+    CapFlush_Count,
+};
 
 // hi-res display capture (see GPU::HiresCapture): why a frame's capture isn't redone at the 3D
 // scale. the 2D renderer sets the first four while it records, the compositor the others
@@ -151,12 +193,12 @@ public:
     /// LateBlit). Call it before changing anything a queued line reads: LCDC VRAM banks, VRAM
     /// mappings, the flat VRAM copies, the framebuffers or the 2D renderer. It's only a check while
     /// no line is waiting
-    void Sync2D() noexcept
+    void Sync2D(u8 flushCause = CapFlush_Other) noexcept
     {
         if (Is2DRingBusy())
             Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
         if (Deferred2DPending)
-            Flush2DDeferred();
+            Flush2DDeferred(flushCause);
         if (BlitPending)
             RunLateBlit();
     }
@@ -164,11 +206,15 @@ public:
     /// The barrier for writes to LCDC banks. A queued line only reads them in VRAM display mode,
     /// and a line held for display capture writes one, so it only syncs while such a line may
     /// still be waiting
-    void Sync2DForLCDC() noexcept
+    void Sync2DForLCDC(u8 flushCause) noexcept
     {
         if (Queued2DReadsLCDC)
         {
-            Sync2D();
+            // debug only, see GPU_CaptureReads.h
+            if (CapReads)
+                NoteCaptureBarrier();
+
+            Sync2D(flushCause);
             Queued2DReadsLCDC = false;
         }
     }
@@ -185,7 +231,7 @@ public:
     {
         // display capture writes an LCDC bank, so the lines held back for it are drawn first
         if (Deferred2DPending)
-            Flush2DDeferred();
+            Flush2DDeferred(CapFlush_Read);
 
         int bank;
 
@@ -244,7 +290,14 @@ public:
         default: return 0;
         }
 
-        if (VRAMMap_LCDC & (1<<bank)) return *(T*)&VRAM[bank][addr];
+        if (VRAMMap_LCDC & (1<<bank))
+        {
+            // debug only, see GPU_CaptureReads.h
+            if (CapReads && bank < 4)
+                NoteCaptureRead(bank, addr);
+
+            return *(T*)&VRAM[bank][addr];
+        }
 
         return 0;
     }
@@ -254,7 +307,7 @@ public:
     {
         // VRAM display reads LCDC banks directly. the BG/OBJ writers below don't need the barrier:
         // the 2D renderer reads those banks only through the flat copies (see MakeVRAMFlat_2DBGCoherent)
-        Sync2DForLCDC();
+        Sync2DForLCDC(CapFlush_Write);
 
         int bank;
 
@@ -320,7 +373,13 @@ public:
 
             // banks A-D can hold a hi-res capture copy, which this write makes stale
             if (bank < 4)
+            {
                 NoteHiresCaptureWrite(bank);
+
+                // debug only, see GPU_CaptureReads.h
+                if (CapReads)
+                    NoteCaptureWrite(bank, addr);
+            }
         }
     }
 
@@ -349,6 +408,10 @@ public:
     void WriteVRAM_ABG(u32 addr, T val)
     {
         u32 mask = VRAMMap_ABG[(addr >> 14) & 0x1F];
+
+        // debug only, see GPU_CaptureReads.h. what's there now, before this write replaces it
+        if (CapReads && mask)
+            NoteCaptureFlatWrite(CapTrack_ABG, addr & 0x7FFFF, sizeof(T), ReadVRAM_ABG<T>(addr) != val);
 
         if (mask & (1<<0))
         {
@@ -411,6 +474,10 @@ public:
     {
         u32 mask = VRAMMap_AOBJ[(addr >> 14) & 0xF];
 
+        // debug only, see GPU_CaptureReads.h. what's there now, before this write replaces it
+        if (CapReads && mask)
+            NoteCaptureFlatWrite(CapTrack_AOBJ, addr & 0x3FFFF, sizeof(T), ReadVRAM_AOBJ<T>(addr) != val);
+
         if (mask & (1<<0))
         {
             VRAMDirty[0][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
@@ -460,6 +527,10 @@ public:
     {
         u32 mask = VRAMMap_BBG[(addr >> 14) & 0x7];
 
+        // debug only, see GPU_CaptureReads.h. what's there now, before this write replaces it
+        if (CapReads && mask)
+            NoteCaptureFlatWrite(CapTrack_BBG, addr & 0x1FFFF, sizeof(T), ReadVRAM_BBG<T>(addr) != val);
+
         if (mask & (1<<2))
         {
             VRAMDirty[2][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
@@ -497,6 +568,10 @@ public:
     void WriteVRAM_BOBJ(u32 addr, T val)
     {
         u32 mask = VRAMMap_BOBJ[(addr >> 14) & 0x7];
+
+        // debug only, see GPU_CaptureReads.h. what's there now, before this write replaces it
+        if (CapReads && mask)
+            NoteCaptureFlatWrite(CapTrack_BOBJ, addr & 0x1FFFF, sizeof(T), ReadVRAM_BOBJ<T>(addr) != val);
 
         if (mask & (1<<3))
         {
@@ -588,8 +663,10 @@ public:
     void WritePalette(u32 addr, T val)
     {
         // queued lines read a copy (see Start2DJob), so only the held ones are drawn first
+        if (CapReads)
+            NoteCaptureBarrier();
         if (Deferred2DPending)
-            Flush2DDeferred();
+            Flush2DDeferred(CapFlush_Palette);
         addr &= 0x7FF;
 
         *(T*)&Palette[addr] = val;
@@ -607,8 +684,10 @@ public:
     void WriteOAM(u32 addr, T val)
     {
         // as WritePalette
+        if (CapReads)
+            NoteCaptureBarrier();
         if (Deferred2DPending)
-            Flush2DDeferred();
+            Flush2DDeferred(CapFlush_OAM);
         addr &= 0x7FF;
 
         *(T*)&OAM[addr] = val;
@@ -767,6 +846,18 @@ public:
     // after a load
     bool ScreenSwap = false;
 
+    // debug only: counts how often games read what display capture wrote and logs a CAPREADS line
+    // once a second (GPU_CaptureReads.h). null while it's off, the default, so that's all it costs.
+    // emulator thread only, and nothing in it goes into emulation or savestates
+    std::unique_ptr<CaptureReadCounter> CapReads;
+    void SetCaptureReadLogging(bool enable) noexcept;
+    void NoteCaptureRead(u32 bank, u32 addr) noexcept;
+    void NoteCaptureWrite(u32 bank, u32 addr) noexcept;
+    void NoteCaptureBarrier() noexcept;
+    void NoteCaptureDMA(u32 channel, bool ndma, u32 mode, u32 src, u32 dst, u32 words, u32 wordSize, bool repeat) noexcept;
+    void NoteCaptureDMARun(u32 channel, bool ndma, u32 mode, u32 src, u32 dst, u32 words, u32 wordSize, bool repeat) noexcept;
+    void NoteCaptureFlatWrite(u32 tracker, u32 offset, u32 size, bool changed) noexcept;
+
     void SetHiresCapture(bool enable) noexcept;
     // DoCapture, on every capture line it draws with HiresCapture on: the line's record entry
     HiresCaptureRecord& RecordHiresCaptureLine(u32 line, u32 captureCnt) noexcept;
@@ -837,7 +928,10 @@ private:
         return deferred && &job == deferred + Deferred2DEnd;
     }
     GPU2D::LineJob* BeginDeferred2DJob() noexcept;
-    void Flush2DDeferred() noexcept;
+    void Flush2DDeferred(u8 flushCause = CapFlush_Other) noexcept;
+    void NoteCaptureFlush(u8 flushCause) noexcept;
+    void NoteCaptureMap(bool end) noexcept;
+    void NoteCaptureFlatCheck(const CaptureFlatDirty* dirty, u32 count) noexcept;
 
     // true while some line isn't drawn yet: queued for the 2D thread or held for display capture
     bool Is2DThreadBusy() const noexcept
