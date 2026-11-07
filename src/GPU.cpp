@@ -539,10 +539,12 @@ void GPU::HiresCaptureBlitDone() noexcept
     HiresCapWritesInCapture = 0;
 }
 
-// the Blit StartScanline(192) left for later (see LateBlit), from Sync2D once every line is drawn
+// the Blit StartScanline(192) left for later (see LateBlit and BlitAfterReadback), from Sync2D
+// once every line is drawn, or from StartHBlank at line 215
 void GPU::RunLateBlit() noexcept
 {
     BlitPending = false;
+    BlitAfter3DPending = false;
 
     // the compositor gets the bank writes as of line 192, and the ones made since stay for the
     // next Blit, as they would have after a Blit at line 192
@@ -1142,7 +1144,11 @@ void GPU::SetPowerCnt(u32 val) noexcept
     else
         LCDPowerLogged = false;
 
-    Sync2D(CapFlush_PowCnt);
+    // a Blit left for after the 3D render stays: it reads the back buffers directly, not through
+    // the engines' framebuffer pointers AssignFramebuffers changes, the screen swap it reads was
+    // latched at StartFrame, and the engine enables and the 3D state only matter to lines and
+    // renders after it. dual-screen 3D games flip bit 15 every VBlank
+    Sync2D(CapFlush_PowCnt, false);
 
     GPU2D_A.SetEnabled(val & (1<<1));
     GPU2D_B.SetEnabled(val & (1<<9));
@@ -1235,6 +1241,13 @@ void GPU::StartHBlank(u32 line) noexcept
         if (Deferred2DPending)
             Flush2DDeferred(CapFlush_Line215);
 
+        // BlitAfterReadback: the render keeps the 3D frame the Blit reads, unless it's about to
+        // resize the targets, and with them the compositor. then the Blit goes first, as before
+        Renderer3D& renderer = GPU3D.GetCurrentRenderer();
+        bool blitAfter = BlitAfter3DPending && renderer.KeepFrameForBlit(*this);
+        if (BlitAfter3DPending && !blitAfter)
+            RunLateBlit();
+
         GPU3D.VCount215(*this);
 
         // this frame held lines that capture 3D, so the next one most likely reads this 3D
@@ -1243,8 +1256,27 @@ void GPU::StartHBlank(u32 line) noexcept
         if (CaptureHeldThisFrame)
         {
             CaptureHeldThisFrame = false;
-            if (EarlyFlushCapture)
-                GPU3D.GetCurrentRenderer().FlushCommands();
+            if (BlitAfterReadback && renderer.SupportsBlitAfterRender())
+            {
+                // and read it back now, which line 0 then skips (SoftRenderer::VBlankEnd), so the
+                // GPU has it before the compositor below and before the frontend's frame. the
+                // flush is what keeps them apart: the map at line 192 then only waits for this
+                renderer.PrepareEarlyCaptureFrame();
+                renderer.FlushCommands();
+                if (CapReads)
+                    CapReads->NoteEarlyReadback();
+            }
+            else if (EarlyFlushCapture)
+                renderer.FlushCommands();
+        }
+
+        // the Blit line 192 left, from the 3D frame the render kept, and submitted right away
+        if (blitAfter)
+        {
+            RunLateBlit();
+            renderer.FlushCommands();
+            if (CapReads)
+                CapReads->NoteBlitAfter3D();
         }
     }
     else if (VCount == 262)
@@ -1477,9 +1509,10 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 // memory it reads to stay as it was: whatever writes LCDC banks it may read, the flat copies, the
 // framebuffers or the renderer runs Sync2D first. palette and OAM are copied into the job instead
 // (see Start2DJob). with an accelerated 3D renderer the frame's lines are all drawn by the GL
-// compositor's Blit, at line 192, or with LateBlit just before the 3D render at line 215, and the
-// thread is idle between frames (FinishFrame and NDS::RunFrame sync), so the frontend can read the
-// framebuffers and save states as before.
+// compositor's Blit, at line 192, or with LateBlit just before the 3D render at line 215 (with
+// BlitAfterReadback, in capture frames, just after it), and the thread is idle between frames
+// (FinishFrame and NDS::RunFrame sync), so the frontend can read the framebuffers and save states
+// as before.
 // while display capture is armed, lines are drawn on the emulator thread instead, after a Sync2D:
 // DoCapture writes VRAM and VRAMDirty, and the GL renderers' GetLine needs the GL context. capture
 // is armed at line 0 and stays on until VBlank, so a frame that captures goes back to drawing here
@@ -1489,12 +1522,12 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 // display capture with an accelerated 3D renderer (and DeferCapture2D): the lines aren't drawn at
 // their HBlank but held in Deferred2DJobs, and drawn in order on the emulator thread by
 // Flush2DDeferred, at the latest by the Sync2D before the GL compositor at line 192 (capture frames
-// keep the Blit there). the 3D frame
-// is submitted at line 215 and read back into a GL buffer at line 0, and the first captured line
-// maps that buffer (GetLine(0)), which waits for the GPU. drawing it at line 192 instead gives the
-// GPU the whole frame to finish. this works with threaded 2D on or off: the ring is drained when
-// the first line is held, and a line that isn't held draws the held ones first, so nothing is
-// queued while lines are held.
+// keep the Blit there, or with BlitAfterReadback move it to just after the 3D render). the 3D frame
+// is submitted at line 215 and read back into a GL buffer at line 0 (with BlitAfterReadback right
+// after the render), and the first captured line maps that buffer (GetLine(0)), which waits for
+// the GPU. drawing it at line 192 instead gives the GPU the whole frame to finish. this works with
+// threaded 2D on or off: the ring is drained when the first line is held, and a line that isn't
+// held draws the held ones first, so nothing is queued while lines are held.
 // held lines count as not drawn yet for every barrier: Sync2D draws them, Is2DThreadBusy is true
 // (the flat copies), LCDC writes sync (Queued2DReadsLCDC is set) and LCDC reads draw them first
 // (ReadVRAM_LCDC), since DoCapture writes an LCDC bank and capture source B reads one. a game that
@@ -1692,7 +1725,7 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
 {
     // a VCount write can bring back visible lines before line 215, so the late Blit reads this
     // frame's lines first
-    if (BlitPending)
+    if (BlitPending || BlitAfter3DPending)
         Sync2D(CapFlush_LateBlit);
 
     GPU2D::LineJob* job = &Job2D;
@@ -1986,7 +2019,7 @@ void GPU::StartScanline(u32 line) noexcept
             // scene: VBlankEnd is about to read the 3D back, and that can't go into VRAM. same order as line 215
             if (GPU3D.NeedsRealSceneRedraw())
             {
-                if (BlitPending)
+                if (BlitPending || BlitAfter3DPending)
                     Sync2D(CapFlush_LateBlit);
                 if (Deferred2DPending)
                     Flush2DDeferred(CapFlush_HalfCam);
@@ -2071,13 +2104,37 @@ void GPU::StartScanline(u32 line) noexcept
                 // the compositor uploads this frame's 2D back buffers, so every line must be drawn.
                 // this is where the lines held for display capture are usually drawn
                 Sync2D(CapFlush_Line192);
-                GPU3D.Blit(*this);
-                HiresCaptureBlitDone();
 
-                // compute renderer: submit the compositor now, while the GPU is idle after the
-                // capture map, instead of ahead of the 3D at the line-215 flush (see BlitFlushCapture)
-                if (BlitFlushCapture && CaptureHeldThisFrame && GPU3D.GetCurrentRenderer().FlushAfterCaptureBlit())
-                    GPU3D.GetCurrentRenderer().FlushCommands();
+                if (BlitAfterReadback && CaptureHeldThisFrame && GPU3D.GetCurrentRenderer().SupportsBlitAfterRender())
+                {
+                    // the Blit runs right after the 3D render at line 215 (see BlitAfterReadback).
+                    // what it reads stays as it is now until then: the 2D back buffers (no line is
+                    // drawn before line 215 without a Sync2D), the hi-res capture record (only
+                    // capture lines write it) and the 3D frame, which the render keeps. the bank
+                    // write masks are kept as of now, like LateBlit's, and the capture pass's
+                    // destination bank is copied, as the CPU can write it meanwhile
+                    LateBlitCapWrites = HiresCapWrites;
+                    LateBlitCapWritesInCapture = HiresCapWritesInCapture;
+                    HiresCapWrites = 0;
+                    HiresCapWritesInCapture = 0;
+                    if (HiresCapRecord && HiresCapRecord->DstMask)
+                    {
+                        HiresCapRecord->DstNativeKept = true;
+                        memcpy(HiresCapRecord->DstNative, VRAM[(HiresCapRecord->Layout >> 16) & 0x3],
+                               sizeof(HiresCapRecord->DstNative));
+                    }
+                    BlitAfter3DPending = true;
+                }
+                else
+                {
+                    GPU3D.Blit(*this);
+                    HiresCaptureBlitDone();
+
+                    // compute renderer: submit the compositor now, while the GPU is idle after the
+                    // capture map, instead of ahead of the 3D at the line-215 flush (see BlitFlushCapture)
+                    if (BlitFlushCapture && CaptureHeldThisFrame && GPU3D.GetCurrentRenderer().FlushAfterCaptureBlit())
+                        GPU3D.GetCurrentRenderer().FlushCommands();
+                }
             }
         }
     }

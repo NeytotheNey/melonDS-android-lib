@@ -282,6 +282,7 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
     glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
 
     glGenBuffers(1, &result->PixelbufferID);
+    glGenBuffers(1, &result->EarlyPixelbufferID);
 
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &result->TexMemID);
@@ -316,10 +317,13 @@ GLRenderer::~GLRenderer()
     glDeleteFramebuffers(1, &MainFramebuffer);
     glDeleteFramebuffers(1, &DownscaleFramebuffer);
     glDeleteTextures(1, &ColorBufferTex);
+    glDeleteTextures(1, &KeptColorTex);
+    glDeleteTextures(1, &SpareColorTex);
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
     glDeleteTextures(1, &DownScaleBufferTex);
     glDeleteBuffers(1, &PixelbufferID);
+    glDeleteBuffers(1, &EarlyPixelbufferID);
 
     glDeleteVertexArrays(1, &VertexArrayID);
     glDeleteBuffers(1, &VertexBufferID);
@@ -349,6 +353,7 @@ void GLRenderer::Reset(GPU& gpu)
     CurGLCompositor.ResetHiresCapture();
     TexMemDirtyAll = true;
     TargetsChanged = true;
+    EarlyCapture = false;
 }
 
 void GLRenderer::SetBetterPolygons(bool betterpolygons) noexcept
@@ -406,19 +411,29 @@ void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
     ResizeTargets(betterpolygons, scale, targetWidth);
 }
 
-void GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept
+// true when anything changed
+bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept
 {
     if (betterpolygons == BetterPolygons && scale == ScaleFactor && targetWidth == TargetWidth)
-        return;
+        return false;
 
     CurGLCompositor.SetRenderSettings(scale, targetWidth);
     ScaleFactor = scale;
     TargetWidth = targetWidth;
     BetterPolygons = betterpolygons;
     TargetsChanged = true;
+    // the pixel buffers are reallocated below
+    EarlyCapture = false;
 
     ScreenW = targetWidth * scale;
     ScreenH = 192 * scale;
+
+    // the other color buffers are at the old size. nothing is kept here: a kept frame only lives
+    // from the render at line 215 to the Blit right after it, and KeepFrameForBlit refuses a render
+    // that resizes
+    glDeleteTextures(1, &SpareColorTex);
+    glDeleteTextures(1, &KeptColorTex);
+    SpareColorTex = KeptColorTex = 0;
 
     glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -441,11 +456,57 @@ void GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) 
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, PixelbufferID);
     glBufferData(GL_PIXEL_PACK_BUFFER, 256*192*4, NULL, GL_DYNAMIC_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, EarlyPixelbufferID);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 256*192*4, NULL, GL_DYNAMIC_READ);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     //glLineWidth(scale);
     //glLineWidth(1.5);
+    return true;
+}
+
+// the width RenderFrame sizes the targets for: the polygons match them, so after a width change
+// they only shrink once the game has built geometry at the new width
+int GLRenderer::FrameTargetWidth(const GPU& gpu) noexcept
+{
+    int targetWidth = std::max(ViewWidth, gpu.GPU3D.RenderViewWidth);
+    if (!TargetFits(targetWidth, ScaleFactor) ||
+        (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
+        targetWidth = ViewWidth;
+    return targetWidth;
+}
+
+// GPU::BlitAfterReadback, at line 215: the compositor's size follows the targets, so a render that
+// resizes them gets the Blit first. otherwise the render draws into the spare color buffer and the
+// one it replaces stays for the Blit (see KeepColorBuffer). a render that's skipped keeps nothing,
+// and the Blit reads the color buffer as it was
+bool GLRenderer::KeepFrameForBlit(const GPU& gpu)
+{
+    if (FrameTargetWidth(gpu) != TargetWidth)
+        return false;
+
+    KeepRequested = true;
+    return true;
+}
+
+// the render about to start draws into the spare color buffer, and the frame it replaces is kept
+// for the Blit. same size and format, so MainFramebuffer stays complete
+void GLRenderer::KeepColorBuffer() noexcept
+{
+    if (!SpareColorTex)
+    {
+        glGenTextures(1, &SpareColorTex);
+        SetupDefaultTexParams(SpareColorTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+
+    KeptColorTex = ColorBufferTex;
+    ColorBufferTex = SpareColorTex;
+    SpareColorTex = 0;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, MainFramebuffer);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex, 0);
 }
 
 
@@ -1468,6 +1529,11 @@ static bool AnyDirty(const NonStupidBitField<Size>& dirty, u32 start, u32 count)
 
 void GLRenderer::RenderFrame(GPU& gpu)
 {
+    bool keep = KeepRequested;
+    KeepRequested = false;
+    // an earlier readback is of the frame this replaces (a skipped one too, to keep it simple)
+    EarlyCapture = false;
+
     // same path as the software and compute renderers: DeriveState gathers the dirty 512 byte
     // chunks of the texture and palette mappings (clearing the bank dirty bits they came from,
     // so this runs exactly once per frame), the flat copies are made coherent, and only the
@@ -1486,20 +1552,20 @@ void GLRenderer::RenderFrame(GPU& gpu)
         TexMemDirtyAll = false;
     }
 
-    // the targets match the polygons drawn here, so after a width change they only shrink once
-    // the game has built geometry at the new width. this runs after the frame's Blit, so the
-    // compositor's width only changes between frames as well
-    int targetWidth = std::max(ViewWidth, gpu.GPU3D.RenderViewWidth);
-    if (!TargetFits(targetWidth, ScaleFactor) ||
-        (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
-        targetWidth = ViewWidth;
-    ResizeTargets(BetterPolygons, ScaleFactor, targetWidth);
+    // the targets match the polygons drawn here (see FrameTargetWidth). this runs after the
+    // frame's Blit, so the compositor's width only changes between frames as well. with a Blit
+    // after it (KeepFrameForBlit), only when the targets stay as they are
+    if (ResizeTargets(BetterPolygons, ScaleFactor, FrameTargetWidth(gpu)))
+        keep = false;
 
     // nothing changed since the last frame: MainFramebuffer still holds it, so Blit and the
     // capture readback keep working from it (upstream's GL renderer skips the same way)
     if (!textureChanged && !texPalChanged && !TargetsChanged && gpu.GPU3D.RenderFrameIdentical)
         return;
     TargetsChanged = false;
+
+    if (keep)
+        KeepColorBuffer();
 
     CurShaderID = -1;
     CurRenderMode = -1;
@@ -1735,9 +1801,17 @@ void GLRenderer::RenderFrame(GPU& gpu)
 void GLRenderer::Stop(const GPU& gpu)
 {
     CurGLCompositor.Stop(gpu);
+    EarlyCapture = false;
 }
 
 void GLRenderer::PrepareCaptureFrame()
+{
+    ReadBackCaptureFrame(PixelbufferID);
+}
+
+// the downscale target is only ever read back, so the early readback writing it changes nothing
+// a capture sees
+void GLRenderer::ReadBackCaptureFrame(GLuint pixelBuffer) noexcept
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -1750,7 +1824,7 @@ void GLRenderer::PrepareCaptureFrame()
     glBlitFramebuffer(captureX, 0, captureX + WideMelon::NativeWidth * ScaleFactor, ScreenH,
                       0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, PixelbufferID);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pixelBuffer);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, DownscaleFramebuffer);
     glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 }
@@ -1763,6 +1837,37 @@ void GLRenderer::FlushCommands()
 void GLRenderer::Blit(const GPU& gpu)
 {
     CurGLCompositor.RenderFrame(gpu, *this);
+
+    // the compositor and its hi-res capture pass were the last to read the kept frame, and GL
+    // keeps their reads ahead of the render that next draws into it
+    if (KeptColorTex)
+    {
+        SpareColorTex = KeptColorTex;
+        KeptColorTex = 0;
+    }
+}
+
+// GPU::BlitAfterReadback: line 0's readback, made right after the render at line 215, into the
+// early buffer, so GetLine's stays as the last line-0 readback left it until line 0 takes this.
+// it reads MainFramebuffer's centre, and whatever could change that before line 0 clears
+// EarlyCapture: a render (HalfCamera's redraw at line 0 too), a resize, a reset, a stop or a
+// savestate load
+void GLRenderer::PrepareEarlyCaptureFrame()
+{
+    ReadBackCaptureFrame(EarlyPixelbufferID);
+    EarlyCapture = true;
+}
+
+// at line 0, with use where PrepareCaptureFrame would run: the early buffer holds what it would
+// write into GetLine's, so the two swap instead. without use, or once it's stale, GetLine's buffer
+// stays as it is, and the next early readback overwrites the other
+bool GLRenderer::TakeEarlyCaptureFrame(bool use)
+{
+    bool early = use && EarlyCapture;
+    EarlyCapture = false;
+    if (early)
+        std::swap(PixelbufferID, EarlyPixelbufferID);
+    return early;
 }
 
 void GLRenderer::SetOutputTexture(int buffer, u32 texture)
@@ -1779,6 +1884,8 @@ void GLRenderer::SavestateLoaded()
 {
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
+    // line 0 reads back MainFramebuffer again, as it did before the early readback
+    EarlyCapture = false;
 }
 
 u32* GLRenderer::GetLine(int line)
@@ -1811,7 +1918,8 @@ u32* GLRenderer::GetLine(int line)
 
 void GLRenderer::SetupAccelFrame()
 {
-    glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
+    // the 3D frame of the Blit's own frame, kept while the next one is drawn (see KeepFrameForBlit)
+    glBindTexture(GL_TEXTURE_2D, KeptColorTex ? KeptColorTex : ColorBufferTex);
 }
 
 }

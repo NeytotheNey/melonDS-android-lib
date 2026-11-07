@@ -182,6 +182,9 @@ struct CaptureReadCounter
         FlushCauseStats Causes[CapFlush_Count];
         u32 Disjoint, Overlap, NoHeld, NoRead, Stray;   // frames, and stray reads that flushed
         u32 DMA[9];         // starts: DMA modes 0-7, then NDMA
+        // GPU::BlitAfterReadback: Blits run after the 3D render, readbacks made right after it, and
+        // of those the ones line 0 used for a capture
+        u32 BlitsAfter3D, EarlyReadbacks, EarlyUsed;
     };
 
     struct FrameFlush
@@ -468,6 +471,25 @@ struct CaptureReadCounter
         Frame.SpinNs += spinNs - MapStartSpinNs;
         FlushSecond.Causes[Frame.MapCause].MapNs += ns;
         FlushTotal.Causes[Frame.MapCause].MapNs += ns;
+    }
+
+    // GPU::BlitAfterReadback, at line 215 and at line 0 (SoftRenderer::VBlankEnd)
+    void NoteBlitAfter3D() noexcept
+    {
+        FlushSecond.BlitsAfter3D++;
+        FlushTotal.BlitsAfter3D++;
+    }
+
+    void NoteEarlyReadback() noexcept
+    {
+        FlushSecond.EarlyReadbacks++;
+        FlushTotal.EarlyReadbacks++;
+    }
+
+    void NoteEarlyReadbackUsed() noexcept
+    {
+        FlushSecond.EarlyUsed++;
+        FlushTotal.EarlyUsed++;
     }
 
     // DMA::Start and DSi_NDMA::Start, with the source in LCDC VRAM. a start mode that repeats
@@ -1377,6 +1399,10 @@ private:
         }
         if (s.DMA[8])
             Append(p, end, " ndma=%u", s.DMA[8]);
+
+        // last, so it's what a full line cuts. blitafter3d: Blits after the 3D render. early:
+        // readbacks made at line 215, and the ones line 0 used for a capture
+        Append(p, end, " blitafter3d=%u early=%u/%u", s.BlitsAfter3D, s.EarlyReadbacks, s.EarlyUsed);
     }
 
     void NoteRowUse(u32 bank, u32 row, u32 flags) noexcept

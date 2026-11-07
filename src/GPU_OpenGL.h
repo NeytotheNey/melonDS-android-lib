@@ -201,7 +201,7 @@ private:
     void FreeHiresCapture() noexcept;
     void LogHiresCapture() noexcept;
 #ifdef MELONADE_DEBUG_TOOLS
-    void CheckHiresCapture(const GPU& gpu, int bank, int rowStart, int rows) noexcept;
+    void CheckHiresCapture(const u8* bankNative, int bank, int rowStart, int rows) noexcept;
 #endif
 
     // filtered 2D (see GPU::Filter2D and RunFilter2D). everything here is made the first time a

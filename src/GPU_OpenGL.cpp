@@ -1021,7 +1021,8 @@ void GLCompositor::PrepareHiresStream(const GPU& gpu, int backbuf) noexcept
 
 // the capture pass: redoes this frame's display capture at the 3D scale, from the record the 2D
 // renderer made (GPU::HiresCapRecord), the hi-res 3D frame (still bound on unit 1 by
-// SetupAccelFrame: the next 3D frame only replaces it at line 215, after this in GL command order)
+// SetupAccelFrame: the next 3D frame only replaces it at line 215, after this in GL command order,
+// or with GPU::BlitAfterReadback draws into the other color buffer while this reads the kept one)
 // and the source B copy, into the destination bank's copy. the copies of the banks this frame
 // captured into are dropped first, so a capture that can't be redone leaves its destination native
 void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
@@ -1173,14 +1174,16 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
     // the destination's old image becomes the scratch one, and stays usable for the next frame's
     // stream with the rows it covered, until the next pass draws over it. the native capture is
     // finished: every capture line is drawn before the Blit (GPU::StartScanline at line 192), and
-    // a write to the bank during it skipped this pass (HiresCapSkip_Written)
+    // a write to the bank during it skipped this pass (HiresCapSkip_Written). a Blit that waited
+    // for line 215 (GPU::BlitAfterReadback) reads the bank as line 192 left it
+    const u8* dstNative = record->DstNativeKept ? (const u8*)record->DstNative : gpu.VRAM[dst];
     std::swap(HiresCap.BankTex[dst], HiresCap.ScratchTex);
     std::swap(HiresCap.BankNative[dst], HiresCap.ScratchNative);
     HiresNativeRows& native = HiresCap.BankNative[dst];
     native.State = {true, dstRow, rows};
     native.Words.resize(256 * 192);
     if (dstRow < 192)
-        memcpy(&native.Words[dstRow * 256], &gpu.VRAM[dst][dstRow * 512],
+        memcpy(&native.Words[dstRow * 256], &dstNative[dstRow * 512],
                (std::min(dstRow + rows, 192) - dstRow) * 512);
 
     HiresCap.Banks[dst] = {true, dstRow, rows};
@@ -1188,7 +1191,7 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (gpu.HiresCaptureDebug >= 2 && Scale == 1 && (HiresCap.CheckCount++ % 30) == 0)
-        CheckHiresCapture(gpu, dst, dstRow, rows);
+        CheckHiresCapture(dstNative, dst, dstRow, rows);
 #endif
 
     // back to what RenderFrame leaves bound, like CopyHeldWings. the viewport too, which
@@ -1302,8 +1305,9 @@ void GLCompositor::LogHiresCapture() noexcept
 
 #ifdef MELONADE_DEBUG_TOOLS
 // check mode (GPU::HiresCaptureDebug 2, at 1x): reads the copy the pass just made back and
-// compares it with the native capture in VRAM, which it should match word for word
-void GLCompositor::CheckHiresCapture(const GPU& gpu, int bank, int rowStart, int rows) noexcept
+// compares it with the native capture (the bank's VRAM, or its copy from line 192), which it
+// should match word for word
+void GLCompositor::CheckHiresCapture(const u8* bankNative, int bank, int rowStart, int rows) noexcept
 {
     // R16UI reads back as GL_RGBA_INTEGER/GL_UNSIGNED_INT, which GLES 3 always allows for it.
     // the pass framebuffer still has the copy attached
@@ -1313,7 +1317,7 @@ void GLCompositor::CheckHiresCapture(const GPU& gpu, int bank, int rowStart, int
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     glReadPixels(0, rowStart, 256, rows, GL_RGBA_INTEGER, GL_UNSIGNED_INT, texels.data());
 
-    const u16* vram = (const u16*)gpu.VRAM[bank];
+    const u16* vram = (const u16*)bankNative;
     int mismatches = 0, firstX = -1, firstY = -1;
     u32 firstHires = 0, firstNative = 0;
     for (int y = 0; y < rows; y++)

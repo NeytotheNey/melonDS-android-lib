@@ -429,7 +429,17 @@ void SoftRenderer::VBlankEnd(Unit* unitA, Unit* unitB)
 #ifdef OGLRENDERER_ENABLED
     if (Renderer3D& renderer3d = GPU.GPU3D.GetCurrentRenderer(); renderer3d.Accelerated)
     {
-        if ((unitA->CaptureCnt & (1<<31)) && (((unitA->CaptureCnt >> 29) & 0x3) != 1))
+        // read back already, right after the render at line 215 (GPU::BlitAfterReadback), into a
+        // buffer of its own, and nothing has drawn into the 3D frame since: it becomes the one
+        // GetLine maps. dropped whether this frame captures or not, so it's never used past the
+        // line 0 it was made for, and one that isn't used here leaves GetLine's buffer as it was,
+        // for a capture armed later in this line
+        bool captures3D = (unitA->CaptureCnt & (1<<31)) && (((unitA->CaptureCnt >> 29) & 0x3) != 1);
+        bool earlyReadback = renderer3d.TakeEarlyCaptureFrame(captures3D);
+        if (GPU.CapReads && earlyReadback)
+            GPU.CapReads->NoteEarlyReadbackUsed();
+
+        if (captures3D && !earlyReadback)
         {
             renderer3d.PrepareCaptureFrame();
 

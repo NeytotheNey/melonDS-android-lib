@@ -405,6 +405,18 @@ public:
     // whether GPU::BlitFlushCapture flushes right after the line-192 Blit in capture frames. only
     // the compute renderer gains from it; with classic OpenGL it cost ~9% more GPU cycles for no fps
     virtual bool FlushAfterCaptureBlit() const { return false; }
+    // GPU::BlitAfterReadback, which only runs with a renderer that has these. at line 215, before
+    // RenderFrame: true when the render can keep the 3D frame it replaces for the Blit after it
+    // (SetupAccelFrame binds that one until the Blit is done), false when the Blit has to go first
+    [[nodiscard]] virtual bool SupportsBlitAfterRender() const noexcept { return false; }
+    virtual bool KeepFrameForBlit(const GPU& gpu) { return false; }
+    // PrepareCaptureFrame right after the render at line 215, for the next frame's capture, into a
+    // buffer of its own. at line 0, with use set (where PrepareCaptureFrame would run), the take
+    // makes it the one GetLine maps and returns true, if it still holds what PrepareCaptureFrame
+    // would read back (nothing drew into the 3D frame or resized it since). either way it's dropped,
+    // and one that isn't used leaves GetLine's buffer as the old path would
+    virtual void PrepareEarlyCaptureFrame() {}
+    virtual bool TakeEarlyCaptureFrame(bool use) { return false; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
     // after a savestate is loaded, for what the renderer keeps from earlier frames' output

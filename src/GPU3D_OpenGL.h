@@ -64,6 +64,11 @@ public:
     void FlushCommands() override;
     void Blit(const GPU& gpu) override;
 
+    [[nodiscard]] bool SupportsBlitAfterRender() const noexcept override { return true; }
+    bool KeepFrameForBlit(const GPU& gpu) override;
+    void PrepareEarlyCaptureFrame() override;
+    bool TakeEarlyCaptureFrame(bool use) override;
+
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
     void SavestateLoaded() override;
@@ -101,7 +106,10 @@ private:
     u32 WideVertexX(s32 hiresx) const;
     bool TargetFits(int width, int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
-    void ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept;
+    int FrameTargetWidth(const GPU& gpu) noexcept;
+    bool ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept;
+    void KeepColorBuffer() noexcept;
+    void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
@@ -236,8 +244,21 @@ private:
     GLuint ShadowLogQueries[64] {};
 
     GLuint ColorBufferTex {}, DepthBufferTex {}, AttrBufferTex {};
+    // GPU::BlitAfterReadback: the 3D frame the render at line 215 replaced, which the Blit right
+    // after it still reads (SetupAccelFrame binds it), and the color buffer the render after that
+    // draws into. ColorBufferTex swaps with them, so with the switch on two color buffers take
+    // turns. the spare is made the first time a frame is kept and dropped on a resize
+    GLuint KeptColorTex {}, SpareColorTex {};
+    // set by KeepFrameForBlit for the next RenderFrame, which clears it
+    bool KeepRequested = false;
+    // PrepareEarlyCaptureFrame's readback is in EarlyPixelbufferID and is still what line 0 would
+    // read back. cleared by anything that draws into or resizes the 3D frame, or replaces the state
+    bool EarlyCapture = false;
     GLuint DownScaleBufferTex {};
+    // the buffer GetLine maps, and the early readback's, which swap when line 0 takes it
+    // (TakeEarlyCaptureFrame). both are sized by ResizeTargets
     GLuint PixelbufferID {};
+    GLuint EarlyPixelbufferID {};
 
     GLuint MainFramebuffer {}, DownscaleFramebuffer {};
     u32 Framebuffer[256*192] {};

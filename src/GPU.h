@@ -100,7 +100,8 @@ enum : u32
 // compositor's capture pass (GLCompositor::RunHiresCapture), which redoes the frame's capture at
 // the 3D scale from it. lines are indexed by the capture line. the 2D renderer writes it on the
 // emulator thread (capture lines are never drawn on the 2D thread), the compositor reads it at the
-// line-192 Blit, and GPU clears it right after (see GPU::HiresCaptureBlitDone)
+// line-192 Blit (or the one after the line-215 render, see GPU::BlitAfterReadback), and GPU clears
+// it right after (see GPU::HiresCaptureBlitDone)
 struct HiresCaptureRecord
 {
     u32 Skip;               // HiresCapSkip_* bits
@@ -126,6 +127,11 @@ struct HiresCaptureRecord
     u32 Planes[192][256*3];
     // source B as DoCapture read it
     u16 SrcB[192][256];
+    // the destination bank (Layout's) as native capture left it at line 192, when the Blit waits
+    // for line 215 (GPU::BlitAfterReadback): the pass keeps its native rows, and the CPU can write
+    // the bank before then. without it the pass reads VRAM, at line 192
+    bool DstNativeKept;
+    u16 DstNative[256][256];
 
     void Clear() noexcept
     {
@@ -134,6 +140,7 @@ struct HiresCaptureRecord
         Layout = 0;
         DstMask = 0;
         OffsetMask = 0;
+        DstNativeKept = false;
     }
 
     bool HasLine(u32 line) const noexcept { return (LineMask[line >> 5] >> (line & 31)) & 1; }
@@ -191,16 +198,16 @@ public:
 
     /// The 2D barrier: waits until the 2D thread has drawn every line it was given, draws the
     /// lines held back for display capture (see Begin2DJob) and runs a Blit left for later (see
-    /// LateBlit). Call it before changing anything a queued line reads: LCDC VRAM banks, VRAM
-    /// mappings, the flat VRAM copies, the framebuffers or the 2D renderer. It's only a check while
-    /// no line is waiting
-    void Sync2D(u8 flushCause = CapFlush_Other) noexcept
+    /// LateBlit and BlitAfterReadback). Call it before changing anything a queued line reads: LCDC
+    /// VRAM banks, VRAM mappings, the flat VRAM copies, the framebuffers or the 2D renderer. It's
+    /// only a check while no line is waiting
+    void Sync2D(u8 flushCause = CapFlush_Other, bool blitAfter3D = true) noexcept
     {
         if (Is2DRingBusy())
             Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
         if (Deferred2DPending)
             Flush2DDeferred(flushCause);
-        if (BlitPending)
+        if (BlitPending || (BlitAfter3DPending && blitAfter3D))
             RunLateBlit();
     }
 
@@ -215,7 +222,8 @@ public:
             if (CapReads)
                 NoteCaptureBarrier();
 
-            Sync2D(flushCause);
+            // a Blit left for after the 3D render stays: it reads no LCDC bank (see BlitAfter3DPending)
+            Sync2D(flushCause, false);
             Queued2DReadsLCDC = false;
         }
     }
@@ -828,6 +836,14 @@ public:
     // not in frames that hold capture lines or record any for hi-res capture. only turned off by a
     // debug switch, to compare
     bool LateBlit = true;
+    // OpenGL renderer (Renderer3D::SupportsBlitAfterRender), in frames that hold capture lines: the
+    // Blit waits from line 192 until right after the 3D render at line 215, which draws into the
+    // other of two 3D color buffers while the compositor reads the one it replaced, and the next
+    // frame's capture readback is issued between the two instead of at line 0. then the GPU runs
+    // the 3D render and the readback that line 192's map waits for before the compositor and the
+    // filtered 2D passes, not after them. what the game reads back is the same frame either way.
+    // off by default here until it's tested on a phone; debug builds turn it on (DebugProperties)
+    bool BlitAfterReadback = false;
     // compute renderer: before mapping the capture readback, poll a fence for up to this many µs
     // (yielding in between) instead of sleeping in the driver's map, which keeps the emulator
     // thread's clock up. 0 = no fence, no poll. only changed by a debug switch
@@ -1082,6 +1098,11 @@ private:
     // the Blit StartScanline(192) left for line 215 (see LateBlit). Sync2D runs it, so whatever
     // syncs before reading or changing the 2D output, the 3D frame or the renderer gets it first
     bool BlitPending = false;
+    // the Blit StartScanline(192) left for right after the 3D render at line 215 (see
+    // BlitAfterReadback). never set together with BlitPending. Sync2D runs it too, except for LCDC
+    // writes (Sync2DForLCDC: the only LCDC bank it reads, the hi-res capture destination, was
+    // copied at line 192) and POWCNT writes (SetPowerCnt)
+    bool BlitAfter3DPending = false;
     // HiresCapWrites and HiresCapWritesInCapture as of line 192, for the late Blit (see RunLateBlit)
     u8 LateBlitCapWrites = 0;
     u8 LateBlitCapWritesInCapture = 0;
