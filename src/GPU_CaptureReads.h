@@ -82,6 +82,9 @@ namespace melonDS
 // a line job holds both engines (LineJob::BG[2], OBJ[2], drawn together by SoftRenderer::RunJob), so
 // a write on either engine's copy flushes both engines' lines. display capture only reads engine A's
 // output, so a write to engine B's copy can only change engine B's held lines, never the capture.
+// with GPU::EngineBNoHold, engine B's part is drawn right away and only engine A's stays held: a dirty
+// engine B copy is no barrier, used and effect only ask about engine A, and engine B's writes are only
+// added up as bskip (checks with lines held), bchg and bsame.
 //
 // "used" is one-sided: used=no means no enabled layer on any held line of that engine can read a dirty
 // page, so the barrier wasn't needed for it. used=yes only means it can't be ruled out. it works at
@@ -243,6 +246,8 @@ struct CaptureReadCounter
         u32 ByARM9, ByDMA, ByBoth, ByNone;
         u32 Writes, Changed, Same;
         u32 UsedYes, UsedNo, EffectYes, EffectNo;
+        u32 BSkip, BChanged, BSame;     // with EngineBNoHold: engine B checks that found something dirty, and their writes
+        u32 ObjIdleA, ObjIdleB;         // OBJ checks that found something dirty with nothing held
         DirtyEvent First;
     };
 
@@ -252,6 +257,9 @@ struct CaptureReadCounter
         u32 ByARM9, ByDMA, ByBoth, ByNone;
         u64 Changed, Same;
         u32 UsedYes, UsedNo, EffectYes, EffectNo;
+        u32 BSkip;
+        u64 BChanged, BSame;
+        u32 ObjIdleA, ObjIdleB;
     };
 
     // reads of a captured bank (or of any bank while lines are modeled as held)
@@ -363,20 +371,44 @@ struct CaptureReadCounter
     }
 
     // GPU::MakeVRAMFlat_2DBG/OBJCoherent, each time, before the barrier: held is the lines it would draw
-    void NoteFlatCheck(const GPU& gpu, const CaptureFlatDirty* dirty, u32 count, const GPU2D::LineJob* held, u32 numHeld) noexcept
+    void NoteFlatCheck(const GPU& gpu, const CaptureFlatDirty* dirty, u32 count, const GPU2D::LineJob* held, u32 numHeld, bool engineBNoHold) noexcept
     {
         s32 first = -1;
-        for (u32 i = 0; i < count && first < 0; i++)
+        bool bDirty = false;
+        for (u32 i = 0; i < count; i++)
         {
-            if (FirstBit(dirty[i]) >= 0)
+            const CaptureFlatDirty& d = dirty[i];
+            if (FirstBit(d) < 0)
+                continue;
+
+            // what no flush can be for without lines held. this check runs after the BG pass's, so
+            // when that flushed there's nothing held here, and a dirty OBJ copy says nothing
+            if (!numHeld && d.Tracker == CapTrack_AOBJ) { Frame.Dirty.ObjIdleA++; DirtyTotal.ObjIdleA++; }
+            if (!numHeld && d.Tracker == CapTrack_BOBJ) { Frame.Dirty.ObjIdleB++; DirtyTotal.ObjIdleB++; }
+
+            if (engineBNoHold && IsEngineB(d.Tracker))
+            {
+                bDirty = true;
+                const FlatWrites& w = Writes[d.Tracker];
+                Frame.Dirty.BChanged += w.Changed;
+                Frame.Dirty.BSame += w.Same;
+                DirtyTotal.BChanged += w.Changed;
+                DirtyTotal.BSame += w.Same;
+            }
+            else if (first < 0)
                 first = i;
+        }
+        if (bDirty && numHeld)
+        {
+            Frame.Dirty.BSkip++;
+            DirtyTotal.BSkip++;
         }
 
         if (first >= 0)
         {
             NoteBarrier();
             if (numHeld)
-                NoteFlatFlush(gpu, dirty, count, dirty[first], held, numHeld);
+                NoteFlatFlush(gpu, dirty, count, dirty[first], held, numHeld, engineBNoHold);
         }
 
         // the check consumes the dirty bits with or without a flush, so the writes start over
@@ -673,7 +705,7 @@ struct CaptureReadCounter
         Second = {};
 
         // the total and dirty parts are the ones that matter on the last line, so they get more room
-        char flushSecondText[240], flushTotalText[400], dirtyText[310];
+        char flushSecondText[220], flushTotalText[380], dirtyText[350];
         FormatFlushStats(flushSecondText, sizeof(flushSecondText), FlushSecond);
         FormatFlushStats(flushTotalText, sizeof(flushTotalText), FlushTotal);
         FormatDirtyStats(dirtyText, sizeof(dirtyText));
@@ -697,6 +729,11 @@ struct CaptureReadCounter
     }
 
 private:
+    static bool IsEngineB(u32 tracker) noexcept
+    {
+        return tracker >= CapTrack_BBG && tracker != CapTrack_AOBJ;
+    }
+
     static s32 FirstBit(const CaptureFlatDirty& d) noexcept
     {
         for (u32 i = 0; i < d.Words; i++)
@@ -826,7 +863,7 @@ private:
     // a held line reading a dirty page of this tracker's copy
     static bool JobReads(const GPU2D::LineJob& job, u32 tracker, const u64* bits, s8& layerOut, char& kindOut) noexcept
     {
-        bool engineB = tracker >= CapTrack_BBG && tracker != CapTrack_AOBJ;
+        bool engineB = IsEngineB(tracker);
         const GPU2D::UnitState& bg = job.BG[engineB ? 1 : 0];
         const GPU2D::UnitState& obj = job.OBJ[engineB ? 1 : 0];
 
@@ -892,7 +929,7 @@ private:
         }
     }
 
-    void NoteFlatFlush(const GPU& gpu, const CaptureFlatDirty* dirty, u32 count, const CaptureFlatDirty& first, const GPU2D::LineJob* held, u32 numHeld) noexcept
+    void NoteFlatFlush(const GPU& gpu, const CaptureFlatDirty* dirty, u32 count, const CaptureFlatDirty& first, const GPU2D::LineJob* held, u32 numHeld, bool engineBNoHold) noexcept
     {
         DirtyEvent ev {};
         ev.VCount = gpu.VCount;
@@ -923,11 +960,11 @@ private:
         for (u32 i = 0; i < count; i++)
         {
             const CaptureFlatDirty& d = dirty[i];
-            if (FirstBit(d) < 0)
+            if (FirstBit(d) < 0 || (engineBNoHold && IsEngineB(d.Tracker)))
                 continue;
 
             Frame.Dirty.Tracker[d.Tracker]++;
-            if (d.Tracker >= CapTrack_BBG && d.Tracker != CapTrack_AOBJ) engineB = true;
+            if (IsEngineB(d.Tracker)) engineB = true;
             else engineA = true;
 
             const FlatWrites& w = Writes[d.Tracker];
@@ -1138,7 +1175,7 @@ private:
                     TraceSecondLines++;
                     TraceLines++;
                     LogFrame(verdict);
-                    if (Frame.Dirty.Events)
+                    if (Frame.Dirty.Events || Frame.Dirty.BSkip || Frame.Dirty.ObjIdleA || Frame.Dirty.ObjIdleB)
                         LogDirty();
                 }
             }
@@ -1229,6 +1266,13 @@ private:
         const FrameDirty& f = Frame.Dirty;
         const DirtyEvent& ev = f.First;
 
+        if (!f.Events)
+        {
+            Platform::Log(Platform::LogLevel::Info, "CAPDIRTY f=%u flushes=0 bskip=%u bchg=%u bsame=%u objidle=a%u,b%u\n",
+                          TraceFrames, f.BSkip, f.BChanged, f.BSame, f.ObjIdleA, f.ObjIdleB);
+            return;
+        }
+
         static constexpr u32 bases[CapTrack_Count] = {0x06000000, 0, 0, 0x06200000, 0, 0, 0x06400000, 0x06600000};
         u32 base = bases[ev.Tracker];
         Append(p, end, "f=%u flushes=%u bgA=%u bgB=%u objA=%u objB=%u first v=%u trk=%s bits=%u-%u addr=%08X-%08X banks=%X held=%u cap=%u actA=%u actB=%u",
@@ -1249,8 +1293,9 @@ private:
             Append(p, end, " used=yes by=%d%c", ev.UsedLayer, ev.UsedKind);
         else
             Append(p, end, "%s", " used=no");
-        Append(p, end, " effect=%s frame arm9=%u dma=%u both=%u none=%u writes=%u chg=%u same=%u used=%u/%u effect=%u/%u",
-               ev.Effect ? "yes" : "no", f.ByARM9, f.ByDMA, f.ByBoth, f.ByNone, f.Writes, f.Changed, f.Same, f.UsedYes, f.UsedNo, f.EffectYes, f.EffectNo);
+        Append(p, end, " effect=%s frame arm9=%u dma=%u both=%u none=%u writes=%u chg=%u same=%u used=%u/%u effect=%u/%u bskip=%u bchg=%u bsame=%u objidle=a%u,b%u",
+               ev.Effect ? "yes" : "no", f.ByARM9, f.ByDMA, f.ByBoth, f.ByNone, f.Writes, f.Changed, f.Same, f.UsedYes, f.UsedNo, f.EffectYes, f.EffectNo,
+               f.BSkip, f.BChanged, f.BSame, f.ObjIdleA, f.ObjIdleB);
 
         Platform::Log(Platform::LogLevel::Info, "CAPDIRTY %s\n", text);
     }
@@ -1263,9 +1308,10 @@ private:
         const char* end = text + size;
         const DirtyStats& s = DirtyTotal;
 
-        Append(p, end, "dirty bg=a%u,b%u,ab%u obj=a%u,b%u who=arm9:%u,dma:%u,both:%u,none:%u chg=%llu same=%llu used=y%u,n%u effect=y%u,n%u",
-               s.BGA, s.BGB, s.BGBoth, s.OBJA, s.OBJB, s.ByARM9, s.ByDMA, s.ByBoth, s.ByNone,
-               (unsigned long long)s.Changed, (unsigned long long)s.Same, s.UsedYes, s.UsedNo, s.EffectYes, s.EffectNo);
+        Append(p, end, "dirty bg=a%u,b%u,ab%u obj=a%u,b%u objidle=a%u,b%u who=arm9:%u,dma:%u,both:%u,none:%u chg=%llu same=%llu used=y%u,n%u effect=y%u,n%u bskip=%u bchg=%llu bsame=%llu",
+               s.BGA, s.BGB, s.BGBoth, s.OBJA, s.OBJB, s.ObjIdleA, s.ObjIdleB, s.ByARM9, s.ByDMA, s.ByBoth, s.ByNone,
+               (unsigned long long)s.Changed, (unsigned long long)s.Same, s.UsedYes, s.UsedNo, s.EffectYes, s.EffectNo,
+               s.BSkip, (unsigned long long)s.BChanged, (unsigned long long)s.BSame);
 
         PCCount pcs[16];
         memcpy(pcs, TopPCs, sizeof(pcs));

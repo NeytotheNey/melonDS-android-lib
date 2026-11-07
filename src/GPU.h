@@ -662,11 +662,15 @@ public:
     template<typename T>
     void WritePalette(u32 addr, T val)
     {
-        // queued lines read a copy (see Start2DJob), so only the held ones are drawn first
-        if (CapReads)
-            NoteCaptureBarrier();
-        if (Deferred2DPending)
-            Flush2DDeferred(CapFlush_Palette);
+        // queued lines read a copy (see Start2DJob), so only the held ones are drawn first. with
+        // EngineBNoHold they only have engine A's part left, which doesn't read engine B's half
+        if (!(EngineBNoHold && (addr & 0x400)))
+        {
+            if (CapReads)
+                NoteCaptureBarrier();
+            if (Deferred2DPending)
+                Flush2DDeferred(CapFlush_Palette);
+        }
         addr &= 0x7FF;
 
         *(T*)&Palette[addr] = val;
@@ -684,10 +688,13 @@ public:
     void WriteOAM(u32 addr, T val)
     {
         // as WritePalette
-        if (CapReads)
-            NoteCaptureBarrier();
-        if (Deferred2DPending)
-            Flush2DDeferred(CapFlush_OAM);
+        if (!(EngineBNoHold && (addr & 0x400)))
+        {
+            if (CapReads)
+                NoteCaptureBarrier();
+            if (Deferred2DPending)
+                Flush2DDeferred(CapFlush_OAM);
+        }
         addr &= 0x7FF;
 
         *(T*)&OAM[addr] = val;
@@ -785,6 +792,11 @@ public:
     // hold display capture lines back until line 192 with an accelerated 3D renderer (see
     // Begin2DJob). only turned off by a debug switch, to compare against drawing them at HBlank
     bool DeferCapture2D = true;
+    // while display capture lines are held, draw engine B's part of each line right away and hold
+    // only engine A's, which is all that display capture reads and all that needs the 3D readback.
+    // then a game writing engine B's VRAM, palette or OAM doesn't draw the held lines early. off by
+    // default here; debug builds turn it on (DebugProperties) to compare. set between games only
+    bool EngineBNoHold = false;
     // with DeferCapture2D, submit the GPU work held lines wait for (the 3D frame at line 215, its
     // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
     // line 192. only turned off by a debug switch, to compare

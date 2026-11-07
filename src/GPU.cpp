@@ -415,7 +415,7 @@ void GPU::NoteCaptureFlatWrite(u32 tracker, u32 offset, u32 size, bool changed) 
 void GPU::NoteCaptureFlatCheck(const CaptureFlatDirty* dirty, u32 count) noexcept
 {
     const GPU2D::LineJob* held = Deferred2DPending ? &Deferred2DJobs[Deferred2DEnd - Deferred2DPending] : nullptr;
-    CapReads->NoteFlatCheck(*this, dirty, count, held, Deferred2DPending);
+    CapReads->NoteFlatCheck(*this, dirty, count, held, Deferred2DPending, EngineBNoHold);
 }
 
 // before the held lines are drawn: what asked for it, when, and whether the line with the 3D
@@ -1272,6 +1272,7 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     // so the record copy and the display flags would be wasted. the copies are dropped on every
     // scale change and a new renderer starts without any, so none can be valid when this turns on
     job.HiresCapture = job.Accelerated && HiresCapture && GPU3D.GetCurrentRenderer().RunsHiresCapture(HiresCaptureDebug);
+    job.EngineBNoHold = EngineBNoHold;
 
     // a queued job reads palette and OAM from a copy made when it's built, so CPU writes don't wait
     // for the 2D thread. the other jobs are drawn before any write (see WritePalette)
@@ -1398,7 +1399,10 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
         NoteCaptureFlatCheck(dirty, 6);
     }
 
-    if (Is2DThreadBusy() && (bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA || bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB))
+    // with EngineBNoHold, held lines have no engine B part left to read engine B's copies
+    bool dirtyA = bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA;
+    bool dirtyB = bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB;
+    if (EngineBNoHold ? ((dirtyA && Is2DThreadBusy()) || (dirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (dirtyA || dirtyB)))
         Sync2D(CapFlush_FlatBG);
 
     MakeVRAMFlat_ABGCoherent(bgDirtyA);
@@ -1424,7 +1428,7 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
         NoteCaptureFlatCheck(dirty, 2);
     }
 
-    if (Is2DThreadBusy() && (objDirtyA || objDirtyB))
+    if (EngineBNoHold ? ((objDirtyA && Is2DThreadBusy()) || (objDirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (objDirtyA || objDirtyB)))
         Sync2D(CapFlush_FlatOBJ);
 
     MakeVRAMFlat_AOBJCoherent(objDirtyA);
@@ -1720,6 +1724,7 @@ GPU2D::LineJob* GPU::BeginDeferred2DJob() noexcept
 
     GPU2D::LineJob* job = &Deferred2DJobs[Deferred2DEnd];
     job->Fetch3DLine = false;
+    job->EngineBDrawn = false;
     return job;
 }
 
@@ -1748,7 +1753,7 @@ void GPU::Flush2DDeferred(u8 flushCause) noexcept
                 NoteCaptureMap(true);
         }
 
-        GPU2D_Renderer->RunJob(job);
+        GPU2D_Renderer->RunJob(job, job.EngineBDrawn ? (u32)GPU2D::Renderer2D::EngineA : (GPU2D::Renderer2D::EngineA | GPU2D::Renderer2D::EngineB));
     }
 
     Deferred2DPending = 0;
@@ -1768,6 +1773,14 @@ void GPU::End2DJob(GPU2D::LineJob& job) noexcept
         // sprite snapshot can be a barrier too, and that barrier only draws the lines before this one
         if (CapReads && job.DrawBG)
             CapReads->NoteHeldLine(job.BG[0].CaptureCnt, job.BG[0].CaptureLatch, job.VCount, job.VRAMMap_LCDC);
+
+        // engine B's part is drawn when an unheld line would be, against the same flat copies. a
+        // held job then only ever means engine A's part is left, so no barrier needs to know more
+        if (EngineBNoHold)
+        {
+            GPU2D_Renderer->RunJob(job, GPU2D::Renderer2D::EngineB);
+            job.EngineBDrawn = true;
+        }
 
         Deferred2DEnd++;
         Deferred2DPending++;

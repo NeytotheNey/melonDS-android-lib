@@ -103,21 +103,21 @@ u32 SoftRenderer::ColorComposite(int i, u32 val1, u32 val2) const
     return val1;
 }
 
-void SoftRenderer::RunJob(const LineJob& job)
+void SoftRenderer::RunJob(const LineJob& job, u32 engines)
 {
     CurJob = &job;
 
     if (job.DrawBG)
     {
-        DrawScanline(job.Line, &job.BG[0]);
-        DrawScanline(job.Line, &job.BG[1]);
+        if (engines & EngineA) DrawScanline(job.Line, &job.BG[0]);
+        if (engines & EngineB) DrawScanline(job.Line, &job.BG[1]);
     }
 
     // sprites are pre-rendered one scanline in advance
     if (job.DrawOBJ)
     {
-        DrawSprites(job.SpriteLine, &job.OBJ[0]);
-        DrawSprites(job.SpriteLine, &job.OBJ[1]);
+        if (engines & EngineA) DrawSprites(job.SpriteLine, &job.OBJ[0]);
+        if (engines & EngineB) DrawSprites(job.SpriteLine, &job.OBJ[1]);
     }
 }
 
@@ -923,6 +923,14 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         for (int i = 0; i < 256; i+=2)
             *(u64*)&BGOBJLine[i] = backdrop;
     }
+
+    // a pass only resets the first plane, so a column no layer draws in keeps the last pass's second
+    // plane as what's under the backdrop. engine B's pass leaves it 0, and engine A's first pass after
+    // it depends on that: with engine A's parts held (GPU::EngineBNoHold) they can follow each other,
+    // and what they leave would reach the 3D compositing and display capture. this also stops engine
+    // B from seeing what engine A leaves, which only shows with the backdrop as a blend's first target
+    if (CurJob->Accelerated && CurJob->EngineBNoHold)
+        memset(&BGOBJLine[256], 0, 256 * sizeof(u32));
 
     if (CurUnit->DispCnt & 0xE000)
     {

@@ -170,6 +170,8 @@ struct LineJob
     u32 VRAMMap_LCDC;       // VRAM display and display capture only use LCDC banks
     bool ScreensEnabled;    // POWCNT1 bit 0 as latched at the frame start: clear = both screens black
     bool HiresCapture;      // Accelerated, GPU::HiresCapture and the compositor's pass would run: capture lines fill the record, VRAM display lines get the flag
+    bool EngineBNoHold;     // GPU::EngineBNoHold: passes can follow each other in any order, so each starts with its second plane clear
+    bool EngineBDrawn;      // held for display capture: engine B's part is drawn already, only engine A's is left
     const u8* Palette;      // palette and OAM as they were when the job was built: a copy for a queued job (see GPU::Start2DJob)
     const u8* OAM;
 
@@ -186,10 +188,13 @@ struct LineJob
 class Renderer2D
 {
 public:
+    enum : u32 { EngineA = 1 << 0, EngineB = 1 << 1 };
+
     virtual ~Renderer2D() {}
 
-    // the only drawing entry point: everything a line needs comes in the job
-    virtual void RunJob(const LineJob& job) = 0;
+    // the only drawing entry point: everything a line needs comes in the job. engines says which
+    // units' parts of it to draw, in order
+    virtual void RunJob(const LineJob& job, u32 engines = EngineA | EngineB) = 0;
 
     virtual void VBlankEnd(Unit* unitA, Unit* unitB) = 0;
 

@@ -33,7 +33,7 @@ public:
     SoftRenderer(melonDS::GPU& gpu);
     ~SoftRenderer() override {}
 
-    void RunJob(const LineJob& job) override;
+    void RunJob(const LineJob& job, u32 engines = EngineA | EngineB) override;
     void VBlankEnd(Unit* unitA, Unit* unitB) override;
 private:
     void DrawScanline(u32 line, const UnitState* unit);
