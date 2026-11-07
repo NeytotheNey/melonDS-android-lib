@@ -183,7 +183,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     HeldWingsW(other.HeldWingsW),
     HeldWingsH(other.HeldWingsH),
     HiresCap(other.HiresCap),
-    Filter2D(other.Filter2D),
+    Filter2D(std::move(other.Filter2D)),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -259,7 +259,7 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         HiresCap = other.HiresCap;
 
         FreeFilter2D();
-        Filter2D = other.Filter2D;
+        Filter2D = std::move(other.Filter2D);
 
         other.HeldWingsTex = {};
         other.HeldWingsFB = {};
@@ -372,6 +372,7 @@ void GLCompositor::Stop(const GPU& gpu) noexcept
 
     ResetWingHold();
     ResetHiresCapture();
+    ResetFilter2D();
 }
 
 void GLCompositor::ResetWingHold() noexcept
@@ -391,6 +392,13 @@ void GLCompositor::ResetHiresCapture() noexcept
     HiresCap.StreamSource = -1;
     HiresCap.LastScreenSwap = -1;
     HiresCap.StreamMissed = false;
+}
+
+// the map only depends on what UpdateFilter2DKeys compares, so a new scene would remake it anyway
+// once its keys differ. this is so nothing from before can be reused, whatever the keys
+void GLCompositor::ResetFilter2D() noexcept
+{
+    Filter2D.MapPasses = 0;
 }
 
 // decides, from the control words of the frame being composited, which wing lines are held
@@ -612,6 +620,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, CompScreenInputTex);
 
+    // the control words again, with the held lines flagged (see PrepareWingHold) and the
+    // hi-res capture flag only on the lines that show an image (see PrepareHiresDisplay)
+    bool ctrlCopied = wingHold || hiresDisplay;
     if (hasFramebuffers)
     {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256*3 + 1, 192, GL_RGBA_INTEGER,
@@ -619,9 +630,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256*3 + 1, 192, GL_RGBA_INTEGER,
                         GL_UNSIGNED_BYTE, gpu.Framebuffer[backbuf][1].get());
 
-        // the control words again, with the held lines flagged (see PrepareWingHold) and the
-        // hi-res capture flag only on the lines that show an image (see PrepareHiresDisplay)
-        if (wingHold || hiresDisplay)
+        if (ctrlCopied)
             glTexSubImage2D(GL_TEXTURE_2D, 0, 256*3, 0, 1, 384, GL_RGBA_INTEGER,
                             GL_UNSIGNED_BYTE, CtrlWords.data());
     }
@@ -629,7 +638,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // after the upload: the pre-pass reads the frame's planes and the final control words
     if (filterPasses > 0)
     {
-        RunFilter2D(gpu, backbuf, hiresDisplay, filterPasses);
+        RunFilter2D(gpu, backbuf, hiresDisplay, ctrlCopied, filterPasses);
         glUseProgram(filterComp.Program);
     }
 
@@ -776,13 +785,112 @@ bool GLCompositor::MakeFilter2DTarget(GLuint& texture, GLuint& fb, GLenum format
     return glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
 }
 
+// filtered 2D: the key the pre-pass (kFilter2DKeyFS) gives each native pixel, from the same planes
+// and control words it reads, into Filter2D.Keys. returns how many lines have a key that changed.
+// these keys aren't the shader's, but two of them are equal exactly when the shader's are: the
+// pixel's 6-bit color, with bit 31 for a 3D slot, and on a line that stays as it is one value no
+// color has (the shader's key there is the pixel's position, the same every frame). the passes
+// only read their keys, so a map made from equal keys by the same passes is the one they'd make
+int GLCompositor::UpdateFilter2DKeys(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied) noexcept
+{
+    constexpr u32 colorMask = 0x3F3F3F;
+    constexpr u32 slot3DKey = 1u << 31;
+    constexpr u32 stayKey = 1u << 30;
+
+    Filter2D.Keys.resize(256 * 384);
+    int changedLines = 0;
+    for (int half = 0; half < 2; half++)
+    {
+        const u32* fb = gpu.Framebuffer[backbuf][half].get();
+        for (int line = 0; line < 192; line++)
+        {
+            int outLine = half * 192 + line;
+            const u32* planes = &fb[line * (256*3 + 1)];
+            u32 ctrl = ctrlCopied ? CtrlWords[outLine] : planes[256*3];
+            u32 dispmode = (ctrl >> 16) & 0x3;
+            u32* keys = &Filter2D.Keys[outLine * 256];
+
+            u32 diff = 0;
+            if (dispmode >= 2 || (hiresDisplay && (ctrl & HiresDisplayFlag)))
+            {
+                for (int i = 0; i < 256; i++)
+                {
+                    diff |= keys[i] ^ stayKey;
+                    keys[i] = stayKey;
+                }
+            }
+            else if (dispmode == 0)
+            {
+                // dispmode 0 only reads plane 0
+                for (int i = 0; i < 256; i++)
+                {
+                    u32 key = planes[i] & colorMask;
+                    diff |= keys[i] ^ key;
+                    keys[i] = key;
+                }
+            }
+            else
+            {
+                // plane 1 for the compmodes that show 3D (0-4), plane 0 for the others. both are
+                // read either way, so the compiler can vectorize the loop
+                for (int i = 0; i < 256; i++)
+                {
+                    u32 key2D = planes[i] & colorMask;
+                    u32 key3D = (planes[256 + i] & colorMask) | slot3DKey;
+                    u32 key = ((planes[512 + i] >> 24) & 0xF) <= 4 ? key3D : key2D;
+                    diff |= keys[i] ^ key;
+                    keys[i] = key;
+                }
+            }
+
+            if (diff)
+                changedLines++;
+        }
+    }
+
+    return changedLines;
+}
+
 // filtered 2D: fills the map the compositor reads planes 0-2 through, from the planes and control
 // words just uploaded. a key per native pixel, then MMPX to 2x, then at scale 4 and up to 4x. all
 // of it is the frame's own data, so what a target held before doesn't matter, and tiled GPUs are
 // told so. each pass leaves its texture for the next one on the map's unit, and the last leaves
-// the map. RenderFrame's state is back afterwards except for the program, which it sets
-void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, int passes) noexcept
+// the map. RenderFrame's state is back afterwards except for the program, which it sets.
+// most frames of a 2D scene have the keys of the one before, and then the map from the last run
+// is bound as it is
+void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied, int passes) noexcept
 {
+    auto nowNs = []
+    {
+        return (s64) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
+    s64 checkStart = gpu.Filter2DLogging ? nowNs() : 0;
+    int changedLines = UpdateFilter2DKeys(gpu, backbuf, hiresDisplay, ctrlCopied);
+    bool identity = gpu.Filter2D == 3;
+    bool reuse = changedLines == 0 && Filter2D.MapPasses == passes && Filter2D.MapIdentity == identity;
+    if (gpu.Filter2DLogging)
+    {
+        s64 checkNs = nowNs() - checkStart;
+        Filter2D.LogCheckNs += checkNs;
+        Filter2D.LogCheckMaxNs = std::max(Filter2D.LogCheckMaxNs, checkNs);
+        Filter2D.LogChangedLines += changedLines;
+        if (reuse)
+            Filter2D.LogSkipped++;
+        else
+            Filter2D.LogRan++;
+    }
+
+    if (reuse)
+    {
+        // the unit may have been used since
+        glActiveTexture(GL_TEXTURE0 + Filter2DMapUnit);
+        glBindTexture(GL_TEXTURE_2D, Filter2D.MapTex);
+        glActiveTexture(GL_TEXTURE0);
+        return;
+    }
+
     const GLenum attachment = GL_COLOR_ATTACHMENT0;
 
     // kHiresCaptureVS needs no attributes, but the VAO may be the 3D renderer's
@@ -796,7 +904,7 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, i
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     glUseProgram(Filter2D.MmpxShader);
-    glUniform1i(Filter2D.MmpxIdentityLoc, gpu.Filter2D == 3);
+    glUniform1i(Filter2D.MmpxIdentityLoc, identity);
     glActiveTexture(GL_TEXTURE0 + Filter2DMapUnit);
 
     glBindTexture(GL_TEXTURE_2D, Filter2D.KeyTex);
@@ -823,6 +931,9 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, i
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
     glViewport(0, 0, ScreenW, ScreenH);
+
+    Filter2D.MapPasses = passes;
+    Filter2D.MapIdentity = identity;
 }
 
 void GLCompositor::FreeFilter2DTextures() noexcept
@@ -840,6 +951,8 @@ void GLCompositor::FreeFilter2DTextures() noexcept
     Filter2D.Map2xTex = Filter2D.Map2xFB = 0;
     Filter2D.MapTex = Filter2D.MapFB = 0;
     Filter2D.MapScale = 0;
+    Filter2D.MapPasses = 0;
+    Filter2D.Keys = std::vector<u32>();
 }
 
 void GLCompositor::FreeFilter2D() noexcept
@@ -854,7 +967,9 @@ void GLCompositor::FreeFilter2D() noexcept
     Filter2D.Comp = {};
 }
 
-// debug only (GPU::Filter2DLogging): the mode, the scale and how many passes frames run, once a second
+// debug only (GPU::Filter2DLogging): the mode, the scale and how many passes frames run, once a second.
+// of the frames, ran made the map and skipped reused it. changedlines is how many lines' keys changed
+// and checkus how long UpdateFilter2DKeys took, on average over those two, and checkmaxus its longest
 void GLCompositor::LogFilter2D(const GPU& gpu, int passes) noexcept
 {
     s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -865,11 +980,18 @@ void GLCompositor::LogFilter2D(const GPU& gpu, int passes) noexcept
     if (now - Filter2D.LogStartNs < 1000000000)
         return;
 
-    Log(LogLevel::Info, "FILTER2D mode=%d scale=%d passes=%d mapscale=%d frames=%u failed=%d\n",
-        gpu.Filter2D, Scale, passes, Filter2D.MapScale, Filter2D.LogFrames, Filter2D.Failed ? 1 : 0);
+    u32 checked = Filter2D.LogRan + Filter2D.LogSkipped;
+    double perChecked = checked ? 1.0 / checked : 0.0;
+    Log(LogLevel::Info, "FILTER2D mode=%d scale=%d passes=%d mapscale=%d frames=%u ran=%u skipped=%u "
+        "changedlines=%.1f checkus=%.1f checkmaxus=%.1f failed=%d\n",
+        gpu.Filter2D, Scale, passes, Filter2D.MapScale, Filter2D.LogFrames, Filter2D.LogRan, Filter2D.LogSkipped,
+        Filter2D.LogChangedLines * perChecked, Filter2D.LogCheckNs * perChecked / 1000.0,
+        Filter2D.LogCheckMaxNs / 1000.0, Filter2D.Failed ? 1 : 0);
 
     Filter2D.LogStartNs = now;
     Filter2D.LogFrames = 0;
+    Filter2D.LogRan = Filter2D.LogSkipped = Filter2D.LogChangedLines = 0;
+    Filter2D.LogCheckNs = Filter2D.LogCheckMaxNs = 0;
 }
 
 // hi-res display capture: decides which VRAM display lines show a hi-res bank copy. the 2D

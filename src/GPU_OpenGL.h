@@ -60,6 +60,9 @@ public:
     // drops the hi-res capture copies (see HiresCap), for a reset or a savestate load. CPU state
     // only too: the textures stay for the next capture
     void ResetHiresCapture() noexcept;
+    // makes the next frame redo the filtered 2D map (see Filter2DState::MapPasses), for a reset or
+    // a savestate load. CPU state only too
+    void ResetFilter2D() noexcept;
     // whether the capture pass would run now (see RunHiresCapture): above 1x, or at 1x in the
     // check mode (GPU::HiresCaptureDebug 2), and while the capture program hasn't failed. GPU
     // only records capture lines and flags VRAM display lines while it does (GPU::Start2DJob)
@@ -207,7 +210,8 @@ private:
     // filtered 2D (see GPU::Filter2D and RunFilter2D). everything here is made the first time a
     // frame needs it, and the textures go at a scale change or when the filter goes off. the
     // compositor programs are the usual ones with FILTER2D defined, one for each of the view's
-    // widths, so a frame without the filter runs exactly what it would without this
+    // widths, so a frame without the filter runs exactly what it would without this. a frame whose
+    // pre-pass would get the same keys as the one that made the map reuses it (see UpdateFilter2DKeys)
     static constexpr int Filter2DMapUnit = 9;
     struct Filter2DProgram
     {
@@ -220,6 +224,12 @@ private:
         GLuint Map2xTex = 0, Map2xFB = 0;   // GL_RG32UI 512x768: the first pass's, when a second one reads it
         GLuint MapTex = 0, MapFB = 0;       // GL_R16UI 256x384 at MapScale: what the compositor reads
         int MapScale = 0;
+        // what's in MapTex: the passes that made it (0 for nothing, as at the start, after a reset or
+        // a savestate load and once the textures went), whether they wrote identity coordinates,
+        // and the keys they read, 256 per line in UpdateFilter2DKeys's form
+        int MapPasses = 0;
+        bool MapIdentity = false;
+        std::vector<u32> Keys;
 
         bool Failed = false;                // a program didn't build or a target isn't complete
         GLuint KeyShader = 0;
@@ -231,13 +241,16 @@ private:
         // the FILTER2D log, GPU::Filter2DLogging only
         s64 LogStartNs = 0;
         u32 LogFrames = 0;
+        u32 LogRan = 0, LogSkipped = 0, LogChangedLines = 0;
+        s64 LogCheckNs = 0, LogCheckMaxNs = 0;
     };
     Filter2DState Filter2D {};
 
     int PrepareFilter2D(const GPU& gpu, bool hasFramebuffers) noexcept;
     bool PrepareFilter2DShaders(bool wide) noexcept;
     bool MakeFilter2DTarget(GLuint& texture, GLuint& fb, GLenum format, int width, int height) noexcept;
-    void RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, int passes) noexcept;
+    int UpdateFilter2DKeys(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied) noexcept;
+    void RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied, int passes) noexcept;
     void FreeFilter2DTextures() noexcept;
     void FreeFilter2D() noexcept;
     void LogFilter2D(const GPU& gpu, int passes) noexcept;

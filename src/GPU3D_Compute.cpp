@@ -417,9 +417,11 @@ void ComputeRenderer::DeleteShaders()
 void ComputeRenderer::Reset(GPU& gpu)
 {
     Texcache.Reset();
-    // held WideMelon wings and hi-res capture copies belong to the old scene
+    // held WideMelon wings and hi-res capture copies belong to the old scene, and so does the
+    // filtered 2D map
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
+    CurGLCompositor.ResetFilter2D();
     ClearBitmapDirty = 0x3;
     DropEarlyCapture();
 }
@@ -428,6 +430,7 @@ void ComputeRenderer::SavestateLoaded()
 {
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
+    CurGLCompositor.ResetFilter2D();
     // line 0 reads the low res image back again, as it did before the early readback
     DropEarlyCapture();
 }

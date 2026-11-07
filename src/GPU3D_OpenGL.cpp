@@ -348,9 +348,11 @@ GLRenderer::~GLRenderer()
 
 void GLRenderer::Reset(GPU& gpu)
 {
-    // held WideMelon wings and hi-res capture copies belong to the old scene
+    // held WideMelon wings and hi-res capture copies belong to the old scene, and so does the
+    // filtered 2D map
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
+    CurGLCompositor.ResetFilter2D();
     TexMemDirtyAll = true;
     TargetsChanged = true;
     EarlyCapture = false;
@@ -1884,6 +1886,7 @@ void GLRenderer::SavestateLoaded()
 {
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
+    CurGLCompositor.ResetFilter2D();
     // line 0 reads back MainFramebuffer again, as it did before the early readback
     EarlyCapture = false;
 }
