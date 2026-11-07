@@ -182,6 +182,10 @@ void DSi_NDMA::Start()
     //if (SubblockTimer & 0xFFFF)
     //    printf("TODO! NDMA SUBBLOCK TIMER: %08X\n", SubblockTimer);
 
+    // debug only, see GPU_CaptureReads.h: an NDMA reading LCDC VRAM. only the ARM9 side can reach it
+    if (DSi.GPU.CapReads && CPU == 0 && (CurSrcAddr & 0xFF800000) == 0x06800000)
+        DSi.GPU.NoteCaptureDMA(Num, true, StartMode, CurSrcAddr, CurDstAddr, IterCount, 4, Cnt & (1<<29));
+
     if (DSi.DMAsRunning(CPU))
         Running = 1;
     else
@@ -203,6 +207,10 @@ void DSi_NDMA::Run9()
     if (DSi.ARM9Timestamp >= DSi.ARM9Target) return;
 
     Executing = true;
+
+    // debug only, see GPU_CaptureReads.h: who the writes coming up belong to
+    if (DSi.GPU.CapReads)
+        DSi.GPU.NoteCaptureDMARun(Num, true, StartMode, CurSrcAddr, CurDstAddr, IterCount, 4, Cnt & (1<<29));
 
     // add NS penalty for first accesses in burst
     bool burststart = (Running == 2);

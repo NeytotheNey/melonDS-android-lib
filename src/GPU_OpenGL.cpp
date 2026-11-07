@@ -30,6 +30,7 @@
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL.h"
+#include "GPU_CaptureReads.h"
 #include "GPU_HiresStream.h"
 #include "OpenGLSupport.h"
 #include "Platform.h"
@@ -645,6 +646,9 @@ bool GLCompositor::PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCop
     u8 stale = record ? record->StaleMask : gpu.NativeCapturedSincePass;
     u8 offsetCapture = record ? record->OffsetMask : 0;
 
+    // debug only, see GPU_CaptureReads.h: the banks whose lines show the copy or stay native
+    u8 hiresBanks = 0, nativeBanks = 0;
+
     int firstBank = -1;
     for (int half = 0; half < 2; half++)
     {
@@ -673,9 +677,13 @@ bool GLCompositor::PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCop
                 HiresCap.ShowBank = bank;
                 HiresCap.LinesShown++;
                 ctrl &= ~(HiresDisplayBits & ~HiresDisplayFlag);
+                hiresBanks |= 1 << bank;
             }
             else
+            {
                 ctrl &= ~HiresDisplayBits;
+                nativeBanks |= 1 << bank;
+            }
         }
     }
 
@@ -695,7 +703,12 @@ bool GLCompositor::PrepareHiresDisplay(const GPU& gpu, int backbuf, bool ctrlCop
             }
         }
         HiresCap.ShowBank = -1;
+        nativeBanks |= hiresBanks;
+        hiresBanks = 0;
     }
+
+    if (gpu.CapReads)
+        gpu.CapReads->NoteHiresDisplay(hiresBanks, nativeBanks);
 
     return HiresCap.ShowBank >= 0 || HiresCap.StreamSource >= 0;
 }
@@ -796,6 +809,7 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
     // for the display FIFO
     int bankB = -1;
     bool anyPlanes = false, anyNativeB = false;
+    u8 hiresBanksB = 0, nativeBanksB = 0; // debug only, see GPU_CaptureReads.h
     if (!skip)
     {
         for (int line = 0; line < rows; line++)
@@ -816,11 +830,13 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
                 {
                     bankB = bank;
                     HiresCap.LinesHiresB++;
+                    hiresBanksB |= 1 << bank;
                 }
                 else
                 {
                     anyNativeB = true;
                     HiresCap.LinesNativeB++;
+                    nativeBanksB |= 1 << bank;
                 }
             }
             if (mode != 1 && !(capcnt & (1 << 24)))
@@ -830,6 +846,9 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
             HiresCapCtrl[line * 2 + 1] = (entry.RenderXPos & 0x1FF) | (hiresB << 9) |
                                          (entry.SrcBPresent << 10) | (entry.SrcBRow << 16);
         }
+
+        if (gpu.CapReads)
+            gpu.CapReads->NoteHiresSrcB(hiresBanksB, nativeBanksB);
     }
 
     for (int bank = 0; bank < 4; bank++)

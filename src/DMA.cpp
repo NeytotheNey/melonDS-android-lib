@@ -187,6 +187,10 @@ void DMA::Start()
 
     IsGXFIFODMA = (CPU == 0 && (CurSrcAddr>>24) == 0x02 && CurDstAddr == 0x04000400 && DstAddrInc == 0);
 
+    // debug only, see GPU_CaptureReads.h: a DMA reading LCDC VRAM. only the ARM9 side can reach it
+    if (NDS.GPU.CapReads && CPU == 0 && (CurSrcAddr & 0xFF800000) == 0x06800000)
+        NDS.GPU.NoteCaptureDMA(Num, false, StartMode, CurSrcAddr, CurDstAddr, IterCount, (Cnt & (1<<26)) ? 4 : 2, Cnt & (1<<25));
+
     // TODO eventually: not stop if we're running code in ITCM
 
     Running = 2;
@@ -557,6 +561,10 @@ void DMA::Run9()
     if (NDS.ARM9Timestamp >= NDS.ARM9Target) return;
 
     Executing = true;
+
+    // debug only, see GPU_CaptureReads.h: who the writes coming up belong to
+    if (NDS.GPU.CapReads)
+        NDS.GPU.NoteCaptureDMARun(Num, false, StartMode, CurSrcAddr, CurDstAddr, IterCount, (Cnt & (1<<26)) ? 4 : 2, Cnt & (1<<25));
 
     // add NS penalty for first accesses in burst
     bool burststart = (Running == 2);

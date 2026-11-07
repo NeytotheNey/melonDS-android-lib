@@ -27,6 +27,7 @@
 
 #include "GPU2D_Soft.h"
 #include "GPU3D.h"
+#include "GPU_CaptureReads.h"
 
 namespace melonDS
 {
@@ -259,6 +260,8 @@ void GPU::Reset() noexcept
 
     ResetVRAMCache();
     ResetHiresCapture();
+    if (CapReads)
+        CapReads->DropAll();
 
     OAMDirty = 0x3;
     PaletteDirty = 0xF;
@@ -286,7 +289,10 @@ void GPU::Stop() noexcept
 
 void GPU::DoSavestate(Savestate* file) noexcept
 {
-    Sync2D();
+    Sync2D(CapFlush_Savestate);
+
+    if (CapReads && file->Saving)
+        CapReads->NoteSavestate();
 
     file->Section("GPUG");
 
@@ -356,8 +362,93 @@ void GPU::DoSavestate(Savestate* file) noexcept
         ResetVRAMCache();
         // nothing hi-res is saved: the copies are dropped and rebuild from native source B
         ResetHiresCapture();
+        if (CapReads)
+            CapReads->DropAll();
         GPU3D.GetCurrentRenderer().SavestateLoaded();
     }
+}
+
+void GPU::SetCaptureReadLogging(bool enable) noexcept
+{
+    if (enable && !CapReads)
+        CapReads = std::make_unique<CaptureReadCounter>();
+    else if (!enable)
+        CapReads.reset();
+}
+
+// out of line because GPU.h can't see NDS. the CPU doesn't run while an ARM9 DMA holds it stopped
+// (NDS::RunFrame), so this tells DMA from the CPU without touching the DMA code. a JIT block that
+// starts a DMA finishes first, so reads in the rest of that block count as DMA
+void GPU::NoteCaptureRead(u32 bank, u32 addr) noexcept
+{
+    CapReads->NoteRead(bank, addr, (NDS.CPUStop & CPUStop_DMA9) != 0, VCount);
+}
+
+void GPU::NoteCaptureWrite(u32 bank, u32 addr) noexcept
+{
+    CapReads->NoteWrite(bank, addr);
+}
+
+void GPU::NoteCaptureBarrier() noexcept
+{
+    CapReads->NoteBarrier();
+}
+
+void GPU::NoteCaptureDMA(u32 channel, bool ndma, u32 mode, u32 src, u32 dst, u32 words, u32 wordSize, bool repeat) noexcept
+{
+    CapReads->NoteDMA(channel, ndma, mode, src, dst, words, wordSize, repeat, VCount);
+}
+
+void GPU::NoteCaptureDMARun(u32 channel, bool ndma, u32 mode, u32 src, u32 dst, u32 words, u32 wordSize, bool repeat) noexcept
+{
+    CapReads->NoteDMARun(channel, ndma, mode, src, dst, words, wordSize, repeat);
+}
+
+// a CPU or DMA write to a bank a flat copy comes from. R15 is what the JIT last stored, so with the
+// JIT it's about where the block started; the interpreter has the instruction + 8 (+ 4 in Thumb)
+void GPU::NoteCaptureFlatWrite(u32 tracker, u32 offset, u32 size, bool changed) noexcept
+{
+    CapReads->NoteFlatWrite(tracker, offset, size, changed, (NDS.CPUStop & CPUStop_DMA9) != 0, NDS.ARM9.R[15]);
+}
+
+// each check of the flat copies. the lines held right now are the ones the check's barrier draws
+void GPU::NoteCaptureFlatCheck(const CaptureFlatDirty* dirty, u32 count) noexcept
+{
+    const GPU2D::LineJob* held = Deferred2DPending ? &Deferred2DJobs[Deferred2DEnd - Deferred2DPending] : nullptr;
+    CapReads->NoteFlatCheck(*this, dirty, count, held, Deferred2DPending, EngineBNoHold);
+}
+
+// before the held lines are drawn: what asked for it, when, and whether the line with the 3D
+// readback map (GetLine(0), see GPU3D::GetLine for the abort case) is among them
+void GPU::NoteCaptureFlush(u8 flushCause) noexcept
+{
+    if (flushCause == CapFlush_Read)
+        flushCause = (NDS.CPUStop & CPUStop_DMA9) ? CapFlush_ReadDMA : CapFlush_ReadARM9;
+
+    bool maps = false;
+    for (u32 i = Deferred2DEnd - Deferred2DPending; i < Deferred2DEnd; i++)
+    {
+        const GPU2D::LineJob& job = Deferred2DJobs[i];
+        maps = maps || (job.Fetch3DLine && job.Line == 0 && !job.Abort3DLine);
+    }
+
+    CapReads->NoteFlush(flushCause, VCount, Deferred2DPending, maps);
+}
+
+// around the map: the time it took, and with the compute renderer in debug builds the wait and
+// spin the frontend's CAPWAIT line sums up, for this map alone. reading them changes nothing
+void GPU::NoteCaptureMap(bool end) noexcept
+{
+    s64 waitNs = 0, spinNs = 0;
+#ifdef MELONADE_DEBUG_TOOLS
+    const Renderer3D& renderer = GPU3D.GetCurrentRenderer();
+    waitNs = renderer.CaptureMapWaitNs;
+    spinNs = renderer.CaptureSpinNs;
+#endif
+    if (end)
+        CapReads->NoteMapEnd(waitNs, spinNs);
+    else
+        CapReads->NoteMapStart(waitNs, spinNs);
 }
 
 // the hi-res capture copies no longer match VRAM: all four banks count as written, which drops
@@ -567,10 +658,12 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2DForLCDC();
+    Sync2DForLCDC(CapFlush_VRAMCNT);
 
     // the bank may have been written while it was mapped elsewhere
     NoteHiresCaptureWrite(bank);
+    if (CapReads)
+        CapReads->NoteRemap(bank, cnt);
 
     u8 oldofs = (oldcnt >> 3) & 0x3;
     u8 ofs = (cnt >> 3) & 0x3;
@@ -633,10 +726,12 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
     VRAMSTAT &= ~(1 << (bank-2));
 
     if (oldcnt == cnt) return;
-    Sync2DForLCDC();
+    Sync2DForLCDC(CapFlush_VRAMCNT);
 
     // the bank may have been written while it was mapped elsewhere
     NoteHiresCaptureWrite(bank);
+    if (CapReads)
+        CapReads->NoteRemap(bank, cnt);
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -722,7 +817,7 @@ void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2DForLCDC();
+    Sync2DForLCDC(CapFlush_VRAMCNT);
 
     u32 bankmask = 1 << bank;
 
@@ -787,7 +882,7 @@ void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2DForLCDC();
+    Sync2DForLCDC(CapFlush_VRAMCNT);
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -888,7 +983,7 @@ void GPU::MapVRAM_H(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2DForLCDC();
+    Sync2DForLCDC(CapFlush_VRAMCNT);
 
     u32 bankmask = 1 << bank;
 
@@ -951,7 +1046,7 @@ void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
-    Sync2DForLCDC();
+    Sync2DForLCDC(CapFlush_VRAMCNT);
 
     u32 bankmask = 1 << bank;
 
@@ -1034,7 +1129,7 @@ void GPU::SetPowerCnt(u32 val) noexcept
     else
         LCDPowerLogged = false;
 
-    Sync2D();
+    Sync2D(CapFlush_PowCnt);
 
     GPU2D_A.SetEnabled(val & (1<<1));
     GPU2D_B.SetEnabled(val & (1<<9));
@@ -1119,13 +1214,13 @@ void GPU::StartHBlank(u32 line) noexcept
         // the late barrier and Blit (see StartScanline), before the 3D render replaces the 3D
         // frame the compositor reads
         if (BlitPending)
-            Sync2D();
+            Sync2D(CapFlush_LateBlit);
 
         // lines still held for display capture (a VCount write skipped line 192) read the GL
         // readback buffer, which the 3D render can reallocate, so they're drawn first. only the
         // held lines: nothing is queued while lines are held, and software 3D needs no ring sync here
         if (Deferred2DPending)
-            Flush2DDeferred();
+            Flush2DDeferred(CapFlush_Line215);
 
         GPU3D.VCount215(*this);
 
@@ -1177,6 +1272,7 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     // so the record copy and the display flags would be wasted. the copies are dropped on every
     // scale change and a new renderer starts without any, so none can be valid when this turns on
     job.HiresCapture = job.Accelerated && HiresCapture && GPU3D.GetCurrentRenderer().RunsHiresCapture(HiresCaptureDebug);
+    job.EngineBNoHold = EngineBNoHold;
 
     // a queued job reads palette and OAM from a copy made when it's built, so CPU writes don't wait
     // for the 2D thread. the other jobs are drawn before any write (see WritePalette)
@@ -1218,6 +1314,10 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
     job.Line = line;
     job.BG[0] = GPU2D_A.State();
     job.BG[1] = GPU2D_B.State();
+
+    // debug only, see GPU_CaptureReads.h. counted here as the line may be drawn on the 2D thread
+    if (CapReads && ((job.BG[0].DispCnt >> 16) & 0x3) == 2 && (job.VRAMMap_LCDC & (1 << ((job.BG[0].DispCnt >> 18) & 0x3))))
+        CapReads->NoteDisplayLine((job.BG[0].DispCnt >> 18) & 0x3, job.VCount);
 
     // unit A's 3D line, fetched in the same cases the renderer used to: always with the software
     // renderer, and for display capture with the GL ones (their GetLine maps a GL buffer on line 0).
@@ -1285,8 +1385,25 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
     auto bgExtPalDirtyB = VRAMDirty_BBGExtPal.DeriveState(VRAMMap_BBGExtPal, *this);
     auto objExtPalDirtyB = VRAMDirty_BOBJExtPal.DeriveState(&VRAMMap_BOBJExtPal, *this);
 
-    if (Is2DThreadBusy() && (bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA || bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB))
-        Sync2D();
+    // debug only, see GPU_CaptureReads.h
+    if (CapReads)
+    {
+        const CaptureFlatDirty dirty[] = {
+            {CapTrack_ABG, bgDirtyA.Data, bgDirtyA.DataLength},
+            {CapTrack_ABGExtPal, bgExtPalDirtyA.Data, bgExtPalDirtyA.DataLength},
+            {CapTrack_AOBJExtPal, objExtPalDirtyA.Data, objExtPalDirtyA.DataLength},
+            {CapTrack_BBG, bgDirtyB.Data, bgDirtyB.DataLength},
+            {CapTrack_BBGExtPal, bgExtPalDirtyB.Data, bgExtPalDirtyB.DataLength},
+            {CapTrack_BOBJExtPal, objExtPalDirtyB.Data, objExtPalDirtyB.DataLength},
+        };
+        NoteCaptureFlatCheck(dirty, 6);
+    }
+
+    // with EngineBNoHold, held lines have no engine B part left to read engine B's copies
+    bool dirtyA = bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA;
+    bool dirtyB = bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB;
+    if (EngineBNoHold ? ((dirtyA && Is2DThreadBusy()) || (dirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (dirtyA || dirtyB)))
+        Sync2D(CapFlush_FlatBG);
 
     MakeVRAMFlat_ABGCoherent(bgDirtyA);
     MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirtyA);
@@ -1301,8 +1418,18 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
     auto objDirtyA = VRAMDirty_AOBJ.DeriveState(VRAMMap_AOBJ, *this);
     auto objDirtyB = VRAMDirty_BOBJ.DeriveState(VRAMMap_BOBJ, *this);
 
-    if (Is2DThreadBusy() && (objDirtyA || objDirtyB))
-        Sync2D();
+    // debug only, see GPU_CaptureReads.h
+    if (CapReads)
+    {
+        const CaptureFlatDirty dirty[] = {
+            {CapTrack_AOBJ, objDirtyA.Data, objDirtyA.DataLength},
+            {CapTrack_BOBJ, objDirtyB.Data, objDirtyB.DataLength},
+        };
+        NoteCaptureFlatCheck(dirty, 2);
+    }
+
+    if (EngineBNoHold ? ((objDirtyA && Is2DThreadBusy()) || (objDirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (objDirtyA || objDirtyB)))
+        Sync2D(CapFlush_FlatOBJ);
 
     MakeVRAMFlat_AOBJCoherent(objDirtyA);
     MakeVRAMFlat_BOBJCoherent(objDirtyB);
@@ -1531,7 +1658,7 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
     // a VCount write can bring back visible lines before line 215, so the late Blit reads this
     // frame's lines first
     if (BlitPending)
-        Sync2D();
+        Sync2D(CapFlush_LateBlit);
 
     GPU2D::LineJob* job = &Job2D;
 
@@ -1544,7 +1671,7 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
     {
         // held lines are drawn before any line that isn't
         if (Deferred2DPending)
-            Flush2DDeferred();
+            Flush2DDeferred(CapFlush_NotHeld);
 
         if (Threaded2D)
         {
@@ -1565,7 +1692,7 @@ GPU2D::LineJob& GPU::Begin2DJob() noexcept
             else
             {
                 // display capture: drawn here, after the lines queued before it
-                Sync2D();
+                Sync2D(CapFlush_NotHeld);
             }
         }
     }
@@ -1588,7 +1715,7 @@ GPU2D::LineJob* GPU::BeginDeferred2DJob() noexcept
         Deferred2DJobs = std::make_unique<GPU2D::LineJob[]>(Deferred2DSize);
 
     if (Deferred2DEnd == Deferred2DSize)
-        Flush2DDeferred();
+        Flush2DDeferred(CapFlush_Full);
     if (!Deferred2DPending)
         Deferred2DEnd = 0;
 
@@ -1597,14 +1724,19 @@ GPU2D::LineJob* GPU::BeginDeferred2DJob() noexcept
 
     GPU2D::LineJob* job = &Deferred2DJobs[Deferred2DEnd];
     job->Fetch3DLine = false;
+    job->EngineBDrawn = false;
     return job;
 }
 
 // draws the held display capture lines, in order, as StartHBlank would have drawn them. the 2D
 // thread is idle here (nothing is queued while lines are held), and the job being built, if any,
 // isn't held yet (it's at Deferred2DEnd)
-void GPU::Flush2DDeferred() noexcept
+void GPU::Flush2DDeferred(u8 flushCause) noexcept
 {
+    // debug only, see GPU_CaptureReads.h
+    if (CapReads && Deferred2DPending)
+        NoteCaptureFlush(flushCause);
+
     for (u32 i = Deferred2DEnd - Deferred2DPending; i < Deferred2DEnd; i++)
     {
         GPU2D::LineJob& job = Deferred2DJobs[i];
@@ -1612,9 +1744,16 @@ void GPU::Flush2DDeferred() noexcept
         // the first one with a 3D line maps the GL readback buffer (GetLine(0)), the rest read
         // the copy the renderer made of it
         if (job.Fetch3DLine)
+        {
+            bool timeMap = CapReads && job.Line == 0 && !job.Abort3DLine;
+            if (timeMap)
+                NoteCaptureMap(false);
             job.Line3D = GPU3D.GetLine(job.Line, job.RenderXPos, job.Abort3DLine);
+            if (timeMap)
+                NoteCaptureMap(true);
+        }
 
-        GPU2D_Renderer->RunJob(job);
+        GPU2D_Renderer->RunJob(job, job.EngineBDrawn ? (u32)GPU2D::Renderer2D::EngineA : (GPU2D::Renderer2D::EngineA | GPU2D::Renderer2D::EngineB));
     }
 
     Deferred2DPending = 0;
@@ -1630,6 +1769,19 @@ void GPU::End2DJob(GPU2D::LineJob& job) noexcept
 
     if (Is2DJobDeferred(job))
     {
+        // debug only, see GPU_CaptureReads.h. here and not when the BG pass is snapshotted: the line's
+        // sprite snapshot can be a barrier too, and that barrier only draws the lines before this one
+        if (CapReads && job.DrawBG)
+            CapReads->NoteHeldLine(job.BG[0].CaptureCnt, job.BG[0].CaptureLatch, job.VCount, job.VRAMMap_LCDC);
+
+        // engine B's part is drawn when an unheld line would be, against the same flat copies. a
+        // held job then only ever means engine A's part is left, so no barrier needs to know more
+        if (EngineBNoHold)
+        {
+            GPU2D_Renderer->RunJob(job, GPU2D::Renderer2D::EngineB);
+            job.EngineBDrawn = true;
+        }
+
         Deferred2DEnd++;
         Deferred2DPending++;
         return;
@@ -1648,7 +1800,10 @@ void GPU::End2DJob(GPU2D::LineJob& job) noexcept
 void GPU::FinishFrame(u32 lines) noexcept
 {
     // line 262 queued the next frame's first sprites. after this the 2D thread is idle until the next frame
-    Sync2D();
+    Sync2D(CapFlush_FrameEnd);
+
+    if (CapReads)
+        CapReads->EndFrame();
 
     if (Hash2DLogging)
         LogHash2D();
@@ -1795,9 +1950,9 @@ void GPU::StartScanline(u32 line) noexcept
             if (GPU3D.NeedsRealSceneRedraw())
             {
                 if (BlitPending)
-                    Sync2D();
+                    Sync2D(CapFlush_LateBlit);
                 if (Deferred2DPending)
-                    Flush2DDeferred();
+                    Flush2DDeferred(CapFlush_HalfCam);
                 GPU3D.RedrawRealScene(*this);
             }
 
@@ -1821,6 +1976,10 @@ void GPU::StartScanline(u32 line) noexcept
     {
         if (VCount == 192)
         {
+            // debug only, see GPU_CaptureReads.h: the Sync2D below ends the frame's held lines
+            if (CapReads)
+                CapReads->NoteBarrier();
+
             // the last lines are usually still being drawn here, and nothing below needs them until
             // the GL compositor reads the 2D back buffers (the Blit at the end, or at line 215), so
             // the wait is there. the VBlank DMAs and the CPU only reach what a queued line reads
@@ -1874,7 +2033,7 @@ void GPU::StartScanline(u32 line) noexcept
             {
                 // the compositor uploads this frame's 2D back buffers, so every line must be drawn.
                 // this is where the lines held for display capture are usually drawn
-                Sync2D();
+                Sync2D(CapFlush_Line192);
                 GPU3D.Blit(*this);
                 HiresCaptureBlitDone();
 
