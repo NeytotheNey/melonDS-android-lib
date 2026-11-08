@@ -1072,19 +1072,40 @@ void GPU3D::SubmitPolygon() noexcept
 
     // the wide check: the wider view lets more polygons through clipping, and a kept polygon keeps
     // the pipeline busy longer (below, by its clipped vertex count), which the game sees as timing.
-    // time every polygon as kept with the vertices it was sent with, culled or not, in both runs,
-    // so their geometry engines stay in step
-    if (WideCheck)
+    // WideMelon times polygons by the native view for that (below), but by default the check times
+    // every polygon as kept with the vertices it was sent with, culled or not, in both runs, so their
+    // geometry engines stay in step whatever that gets wrong
+    const bool equaltiming = WideCheck && WideCheckEqualTiming;
+    if (equaltiming)
     {
         PolygonPipeline = (nverts == 4) ? 35 : 26;
         VertexSlotsFree = (nverts == 4) ? ((PolygonMode & 0x2) ? 0b11100 : 0b11110) : ((PolygonMode & 0x2) ? 0b1000 : 0b1110);
     }
 
-    // WideMelon: the native view, what this polygon would do without the squeeze. it only gets its polygon
-    // and vertex RAM counts (NativeNumPolygons), for the drop counter. the polygon is the same but for
-    // the X before the squeeze (TempVertexNativeX), and both cull alike (below)
+    // WideMelon: the native view, what this polygon would do without the squeeze. it gets its polygon and
+    // vertex RAM counts (NativeNumPolygons), for the drop counter, and it picks the polygon's timing, so
+    // the game sees stock geometry timing. the polygon is the same but for the X before the squeeze
+    // (TempVertexNativeX), and both cull alike (below)
     const bool wide = ViewWidth != WideMelon::NativeWidth;
     const int sentverts = nverts;
+    // a kept polygon keeps the pipeline busy by its clipped vertex count
+    auto startpipeline = [this](int n)
+    {
+        if (n == 4)
+        {
+            PolygonPipeline = 35;
+            VertexSlotCounter = 1;
+            if (PolygonMode & 0x2) VertexSlotsFree = 0b11100;
+            else                   VertexSlotsFree = 0b11110;
+        }
+        else
+        {
+            PolygonPipeline = 26;
+            VertexSlotCounter = 1;
+            if (PolygonMode & 0x2) VertexSlotsFree = 0b1000;
+            else                   VertexSlotsFree = 0b1110;
+        }
+    };
     // [n] if the native view has room for a polygon of [n] vertices, else 0
     auto fitsnative = [this](int n) { return (NativeNumPolygons < 2048 && NativeNumVertices + n <= 6144) ? n : 0; };
     auto keepnative = [this](int n, bool reused)
@@ -1207,6 +1228,7 @@ void GPU3D::SubmitPolygon() noexcept
         {
             DroppedNativeFit++;
             keepnative(nativeverts, nativereused);
+            if (!equaltiming) startpipeline(nativeverts);
         }
         if (VertexIdLog) VertexIdLog->OnPolygonRejected();
         LastStripPolygon = NULL;
@@ -1318,21 +1340,11 @@ void GPU3D::SubmitPolygon() noexcept
 
     // build the actual polygon
 
-    // (the clipped vertex count picks the timing, which the wide check can't have, see above)
-    if ((WideCheck ? ((PolygonMode & 0x1) ? 4 : 3) : nverts) == 4)
-    {
-        PolygonPipeline = 35;
-        VertexSlotCounter = 1;
-        if (PolygonMode & 0x2) VertexSlotsFree = 0b11100;
-        else                   VertexSlotsFree = 0b11110;
-    }
-    else
-    {
-        PolygonPipeline = 26;
-        VertexSlotCounter = 1;
-        if (PolygonMode & 0x2) VertexSlotsFree = 0b1000;
-        else                   VertexSlotsFree = 0b1110;
-    }
+    // the timing: with WideMelon on, from the native view, which leaves a polygon it wouldn't keep at
+    // the 8 cycles of a rejected one (from the top). the wide check's equal timing is the top's again
+    if (equaltiming) startpipeline(sentverts);
+    else if (wide) { if (nativeverts) startpipeline(nativeverts); }
+    else startpipeline(nverts);
 
     if (nativeverts) keepnative(nativeverts, nativereused);
 

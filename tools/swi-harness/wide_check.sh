@@ -46,6 +46,9 @@ run ph-intro "$PH.nds" 1200
 run w2-state "$W2.nds" 600 --state "$OUT/states/w2.ml3"
 # the same with box tests squeezed as WideMelon does them, so memory differs and is only reported
 run w2-state-boxwide "$W2.nds" 600 --state "$OUT/states/w2.ml3" --box-test wide
+# geometry timed as WideMelon times it, not alike in both runs: memory must still match
+run mkds-demo-timing "$MKDS.nds" 2400 --timing native
+run ph-intro-timing "$PH.nds" 1200 --timing native
 
 [ $failed = 0 ] && echo "wide check: all passed" || echo "wide check: FAILED (diffs.txt in each $OUT/<game>)"
 exit $failed

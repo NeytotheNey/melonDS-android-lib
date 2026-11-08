@@ -138,11 +138,14 @@ public:
     // built for this width whatever the renderer says (256 = wide off), 2D writes the accelerated
     // line format (with the wings bits above 256), and GetLine hands display capture a fixed
     // pattern, since software 3D can't draw the wide middle like the GL renderers. polygons are
-    // timed alike and box tests answered as stock (unless WideCheckSqueezeBoxTest), as both are
+    // timed alike (unless not WideCheckEqualTiming) and box tests answered as stock (unless
+    // WideCheckSqueezeBoxTest), as both are
     // game-visible by design (see SubmitPolygon, BoxTest). set it before SetRenderer3D, which
     // sizes the framebuffers. the counts are for its report
     int WideCheck = 0;
     bool WideCheckSqueezeBoxTest = false;
+    // false: polygons timed as WideMelon times them (by the native view), not alike in both runs
+    bool WideCheckEqualTiming = true;
     u32 WideCheckBoxTests = 0, WideCheckBoxHits = 0, WideCheckCountReads = 0;
     u32 WideCheckBoxRetryHits = 0; // box tests that missed natively and hit on the wide retry
 

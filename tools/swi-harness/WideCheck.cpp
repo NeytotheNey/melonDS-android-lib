@@ -33,8 +33,10 @@
 // Left out on purpose, since they differ by design:
 // - the 3D pixels: software 3D draws the squeezed scene into 256 columns, so both runs hand
 //   display capture the same fixed pattern instead (GPU3D::GetLine);
-// - geometry timing: the wider view keeps more polygons, which keep the pipeline busy longer, so
-//   both runs time every polygon alike (GPU3D::SubmitPolygon);
+// - geometry timing: the wider view keeps more polygons, which keep the pipeline busy longer. WideMelon
+//   times each polygon by the native view's clip result instead, so the game should see stock timing,
+//   but by default both runs time every polygon alike (GPU3D::SubmitPolygon), so a slip there can't
+//   hide other differences; --timing native checks WideMelon's own timing;
 // - box test results: answered as stock in both runs, unless --box-test wide, which squeezes them
 //   as WideMelon does and then only reports memory differences;
 // - the window edge fix (native columns 0 and 255 take their neighbor's window mask), which changes
@@ -82,6 +84,7 @@ std::unique_ptr<NDS> Boot(const WideCheckOptions& opts, int width, const std::ve
 
     nds->GPU.GPU3D.WideCheck = width;
     nds->GPU.GPU3D.WideCheckSqueezeBoxTest = opts.SqueezeBoxTest;
+    nds->GPU.GPU3D.WideCheckEqualTiming = opts.EqualTiming;
     nds->SetRenderer3D(std::make_unique<SoftRenderer>()); // sizes the framebuffers for the switch
 
     auto romdata = std::make_unique<u8[]>(rom.size());
@@ -269,7 +272,7 @@ int RunWideCheck(const WideCheckOptions& opts)
     const GPU3D& g1 = on->GPU.GPU3D;
     char summary[1024];
     snprintf(summary, sizeof(summary),
-        "%s: %u frames, wide %d: %s\n"
+        "%s: %u frames, wide %d, %s timing: %s\n"
         "  differing frames %u (first %u): plane pixels %llu, control lines %llu, memory regions %llu\n"
         "  frames with 3D %u, with display capture %u\n"
         "  info: polygons drawn off %llu / on %llu (differ in %llu frames), polygon RAM count reads %u off / %u on,\n"
@@ -278,7 +281,7 @@ int RunWideCheck(const WideCheckOptions& opts)
         "  on in %u frames, at most %u in one; the on run's native polygon RAM counts were off in %u frames\n"
         "  (by at most %u polygons, %u vertices)\n",
         std::filesystem::path(opts.RomPath).filename().string().c_str(), opts.Frames, opts.Width,
-        failFrames ? "FAIL" : "PASS", failFrames, firstFail,
+        opts.EqualTiming ? "equalized" : "native", failFrames ? "FAIL" : "PASS", failFrames, firstFail,
         (unsigned long long)planeDiffs, (unsigned long long)ctrlDiffs, (unsigned long long)memDiffs, frames3D, captureFrames,
         (unsigned long long)polysOff, (unsigned long long)polysOn, (unsigned long long)polyFrames,
         g0.WideCheckCountReads, g1.WideCheckCountReads, opts.SqueezeBoxTest ? "squeezed, memory not compared" : "stock",

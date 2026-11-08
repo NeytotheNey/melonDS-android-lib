@@ -432,7 +432,9 @@ void Usage()
         "                 or anything the game can see differs (see WideCheck.cpp)\n"
         "  --state <file> with --wide-check: load this savestate after boot\n"
         "  --box-test wide  with --wide-check: squeeze box tests as WideMelon does (memory is then\n"
-        "                 only reported, since the game sees them)\n");
+        "                 only reported, since the game sees them)\n"
+        "  --timing native  with --wide-check: time polygons as WideMelon does (by the native view's\n"
+        "                 clip result) instead of alike in both runs, to check that the timing is stock\n");
 }
 
 const char* ConsoleModeName(u16 scfgbios)
@@ -600,7 +602,7 @@ int main(int argc, char** argv)
     std::vector<std::pair<u32, u32>> pokes;
     bool swilog = true;
     int widecheck = 0;
-    std::string statepath, boxtest = "stock";
+    std::string statepath, boxtest = "stock", timing = "equal";
 
     for (int i = 1; i < argc; i++)
     {
@@ -662,6 +664,7 @@ int main(int argc, char** argv)
         else if (arg == "--wide-check") widecheck = (int)strtol(next().c_str(), nullptr, 0);
         else if (arg == "--state") statepath = next();
         else if (arg == "--box-test") boxtest = next();
+        else if (arg == "--timing") timing = next();
         else if (arg == "--no-core-log") CoreLogEnabled = false;
         else if (arg == "--dsi") dsidir = next();
         else if (arg == "--nand") nandpath = next();
@@ -689,7 +692,7 @@ int main(int argc, char** argv)
     {
         if (rompath.empty() || outdir.empty() || frames == 0 || widecheck < 256 || widecheck > 768 || (widecheck & 1)
             || (!biosmode.empty() && biosmode != "free") || console != "ds"
-            || (boxtest != "stock" && boxtest != "wide"))
+            || (boxtest != "stock" && boxtest != "wide") || (timing != "equal" && timing != "native"))
         {
             fprintf(stderr, "--wide-check needs an even width 256..768 (256 = both runs off), --frames, --out, and FreeBIOS in DS mode\n");
             return 1;
@@ -704,6 +707,7 @@ int main(int argc, char** argv)
         opts.Frames = frames;
         opts.Width = widecheck;
         opts.SqueezeBoxTest = boxtest == "wide";
+        opts.EqualTiming = timing == "equal";
         for (const Tap& tap : taps)
             opts.Taps.push_back({tap.Frame, tap.Key});
         memcpy(opts.RTC, rtc, sizeof(rtc));
