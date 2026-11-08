@@ -318,15 +318,15 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
 
         if (CurJob->WideView)
         {
-            // wide 3D view: bit 18 = this line shows unit A's 3D layer in the wings, bits 19-20 = its
-            // BLDCNT fade (BG0 as 1st target) and bits 8-12 = EVY for it, bit 21 = white wings, for
-            // a white line (screen off or forced blank), bit 22 = unit A shows 3D on BG0 on this
-            // line, whatever the windows do with it (the wing hold reads it to tell which half
-            // unit A is in). the fade bits are only read with bit 18: a line whose wings a window
-            // hid has black wings, and a held line takes the copied wings with their fade as
-            // drawn. the master brightness register doesn't use bits 5-13: 5-7 are the hi-res
-            // capture flag above, and the GL compositor flags held wing lines with bit 13 in its
-            // own copy (see GLCompositor::PrepareWingHold)
+            // wide 3D view: bit 18 = this line shows unit A's 3D layer in the wings, composited from
+            // the line's wing planes (see DrawWingPlanes), bit 21 = white wings, for a white line
+            // (screen off or forced blank), bit 22 = unit A shows 3D on BG0 on this line, whatever
+            // the windows do with it (the wing hold reads it to tell which half unit A is in). a
+            // line whose wings a window hid has black wings, and a held line takes the copied wings
+            // as drawn. the master brightness register doesn't use bits 5-13: 5-7 are the hi-res
+            // capture flag above, 8-12 are kept clear (free since the wings' fade moved to the wing
+            // planes), and the GL compositor flags held wing lines with bit 13 in its own copy (see
+            // GLCompositor::PrepareWingHold). bits 19-20 are free too
             dst[256*3] &= ~0x1F00;
 
             if ((dispmode == 0) || ((dispmode == 1) &&
@@ -345,11 +345,8 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
                 // wings bit, so both show 3D if either edge does
                 if (!(CurUnit->DispCnt & 0xE000) || ((WindowMask[0] | WindowMask[255]) & 0x01))
                 {
-                    u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
-                    u32 evy = CurUnit->EVY;
-                    if (evy > 16) evy = 16;
-
-                    dst[256*3] |= (1 << 18) | (effect << 19) | (evy << 8);
+                    dst[256*3] |= (1 << 18);
+                    DrawWingPlanes(dst, &CurJob->Framebuffer[0][AccelWingPlanesStart + CurJob->Line * WingPlanesWords]);
                 }
             }
         }
@@ -403,6 +400,45 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
 
     if (!CurJob->ScreensEnabled)
         FillScreensOff(dst);
+}
+
+// WideMelon: the planes of the wings' pixels on a line with 3D wings (control word bit 18), from
+// the line as drawn into the framebuffer (line), for the GL compositor to composite with the 3D
+// at the wing's X like a middle pixel. the wings have no 2D layers, so a wing carries on its edge
+// column (0 for the left one, 255 for the right) when the 3D is on top there with nothing but
+// the backdrop under it: it gets that column's planes, so it's composited exactly as the edge
+// pixel would be with the wing's 3D pixel (blend or fade, and the backdrop where the 3D is
+// transparent, with the edge's window effects). otherwise a 2D layer is over or under the 3D at
+// the edge, which can't carry on into the wings, so the wing shows the 3D as it is, transparent
+// or not, with its BLDCNT fade (BG0 as 1st target, whatever the windows do), as before the wing
+// planes: WingRaw3D tells the compositor to take the 3D pixel as opaque. both wings get the 3D
+// whichever edge shows BG0, as the control word's one wings bit says
+void SoftRenderer::DrawWingPlanes(const u32* line, u32* wing) const
+{
+    u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
+    if (effect == 1)
+        effect = 0;
+
+    for (int side = 0; side < 2; side++)
+    {
+        int edge = side ? 255 : 0;
+        u32 compmode = (line[512 + edge] >> 24) & 0xF;
+        u32* planes = &wing[side * 3];
+
+        // compmodes 0 and 2-4 are 3D on top, with what's under it in plane 0 (flag 0x20: the backdrop)
+        if (compmode <= 4 && compmode != 1 && (line[edge] >> 24) == 0x20)
+        {
+            planes[0] = line[edge];
+            planes[1] = line[256 + edge];
+            planes[2] = line[512 + edge];
+        }
+        else
+        {
+            planes[0] = 0;
+            planes[1] = 0;
+            planes[2] = WingRaw3D | (effect << 24) | (CurUnit->EVY << 8);
+        }
+    }
 }
 
 // POWCNT1 bit 0 clear: the screens show black, whatever the units output. display capture

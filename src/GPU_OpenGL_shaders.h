@@ -140,6 +140,9 @@ uniform uint u3DScale;
 #ifdef WIDE
 uniform int uWideOffset;
 uniform mediump sampler2D HeldWingsTex;
+// each line's wing planes (GPU2D::AccelWingPlanesStart): planes 0-2 of the left wing's pixel in
+// texels 0-2, the right one's in 3-5, at the screen texture's rows
+uniform usampler2D WingPlanesTex;
 #endif
 
 uniform usampler2D ScreenTex;
@@ -193,11 +196,15 @@ ivec4 Fetch3D(float xpos, float ypos)
 // the wide output's extra columns. only unit A's 3D layer goes there, on the lines where it
 // shows it (control word bit 18), and the 2D layers stay native. unit A writes its control
 // words into whichever screen it's on, so the wings follow the 3D to the bottom half too (the
-// frontend shows that half wide when the player swaps the screens). lines that are all white
-// (bit 21, from either unit) get white wings
+// frontend shows that half wide when the player swaps the screens). a 3D line's wing pixel is
+// composited like a middle one, from the planes the 2D renderer worked out for the wing (see
+// GPU2D::SoftRenderer::DrawWingPlanes): where the edge shows the 3D over the backdrop, the wing
+// does too, so the backdrop shows where the 3D is transparent. lines that are all white (bit 21,
+// from either unit) get white wings
 ivec4 WingPixel()
 {
-    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+    int row = int(fTexcoord.y);
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
     int dispmode = mbright.b & 0x3;
 
     ivec4 pixel = ivec4(0);
@@ -207,15 +214,22 @@ ivec4 WingPixel()
     }
     else if ((mbright.b & 0x4) != 0)
     {
+        int side = fTexcoord.x < 0.0 ? 0 : 3;
+        ivec4 val1 = ivec4(texelFetch(WingPlanesTex, ivec2(side, row), 0));
+        ivec4 val2 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 1, row), 0));
+        ivec4 val3 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 2, row), 0));
+
         // same X scroll as the middle
         float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
-        pixel = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
+        ivec4 _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
 
-        // BLDCNT fade, as for 3D on top in the middle (bits 19-20, EVY in bits 8-12)
-        int effect = (mbright.b >> 3) & 0x3;
-        int evy = mbright.g & 0x1F;
-        if      (effect == 2) pixel += (((0x3F - pixel) * evy) + 0x8) >> 4;
-        else if (effect == 3) pixel -= ((pixel * evy) + 0x7) >> 4;
+        // GPU2D::WingRaw3D: there's no backdrop under the 3D at the edge, so the wing shows the
+        // 3D as it is, transparent or not (then planes 0 and 1 are never read)
+        if ((val3.a & 0x10) != 0)
+            _3dpix.a = max(_3dpix.a, 1);
+
+        bool opaque;
+        pixel = CompositePixel(val1, val2, val3, _3dpix, opaque);
     }
 
     if (dispmode != 0)

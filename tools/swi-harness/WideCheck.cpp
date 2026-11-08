@@ -29,7 +29,7 @@
 // what the middle 256 shows, and fails on any difference:
 // - both screens' 2D planes 0-2 (the accelerated line format, where the 3D layer is a placeholder),
 //   plane 1 and 2 only on display mode 1 lines, as GPU::LogHash2D does;
-// - the control words with the wings bits masked (8-12 EVY, 18-22 wings flags);
+// - the control words with the wings bits masked (18-22, and 8-12, the old wings fade EVY);
 // - main RAM, shared and ARM7 WRAM, ITCM, DTCM, all VRAM banks (so the capture banks), palette, OAM;
 // - timing, so a slip shows up the frame it happens instead of when it reaches memory: the ARM9,
 //   ARM7 and geometry engine timestamps, GXSTAT, the GX FIFO level and DISP3DCNT but bit 13 (the

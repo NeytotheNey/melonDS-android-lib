@@ -95,6 +95,12 @@ private:
     GLuint CompWideOffsetLoc = 0;
     GLuint CompWideHiresCapLoc = 0;
 
+    // the wide programs' wing planes (see GPU2D::AccelWingPlanesStart), GL_RGBA8UI, 6 texels per
+    // line, both screens' 192 lines like the screen texture. made with the wide program and
+    // uploaded with the frame's lines, so it's always the composited frame's
+    static constexpr int WingPlanesUnit = 10;
+    GLuint WingPlanesTex = 0;
+
     // WideMelon wing hold. games with 3D on both screens move unit A (and the 3D) to the other
     // screen every frame, so each half only gets 3D wings every other frame. the frames in
     // between reuse the half's wings from the last frame that had them, kept in HeldWingsTex
@@ -114,10 +120,10 @@ private:
     // frame's, when the wing hold or the hi-res capture display rewrites them: WingHeldBit set on
     // the held lines and cleared on the others, and HiresDisplayBits cleared on the lines that
     // don't show a hi-res copy. the master brightness field only uses bits 0-4 and 14-15 there:
-    // bits 5-7 are the 2D renderer's hi-res capture flag (bit 7) and bank (5-6), 8-12 the wings'
-    // fade EVY, and 13 was free. once PrepareHiresDisplay rewrote them, bit 7 means the line shows
-    // a hi-res image, and bit 5 that it's the stream's (HiresStreamTex) instead of the VRAM display
-    // bank's (HiresBankTex)
+    // bits 5-7 are the 2D renderer's hi-res capture flag (bit 7) and bank (5-6), 8-12 are kept
+    // clear in a wide view, and 13 was free. once PrepareHiresDisplay rewrote them, bit 7 means
+    // the line shows a hi-res image, and bit 5 that it's the stream's (HiresStreamTex) instead of
+    // the VRAM display bank's (HiresBankTex)
     static constexpr u32 WingHeldBit = 1u << 13;
     static constexpr u32 HiresDisplayFlag = 1u << 7;
     static constexpr u32 HiresStreamBit = 1u << 5;

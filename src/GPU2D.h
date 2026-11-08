@@ -147,6 +147,18 @@ private:
     melonDS::GPU& GPU;
 };
 
+// the accelerated line format (OpenGL/Compute 3D, or the wide check): per line, planes 0-2 of 256
+// words and a control word. after a screen's 192 lines come its WideMelon wing planes: per line,
+// planes 0-2 of the left wing's pixel, then of the right one's, as SoftRenderer::DrawWingPlanes
+// writes them on lines with 3D wings (control word bit 18). they're in the screen's buffer so they
+// always belong to the frame being composited, POWCNT's screen swap included
+constexpr int AccelLineWords = 256*3 + 1;
+constexpr int WingPlanesWords = 6;
+constexpr int AccelWingPlanesStart = AccelLineWords * 192;
+constexpr int AccelFramebufferWords = AccelWingPlanesStart + WingPlanesWords * 192;
+// in a wing's plane 2, next to the compmode (bits 24-27): show the 3D pixel as opaque
+constexpr u32 WingRaw3D = 1u << 28;
+
 // one HBlank's worth of 2D drawing: the BG/OBJ pass of the current line and the sprites of the
 // next one, for both Units. GPU::StartHBlank builds it on the emulator thread, and the renderer
 // draws only from it plus VRAM (and its flat copies), and palette and OAM through its pointers.

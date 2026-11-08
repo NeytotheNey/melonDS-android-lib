@@ -151,6 +151,7 @@ GLCompositor::~GLCompositor()
     glDeleteTextures(CompScreenOutputTex.size(), &CompScreenOutputTex[0]);
     glDeleteFramebuffers(1, &HeldWingsFB);
     glDeleteTextures(1, &HeldWingsTex);
+    glDeleteTextures(1, &WingPlanesTex);
     FreeHiresCapture();
     FreeFilter2D();
 
@@ -175,6 +176,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     CompWideRatioLoc(other.CompWideRatioLoc),
     CompWideOffsetLoc(other.CompWideOffsetLoc),
     CompWideHiresCapLoc(other.CompWideHiresCapLoc),
+    WingPlanesTex(other.WingPlanesTex),
     WingHold(other.WingHold),
     WingCopy(other.WingCopy),
     WingHoldLines(other.WingHoldLines),
@@ -194,6 +196,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
 {
     other.HeldWingsTex = {};
     other.HeldWingsFB = {};
+    other.WingPlanesTex = {};
     other.HiresCap = {};
     other.Filter2D = {};
     other.CompScreenOutputFB = {};
@@ -255,6 +258,9 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         glDeleteFramebuffers(1, &HeldWingsFB);
         HeldWingsFB = other.HeldWingsFB;
 
+        glDeleteTextures(1, &WingPlanesTex);
+        WingPlanesTex = other.WingPlanesTex;
+
         FreeHiresCapture();
         HiresCap = other.HiresCap;
 
@@ -263,6 +269,7 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
 
         other.HeldWingsTex = {};
         other.HeldWingsFB = {};
+        other.WingPlanesTex = {};
         other.HiresCap = {};
         other.Filter2D = {};
         other.CompScreenOutputFB = {};
@@ -309,8 +316,19 @@ bool GLCompositor::PrepareWide() noexcept
     glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
     glUniform1i(glGetUniformLocation(CompShaderWide, "_3DTex"), 1);
     glUniform1i(glGetUniformLocation(CompShaderWide, "HeldWingsTex"), 2);
+    glUniform1i(glGetUniformLocation(CompShaderWide, "WingPlanesTex"), WingPlanesUnit);
     glUniform1i(glGetUniformLocation(CompShaderWide, "HiresBankTex"), HiresBankUnit);
     glUniform1i(glGetUniformLocation(CompShaderWide, "HiresStreamTex"), HiresStreamUnit);
+
+    glGenTextures(1, &WingPlanesTex);
+    glActiveTexture(GL_TEXTURE0 + WingPlanesUnit);
+    glBindTexture(GL_TEXTURE_2D, WingPlanesTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, GPU2D::WingPlanesWords, 192*2, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
+    glActiveTexture(GL_TEXTURE0);
 
     return true;
 }
@@ -603,6 +621,16 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     {
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, HeldWingsTex);
+
+        // the frame's wing planes, which come after each screen's lines in its buffer
+        glActiveTexture(GL_TEXTURE0 + WingPlanesUnit);
+        glBindTexture(GL_TEXTURE_2D, WingPlanesTex);
+        if (hasFramebuffers)
+        {
+            for (int half = 0; half < 2; half++)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, half * 192, GPU2D::WingPlanesWords, 192, GL_RGBA_INTEGER,
+                                GL_UNSIGNED_BYTE, &gpu.Framebuffer[backbuf][half][GPU2D::AccelWingPlanesStart]);
+        }
     }
 
     if (hiresDisplay && HiresCap.ShowBank >= 0)
@@ -765,6 +793,7 @@ bool GLCompositor::PrepareFilter2DShaders(bool wide) noexcept
         glUniform1i(glGetUniformLocation(shader, "ScreenTex"), 0);
         glUniform1i(glGetUniformLocation(shader, "_3DTex"), 1);
         glUniform1i(glGetUniformLocation(shader, "HeldWingsTex"), 2);
+        glUniform1i(glGetUniformLocation(shader, "WingPlanesTex"), WingPlanesUnit);
         glUniform1i(glGetUniformLocation(shader, "HiresBankTex"), HiresBankUnit);
         glUniform1i(glGetUniformLocation(shader, "HiresStreamTex"), HiresStreamUnit);
         glUniform1i(glGetUniformLocation(shader, "FilterMapTex"), Filter2DMapUnit);

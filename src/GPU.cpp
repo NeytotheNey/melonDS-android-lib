@@ -237,7 +237,7 @@ void GPU::Reset() noexcept
 
     size_t fbsize;
     if (GPU3D.UsesAccelLines())
-        fbsize = (256*3 + 1) * 192;
+        fbsize = GPU2D::AccelFramebufferWords;
     else
         fbsize = 256 * 192;
 
@@ -278,7 +278,7 @@ void GPU::Stop() noexcept
 
     int fbsize;
     if (GPU3D.UsesAccelLines())
-        fbsize = (256*3 + 1) * 192;
+        fbsize = GPU2D::AccelFramebufferWords;
     else
         fbsize = 256 * 192;
 
@@ -592,7 +592,7 @@ void GPU::InitFramebuffers() noexcept
 
     int fbsize;
     if (GPU3D.UsesAccelLines())
-        fbsize = (256*3 + 1) * 192;
+        fbsize = GPU2D::AccelFramebufferWords;
     else
         fbsize = 256 * 192;
 
@@ -1938,7 +1938,7 @@ void GPU::BlankFrame() noexcept
     int backbuf = FrontBuffer ? 0 : 1;
     int fbsize;
     if (GPU3D.UsesAccelLines())
-        fbsize = (256*3 + 1) * 192;
+        fbsize = GPU2D::AccelFramebufferWords;
     else
         fbsize = 256 * 192;
 

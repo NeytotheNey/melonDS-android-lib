@@ -794,6 +794,8 @@ public:
     u8* VRAMPtr_BOBJ[0x8] {};
 
     int FrontBuffer = 0;
+    // [buffer][screen]: 256 x 192 BGRA, or in the accelerated line format GPU2D::AccelFramebufferWords
+    // (the lines, then the WideMelon wing planes)
     std::unique_ptr<u32[]> Framebuffer[2][2] {};
 
     // debug only: log a checksum of both 2D framebuffers at the end of every frame (see LogHash2D)
