@@ -256,13 +256,13 @@ int RunWideCheck(const WideCheckOptions& opts)
         "  differing frames %u (first %u): plane pixels %llu, control lines %llu, memory regions %llu\n"
         "  frames with 3D %u, with display capture %u\n"
         "  info: polygons drawn off %llu / on %llu (differ in %llu frames), polygon RAM count reads %u off / %u on,\n"
-        "  box tests (%s) %u/%u hit off, %u/%u on\n",
+        "  box tests (%s) %u/%u hit off, %u/%u on (%u by the wide retry)\n",
         std::filesystem::path(opts.RomPath).filename().string().c_str(), opts.Frames, opts.Width,
         failFrames ? "FAIL" : "PASS", failFrames, firstFail,
         (unsigned long long)planeDiffs, (unsigned long long)ctrlDiffs, (unsigned long long)memDiffs, frames3D, captureFrames,
         (unsigned long long)polysOff, (unsigned long long)polysOn, (unsigned long long)polyFrames,
         g0.WideCheckCountReads, g1.WideCheckCountReads, opts.SqueezeBoxTest ? "squeezed, memory not compared" : "stock",
-        g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests);
+        g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests, g1.WideCheckBoxRetryHits);
     fputs(summary, stdout);
     if (FILE* f = fopen((opts.OutDir + "/summary.txt").c_str(), "w")) { fputs(summary, f); fclose(f); }
 

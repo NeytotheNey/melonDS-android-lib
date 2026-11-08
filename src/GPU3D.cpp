@@ -1626,11 +1626,25 @@ void GPU3D::CalculateLighting() noexcept
 }
 
 
+// whether any face of the box (clip space corners, see BoxTest) is left after clipping
+static bool BoxTestHits(GPU3D& gpu, const Vertex* cube)
+{
+    // front (-Z), back (+Z), left (-X), right (+X), bottom (-Y), top (+Y)
+    static const u8 faces[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 3, 4, 5}, {1, 2, 7, 6}, {0, 1, 6, 5}, {2, 3, 4, 7}};
+    Vertex face[10];
+    for (const u8* f : faces)
+    {
+        for (int i = 0; i < 4; i++)
+            face[i] = cube[f[i]];
+        if (ClipPolygon<false>(gpu, face, 4, 0) > 0)
+            return true;
+    }
+    return false;
+}
+
 void GPU3D::BoxTest(const u32* params) noexcept
 {
     Vertex cube[8];
-    Vertex face[10];
-    int res;
 
     AddCycles(254);
     GXStat &= ~(1<<1);
@@ -1668,68 +1682,23 @@ void GPU3D::BoxTest(const u32* params) noexcept
         cube[i].Position[3] = ((s64)x*ClipMatrix[3] + (s64)y*ClipMatrix[7] + (s64)z*ClipMatrix[11] + (s64)0x1000*ClipMatrix[15]) >> 12;
     }
 
-    // box tests have to agree with the widened frustum, otherwise games that
-    // cull with them drop objects that would be visible at the sides. the wide check answers them
-    // as stock unless asked (WideCheckSqueezeBoxTest), so the game's memory can be compared
-    if (ViewWidth != WideMelon::NativeWidth && (!WideCheck || WideCheckSqueezeBoxTest))
+    bool hit = BoxTestHits(*this, cube);
+
+    // WideMelon: a box that misses the native view gets one more try against the wide view plus about
+    // 4 px a side (the squeeze for a view 8 px wider, in pixels of a full-screen viewport), so games that
+    // cull with box tests don't drop objects in the wings. a native hit stays a hit, so nothing that shows
+    // natively changes. the wide check answers them as stock unless asked (WideCheckSqueezeBoxTest), so
+    // the game's memory can be compared
+    if (!hit && ViewWidth != WideMelon::NativeWidth && (!WideCheck || WideCheckSqueezeBoxTest))
     {
         for (int i = 0; i < 8; i++)
-            cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], ViewWidth);
+            cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], ViewWidth + 8);
+        hit = BoxTestHits(*this, cube);
+        if (WideCheck) WideCheckBoxRetryHits += hit;
     }
 
-    // front face (-Z)
-    face[0] = cube[0]; face[1] = cube[1]; face[2] = cube[2]; face[3] = cube[3];
-    res = ClipPolygon<false>(*this, face, 4, 0);
-    if (res > 0)
-    {
+    if (hit)
         GXStat |= (1<<1);
-        return;
-    }
-
-    // back face (+Z)
-    face[0] = cube[4]; face[1] = cube[5]; face[2] = cube[6]; face[3] = cube[7];
-    res = ClipPolygon<false>(*this, face, 4, 0);
-    if (res > 0)
-    {
-        GXStat |= (1<<1);
-        return;
-    }
-
-    // left face (-X)
-    face[0] = cube[0]; face[1] = cube[3]; face[2] = cube[4]; face[3] = cube[5];
-    res = ClipPolygon<false>(*this, face, 4, 0);
-    if (res > 0)
-    {
-        GXStat |= (1<<1);
-        return;
-    }
-
-    // right face (+X)
-    face[0] = cube[1]; face[1] = cube[2]; face[2] = cube[7]; face[3] = cube[6];
-    res = ClipPolygon<false>(*this, face, 4, 0);
-    if (res > 0)
-    {
-        GXStat |= (1<<1);
-        return;
-    }
-
-    // bottom face (-Y)
-    face[0] = cube[0]; face[1] = cube[1]; face[2] = cube[6]; face[3] = cube[5];
-    res = ClipPolygon<false>(*this, face, 4, 0);
-    if (res > 0)
-    {
-        GXStat |= (1<<1);
-        return;
-    }
-
-    // top face (+Y)
-    face[0] = cube[2]; face[1] = cube[3]; face[2] = cube[4]; face[3] = cube[7];
-    res = ClipPolygon<false>(*this, face, 4, 0);
-    if (res > 0)
-    {
-        GXStat |= (1<<1);
-        return;
-    }
 }
 
 void GPU3D::PosTest() noexcept

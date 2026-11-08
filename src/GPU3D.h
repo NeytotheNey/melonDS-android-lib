@@ -143,6 +143,7 @@ public:
     int WideCheck = 0;
     bool WideCheckSqueezeBoxTest = false;
     u32 WideCheckBoxTests = 0, WideCheckBoxHits = 0, WideCheckCountReads = 0;
+    u32 WideCheckBoxRetryHits = 0; // box tests that missed natively and hit on the wide retry
 
     [[nodiscard]] Renderer3D& GetCurrentRenderer() noexcept { return *CurrentRenderer; }
     [[nodiscard]] const Renderer3D& GetCurrentRenderer() const noexcept { return *CurrentRenderer; }
