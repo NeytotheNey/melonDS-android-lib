@@ -138,6 +138,7 @@ struct HalfCamera::GeometryState
     u32 PolygonAttr, CurPolygonAttr, TexParam, TexPalette;
 
     Vertex TempVertexBuffer[4];
+    s32 TempVertexNativeX[4];
     u32 VertexNum, VertexNumInPoly, NumConsecutivePolygons;
     u32 ExecParams[32];
     u32 ExecParamCount;
@@ -163,7 +164,7 @@ static void CopyGeometry(Dst& dst, const Src& src)
     COPY_FIELD(MatDiffuse); COPY_FIELD(MatAmbient); COPY_FIELD(MatSpecular); COPY_FIELD(MatEmission);
     COPY_FIELD(UseShininessTable); COPY_FIELD(ShininessTable);
     COPY_FIELD(PolygonAttr); COPY_FIELD(CurPolygonAttr); COPY_FIELD(TexParam); COPY_FIELD(TexPalette);
-    COPY_FIELD(TempVertexBuffer);
+    COPY_FIELD(TempVertexBuffer); COPY_FIELD(TempVertexNativeX);
     COPY_FIELD(VertexNum); COPY_FIELD(VertexNumInPoly); COPY_FIELD(NumConsecutivePolygons);
     COPY_FIELD(ExecParams); COPY_FIELD(ExecParamCount);
     COPY_FIELD(FlushAttributes);
@@ -1201,6 +1202,8 @@ void HalfCamera::ResetShadow()
     shadow.NumVertices = 0;
     shadow.NumPolygons = 0;
     shadow.NumOpaquePolygons = 0;
+    shadow.NativeNumVertices = 0;
+    shadow.NativeNumPolygons = 0;
 }
 
 bool HalfCamera::Replay(const SceneInfo& current, const SceneInfo& previous)

@@ -20,6 +20,7 @@
 #define GPU3D_H
 
 #include <array>
+#include <chrono>
 #include <memory>
 
 #include "Savestate.h"
@@ -162,6 +163,17 @@ public:
     void SetVertexIdLogging(int mode) noexcept;
     [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
 
+    // polygons dropped because the polygon or vertex RAM was full, since the last reset, and of those,
+    // with WideMelon on, the ones the native view would still have had room for, so the wide view cost
+    // them (an estimate, see SubmitPolygon). not serialized
+    u32 DroppedPolygons = 0, DroppedNativeFit = 0;
+    // the polygon and vertex RAM counts the native view would have so far, with WideMelon on (for the wide check)
+    [[nodiscard]] u32 GetNativeNumPolygons() const noexcept { return NativeNumPolygons; }
+    [[nodiscard]] u32 GetNativeNumVertices() const noexcept { return NativeNumVertices; }
+    // debug only: logs a WIDEDROPS line once a second on those. set before the game runs
+    void SetWideDropLogging(bool enable) noexcept { WideDrops = {}; WideDrops.Enabled = enable; }
+    [[nodiscard]] bool GetWideDropLogging() const noexcept { return WideDrops.Enabled; }
+
     // the debug switch for an in-between 3D scene from a halfway camera (see GPU3D_HalfCamera.h). 0 is
     // off, 1 the camera only, 2 characters too, 3 logs the camera per scene as well, 4 also moves
     // billboards with the camera, 5 also logs every pair. set before the game runs
@@ -244,6 +256,22 @@ private:
     u16 RenderXPos = 0;
     int ViewWidth = 256;
     int RendererViewWidth() const noexcept;
+
+    // WideMelon: the polygon and vertex RAM counts the native view would have (NumPolygons and NumVertices
+    // without the wide view), see NativeClipVertices. derived again on a state load, not serialized
+    u32 NativeNumPolygons = 0, NativeNumVertices = 0;
+    int NativeClipVertices(int sentverts, int wideverts) noexcept;
+
+    // the WIDEDROPS line, per scene (polygon RAM swap) and once a second
+    struct WideDropStats
+    {
+        bool Enabled = false;
+        std::chrono::steady_clock::time_point LastLog {};
+        u32 Scenes = 0, DropScenes = 0, MaxSceneDrops = 0, PeakPolygons = 0, PeakVertices = 0;
+        u32 SceneStartDrops = 0, SecondStartDrops = 0, SecondStartNativeFit = 0;
+    } WideDrops;
+    void WideDropsOnSwap() noexcept;
+    void WideDropsOnVBlank() noexcept;
 
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;
@@ -365,6 +393,9 @@ public:
     s16 VecTestResult[3] {};
 
     Vertex TempVertexBuffer[4] {};
+    // the clip space X of each of them before WideMelon's squeeze (the same with it off). derived again
+    // on a state load, not serialized
+    s32 TempVertexNativeX[4] {};
     u32 VertexNum = 0;
     u32 VertexNumInPoly = 0;
     u32 NumConsecutivePolygons = 0;

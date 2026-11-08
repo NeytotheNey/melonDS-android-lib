@@ -179,6 +179,8 @@ int RunWideCheck(const WideCheckOptions& opts)
     u64 planeDiffs = 0, ctrlDiffs = 0, memDiffs = 0, polyFrames = 0, polysOff = 0, polysOn = 0;
     u32 frames3D = 0, captureFrames = 0;
     u32 failFrames = 0, firstFail = 0, reported = 0;
+    u32 dropFrames = 0, maxFrameDrops = 0, lastDrops = 0;
+    u32 nativeMisses = 0, nativeMaxPolys = 0, nativeMaxVerts = 0;
     for (u32 frame = 1; frame <= opts.Frames; frame++)
     {
         u32 keymask = 0xFFF;
@@ -232,6 +234,21 @@ int RunWideCheck(const WideCheckOptions& opts)
 
         u32 pa = off->GPU.GPU3D.RenderNumPolygons, pb = on->GPU.GPU3D.RenderNumPolygons;
         polysOff += pa; polysOn += pb; polyFrames += pa != pb; frames3D += pa != 0;
+        u32 drops = on->GPU.GPU3D.DroppedPolygons - lastDrops;
+        lastDrops += drops;
+        dropFrames += drops > 0;
+        maxFrameDrops = std::max(maxFrameDrops, drops);
+        // the on run's estimate of the native view's polygon RAM counts against the off run's real ones
+        if (opts.Width != 256)
+        {
+            const GPU3D& g0 = off->GPU.GPU3D;
+            const GPU3D& g1 = on->GPU.GPU3D;
+            u32 dp = (u32)std::abs((s64)g1.GetNativeNumPolygons() - g0.NumPolygons);
+            u32 dv = (u32)std::abs((s64)g1.GetNativeNumVertices() - g0.NumVertices);
+            nativeMisses += dp || dv;
+            nativeMaxPolys = std::max(nativeMaxPolys, dp);
+            nativeMaxVerts = std::max(nativeMaxVerts, dv);
+        }
         planeDiffs += plane; ctrlDiffs += ctrl; memDiffs += mem;
         fprintf(log, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n", frame, plane, ctrl, mem, pa, pb, wing3d, white, capture);
 
@@ -256,13 +273,18 @@ int RunWideCheck(const WideCheckOptions& opts)
         "  differing frames %u (first %u): plane pixels %llu, control lines %llu, memory regions %llu\n"
         "  frames with 3D %u, with display capture %u\n"
         "  info: polygons drawn off %llu / on %llu (differ in %llu frames), polygon RAM count reads %u off / %u on,\n"
-        "  box tests (%s) %u/%u hit off, %u/%u on (%u by the wide retry)\n",
+        "  box tests (%s) %u/%u hit off, %u/%u on (%u by the wide retry)\n"
+        "  polygons dropped as the polygon or vertex RAM was full: off %u / on %u (%u of them would have fit natively),\n"
+        "  on in %u frames, at most %u in one; the on run's native polygon RAM counts were off in %u frames\n"
+        "  (by at most %u polygons, %u vertices)\n",
         std::filesystem::path(opts.RomPath).filename().string().c_str(), opts.Frames, opts.Width,
         failFrames ? "FAIL" : "PASS", failFrames, firstFail,
         (unsigned long long)planeDiffs, (unsigned long long)ctrlDiffs, (unsigned long long)memDiffs, frames3D, captureFrames,
         (unsigned long long)polysOff, (unsigned long long)polysOn, (unsigned long long)polyFrames,
         g0.WideCheckCountReads, g1.WideCheckCountReads, opts.SqueezeBoxTest ? "squeezed, memory not compared" : "stock",
-        g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests, g1.WideCheckBoxRetryHits);
+        g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests, g1.WideCheckBoxRetryHits,
+        g0.DroppedPolygons, g1.DroppedPolygons, g1.DroppedNativeFit, dropFrames, maxFrameDrops,
+        nativeMisses, nativeMaxPolys, nativeMaxVerts);
     fputs(summary, stdout);
     if (FILE* f = fopen((opts.OutDir + "/summary.txt").c_str(), "w")) { fputs(summary, f); fclose(f); }
 
