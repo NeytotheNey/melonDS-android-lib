@@ -467,10 +467,6 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
             TempVertexNativeX[i] = TempVertexBuffer[i].Position[0];
         NativeNumVertices = NumVertices;
         NativeNumPolygons = NumPolygons;
-        NativeStripVerts = LastStripPolygon ? LastStripPolygon->NumVertices : 0;
-        NativeStripClipped = 0;
-        for (u32 i = 0; i < NativeStripVerts && i < 10; i++)
-            NativeStripClipped |= (LastStripPolygon->Vertices[i] && LastStripPolygon->Vertices[i]->Clipped) << i;
     }
 
     file->Var32(&FlushRequest);
@@ -548,6 +544,15 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
             if (poly->YBottom > 192) poly->Degenerate = true;
         }
+    }
+
+    if (!file->Saving)
+    {
+        // and the native view's last strip polygon from the real one, now that the polygon and vertex RAM are in
+        NativeStripVerts = LastStripPolygon ? LastStripPolygon->NumVertices : 0;
+        NativeStripClipped = 0;
+        for (u32 i = 0; i < NativeStripVerts && i < 10; i++)
+            NativeStripClipped |= (LastStripPolygon->Vertices[i] && LastStripPolygon->Vertices[i]->Clipped) << i;
     }
 
     CmdStallQueue.DoSavestate(file);
@@ -876,13 +881,6 @@ void GPU3D::StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept
 }
 
 
-
-// a vertex with only what clipping looks at, for WideMelon's native view (see NativeClipVertices)
-struct ClipPosition
-{
-    s32 Position[4];
-    bool Clipped;
-};
 
 template<int comp, s32 plane, bool attribs, typename V>
 void ClipSegment(V* outbuf, V* vin, V* vout)
@@ -1241,6 +1239,9 @@ void GPU3D::SubmitPolygon() noexcept
     if (NumPolygons >= 2048 || NumVertices+nverts > 6144)
     {
         DroppedPolygons++;
+        // the native view has room: its zero-dot check is next (as below)
+        if (nativeverts && !(CurPolygonAttr & (1<<13)) && ZeroDotWLimit < 0xFFFFFF && NativeZeroDot(sentverts))
+            nativeverts = 0;
         if (nativeverts)
         {
             DroppedNativeFit++;
@@ -1348,23 +1349,27 @@ void GPU3D::SubmitPolygon() noexcept
             }
         }
 
-        // the native view: only a polygon at most a pixel wide on one row here can be zero-dot there
-        // (or only here), as the squeeze narrows it by 256/W, so only that one is worked out again
-        if (nativeverts)
+        // the native view. nothing is zero-dot while ZeroDotWLimit is at its reset value, as no W gets past
+        // it. with the same clip in both, as the squeeze narrows by 256/W, only a polygon at most a pixel
+        // wide on one row here, with every W past the limit, can be zero-dot in one view and not the other,
+        // so only that one is worked out again. one the native X planes cut always is (it's clipped already)
+        if (nativeverts && ZeroDotWLimit < 0xFFFFFF)
         {
-            s32 x0 = clippedvertices[0].FinalPosition[0], x1 = x0, y = clippedvertices[0].FinalPosition[1];
-            bool narrow = true;
-            for (int i = 1; i < nverts && narrow; i++)
+            bool check = true;
+            if (NativeClipSame)
             {
-                s32 x = clippedvertices[i].FinalPosition[0];
-                x0 = std::min(x0, x);
-                x1 = std::max(x1, x);
-                narrow = clippedvertices[i].FinalPosition[1] == y && x1 - x0 <= 1;
+                s32 x0 = clippedvertices[0].FinalPosition[0], x1 = x0, y = clippedvertices[0].FinalPosition[1];
+                for (int i = 1; i < nverts && check; i++)
+                {
+                    s32 x = clippedvertices[i].FinalPosition[0];
+                    x0 = std::min(x0, x);
+                    x1 = std::max(x1, x);
+                    check = clippedvertices[i].FinalPosition[1] == y && x1 - x0 <= 1;
+                }
+                for (int i = 0; i < nverts && check; i++)
+                    check = clippedvertices[i].Position[3] > ZeroDotWLimit;
             }
-            // with the same clip in both, a vertex in front of ZeroDotWLimit here is there too
-            for (int i = 0; i < nverts && narrow && NativeClipSame; i++)
-                narrow = clippedvertices[i].Position[3] > ZeroDotWLimit;
-            if (narrow && NativeZeroDot(sentverts))
+            if (check && NativeZeroDot(sentverts))
                 nativeverts = 0;
         }
 
@@ -1570,27 +1575,32 @@ int GPU3D::NativeClipVertices(int sentverts, int wideverts, const Vertex* widecl
     }
     if (left == sentverts || right == sentverts) return 0;
 
-    ClipPosition native[10];
+    ClipPosition* native = NativeClipped;
     for (int i = 0; i < sentverts; i++)
     {
         native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
     }
-    int n = ClipPolygon<false>(*this, native, sentverts, 0);
+    int n = NativeClippedCount = ClipPolygon<false>(*this, native, sentverts, 0);
     for (int i = 0; i < n; i++)
         clippedmask |= native[i].Clipped << i;
     return n;
 }
 
 // WideMelon: whether SubmitPolygon's zero-dot check would reject the polygon in TempVertexBuffer in
-// the native view: clipped there, it has all its vertices on the same pixel and behind ZeroDotWLimit
+// the native view: clipped there, it has all its vertices on the same pixel and behind ZeroDotWLimit.
+// after NativeClipVertices, whose clip it reuses when that had one of its own
 bool GPU3D::NativeZeroDot(int sentverts) noexcept
 {
-    ClipPosition native[10];
-    for (int i = 0; i < sentverts; i++)
+    ClipPosition* native = NativeClipped;
+    int n = NativeClippedCount;
+    if (NativeClipSame)
     {
-        native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
+        for (int i = 0; i < sentverts; i++)
+        {
+            native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
+        }
+        n = ClipPolygon<false>(*this, native, sentverts, 0);
     }
-    int n = ClipPolygon<false>(*this, native, sentverts, 0);
 
     // the viewport transform as SubmitPolygon does it
     u32 firstX = 0, firstY = 0;

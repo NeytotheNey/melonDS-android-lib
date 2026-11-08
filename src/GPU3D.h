@@ -53,6 +53,13 @@ struct Vertex
     void DoSavestate(Savestate* file) noexcept;
 };
 
+// a vertex with only what clipping looks at, for WideMelon's native view (see GPU3D::NativeClipVertices)
+struct ClipPosition
+{
+    s32 Position[4];
+    bool Clipped;
+};
+
 struct Polygon
 {
     Vertex* Vertices[10];
@@ -268,8 +275,11 @@ private:
     u32 NativeStripVerts = 0, NativeStripClipped = 0;
     int NativeClipVertices(int sentverts, int wideverts, const Vertex* wideclipped, u32& clippedmask) noexcept;
     bool NativeZeroDot(int sentverts) noexcept;
-    // whether the last NativeClipVertices came out as the squeezed view's clip (no native X plane in the way)
+    // whether the last NativeClipVertices came out as the squeezed view's clip (no native X plane in the way),
+    // and if not, the polygon it clipped, for NativeZeroDot
     bool NativeClipSame = false;
+    ClipPosition NativeClipped[10];
+    int NativeClippedCount = 0;
 
     // the WIDEDROPS line, per scene (polygon RAM swap) and once a second
     struct WideDropStats
