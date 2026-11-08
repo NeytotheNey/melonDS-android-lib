@@ -29,7 +29,7 @@ struct WideCheckOptions
     std::string RomPath, OutDir;
     std::string StatePath; // a melonDS savestate (.mlN) loaded after boot, or empty
     melonDS::u32 Frames = 0;
-    int Width = 0;         // the wide run's view width, 258..768 and even
+    int Width = 0;         // the wide run's view width, even, 256..768 (256 = both runs off, a sanity run)
     std::vector<std::pair<melonDS::u32, melonDS::u32>> Taps; // (first frame, key bit), held for 6 frames
     int RTC[6] {};
     bool SqueezeBoxTest = false; // box tests as WideMelon does them: memory may differ, only reported
@@ -37,7 +37,8 @@ struct WideCheckOptions
 };
 
 // runs the game twice in lockstep, WideMelon off and on, and compares what has to match;
-// returns the exit code (0 = pass, 1 = fail, 2 = couldn't run)
+// returns the exit code (0 = pass, 1 = fail, 2 = couldn't run, 3 = inconclusive: a wide run that
+// never drew 3D or never kept a different polygon count, so it didn't exercise the wide path)
 int RunWideCheck(const WideCheckOptions& opts);
 
 #endif // SWIHARNESS_WIDECHECK_H

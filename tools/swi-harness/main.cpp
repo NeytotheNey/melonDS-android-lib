@@ -695,7 +695,7 @@ int main(int argc, char** argv)
             || (boxtest != "stock" && boxtest != "wide") || (timing != "equal" && timing != "native"))
         {
             fprintf(stderr, "--wide-check needs an even width 256..768 (256 = both runs off), --frames, --out, and FreeBIOS in DS mode\n");
-            return 1;
+            return 2; // couldn't run, as RunWideCheck returns
         }
         std::filesystem::create_directories(outdir);
         if (CoreLogEnabled)

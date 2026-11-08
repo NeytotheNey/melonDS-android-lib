@@ -21,7 +21,8 @@
 //   sh tools/swi-harness/wide_check.sh
 //
 // or one with swi-harness.exe <rom.nds> --wide-check W --frames N --out <dir> [--state <file.mlN>]
-// [--tap KEY@FRAME ...] [--box-test wide]. Writes summary.txt, frames.tsv and diffs.txt to <dir>.
+// [--tap KEY@FRAME ...] [--box-test wide] [--timing native]. Writes summary.txt, frames.tsv and
+// diffs.txt to <dir>. Exits 0 on PASS, 1 on FAIL, 2 if it couldn't run, 3 if INCONCLUSIVE.
 //
 // Two emulators run the same frames in lockstep with FreeBIOS: one with WideMelon off, one with
 // the view W wide (GPU3D::WideCheck). After every frame it compares what the game can see and
@@ -29,7 +30,16 @@
 // - both screens' 2D planes 0-2 (the accelerated line format, where the 3D layer is a placeholder),
 //   plane 1 and 2 only on display mode 1 lines, as GPU::LogHash2D does;
 // - the control words with the wings bits masked (8-12 EVY, 18-22 wings flags);
-// - main RAM, shared and ARM7 WRAM, ITCM, DTCM, all VRAM banks (so the capture banks), palette, OAM.
+// - main RAM, shared and ARM7 WRAM, ITCM, DTCM, all VRAM banks (so the capture banks), palette, OAM;
+// - timing, so a slip shows up the frame it happens instead of when it reaches memory: the ARM9,
+//   ARM7 and geometry engine timestamps, GXSTAT, the GX FIFO level and DISP3DCNT but bit 13 (the
+//   polygon/vertex RAM overflow flag: the wider view keeps more polygons, so it can fill the RAM
+//   where the native one doesn't, as the drop counter counts; reported).
+// With --box-test wide the game sees other box test results by design and runs differently, so
+// memory and timing are then only reported.
+// A wide run (W > 256) that never drew 3D, or whose wide view never kept a different number of
+// polygons than the native one, didn't exercise the wide path (a hung game, a broken savestate,
+// a 2D-only scene): it's INCONCLUSIVE, not a PASS.
 // Left out on purpose, since they differ by design:
 // - the 3D pixels: software 3D draws the squeezed scene into 256 columns, so both runs hand
 //   display capture the same fixed pattern instead (GPU3D::GetLine);
@@ -45,6 +55,7 @@
 // The wings themselves are drawn by the GL compositor, so there's no wing picture here.
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <memory>
 #include <filesystem>
@@ -68,6 +79,7 @@ bool ReadAll(const std::string& path, std::vector<u8>& out)
     if (!f) return false;
     fseeko64(f, 0, SEEK_END);
     s64 len = ftello64(f);
+    if (len < 0) { fclose(f); return false; }
     fseeko64(f, 0, SEEK_SET);
     out.resize(len);
     bool ok = fread(out.data(), 1, len, f) == (size_t)len;
@@ -129,6 +141,33 @@ std::vector<Region> Regions(NDS& off, NDS& on)
 
 const u32 WingBits = 0x1F00 | 0x7C0000;
 
+// DISP3DCNT bit 13, the polygon/vertex RAM overflow flag, which the wider view can set where the native one doesn't
+const u32 Disp3DOverflow = 1 << 13;
+
+// which timing values differ between the runs after a frame (bits as in frames.tsv's timing column)
+enum { TimeARM9 = 1, TimeARM7 = 2, Time3D = 4, TimeGXStat = 8, TimeFIFO = 16, TimeDisp3D = 32 };
+u32 TimingDiffs(NDS& off, NDS& on)
+{
+    const GPU3D& a = off.GPU.GPU3D;
+    const GPU3D& b = on.GPU.GPU3D;
+    return (off.ARM9Timestamp != on.ARM9Timestamp ? TimeARM9 : 0)
+        | (off.ARM7Timestamp != on.ARM7Timestamp ? TimeARM7 : 0)
+        | (a.Timestamp != b.Timestamp ? Time3D : 0)
+        | (a.GXStat != b.GXStat ? TimeGXStat : 0)
+        | (a.CmdFIFO.Level() != b.CmdFIFO.Level() ? TimeFIFO : 0)
+        | (((a.DispCnt ^ b.DispCnt) & ~Disp3DOverflow) ? TimeDisp3D : 0);
+}
+
+void AppendF(std::string& out, const char* fmt, ...)
+{
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    out += buf;
+}
+
 // plane 0 of a frame as a BMP, both screens stacked, for looking at a difference
 void WritePlane0(NDS& nds, const std::string& path)
 {
@@ -177,13 +216,14 @@ int RunWideCheck(const WideCheckOptions& opts)
     FILE* log = fopen((opts.OutDir + "/frames.tsv").c_str(), "w");
     FILE* diffs = fopen((opts.OutDir + "/diffs.txt").c_str(), "w");
     if (!log || !diffs) { fprintf(stderr, "can't write to %s\n", opts.OutDir.c_str()); return 2; }
-    fprintf(log, "frame\tplane_px\tctrl_lines\tmem_regions\tpolys_off\tpolys_on\twing3d_lines\twhite_lines\tcapture\n");
+    fprintf(log, "frame\tplane_px\tctrl_lines\tmem_regions\ttiming\tpolys_off\tpolys_on\twing3d_lines\twhite_lines\tcapture\n");
 
     u64 planeDiffs = 0, ctrlDiffs = 0, memDiffs = 0, polyFrames = 0, polysOff = 0, polysOn = 0;
     u32 frames3D = 0, captureFrames = 0;
     u32 failFrames = 0, firstFail = 0, reported = 0;
     u32 dropFrames = 0, maxFrameDrops = 0, lastDrops = 0;
     u32 nativeMisses = 0, nativeMaxPolys = 0, nativeMaxVerts = 0;
+    u32 timingFrames = 0, firstTiming = 0, timingKinds = 0, overflowFrames = 0;
     for (u32 frame = 1; frame <= opts.Frames; frame++)
     {
         u32 keymask = 0xFFF;
@@ -235,6 +275,22 @@ int RunWideCheck(const WideCheckOptions& opts)
             note("%s: %u bytes differ, first at %05X (%02X vs %02X)", r.Name, n, i, r.Off[i], r.On[i]);
         }
 
+        u32 timing = TimingDiffs(*off, *on);
+        if (timing)
+        {
+            if (!timingFrames++) firstTiming = frame;
+            timingKinds |= timing;
+            if (timingFrames <= 20)
+                note("timing differs (%02X): ARM9 %llu vs %llu, ARM7 %llu vs %llu, 3D %llu vs %llu, GXSTAT %08X vs %08X, "
+                    "FIFO %u vs %u, DISP3DCNT %04X vs %04X", timing,
+                    (unsigned long long)off->ARM9Timestamp, (unsigned long long)on->ARM9Timestamp,
+                    (unsigned long long)off->ARM7Timestamp, (unsigned long long)on->ARM7Timestamp,
+                    (unsigned long long)off->GPU.GPU3D.Timestamp, (unsigned long long)on->GPU.GPU3D.Timestamp,
+                    off->GPU.GPU3D.GXStat, on->GPU.GPU3D.GXStat, off->GPU.GPU3D.CmdFIFO.Level(), on->GPU.GPU3D.CmdFIFO.Level(),
+                    off->GPU.GPU3D.DispCnt, on->GPU.GPU3D.DispCnt);
+        }
+        overflowFrames += ((off->GPU.GPU3D.DispCnt ^ on->GPU.GPU3D.DispCnt) & Disp3DOverflow) != 0;
+
         u32 pa = off->GPU.GPU3D.RenderNumPolygons, pb = on->GPU.GPU3D.RenderNumPolygons;
         polysOff += pa; polysOn += pb; polyFrames += pa != pb; frames3D += pa != 0;
         u32 drops = on->GPU.GPU3D.DroppedPolygons - lastDrops;
@@ -253,9 +309,9 @@ int RunWideCheck(const WideCheckOptions& opts)
             nativeMaxVerts = std::max(nativeMaxVerts, dv);
         }
         planeDiffs += plane; ctrlDiffs += ctrl; memDiffs += mem;
-        fprintf(log, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n", frame, plane, ctrl, mem, pa, pb, wing3d, white, capture);
+        fprintf(log, "%u\t%u\t%u\t%u\t%02X\t%u\t%u\t%u\t%u\t%u\n", frame, plane, ctrl, mem, timing, pa, pb, wing3d, white, capture);
 
-        if (plane || ctrl || (mem && !opts.SqueezeBoxTest))
+        if (plane || ctrl || ((mem || timing) && !opts.SqueezeBoxTest))
         {
             if (!failFrames++)
             {
@@ -270,30 +326,66 @@ int RunWideCheck(const WideCheckOptions& opts)
 
     const GPU3D& g0 = off->GPU.GPU3D;
     const GPU3D& g1 = on->GPU.GPU3D;
-    char summary[1024];
-    snprintf(summary, sizeof(summary),
-        "%s: %u frames, wide %d, %s timing: %s\n"
-        "  differing frames %u (first %u): plane pixels %llu, control lines %llu, memory regions %llu\n"
-        "  frames with 3D %u, with display capture %u\n"
-        "  info: polygons drawn off %llu / on %llu (differ in %llu frames), polygon RAM count reads %u off / %u on,\n"
-        "  box tests (%s) %u/%u hit off, %u/%u on (%u by the wide retry)\n"
-        "  polygons dropped as the polygon or vertex RAM was full: off %u / on %u (%u of them would have fit natively),\n"
-        "  on in %u frames, at most %u in one; the on run's native polygon RAM counts were off in %u frames\n"
-        "  (by at most %u polygons, %u vertices)\n",
+
+    // a wide run has to show the wide path ran: 3D drawn, and the wide view keeping another polygon
+    // count than the native one at least once. without that a PASS proves nothing about it
+    const char* inconclusive = nullptr;
+    if (!failFrames && opts.Width > 256)
+    {
+        if (!frames3D) inconclusive = "no frame drew 3D";
+        else if (!polyFrames) inconclusive = "the wide view never kept a different number of polygons";
+    }
+    const char* result = failFrames ? "FAIL" : inconclusive ? "INCONCLUSIVE" : "PASS";
+
+    std::string summary;
+    AppendF(summary, "%s: %u frames, wide %d, %s timing, %s box tests: %s%s%s\n",
         std::filesystem::path(opts.RomPath).filename().string().c_str(), opts.Frames, opts.Width,
-        opts.EqualTiming ? "equalized" : "native", failFrames ? "FAIL" : "PASS", failFrames, firstFail,
-        (unsigned long long)planeDiffs, (unsigned long long)ctrlDiffs, (unsigned long long)memDiffs, frames3D, captureFrames,
+        opts.EqualTiming ? "equalized" : "native", opts.SqueezeBoxTest ? "squeezed" : "stock", result,
+        inconclusive ? ", " : "", inconclusive ? inconclusive : "");
+
+    // what a PASS here does and doesn't show
+    if (opts.Width == 256)
+        AppendF(summary, "  a PASS means: both runs had WideMelon off and matched, a sanity run of the check itself\n");
+    else if (opts.SqueezeBoxTest)
+        AppendF(summary, "  a PASS means: with box tests squeezed as WideMelon does them, the middle 256 (2D planes 0-2,\n"
+            "  control words) still matched; the game sees other box test results by design, so memory and\n"
+            "  timing were only reported%s\n", opts.EqualTiming ? " (polygon timing equalized)" : "");
+    else if (!opts.EqualTiming)
+        AppendF(summary, "  a PASS means: WideMelon's own polygon timing (by the native view's clip result) gave the game\n"
+            "  stock timing (ARM9/ARM7/geometry timestamps, GXSTAT, FIFO level, DISP3DCNT matched every frame),\n"
+            "  and the middle 256 and game memory matched; box tests answered as stock, the window edge fix\n"
+            "  and the 3D pixels made alike in both runs\n");
+    else
+        AppendF(summary, "  a PASS means: the wide 2D path left the middle 256 (2D planes 0-2, control words) and game\n"
+            "  memory untouched, and the equalizations held (ARM9/ARM7/geometry timestamps, GXSTAT, FIFO level,\n"
+            "  DISP3DCNT matched every frame). equalized in both runs: polygon pipeline timing (every polygon\n"
+            "  timed as kept with its sent vertices), box test results (stock), the window edge fix, and the 3D\n"
+            "  pixels (a fixed pattern). it doesn't mean WideMelon as a whole is invisible to the game: its box\n"
+            "  tests and timing are checked by --box-test wide and --timing native\n");
+
+    AppendF(summary, "  differing frames %u (first %u): plane pixels %llu, control lines %llu, memory regions %llu,\n"
+        "  timing in %u frames (first %u%s%s%s%s%s%s)\n",
+        failFrames, firstFail, (unsigned long long)planeDiffs, (unsigned long long)ctrlDiffs, (unsigned long long)memDiffs,
+        timingFrames, firstTiming,
+        (timingKinds & TimeARM9) ? ", ARM9" : "", (timingKinds & TimeARM7) ? ", ARM7" : "", (timingKinds & Time3D) ? ", 3D" : "",
+        (timingKinds & TimeGXStat) ? ", GXSTAT" : "", (timingKinds & TimeFIFO) ? ", FIFO" : "", (timingKinds & TimeDisp3D) ? ", DISP3DCNT" : "");
+    AppendF(summary, "  frames with 3D %u, with display capture %u\n", frames3D, captureFrames);
+    AppendF(summary, "  info: polygons drawn off %llu / on %llu (differ in %llu frames), polygon RAM count reads %u off / %u on,\n"
+        "  box tests (%s) %u/%u hit off, %u/%u on (%u by the wide retry)\n",
         (unsigned long long)polysOff, (unsigned long long)polysOn, (unsigned long long)polyFrames,
         g0.WideCheckCountReads, g1.WideCheckCountReads, opts.SqueezeBoxTest ? "squeezed, memory not compared" : "stock",
-        g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests, g1.WideCheckBoxRetryHits,
+        g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests, g1.WideCheckBoxRetryHits);
+    AppendF(summary, "  polygons dropped as the polygon or vertex RAM was full: off %u / on %u (%u of them would have fit natively),\n"
+        "  on in %u frames, at most %u in one; the on run's native polygon RAM counts were off in %u frames\n"
+        "  (by at most %u polygons, %u vertices); the DISP3DCNT overflow flag differed in %u frames\n",
         g0.DroppedPolygons, g1.DroppedPolygons, g1.DroppedNativeFit, dropFrames, maxFrameDrops,
-        nativeMisses, nativeMaxPolys, nativeMaxVerts);
-    fputs(summary, stdout);
-    if (FILE* f = fopen((opts.OutDir + "/summary.txt").c_str(), "w")) { fputs(summary, f); fclose(f); }
+        nativeMisses, nativeMaxPolys, nativeMaxVerts, overflowFrames);
+    fputs(summary.c_str(), stdout);
+    if (FILE* f = fopen((opts.OutDir + "/summary.txt").c_str(), "w")) { fputs(summary.c_str(), f); fclose(f); }
 
     fclose(log);
     fclose(diffs);
     off->Stop();
     on->Stop();
-    return failFrames ? 1 : 0;
+    return failFrames ? 1 : inconclusive ? 3 : 0;
 }

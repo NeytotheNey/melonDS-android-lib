@@ -1,7 +1,9 @@
 #!/bin/sh
 # The headless WideMelon check (docs/plan-widemelon.md step 2, see WideCheck.cpp): builds the
 # harness and runs each game below with WideMelon off and on, failing if the middle 256 or
-# anything the game can see differs. From the core repo, in Git Bash:
+# anything the game can see differs, CPU timing included. A run whose wide view never did anything
+# different (no 3D, never another polygon count) is INCONCLUSIVE (exit 3). From the core repo, in
+# Git Bash:
 #
 #   sh tools/swi-harness/wide_check.sh
 #
@@ -29,11 +31,19 @@ W2="$GAMES/Pokemon_ White Version 2/Pokemon - White Version 2 (USA, Europe) (NDS
 cp "$MKDS.ml1" "$OUT/states/mkds.ml1" && cp "$W2.ml3" "$OUT/states/w2.ml3" || exit 2
 
 failed=0
+inconclusive=0
 run() # name rom.nds frames [options]
 {
     name=$1; rom=$2; frames=$3; shift 3
-    "$BUILD/swi-harness.exe" "$rom" --wide-check "$WIDTH" --frames "$frames" --out "$OUT/$name" "$@" 2>/dev/null
-    case $? in 0) ;; 1) failed=1 ;; *) echo "$name: couldn't run"; failed=1 ;; esac
+    mkdir -p "$OUT/$name"
+    # stderr goes to a file (the core can be chatty there) and is shown if the run couldn't start
+    "$BUILD/swi-harness.exe" "$rom" --wide-check "$WIDTH" --frames "$frames" --out "$OUT/$name" "$@" 2> "$OUT/$name/stderr.txt"
+    case $? in
+        0) ;;
+        1) failed=1 ;;
+        3) echo "$name: INCONCLUSIVE, the wide path never ran"; inconclusive=1 ;;
+        *) echo "$name: couldn't run:"; tail -n 20 "$OUT/$name/stderr.txt"; failed=1 ;;
+    esac
 }
 
 # boot, menus, then the attract demo race from about frame 1420 (top 3D, bottom map)
@@ -50,5 +60,12 @@ run w2-state-boxwide "$W2.nds" 600 --state "$OUT/states/w2.ml3" --box-test wide
 run mkds-demo-timing "$MKDS.nds" 2400 --timing native
 run ph-intro-timing "$PH.nds" 1200 --timing native
 
-[ $failed = 0 ] && echo "wide check: all passed" || echo "wide check: FAILED (diffs.txt in each $OUT/<game>)"
-exit $failed
+if [ $failed != 0 ]; then
+    echo "wide check: FAILED (diffs.txt in each $OUT/<game>)"
+    exit 1
+elif [ $inconclusive != 0 ]; then
+    echo "wide check: no failures, but INCONCLUSIVE runs (summary.txt in each $OUT/<game>)"
+    exit 3
+fi
+echo "wide check: all passed"
+exit 0
