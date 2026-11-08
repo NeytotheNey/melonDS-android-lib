@@ -296,6 +296,9 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     glGenBuffers(1, &result->PixelBuffer);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, result->PixelBuffer);
     glBufferData(GL_PIXEL_PACK_BUFFER, 256*192*4, NULL, GL_DYNAMIC_READ);
+    glGenBuffers(1, &result->EarlyPixelBuffer);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, result->EarlyPixelBuffer);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 256*192*4, NULL, GL_DYNAMIC_READ);
 
     glGenFramebuffers(1, &result->CaptureFrameBuffer);
 
@@ -316,7 +319,7 @@ ComputeRenderer::~ComputeRenderer()
         { 0, TileMemory[0] }, { 0, TileMemory[1] }, { 0, TileMemory[2] }, { 0, XSpanSetupMemory },
         { 0, FinalTileMemory }, { 0, WorkDescMemory }, { 0, BinResultMemory },
         { 0, YSpanIndicesTextureMemory }, { 0, YSpanSetupMemory }, { 0, RenderPolygonMemory },
-        { 0, PixelBuffer }, { 0, MetaUniformMemory } };
+        { 0, PixelBuffer }, { 0, EarlyPixelBuffer }, { 0, MetaUniformMemory } };
     for (auto& [size, buffer] : buffers)
     {
         if (buffer == 0)
@@ -346,15 +349,20 @@ ComputeRenderer::~ComputeRenderer()
     glDeleteBuffers(1, &YSpanIndicesTextureMemory);
     glDeleteTextures(1, &YSpanIndicesTexture);
     glDeleteTextures(1, &Framebuffer);
+    glDeleteTextures(1, &KeptFramebuffer);
+    glDeleteTextures(1, &SpareFramebuffer);
     glDeleteTextures(1, &LowResFramebuffer);
     glDeleteBuffers(1, &MetaUniformMemory);
 
     glDeleteSamplers(9, Samplers);
     glDeleteTextures(2, ClearBitmapTex);
     glDeleteBuffers(1, &PixelBuffer);
+    glDeleteBuffers(1, &EarlyPixelBuffer);
     glDeleteFramebuffers(1, &CaptureFrameBuffer);
     if (CaptureFence)
         glDeleteSync(CaptureFence);
+    if (EarlyCaptureFence)
+        glDeleteSync(EarlyCaptureFence);
 
     DeleteShaders();
 }
@@ -413,12 +421,15 @@ void ComputeRenderer::Reset(GPU& gpu)
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
     ClearBitmapDirty = 0x3;
+    DropEarlyCapture();
 }
 
 void ComputeRenderer::SavestateLoaded()
 {
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
+    // line 0 reads the low res image back again, as it did before the early readback
+    DropEarlyCapture();
 }
 
 // the tile size for a scale: starting at 4.5x it doubles every time the scale doubles
@@ -584,6 +595,15 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, WorkDescMemory);
     glBufferData(GL_SHADER_STORAGE_BUFFER, MaxWorkTiles*2*4*2, nullptr, GL_DYNAMIC_DRAW);
+
+    // the other images are at the old size. nothing is kept here: a kept frame only lives from
+    // the render at line 215 to the Blit right after it, and KeepFrameForBlit refuses a render
+    // that resizes. the low res image keeps its size, but a resize is rare enough to read it
+    // back at line 0 again
+    glDeleteTextures(1, &KeptFramebuffer);
+    glDeleteTextures(1, &SpareFramebuffer);
+    KeptFramebuffer = SpareFramebuffer = 0;
+    DropEarlyCapture();
 
     if (Framebuffer != 0)
         glDeleteTextures(1, &Framebuffer);
@@ -855,15 +875,18 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 #endif
     CaptureSpinUs = gpu.CaptureSpinUs;
 
-    // the targets match the polygons drawn here, so after a width change they only shrink once
-    // the game has built geometry at the new width (see GLRenderer::RenderFrame). this is inside
-    // RunFrame, so the shaders for the new width are compiled right here
-    int targetWidth = std::max(ViewWidth, gpu.GPU3D.RenderViewWidth);
-    if (!TargetFits(targetWidth, ScaleFactor) ||
-        (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
-        targetWidth = ViewWidth;
+    bool keep = KeepRequested;
+    KeepRequested = false;
+    // an earlier readback is of the frame this replaces (a skipped one too, to keep it simple)
+    DropEarlyCapture();
+
+    // the targets match the polygons drawn here (see FrameTargetWidth). this is inside RunFrame,
+    // so the shaders for the new width are compiled right here. with a Blit after it
+    // (KeepFrameForBlit), only when the targets stay as they are
+    int targetWidth = FrameTargetWidth(gpu);
     if (targetWidth != TargetWidth)
     {
+        keep = false;
         ResizeTargets(ScaleFactor, HiresCoordinates, targetWidth);
         int current, count;
         while (NeedsShaderCompile())
@@ -881,6 +904,10 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         return;
     }
     ForceRender = false;
+
+    // the final pass writes every texel of the image, so the spare one needs nothing else
+    if (keep)
+        KeepFramebuffer();
 
     // if we're using a clear bitmap, set that up
     ClearBitmapDirty |= clrBitmapDirty;
@@ -1552,25 +1579,112 @@ u32* ComputeRenderer::GetLine(int line)
 
 void ComputeRenderer::SetupAccelFrame()
 {
-    glBindTexture(GL_TEXTURE_2D, Framebuffer);
+    // the 3D image of the Blit's own frame, kept while the next one is drawn (see KeepFrameForBlit)
+    glBindTexture(GL_TEXTURE_2D, KeptFramebuffer ? KeptFramebuffer : Framebuffer);
 }
 
 void ComputeRenderer::PrepareCaptureFrame()
 {
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, PixelBuffer);
+    ReadBackCaptureFrame(PixelBuffer, CaptureFence);
+}
+
+void ComputeRenderer::ReadBackCaptureFrame(GLuint pixelBuffer, GLsync& fence) noexcept
+{
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pixelBuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, CaptureFrameBuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, LowResFramebuffer, 0);
     glReadPixels(0, 0, 256, 192, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // GetLine(0) polls this before it maps the readback (see GPU::CaptureSpinUs)
-    if (CaptureFence)
+    if (fence)
     {
-        glDeleteSync(CaptureFence);
-        CaptureFence = nullptr;
+        glDeleteSync(fence);
+        fence = nullptr;
     }
     if (CaptureSpinUs > 0)
-        CaptureFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+}
+
+// the width RenderFrame sizes the targets for: the polygons match them, so after a width change
+// they only shrink once the game has built geometry at the new width (see GLRenderer)
+int ComputeRenderer::FrameTargetWidth(const GPU& gpu) noexcept
+{
+    int targetWidth = std::max(ViewWidth, gpu.GPU3D.RenderViewWidth);
+    if (!TargetFits(targetWidth, ScaleFactor) ||
+        (targetWidth != WideMelon::NativeWidth && !CurGLCompositor.PrepareWide()))
+        targetWidth = ViewWidth;
+    return targetWidth;
+}
+
+// GPU::BlitAfterReadback, at line 215: the compositor's size follows the targets, so a render that
+// resizes them gets the Blit first. otherwise the render writes the spare 3D image and the one it
+// replaces stays for the Blit (see KeepFramebuffer). a render that's skipped keeps nothing, and the
+// Blit reads the image as it was
+bool ComputeRenderer::KeepFrameForBlit(const GPU& gpu)
+{
+    if (FrameTargetWidth(gpu) != TargetWidth)
+        return false;
+
+    KeepRequested = true;
+    return true;
+}
+
+// the render about to start writes the spare 3D image (the final pass binds Framebuffer), and the
+// one it replaces is kept for the Blit. made like ResizeTargets makes Framebuffer
+void ComputeRenderer::KeepFramebuffer() noexcept
+{
+    if (!SpareFramebuffer)
+    {
+        glGenTextures(1, &SpareFramebuffer);
+        glBindTexture(GL_TEXTURE_2D, SpareFramebuffer);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, TargetWidth * ScaleFactor, ScreenHeight);
+    }
+
+    KeptFramebuffer = Framebuffer;
+    Framebuffer = SpareFramebuffer;
+    SpareFramebuffer = 0;
+}
+
+// GPU::BlitAfterReadback: line 0's readback, made right after the render at line 215, into the
+// early buffer with its own fence, so GetLine's buffer and fence stay as the last line-0 readback
+// left them until line 0 takes this. it reads the low res image, and whatever could change that
+// before line 0 drops it: a render (HalfCamera's redraw at line 0 too), a resize, a reset, a stop
+// or a savestate load
+void ComputeRenderer::PrepareEarlyCaptureFrame()
+{
+    ReadBackCaptureFrame(EarlyPixelBuffer, EarlyCaptureFence);
+    EarlyCapture = true;
+}
+
+// at line 0, with use where PrepareCaptureFrame would run: the early buffer and fence are what it
+// would make, so they swap in for GetLine's, and its old fence goes as PrepareCaptureFrame would
+// have deleted it. without use, or once it's stale, GetLine's stay as they are
+bool ComputeRenderer::TakeEarlyCaptureFrame(bool use)
+{
+    if (!use || !EarlyCapture)
+    {
+        DropEarlyCapture();
+        return false;
+    }
+
+    std::swap(PixelBuffer, EarlyPixelBuffer);
+    if (CaptureFence)
+        glDeleteSync(CaptureFence);
+    CaptureFence = EarlyCaptureFence;
+    EarlyCaptureFence = nullptr;
+    EarlyCapture = false;
+    return true;
+}
+
+void ComputeRenderer::DropEarlyCapture() noexcept
+{
+    EarlyCapture = false;
+    if (EarlyCaptureFence)
+    {
+        glDeleteSync(EarlyCaptureFence);
+        EarlyCaptureFence = nullptr;
+    }
 }
 
 void ComputeRenderer::FlushCommands()
@@ -1591,11 +1705,21 @@ void ComputeRenderer::BindOutputTexture(int buffer)
 void ComputeRenderer::Blit(const GPU &gpu)
 {
     CurGLCompositor.RenderFrame(gpu, *this);
+
+    // the compositor and its hi-res capture pass were the last to read the kept image. the final
+    // pass that next writes it comes later in command order, the same as it always followed the
+    // compositor's reads of the one image there was
+    if (KeptFramebuffer)
+    {
+        SpareFramebuffer = KeptFramebuffer;
+        KeptFramebuffer = 0;
+    }
 }
 
 void ComputeRenderer::Stop(const GPU &gpu)
 {
     CurGLCompositor.Stop(gpu);
+    DropEarlyCapture();
 }
 
 }

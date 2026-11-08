@@ -71,6 +71,11 @@ public:
     bool FlushAfterCaptureBlit() const override { return true; }
     [[nodiscard]] bool CanDrawReplayedScene() const noexcept override { return true; }
 
+    [[nodiscard]] bool SupportsBlitAfterRender() const noexcept override { return true; }
+    bool KeepFrameForBlit(const GPU& gpu) override;
+    void PrepareEarlyCaptureFrame() override;
+    bool TakeEarlyCaptureFrame(bool use) override;
+
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
 
@@ -250,12 +255,26 @@ private:
     u8 ClearBitmapDirty = 0x3;
 
     GLuint Framebuffer = 0;
+    // GPU::BlitAfterReadback: the 3D image the render at line 215 replaced, which the Blit right
+    // after it still reads (SetupAccelFrame binds it), and the image the render after that writes.
+    // Framebuffer swaps with them, so with the switch on two images take turns. the spare is made
+    // the first time a frame is kept and dropped by ResizeTargets
+    GLuint KeptFramebuffer {}, SpareFramebuffer {};
+    // set by KeepFrameForBlit for the next RenderFrame, which clears it
+    bool KeepRequested = false;
     GLuint LowResFramebuffer {};
+    // the buffer GetLine maps, and the early readback's (PrepareEarlyCaptureFrame), which swap
+    // with their fences when line 0 takes it (TakeEarlyCaptureFrame)
     GLuint PixelBuffer {};
+    GLuint EarlyPixelBuffer {};
     GLuint CaptureFrameBuffer {};
     // GPU::CaptureSpinUs (copied at RenderFrame): a fence after the capture readback, polled
     // before the map
     GLsync CaptureFence = nullptr;
+    GLsync EarlyCaptureFence = nullptr;
+    // the early readback is in EarlyPixelBuffer and is still what line 0 would read back. cleared
+    // (with its fence) by anything that draws into the low res image or replaces the state
+    bool EarlyCapture = false;
     int CaptureSpinUs = 0;
 #ifdef MELONADE_DEBUG_TOOLS
     // when RenderFrame last started (ns), for the capture stats
@@ -295,6 +314,10 @@ private:
     bool TargetFits(int width, int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
     void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth);
+    int FrameTargetWidth(const GPU& gpu) noexcept;
+    void KeepFramebuffer() noexcept;
+    void ReadBackCaptureFrame(GLuint pixelBuffer, GLsync& fence) noexcept;
+    void DropEarlyCapture() noexcept;
     s32 WideVertexX(s32 hiresx) const;
 
     void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to);

@@ -828,7 +828,8 @@ public:
     // compute renderer (Renderer3D::FlushAfterCaptureBlit): in frames that hold capture lines,
     // flush right after the line-192 Blit, so the GPU runs the compositor while it would otherwise
     // idle (after the capture map) until the line-215 flush, instead of ahead of the 3D there.
-    // only turned off by a debug switch, to compare
+    // only for a Blit that stays at line 192: with BlitAfterReadback it moves after the 3D and is
+    // flushed there. only turned off by a debug switch, to compare
     bool BlitFlushCapture = true;
     // threaded 2D with an accelerated 3D renderer: the frame-end 2D barrier and the Blit move from
     // line 192 to just before the 3D render at line 215, which is the first thing after them that
@@ -836,10 +837,11 @@ public:
     // not in frames that hold capture lines or record any for hi-res capture. only turned off by a
     // debug switch, to compare
     bool LateBlit = true;
-    // OpenGL renderer (Renderer3D::SupportsBlitAfterRender), in frames that hold capture lines: the
-    // Blit waits from line 192 until right after the 3D render at line 215, which draws into the
-    // other of two 3D color buffers while the compositor reads the one it replaced, and the next
-    // frame's capture readback is issued between the two instead of at line 0. then the GPU runs
+    // OpenGL and compute renderers (Renderer3D::SupportsBlitAfterRender), in frames that hold
+    // capture lines: the Blit waits from line 192 until right after the 3D render at line 215,
+    // which draws into the other of two 3D color buffers while the compositor reads the one it
+    // replaced, and the next frame's capture readback is issued between the two instead of at
+    // line 0, into a pixel buffer of its own that line 0 swaps in. then the GPU runs
     // the 3D render and the readback that line 192's map waits for before the compositor and the
     // filtered 2D passes, not after them. what the game reads back is the same frame either way.
     // off by default here until it's tested on a phone; debug builds turn it on (DebugProperties)
