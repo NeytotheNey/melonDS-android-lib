@@ -130,6 +130,20 @@ public:
     void WriteToGXFIFO(u32 val) noexcept;
 
     [[nodiscard]] bool IsRendererAccelerated() const noexcept;
+    // the accelerated 2D line format (planes + control word): the GL renderers, or the wide check
+    [[nodiscard]] bool UsesAccelLines() const noexcept { return IsRendererAccelerated() || WideCheck; }
+
+    // the PC wide check (tools/swi-harness --wide-check), 0 = off, as everywhere else. geometry is
+    // built for this width whatever the renderer says (256 = wide off), 2D writes the accelerated
+    // line format (with the wings bits above 256), and GetLine hands display capture a fixed
+    // pattern, since software 3D can't draw the wide middle like the GL renderers. polygons are
+    // timed alike and box tests answered as stock (unless WideCheckSqueezeBoxTest), as both are
+    // game-visible by design (see SubmitPolygon, BoxTest). set it before SetRenderer3D, which
+    // sizes the framebuffers. the counts are for its report
+    int WideCheck = 0;
+    bool WideCheckSqueezeBoxTest = false;
+    u32 WideCheckBoxTests = 0, WideCheckBoxHits = 0, WideCheckCountReads = 0;
+
     [[nodiscard]] Renderer3D& GetCurrentRenderer() noexcept { return *CurrentRenderer; }
     [[nodiscard]] const Renderer3D& GetCurrentRenderer() const noexcept { return *CurrentRenderer; }
     void SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept;
@@ -228,6 +242,7 @@ private:
 
     u16 RenderXPos = 0;
     int ViewWidth = 256;
+    int RendererViewWidth() const noexcept;
 
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;

@@ -172,7 +172,7 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
     CurrentRenderer->Reset(NDS.GPU);
 
     // software only does 256, so don't keep squeezing geometry for it
-    ViewWidth = CurrentRenderer->GetViewWidth();
+    ViewWidth = RendererViewWidth();
 }
 
 void GPU3D::SetVertexIdLogging(int mode) noexcept
@@ -337,7 +337,7 @@ void GPU3D::Reset() noexcept
 
     RenderXPos = 0;
 
-    ViewWidth = CurrentRenderer ? CurrentRenderer->GetViewWidth() : WideMelon::NativeWidth;
+    ViewWidth = CurrentRenderer ? RendererViewWidth() : WideMelon::NativeWidth;
     RenderViewWidth = ViewWidth;
 
     if (CurrentRenderer)
@@ -1015,6 +1015,16 @@ void GPU3D::SubmitPolygon() noexcept
     VertexSlotCounter = 1;
     VertexSlotsFree = 0b11110;
 
+    // the wide check: the wider view lets more polygons through clipping, and a kept polygon keeps
+    // the pipeline busy longer (below, by its clipped vertex count), which the game sees as timing.
+    // time every polygon as kept with the vertices it was sent with, culled or not, in both runs,
+    // so their geometry engines stay in step
+    if (WideCheck)
+    {
+        PolygonPipeline = (nverts == 4) ? 35 : 26;
+        VertexSlotsFree = (nverts == 4) ? ((PolygonMode & 0x2) ? 0b11100 : 0b11110) : ((PolygonMode & 0x2) ? 0b1000 : 0b1110);
+    }
+
     // culling
     // TODO: work out how it works on the real thing
     // the normalization part is a wild guess
@@ -1252,7 +1262,8 @@ void GPU3D::SubmitPolygon() noexcept
 
     // build the actual polygon
 
-    if (nverts == 4)
+    // (the clipped vertex count picks the timing, which the wide check can't have, see above)
+    if ((WideCheck ? ((PolygonMode & 0x1) ? 4 : 3) : nverts) == 4)
     {
         PolygonPipeline = 35;
         VertexSlotCounter = 1;
@@ -1658,8 +1669,9 @@ void GPU3D::BoxTest(const u32* params) noexcept
     }
 
     // box tests have to agree with the widened frustum, otherwise games that
-    // cull with them drop objects that would be visible at the sides
-    if (ViewWidth != WideMelon::NativeWidth)
+    // cull with them drop objects that would be visible at the sides. the wide check answers them
+    // as stock unless asked (WideCheckSqueezeBoxTest), so the game's memory can be compared
+    if (ViewWidth != WideMelon::NativeWidth && (!WideCheck || WideCheckSqueezeBoxTest))
     {
         for (int i = 0; i < 8; i++)
             cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], ViewWidth);
@@ -2425,6 +2437,7 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
                 case 0x70: // box test
                     NumTestCommands -= 3;
                     BoxTest(ExecParams);
+                    if (WideCheck) { WideCheckBoxTests++; WideCheckBoxHits += (GXStat >> 1) & 1; }
                     if (VertexIdLog) VertexIdLog->OnBoxTest(GXStat & (1<<1));
                     break;
 
@@ -2643,7 +2656,7 @@ void GPU3D::VBlank() noexcept
             FlushRequest = 0;
 
             // the width only changes between frames of geometry: right after a swap...
-            ViewWidth = CurrentRenderer->GetViewWidth();
+            ViewWidth = RendererViewWidth();
 
             if (HalfCam) HalfCam->OnSceneStart();
         }
@@ -2651,7 +2664,7 @@ void GPU3D::VBlank() noexcept
     else if (NumVertices == 0 && NumPolygons == 0 && VertexNumInPoly == 0)
     {
         // ...or while the geometry engine is off with nothing half-built
-        ViewWidth = CurrentRenderer->GetViewWidth();
+        ViewWidth = RendererViewWidth();
     }
 
     // the renderers skip a frame that's the same as the last one, which would keep the in-between scene up
@@ -2676,6 +2689,14 @@ void GPU3D::SetRenderXPos(u16 xpos) noexcept
 
 u32* GPU3D::GetLine(int line, u16 xpos, bool abort) noexcept
 {
+    // the wide check: the same opaque, translucent and clear pixels in both runs (see WideCheck)
+    if (WideCheck)
+    {
+        for (int x = 0; x < 256; x++)
+            ScrolledLine[x] = (x & 0x3F) | ((line & 0x3F) << 8) | (((x ^ line) & 0x3F) << 16) | (((x * 3 + line) & 0x1F) << 24);
+        return ScrolledLine;
+    }
+
     if (!abort)
     {
         u32* rawline = CurrentRenderer->GetLine(line);
@@ -2707,6 +2728,11 @@ u32* GPU3D::GetLine(int line, u16 xpos, bool abort) noexcept
     }
 
     return ScrolledLine;
+}
+
+int GPU3D::RendererViewWidth() const noexcept
+{
+    return WideCheck ? WideCheck : CurrentRenderer->GetViewWidth();
 }
 
 bool GPU3D::IsRendererAccelerated() const noexcept
@@ -2823,8 +2849,10 @@ u16 GPU3D::Read16(u32 addr) noexcept
         }
 
     case 0x04000604:
+        if (WideCheck) WideCheckCountReads++;
         return NumPolygons;
     case 0x04000606:
+        if (WideCheck) WideCheckCountReads++;
         return NumVertices;
 
     case 0x04000630: return VecTestResult[0];
@@ -2861,6 +2889,7 @@ u32 GPU3D::Read32(u32 addr) noexcept
         }
 
     case 0x04000604:
+        if (WideCheck) WideCheckCountReads++;
         return NumPolygons | (NumVertices << 16);
 
     case 0x04000620: return PosTestResult[0];

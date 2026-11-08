@@ -236,7 +236,7 @@ void GPU::Reset() noexcept
     memset(VRAMPtr_BOBJ, 0, sizeof(VRAMPtr_BOBJ));
 
     size_t fbsize;
-    if (GPU3D.IsRendererAccelerated())
+    if (GPU3D.UsesAccelLines())
         fbsize = (256*3 + 1) * 192;
     else
         fbsize = 256 * 192;
@@ -277,7 +277,7 @@ void GPU::Stop() noexcept
     Sync2D();
 
     int fbsize;
-    if (GPU3D.IsRendererAccelerated())
+    if (GPU3D.UsesAccelLines())
         fbsize = (256*3 + 1) * 192;
     else
         fbsize = 256 * 192;
@@ -591,7 +591,7 @@ void GPU::InitFramebuffers() noexcept
     Sync2D();
 
     int fbsize;
-    if (GPU3D.IsRendererAccelerated())
+    if (GPU3D.UsesAccelLines())
         fbsize = (256*3 + 1) * 192;
     else
         fbsize = 256 * 192;
@@ -1306,9 +1306,9 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     job.Line3D = nullptr;
 
     job.VCount = VCount;
-    job.Accelerated = GPU3D.IsRendererAccelerated();
+    job.Accelerated = GPU3D.UsesAccelLines();
     job.RenderXPos = GPU3D.GetRenderXPos();
-    job.WideView = job.Accelerated && GPU3D.GetCurrentRenderer().GetOutputWidth() != 256;
+    job.WideView = job.Accelerated && (GPU3D.GetCurrentRenderer().GetOutputWidth() != 256 || GPU3D.WideCheck > 256);
     job.Framebuffer[0] = GPU2D_Renderer->GetFramebuffer(0);
     job.Framebuffer[1] = GPU2D_Renderer->GetFramebuffer(1);
     job.VRAMMap_LCDC = VRAMMap_LCDC;
@@ -1899,7 +1899,7 @@ void GPU::FinishFrame(u32 lines) noexcept
 void GPU::LogHash2D() noexcept
 {
     int backbuf = FrontBuffer ? 0 : 1;
-    bool accel = GPU3D.IsRendererAccelerated();
+    bool accel = GPU3D.UsesAccelLines();
     int stride = accel ? (256*3 + 1) : 256;
 
     u64 hash[2];
@@ -1937,7 +1937,7 @@ void GPU::BlankFrame() noexcept
 
     int backbuf = FrontBuffer ? 0 : 1;
     int fbsize;
-    if (GPU3D.IsRendererAccelerated())
+    if (GPU3D.UsesAccelLines())
         fbsize = (256*3 + 1) * 192;
     else
         fbsize = 256 * 192;

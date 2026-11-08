@@ -952,8 +952,8 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         // between the middle and the wings. give the edge columns their neighbour's mask, for
         // both units (unit B can sit next to held wings, see GLCompositor::PrepareWingHold).
         // this also goes into display capture, and the wings rule in DrawScanline reads the
-        // patched edges
-        if (CurJob->WideView)
+        // patched edges. the wide check does it in both runs, as it changes the middle on purpose
+        if (CurJob->WideView || GPU.GPU3D.WideCheck)
         {
             WindowMask[0] = WindowMask[1];
             WindowMask[255] = WindowMask[254];

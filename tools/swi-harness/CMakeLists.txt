@@ -50,7 +50,9 @@ add_subdirectory("${MELONDS_ROOT}/src" "${CMAKE_BINARY_DIR}/core")
 add_executable(swi-harness
     main.cpp
     SWILog.cpp
-    HarnessLog.h)
+    HarnessLog.h
+    WideCheck.cpp
+    WideCheck.h)
 
 target_include_directories(swi-harness PRIVATE "${MELONDS_ROOT}/src")
 target_link_libraries(swi-harness PRIVATE core)

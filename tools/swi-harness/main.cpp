@@ -52,6 +52,7 @@
 #include "GPU.h"
 #include "Platform.h"
 #include "HarnessLog.h"
+#include "WideCheck.h"
 
 using namespace melonDS;
 
@@ -425,7 +426,13 @@ void Usage()
         "                 the first frame (for test ROM modes), can be repeated\n"
         "  --no-swi-log   don't write swi.jsonl and outputs.bin\n"
         "  --no-core-log  drop all core log output (no core.log); the core's unknown-I/O\n"
-        "                 messages can carry values the BIOS loaded\n");
+        "                 messages can carry values the BIOS loaded\n"
+        "  --wide-check W the WideMelon check instead of an SWI log (FreeBIOS, DS mode): runs the\n"
+        "                 game with the view 256 and W wide in lockstep and fails if the middle\n"
+        "                 or anything the game can see differs (see WideCheck.cpp)\n"
+        "  --state <file> with --wide-check: load this savestate after boot\n"
+        "  --box-test wide  with --wide-check: squeeze box tests as WideMelon does (memory is then\n"
+        "                 only reported, since the game sees them)\n");
 }
 
 const char* ConsoleModeName(u16 scfgbios)
@@ -592,6 +599,8 @@ int main(int argc, char** argv)
     u32 dumpaddr = 0, dumplen = 0;
     std::vector<std::pair<u32, u32>> pokes;
     bool swilog = true;
+    int widecheck = 0;
+    std::string statepath, boxtest = "stock";
 
     for (int i = 1; i < argc; i++)
     {
@@ -650,6 +659,9 @@ int main(int argc, char** argv)
             pokes.push_back({addr, (u32)strtoul(val.substr(eq + 1).c_str(), nullptr, 0)});
         }
         else if (arg == "--no-swi-log") swilog = false;
+        else if (arg == "--wide-check") widecheck = (int)strtol(next().c_str(), nullptr, 0);
+        else if (arg == "--state") statepath = next();
+        else if (arg == "--box-test") boxtest = next();
         else if (arg == "--no-core-log") CoreLogEnabled = false;
         else if (arg == "--dsi") dsidir = next();
         else if (arg == "--nand") nandpath = next();
@@ -671,6 +683,33 @@ int main(int argc, char** argv)
         else if (arg == "-h" || arg == "--help") { Usage(); return 0; }
         else if (arg[0] == '-') { fprintf(stderr, "unknown option %s\n", arg.c_str()); Usage(); return 1; }
         else rompath = arg;
+    }
+
+    if (widecheck)
+    {
+        if (rompath.empty() || outdir.empty() || frames == 0 || widecheck < 256 || widecheck > 768 || (widecheck & 1)
+            || (!biosmode.empty() && biosmode != "free") || console != "ds"
+            || (boxtest != "stock" && boxtest != "wide"))
+        {
+            fprintf(stderr, "--wide-check needs an even width 256..768 (256 = both runs off), --frames, --out, and FreeBIOS in DS mode\n");
+            return 1;
+        }
+        std::filesystem::create_directories(outdir);
+        if (CoreLogEnabled)
+            CoreLog = fopen((outdir + "/core.log").c_str(), "w");
+        WideCheckOptions opts;
+        opts.RomPath = rompath;
+        opts.OutDir = outdir;
+        opts.StatePath = statepath;
+        opts.Frames = frames;
+        opts.Width = widecheck;
+        opts.SqueezeBoxTest = boxtest == "wide";
+        for (const Tap& tap : taps)
+            opts.Taps.push_back({tap.Frame, tap.Key});
+        memcpy(opts.RTC, rtc, sizeof(rtc));
+        int ret = RunWideCheck(opts);
+        if (CoreLog) fclose(CoreLog);
+        return ret;
     }
 
     if (rompath.empty() || outdir.empty() || frames == 0 || (biosmode != "official" && biosmode != "file" && biosmode != "free")
