@@ -336,6 +336,7 @@ void GPU3D::Reset() noexcept
     memset(TempVertexNativeX, 0, sizeof(TempVertexNativeX));
     NativeNumVertices = 0;
     NativeNumPolygons = 0;
+    NativeStripVerts = 0;
     DroppedPolygons = 0;
     DroppedNativeFit = 0;
     WideDrops.SceneStartDrops = WideDrops.SecondStartDrops = WideDrops.SecondStartNativeFit = 0;
@@ -466,6 +467,10 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
             TempVertexNativeX[i] = TempVertexBuffer[i].Position[0];
         NativeNumVertices = NumVertices;
         NativeNumPolygons = NumPolygons;
+        NativeStripVerts = LastStripPolygon ? LastStripPolygon->NumVertices : 0;
+        NativeStripClipped = 0;
+        for (u32 i = 0; i < NativeStripVerts && i < 10; i++)
+            NativeStripClipped |= (LastStripPolygon->Vertices[i] && LastStripPolygon->Vertices[i]->Clipped) << i;
     }
 
     file->Var32(&FlushRequest);
@@ -1108,10 +1113,19 @@ void GPU3D::SubmitPolygon() noexcept
     };
     // [n] if the native view has room for a polygon of [n] vertices, else 0
     auto fitsnative = [this](int n) { return (NativeNumPolygons < 2048 && NativeNumVertices + n <= 6144) ? n : 0; };
-    auto keepnative = [this](int n, bool reused)
+    // the native view's last strip polygon: this one's from here on, which stays none unless that view keeps it
+    const u32 nativeprevverts = NativeStripVerts, nativeprevclipped = NativeStripClipped;
+    NativeStripVerts = 0;
+    u32 nativeclipped = 0;
+    auto keepnative = [&](int n, bool reused)
     {
         NativeNumPolygons++;
         NativeNumVertices += reused ? n - 2 : n;
+        if (PolygonMode >= 2)
+        {
+            NativeStripVerts = n;
+            NativeStripClipped = nativeclipped;
+        }
     };
 
     // culling
@@ -1144,7 +1158,9 @@ void GPU3D::SubmitPolygon() noexcept
     // this requires two original vertices shared with the previous polygon, and that
     // the two polygons be of the same type
 
-    if (PolygonMode >= 2 && LastStripPolygon)
+    // (the native view decides that from its own last strip polygon)
+    bool nativestrip = false;
+    if (PolygonMode >= 2)
     {
         int id0, id1;
         if (PolygonMode == 2)
@@ -1170,7 +1186,9 @@ void GPU3D::SubmitPolygon() noexcept
             lastpolyverts = 4;
         }
 
-        if (LastStripPolygon->NumVertices == lastpolyverts &&
+        nativestrip = nativeprevverts == (u32)lastpolyverts && !(nativeprevclipped & ((1 << id0) | (1 << id1)));
+
+        if (LastStripPolygon && LastStripPolygon->NumVertices == lastpolyverts &&
             !LastStripPolygon->Vertices[id0]->Clipped &&
             !LastStripPolygon->Vertices[id1]->Clipped)
         {
@@ -1214,10 +1232,9 @@ void GPU3D::SubmitPolygon() noexcept
     }
 
     // the native view: how many vertices it would store this polygon with, 0 if it wouldn't. one the wide
-    // view clips away is gone there too. zero-dot polygons are taken as the same in both, and strip
-    // vertices as shared in both
-    int nativeverts = wide ? fitsnative(NativeClipVertices(sentverts, nverts)) : 0;
-    bool nativereused = clipstart > 0 && nativeverts == lastpolyverts;
+    // view clips away is gone there too. zero-dot polygons are checked again below
+    int nativeverts = wide ? fitsnative(NativeClipVertices(sentverts, nverts, clippedvertices, nativeclipped)) : 0;
+    bool nativereused = nativestrip && nativeverts == lastpolyverts;
 
     // reject the polygon if it's not going to fit in polygon/vertex RAM
 
@@ -1331,8 +1348,34 @@ void GPU3D::SubmitPolygon() noexcept
             }
         }
 
+        // the native view: only a polygon at most a pixel wide on one row here can be zero-dot there
+        // (or only here), as the squeeze narrows it by 256/W, so only that one is worked out again
+        if (nativeverts)
+        {
+            s32 x0 = clippedvertices[0].FinalPosition[0], x1 = x0, y = clippedvertices[0].FinalPosition[1];
+            bool narrow = true;
+            for (int i = 1; i < nverts && narrow; i++)
+            {
+                s32 x = clippedvertices[i].FinalPosition[0];
+                x0 = std::min(x0, x);
+                x1 = std::max(x1, x);
+                narrow = clippedvertices[i].FinalPosition[1] == y && x1 - x0 <= 1;
+            }
+            // with the same clip in both, a vertex in front of ZeroDotWLimit here is there too
+            for (int i = 0; i < nverts && narrow && NativeClipSame; i++)
+                narrow = clippedvertices[i].Position[3] > ZeroDotWLimit;
+            if (narrow && NativeZeroDot(sentverts))
+                nativeverts = 0;
+        }
+
         if (zerodot && allbehind)
         {
+            // one the native view keeps
+            if (nativeverts)
+            {
+                keepnative(nativeverts, nativereused);
+                if (!equaltiming) startpipeline(nativeverts);
+            }
             LastStripPolygon = NULL;
             return;
         }
@@ -1504,8 +1547,12 @@ void GPU3D::SubmitPolygon() noexcept
 // squeeze only scales X by a positive factor, so the Y and Z planes come out the same, and only the X
 // planes can differ: a polygon inside them natively clips the same way in both views, one wholly past
 // one of them is gone, and only one across them is clipped again, positions only
-int GPU3D::NativeClipVertices(int sentverts, int wideverts) noexcept
+// [clippedmask] gets which of its vertices clipping made, a bit each. [wideclipped] is the squeezed
+// view's clipped polygon
+int GPU3D::NativeClipVertices(int sentverts, int wideverts, const Vertex* wideclipped, u32& clippedmask) noexcept
 {
+    clippedmask = 0;
+    NativeClipSame = false;
     int inside = 0, left = 0, right = 0;
     for (int i = 0; i < sentverts; i++)
     {
@@ -1514,7 +1561,13 @@ int GPU3D::NativeClipVertices(int sentverts, int wideverts) noexcept
         else if (x < -w) left++;
         else inside++;
     }
-    if (inside == sentverts) return wideverts;
+    if (inside == sentverts)
+    {
+        NativeClipSame = true;
+        for (int i = 0; i < wideverts; i++)
+            clippedmask |= wideclipped[i].Clipped << i;
+        return wideverts;
+    }
     if (left == sentverts || right == sentverts) return 0;
 
     ClipPosition native[10];
@@ -1522,7 +1575,48 @@ int GPU3D::NativeClipVertices(int sentverts, int wideverts) noexcept
     {
         native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
     }
-    return ClipPolygon<false>(*this, native, sentverts, 0);
+    int n = ClipPolygon<false>(*this, native, sentverts, 0);
+    for (int i = 0; i < n; i++)
+        clippedmask |= native[i].Clipped << i;
+    return n;
+}
+
+// WideMelon: whether SubmitPolygon's zero-dot check would reject the polygon in TempVertexBuffer in
+// the native view: clipped there, it has all its vertices on the same pixel and behind ZeroDotWLimit
+bool GPU3D::NativeZeroDot(int sentverts) noexcept
+{
+    ClipPosition native[10];
+    for (int i = 0; i < sentverts; i++)
+    {
+        native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
+    }
+    int n = ClipPolygon<false>(*this, native, sentverts, 0);
+
+    // the viewport transform as SubmitPolygon does it
+    u32 firstX = 0, firstY = 0;
+    for (int i = 0; i < n; i++)
+    {
+        u32 w = native[i].Position[3] & 0x00FFFFFF;
+        if (w <= ZeroDotWLimit)
+            return false;
+
+        u32 posX = native[i].Position[0] + w;
+        u32 posY = -native[i].Position[1] + w;
+        u32 den = w;
+        if (w > 0xFFFF)
+        {
+            posX >>= 1;
+            posY >>= 1;
+            den  >>= 1;
+        }
+        den <<= 1;
+        posX = (((posX * Viewport[4]) / den) + Viewport[0]) & 0x1FF;
+        posY = (((posY * Viewport[5]) / den) + Viewport[3]) & 0xFF;
+
+        if (i == 0) { firstX = posX; firstY = posY; }
+        else if (posX != firstX || posY != firstY) return false;
+    }
+    return n > 0;
 }
 
 void GPU3D::SubmitVertex() noexcept
@@ -2231,6 +2325,7 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
             VertexNumInPoly = 0;
             NumConsecutivePolygons = 0;
             LastStripPolygon = NULL;
+            NativeStripVerts = 0;
             CurPolygonAttr = PolygonAttr;
             break;
 

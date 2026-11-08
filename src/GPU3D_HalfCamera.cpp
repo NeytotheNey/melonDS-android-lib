@@ -1204,6 +1204,7 @@ void HalfCamera::ResetShadow()
     shadow.NumOpaquePolygons = 0;
     shadow.NativeNumVertices = 0;
     shadow.NativeNumPolygons = 0;
+    shadow.NativeStripVerts = 0;
 }
 
 bool HalfCamera::Replay(const SceneInfo& current, const SceneInfo& previous)

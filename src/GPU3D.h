@@ -263,7 +263,13 @@ private:
     // WideMelon: the polygon and vertex RAM counts the native view would have (NumPolygons and NumVertices
     // without the wide view), see NativeClipVertices. derived again on a state load, not serialized
     u32 NativeNumPolygons = 0, NativeNumVertices = 0;
-    int NativeClipVertices(int sentverts, int wideverts) noexcept;
+    // and its last strip polygon, as LastStripPolygon is for the real one: its vertex count (0 = none) and
+    // which of its vertices clipping made (bit per vertex), for whether the next one shares two vertices
+    u32 NativeStripVerts = 0, NativeStripClipped = 0;
+    int NativeClipVertices(int sentverts, int wideverts, const Vertex* wideclipped, u32& clippedmask) noexcept;
+    bool NativeZeroDot(int sentverts) noexcept;
+    // whether the last NativeClipVertices came out as the squeezed view's clip (no native X plane in the way)
+    bool NativeClipSame = false;
 
     // the WIDEDROPS line, per scene (polygon RAM swap) and once a second
     struct WideDropStats
