@@ -92,7 +92,7 @@ const char* Shadow2D::ReasonName(u32 reason) noexcept
 {
     static const char* const names[R_Count] = {
         "none", "screensoff", "disabled", "dispmode", "forcedblank", "vcount", "capture", "bgtype",
-        "window", "blend", "mosaic", "rotsprite", "memchanged", "frame", "instcap", "hires", "held",
+        "window", "bleftover", "mosaic", "rotsprite", "memchanged", "frame", "instcap", "hires", "held",
         "policy", "failed",
     };
     return reason < R_Count ? names[reason] : "?";
@@ -305,7 +305,14 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept
             mosaicBG = true;
     }
 
-    // feature-eligible: the base rules, then increment 1's (text BGs and normal sprites only)
+    // feature-eligible: the base rules, then the increments' (text BGs and normal sprites, increment
+    // 1). BLDCNT blending (increment 5) is all done by the composite, but for one case: without
+    // EngineBNoHold, unit B's pass starts with the second plane unit A's pass of the line left
+    // (SoftRenderer only clears it with EngineBNoHold), so where B draws nothing over the backdrop,
+    // an alpha blend with the backdrop as 1st target blends with that leftover, which the shadow
+    // doesn't have. those lines stay on the CPU
+    bool blendLeftover = num && !job.EngineBNoHold && ((u.BlendCnt >> 6) & 0x3) == 1
+        && (u.BlendCnt & 0x0020) && (u.BlendCnt & 0x3F00);
     u32 dispMode = (u.DispCnt >> 16) & (num ? 0x1 : 0x3);
     u32 reason = R_None;
     if (!job.ScreensEnabled) reason = R_ScreensOff;
@@ -316,7 +323,7 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept
     else if (!num && u.CaptureLatch) reason = R_Capture;
     else if (other) reason = R_BGType;
     else if (u.DispCnt & 0xE000) reason = R_Window;
-    else if (u.BlendCnt & 0x3FC0) reason = R_Blend;
+    else if (blendLeftover) reason = R_Blend;
     else if (mosaicBG || LineBit(e.SpriteMosaic, line)) reason = R_Mosaic;
     else if (LineBit(e.SpriteRot, line)) reason = R_RotSprite;
 

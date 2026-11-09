@@ -442,6 +442,8 @@ void Usage()
         "  --shadow2d N   the GPU 2D shadow recorder on (GPU_Shadow2D.h, mode all, with its self-check),\n"
         "                 a SHADOW2D line every N frames to shadow2d.log: lines per reason, block errors\n"
         "  --threaded2d   draw 2D on its own thread, as the app's threaded 2D setting does\n"
+        "  --bnohold      GPU::EngineBNoHold on, as debug builds have it (engine B's part of held\n"
+        "                 lines drawn right away, and each pass starts with its second plane clear)\n"
         "  --console dsi  DSi mode, set up like the app: --bios picks the DS-mode (NTR) BIOS, and\n"
         "                 --dsi <dir> holds the DSi bios9.bin, bios7.bin and firmware.bin\n"
         "  --dsi-bios official|free|file <dir>  the DSi (TWL) BIOS in DSi mode: the dumps in\n"
@@ -645,7 +647,7 @@ int main(int argc, char** argv)
     std::vector<Touch> touches;
     std::string savpath;
     u32 stats2d = 0;
-    bool accel = false, hash2d = false, threaded2d = false;
+    bool accel = false, hash2d = false, threaded2d = false, bnohold = false;
     u32 shadow2d = 0;
     std::string console = "ds", dsidir, nandpath, dsibios = "official", dsibiosdir;
     bool nandreadonly = false;
@@ -711,6 +713,7 @@ int main(int argc, char** argv)
         else if (arg == "--hash2d") hash2d = true;
         else if (arg == "--shadow2d") shadow2d = strtoul(next().c_str(), nullptr, 0);
         else if (arg == "--threaded2d") threaded2d = true;
+        else if (arg == "--bnohold") bnohold = true;
         else if (arg == "--console") console = next();
         else if (arg == "--dump-mainram") dumpmainram = true;
         else if (arg == "--dump-range")
@@ -931,7 +934,9 @@ int main(int argc, char** argv)
         nds->GPU.GPU3D.WideCheck = 256;
         nds->SetRenderer3D(std::make_unique<SoftRenderer>());
     }
-    // before the reset, as the app sets its switches
+    // before the reset, as the app sets its switches (EngineBNoHold only between games)
+    if (bnohold)
+        nds->GPU.EngineBNoHold = true;
     if (shadow2d)
     {
         nds->GPU.SetShadow2D(2, false, false, 0);

@@ -235,6 +235,114 @@ u32 SpritePixel(u32 obj, bool unitB, u32 dispcnt)
     return ColorWord(color, obj & 0xFF000000u);
 }
 
+// kShadow2DFS_Main's copies of SoftRenderer's blend functions and ColorComposite
+u32 ColorBlend4(u32 val1, u32 val2, u32 eva, u32 evb)
+{
+    u32 r =  (((val1 & 0x00003Fu) * eva) + ((val2 & 0x00003Fu) * evb) + 0x000008u) >> 4;
+    u32 g = ((((val1 & 0x003F00u) * eva) + ((val2 & 0x003F00u) * evb) + 0x000800u) >> 4) & 0x007F00u;
+    u32 b = ((((val1 & 0x3F0000u) * eva) + ((val2 & 0x3F0000u) * evb) + 0x080000u) >> 4) & 0x7F0000u;
+    r = std::min(r, 0x00003Fu);
+    g = std::min(g, 0x003F00u);
+    b = std::min(b, 0x3F0000u);
+    return r | g | b | 0xFF000000u;
+}
+
+u32 ColorBlend5(u32 val1, u32 val2)
+{
+    u32 eva = ((val1 >> 24) & 0x1Fu) + 1u;
+    u32 evb = 32u - eva;
+    if (eva == 32u)
+        return val1;
+
+    u32 r =  (((val1 & 0x00003Fu) * eva) + ((val2 & 0x00003Fu) * evb) + 0x000010u) >> 5;
+    u32 g = ((((val1 & 0x003F00u) * eva) + ((val2 & 0x003F00u) * evb) + 0x001000u) >> 5) & 0x007F00u;
+    u32 b = ((((val1 & 0x3F0000u) * eva) + ((val2 & 0x3F0000u) * evb) + 0x100000u) >> 5) & 0x7F0000u;
+    r = std::min(r, 0x00003Fu);
+    g = std::min(g, 0x003F00u);
+    b = std::min(b, 0x3F0000u);
+    return r | g | b | 0xFF000000u;
+}
+
+u32 ColorBrightnessUp(u32 val, u32 factor, u32 bias)
+{
+    u32 rb = val & 0x3F003Fu;
+    u32 g = val & 0x003F00u;
+    rb += ((((0x3F003Fu - rb) * factor) + (bias * 0x010001u)) >> 4) & 0x3F003Fu;
+    g +=  ((((0x003F00u - g ) * factor) + (bias * 0x000100u)) >> 4) & 0x003F00u;
+    return rb | g | 0xFF000000u;
+}
+
+u32 ColorBrightnessDown(u32 val, u32 factor, u32 bias)
+{
+    u32 rb = val & 0x3F003Fu;
+    u32 g = val & 0x003F00u;
+    rb -= (((rb * factor) + (bias * 0x010001u)) >> 4) & 0x3F003Fu;
+    g -=  (((g  * factor) + (bias * 0x000100u)) >> 4) & 0x003F00u;
+    return rb | g | 0xFF000000u;
+}
+
+u32 BlendTarget2(u32 flag)
+{
+    if ((flag & 0x80u) != 0u) return 0x1000u;
+    if ((flag & 0x40u) != 0u) return 0x0100u;
+    return flag << 8;
+}
+
+u32 ColorComposite(u32 val1, u32 val2, u32 blend, u32 evy, u32 win)
+{
+    u32 coloreffect = 0u;
+    u32 eva = 0u, evb = 0u;
+    u32 flag1 = val1 >> 24;
+    u32 flag2 = val2 >> 24;
+    u32 blendCnt = blend & 0xFFFFu;
+    u32 target2 = BlendTarget2(flag2);
+
+    if ((flag1 & 0x80u) != 0u && (blendCnt & target2) != 0u)
+    {
+        coloreffect = 1u;
+        if ((flag1 & 0x40u) != 0u)
+        {
+            eva = flag1 & 0x1Fu;
+            evb = 16u - eva;
+        }
+        else
+        {
+            eva = (blend >> 16) & 0xFFu;
+            evb = (blend >> 24) & 0xFFu;
+        }
+    }
+    else if ((flag1 & 0x40u) != 0u && (blendCnt & target2) != 0u)
+    {
+        coloreffect = 4u;
+    }
+    else
+    {
+        if      ((flag1 & 0x80u) != 0u) flag1 = 0x10u;
+        else if ((flag1 & 0x40u) != 0u) flag1 = 0x01u;
+
+        if ((blendCnt & flag1) != 0u && (win & 0x20u) != 0u)
+        {
+            coloreffect = (blendCnt >> 6) & 0x3u;
+            if (coloreffect == 1u)
+            {
+                if ((blendCnt & target2) != 0u)
+                {
+                    eva = (blend >> 16) & 0xFFu;
+                    evb = (blend >> 24) & 0xFFu;
+                }
+                else
+                    coloreffect = 0u;
+            }
+        }
+    }
+
+    if (coloreffect == 1u) return ColorBlend4(val1, val2, eva, evb);
+    if (coloreffect == 2u) return ColorBrightnessUp(val1, evy, 0x8u);
+    if (coloreffect == 3u) return ColorBrightnessDown(val1, evy, 0x7u);
+    if (coloreffect == 4u) return ColorBlend5(val1, val2);
+    return val1;
+}
+
 }
 
 void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
@@ -322,16 +430,18 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
                         obj = 0u;
                 }
 
-                u32 top = 0u, second = 0u;
+                u32 win = 0xFFu;
+
+                u32 top = 0u, second = 0u, third = 0u;
                 int found = 0;
-                auto push = [&](u32 v) { if (found == 0) top = v; else second = v; found++; };
-                for (int prio = 0; prio < 4 && found < 2; prio++)
+                auto push = [&](u32 v) { if (found == 0) top = v; else if (found == 1) second = v; else third = v; found++; };
+                for (int prio = 0; prio < 4 && found < 3; prio++)
                 {
-                    if (obj != 0u && (int)((obj >> 16) & 0x3u) == prio)
+                    if (obj != 0u && (int)((obj >> 16) & 0x3u) == prio && (win & 0x10u) != 0u)
                         push(SpritePixel(obj, unitB, dispcnt));
-                    for (int bg = 0; bg < 4 && found < 2; bg++)
+                    for (int bg = 0; bg < 4 && found < 3; bg++)
                     {
-                        if ((int)(bgcnt[bg] & 0x3u) != prio)
+                        if ((int)(bgcnt[bg] & 0x3u) != prio || ((win >> (u32)bg) & 0x1u) == 0u)
                             continue;
                         if (bg == 0 && bg0Is3D)
                         {
@@ -345,19 +455,52 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
                             push(pixel);
                     }
                 }
-                if (found < 2)
+                if (found < 3)
                     push(ColorWord((s[W_EVYBackdrop] >> 16) & 0xFFFFu, 0x20000000u));
+                // plane 2 as the pass starts is 0, except unit B's without EngineBNoHold (unit A's
+                // leftover), whose lines that could read it the recorder keeps on the CPU
+                if (found < 3)
+                    push(0u);
 
+                u32 blend = s[W_Blend];
+                u32 blendCnt = blend & 0xFFFFu;
+                u32 evy = s[W_EVYBackdrop] & 0xFFu;
+                u32 eva = (blend >> 16) & 0xFFu;
+                u32 evb = (blend >> 24) & 0xFFu;
+                u32 flag1 = top >> 24;
+                u32 flag2 = second >> 24;
                 u32 p[3];
-                if (!unitB && ((top >> 24) & 0xC0u) == 0x40u)
+                if (!unitB && (flag1 & 0xC0u) == 0x40u && (blendCnt & BlendTarget2(flag2)) != 0u)
                 {
                     p[0] = second;
-                    p[1] = second;
-                    p[2] = (s[W_EVYBackdrop] & 0xFFu) << 8;
+                    p[1] = ColorComposite(second, third, blend, evy, win);
+                    p[2] = 0x04000000u;
+                }
+                else if (!unitB && (flag1 & 0xC0u) == 0x40u)
+                {
+                    u32 effect = (blendCnt >> 6) & 0x3u;
+                    if (effect == 1u || (blendCnt & 0x0001u) == 0u || (win & 0x20u) == 0u)
+                        effect = 0u;
+                    p[0] = second;
+                    p[1] = ColorComposite(second, third, blend, evy, win);
+                    p[2] = (effect << 24) | (evy << 8);
+                }
+                else if (!unitB && (flag2 & 0xC0u) == 0x40u && (blendCnt & 0x01C0u) == 0x0140u)
+                {
+                    u32 effect = 1u;
+                    u32 target1;
+                    if      ((flag1 & 0x80u) != 0u) target1 = 0x0010u;
+                    else if ((flag1 & 0x40u) != 0u) target1 = 0x0001u;
+                    else                            target1 = flag1;
+                    if ((flag1 & 0xC0u) != 0xC0u && !(((blendCnt & target1) != 0u && (win & 0x20u) != 0u) || (flag1 & 0xC0u) == 0x80u))
+                        effect = 7u;
+                    p[0] = top;
+                    p[1] = ColorComposite(top, third, blend, evy, win);
+                    p[2] = (effect << 24) | (evb << 16) | (eva << 8);
                 }
                 else
                 {
-                    p[0] = top;
+                    p[0] = ColorComposite(top, second, blend, evy, win);
                     p[1] = 0u;
                     p[2] = 0x07000000u;
                 }

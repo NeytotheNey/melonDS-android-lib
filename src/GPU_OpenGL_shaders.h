@@ -1048,8 +1048,8 @@ void main()
 // the compositor's own pass. kCompositorFS_Nearest_Head with SHADOW2D (and WIDE for a wide view, or
 // SHADOW2D_PLANES for the check program, at 1x into a 256x384 RGBA32UI target with no gap between
 // the screens) + kCompositePixelFS + kCompositorFS_Nearest_Main + kShadow2DMemFS + this. it rebuilds
-// the line's planes the way SoftRenderer::DrawScanline_BGOBJ does in increment 1 (text BGs, normal
-// sprites, no windows, no blending, no mosaic), then runs the compositor's own maths on them
+// the line's planes the way SoftRenderer::DrawScanline_BGOBJ does (text BGs, normal sprites, BLDCNT
+// blending since increment 5; no windows, no mosaic yet), then runs the compositor's own maths on them
 const char* kShadow2DVS = R"(#version 320 es
 
 in vec2 vPosition;
@@ -1170,7 +1170,124 @@ ivec4 PlaneBytes(uint word)
     return ivec4(int(word & 0xFFu), int((word >> 8) & 0xFFu), int((word >> 16) & 0xFFu), int((word >> 24) & 0xFFu));
 }
 
-#define PUSH(v) { if (found == 0) top = (v); else second = (v); found++; }
+// SoftRenderer::ColorBlend4, ColorBlend5, ColorBrightnessUp and ColorBrightnessDown (GPU2D_Soft.h), on
+// plane words, with the same packed u32 maths (highp uint wraps like u32), so any EVA/EVB/EVY the
+// block holds gives the CPU's result
+uint ColorBlend4(uint val1, uint val2, uint eva, uint evb)
+{
+    uint r =  (((val1 & 0x00003Fu) * eva) + ((val2 & 0x00003Fu) * evb) + 0x000008u) >> 4;
+    uint g = ((((val1 & 0x003F00u) * eva) + ((val2 & 0x003F00u) * evb) + 0x000800u) >> 4) & 0x007F00u;
+    uint b = ((((val1 & 0x3F0000u) * eva) + ((val2 & 0x3F0000u) * evb) + 0x080000u) >> 4) & 0x7F0000u;
+    r = min(r, 0x00003Fu);
+    g = min(g, 0x003F00u);
+    b = min(b, 0x3F0000u);
+    return r | g | b | 0xFF000000u;
+}
+
+uint ColorBlend5(uint val1, uint val2)
+{
+    uint eva = ((val1 >> 24) & 0x1Fu) + 1u;
+    uint evb = 32u - eva;
+    if (eva == 32u)
+        return val1;
+
+    uint r =  (((val1 & 0x00003Fu) * eva) + ((val2 & 0x00003Fu) * evb) + 0x000010u) >> 5;
+    uint g = ((((val1 & 0x003F00u) * eva) + ((val2 & 0x003F00u) * evb) + 0x001000u) >> 5) & 0x007F00u;
+    uint b = ((((val1 & 0x3F0000u) * eva) + ((val2 & 0x3F0000u) * evb) + 0x100000u) >> 5) & 0x7F0000u;
+    r = min(r, 0x00003Fu);
+    g = min(g, 0x003F00u);
+    b = min(b, 0x3F0000u);
+    return r | g | b | 0xFF000000u;
+}
+
+uint ColorBrightnessUp(uint val, uint factor, uint bias)
+{
+    uint rb = val & 0x3F003Fu;
+    uint g = val & 0x003F00u;
+    rb += ((((0x3F003Fu - rb) * factor) + (bias * 0x010001u)) >> 4) & 0x3F003Fu;
+    g +=  ((((0x003F00u - g ) * factor) + (bias * 0x000100u)) >> 4) & 0x003F00u;
+    return rb | g | 0xFF000000u;
+}
+
+uint ColorBrightnessDown(uint val, uint factor, uint bias)
+{
+    uint rb = val & 0x3F003Fu;
+    uint g = val & 0x003F00u;
+    rb -= (((rb * factor) + (bias * 0x010001u)) >> 4) & 0x3F003Fu;
+    g -=  (((g  * factor) + (bias * 0x000100u)) >> 4) & 0x003F00u;
+    return rb | g | 0xFF000000u;
+}
+
+// the 2nd target bit a stack entry's flag byte stands for in BLDCNT: sprites 0x1000, 3D 0x0100,
+// BGs and the backdrop their own bit << 8
+uint BlendTarget2(uint flag)
+{
+    if ((flag & 0x80u) != 0u) return 0x1000u;
+    if ((flag & 0x40u) != 0u) return 0x0100u;
+    return flag << 8;
+}
+
+// SoftRenderer::ColorComposite. blend is the block's W_Blend (BLDCNT, EVA, EVB), evy the unit's EVY, and
+// win the pixel's window mask (WindowMask[i]), whose bit 0x20 enables the BLDCNT effect there
+uint ColorComposite(uint val1, uint val2, uint blend, uint evy, uint win)
+{
+    uint coloreffect = 0u;
+    uint eva = 0u, evb = 0u;
+    uint flag1 = val1 >> 24;
+    uint flag2 = val2 >> 24;
+    uint blendCnt = blend & 0xFFFFu;
+    uint target2 = BlendTarget2(flag2);
+
+    if ((flag1 & 0x80u) != 0u && (blendCnt & target2) != 0u)
+    {
+        // sprite blending: semi-transparent sprites, and bitmap sprites with their own alpha
+        coloreffect = 1u;
+        if ((flag1 & 0x40u) != 0u)
+        {
+            eva = flag1 & 0x1Fu;
+            evb = 16u - eva;
+        }
+        else
+        {
+            eva = (blend >> 16) & 0xFFu;
+            evb = (blend >> 24) & 0xFFu;
+        }
+    }
+    else if ((flag1 & 0x40u) != 0u && (blendCnt & target2) != 0u)
+    {
+        // 3D layer blending
+        coloreffect = 4u;
+    }
+    else
+    {
+        if      ((flag1 & 0x80u) != 0u) flag1 = 0x10u;
+        else if ((flag1 & 0x40u) != 0u) flag1 = 0x01u;
+
+        if ((blendCnt & flag1) != 0u && (win & 0x20u) != 0u)
+        {
+            coloreffect = (blendCnt >> 6) & 0x3u;
+            if (coloreffect == 1u)
+            {
+                if ((blendCnt & target2) != 0u)
+                {
+                    eva = (blend >> 16) & 0xFFu;
+                    evb = (blend >> 24) & 0xFFu;
+                }
+                else
+                    coloreffect = 0u;
+            }
+        }
+    }
+
+    if (coloreffect == 1u) return ColorBlend4(val1, val2, eva, evb);
+    if (coloreffect == 2u) return ColorBrightnessUp(val1, evy, 0x8u);
+    if (coloreffect == 3u) return ColorBrightnessDown(val1, evy, 0x7u);
+    if (coloreffect == 4u) return ColorBlend5(val1, val2);
+    return val1;
+}
+
+// DrawPixel_Accel's 3-entry stack, top first
+#define PUSH(v) { if (found == 0) top = (v); else if (found == 1) second = (v); else third = (v); found++; }
 
 void main()
 {
@@ -1193,6 +1310,7 @@ void main()
         discard;
     uvec4 s1 = texelFetch(LineStateTex, ivec2(1, row), 0);  // BGCNT 2-3, BG0-2 scroll
     uvec4 s2 = texelFetch(LineStateTex, ivec2(2, row), 0);  // BG3 scroll
+    uvec4 s5 = texelFetch(LineStateTex, ivec2(5, row), 0);  // window state, mosaic, BLDCNT with EVA and EVB
     uvec4 s6 = texelFetch(LineStateTex, ivec2(6, row), 0);  // EVY and backdrop, lines, wide modes, left extents
     uvec4 s7 = texelFetch(LineStateTex, ivec2(7, row), 0);  // right extents
 
@@ -1222,22 +1340,27 @@ void main()
             obj = 0u;
     }
 
+    // the pixel's window mask, CalculateWindowMask's WindowMask[i]: bits 0-3 the BGs (BG0 also the 3D
+    // layer), 4 the sprites, 5 the BLDCNT effect. windows are off on every eligible line until
+    // increment 4, which is all set
+    uint win = 0xFFu;
+
     // DrawScanlineBGMode's order backwards (priority 0 first, and in a priority the sprites, then
-    // BG0 to BG3): the first two opaque layers are the top of DrawPixel_Accel's stack, which is all
-    // the planes need without blending. the 3D layer is the placeholder, opaque everywhere
-    uint top = 0u, second = 0u;
+    // BG0 to BG3): the first three opaque layers are DrawPixel_Accel's stack. the 3D layer is the
+    // placeholder, opaque everywhere its window bit is set
+    uint top = 0u, second = 0u, third = 0u;
     int found = 0;
     bool any2D = false;
-    for (int prio = 0; prio < 4 && found < 2; prio++)
+    for (int prio = 0; prio < 4 && found < 3; prio++)
     {
-        if (obj != 0u && int((obj >> 16) & 0x3u) == prio)
+        if (obj != 0u && int((obj >> 16) & 0x3u) == prio && (win & 0x10u) != 0u)
         {
             PUSH(SpritePixel(obj, unitB, dispcnt))
             any2D = true;
         }
-        for (int bg = 0; bg < 4 && found < 2; bg++)
+        for (int bg = 0; bg < 4 && found < 3; bg++)
         {
-            if (int(bgcnt[bg] & 0x3u) != prio)
+            if (int(bgcnt[bg] & 0x3u) != prio || ((win >> uint(bg)) & 0x1u) == 0u)
                 continue;
             if (bg == 0 && bg0Is3D)
             {
@@ -1256,21 +1379,64 @@ void main()
             }
         }
     }
-    if (found < 2)
+    // then the backdrop, and under it the second plane as the pass starts: 0. SoftRenderer clears it
+    // with EngineBNoHold (debug builds, where check runs). without it, unit A's pass starts with
+    // what unit B's last pass left, which is always 0, but unit B's starts with unit A's leftover
+    // from the same line: the recorder keeps the unit B lines that could read it (a backdrop alpha
+    // blend) on the CPU. the third plane's leftover under that is never read: with nothing over
+    // the backdrop, the planes only take ColorComposite(backdrop, plane 2)
+    if (found < 3)
         PUSH(ColorWord((s6.x >> 16) & 0xFFFFu, 0x20000000u))
+    if (found < 3)
+        PUSH(0u)
 
-    // DrawScanline_BGOBJ's accelerated planes, with no blending: 3D on top (unit A only) takes the
-    // fade branch with effect 0, anything else the no-3D one. unit B's are ColorComposite's val1
+    // DrawScanline_BGOBJ's accelerated planes. unit A takes one of its four branches: 3D on top
+    // blending, 3D on top normal or fade, 3D on bottom blending, or no 3D involved. unit B is
+    // ColorComposite with planes 1 and 2 cleared
+    uint blend = s5.w;
+    uint blendCnt = blend & 0xFFFFu;
+    uint blendEVY = s6.x & 0xFFu;
+    uint eva = (blend >> 16) & 0xFFu;
+    uint evb = (blend >> 24) & 0xFFu;
+    uint flag1 = top >> 24;
+    uint flag2 = second >> 24;
     uint p0, p1, p2;
-    if (!unitB && ((top >> 24) & 0xC0u) == 0x40u)
+    if (!unitB && (flag1 & 0xC0u) == 0x40u && (blendCnt & BlendTarget2(flag2)) != 0u)
     {
+        // 3D on top, blending
         p0 = second;
-        p1 = second;
-        p2 = (s6.x & 0xFFu) << 8;
+        p1 = ColorComposite(second, third, blend, blendEVY, win);
+        p2 = 0x04000000u;
+    }
+    else if (!unitB && (flag1 & 0xC0u) == 0x40u)
+    {
+        // 3D on top, normal or fade
+        uint effect = (blendCnt >> 6) & 0x3u;
+        if (effect == 1u || (blendCnt & 0x0001u) == 0u || (win & 0x20u) == 0u)
+            effect = 0u;
+        p0 = second;
+        p1 = ColorComposite(second, third, blend, blendEVY, win);
+        p2 = (effect << 24) | (blendEVY << 8);
+    }
+    else if (!unitB && (flag2 & 0xC0u) == 0x40u && (blendCnt & 0x01C0u) == 0x0140u)
+    {
+        // 3D on bottom, blending. the CPU works out the sprite's EVA and EVB here but only keeps
+        // the effect: the compositor blends with the unit's
+        uint effect = 1u;
+        uint target1;
+        if      ((flag1 & 0x80u) != 0u) target1 = 0x0010u;
+        else if ((flag1 & 0x40u) != 0u) target1 = 0x0001u;
+        else                            target1 = flag1;
+        if ((flag1 & 0xC0u) != 0xC0u && !(((blendCnt & target1) != 0u && (win & 0x20u) != 0u) || (flag1 & 0xC0u) == 0x80u))
+            effect = 7u;
+        p0 = top;
+        p1 = ColorComposite(top, third, blend, blendEVY, win);
+        p2 = (effect << 24) | (evb << 16) | (eva << 8);
     }
     else
     {
-        p0 = top;
+        // no potential 3D pixel involved (unit B always)
+        p0 = ColorComposite(top, second, blend, blendEVY, win);
         p1 = 0u;
         p2 = 0x07000000u;
     }

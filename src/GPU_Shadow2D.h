@@ -120,7 +120,7 @@ enum : u32
     R_Capture,      // unit A, display capture armed
     R_BGType,       // an enabled BG that isn't a text BG
     R_Window,
-    R_Blend,        // BLDCNT effect or 2nd targets
+    R_Blend,        // unit B, no EngineBNoHold: a backdrop alpha blend that would read engine A's leftover plane
     R_Mosaic,       // BG or sprite mosaic
     R_RotSprite,    // an affine sprite on the line
     R_FeatureCount,
