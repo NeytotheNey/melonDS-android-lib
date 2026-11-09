@@ -156,8 +156,12 @@ constexpr int AccelLineWords = 256*3 + 1;
 constexpr int WingPlanesWords = 6;
 constexpr int AccelWingPlanesStart = AccelLineWords * 192;
 constexpr int AccelFramebufferWords = AccelWingPlanesStart + WingPlanesWords * 192;
-// in a wing's plane 2, next to the compmode (bits 24-27): show the 3D pixel as opaque
+// in a wing's plane 2, next to the compmode (bits 24-27): the wing keeps the old look whatever the
+// 3D at the edge is (see SoftRenderer::DrawWingPlanes)
 constexpr u32 WingRaw3D = 1u << 28;
+// and in bits 0-1 and 16-20 (unread by compmodes 0 and 2-4), the old look's BLDCNT fade: the
+// effect (0, 2 or 3) and EVY
+constexpr u32 WingOldFadeMask = 0x1F0003;
 
 // one HBlank's worth of 2D drawing: the BG/OBJ pass of the current line and the sprites of the
 // next one, for both Units. GPU::StartHBlank builds it on the emulator thread, and the renderer

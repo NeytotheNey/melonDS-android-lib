@@ -404,20 +404,23 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
 
 // WideMelon: the planes of the wings' pixels on a line with 3D wings (control word bit 18), from
 // the line as drawn into the framebuffer (line), for the GL compositor to composite with the 3D
-// at the wing's X like a middle pixel. the wings have no 2D layers, so a wing carries on its edge
-// column (0 for the left one, 255 for the right) when the 3D is on top there with nothing but
-// the backdrop under it: it gets that column's planes, so it's composited exactly as the edge
-// pixel would be with the wing's 3D pixel (blend or fade, and the backdrop where the 3D is
-// transparent, with the edge's window effects). otherwise a 2D layer is over or under the 3D at
-// the edge, which can't carry on into the wings, so the wing shows the 3D as it is, transparent
-// or not, with its BLDCNT fade (BG0 as 1st target, whatever the windows do), as before the wing
-// planes: WingRaw3D tells the compositor to take the 3D pixel as opaque. both wings get the 3D
-// whichever edge shows BG0, as the control word's one wings bit says
+// at the wing's X like a middle pixel. the wings have no 2D layers, so a wing can carry on its
+// edge column (0 for the left one, 255 for the right) when the 3D is on top there with nothing
+// but the backdrop under it: it gets that column's planes, so it's composited as the edge pixel
+// would be with the wing's 3D pixel (blend or fade, and the backdrop where the 3D is transparent,
+// with the edge's window effects). the compositor still checks the 3D at the edge, which this
+// can't see: only if that's transparent does the wing use these planes (see WingPixel).
+// otherwise, and on lines where a 2D layer is over or under the 3D at the edge (WingRaw3D), the
+// wing keeps the old look: the 3D as it is, transparent or not, with its BLDCNT fade (BG0 as 1st
+// target, whatever the windows do), which is stashed for it in plane 2 where no compmode the
+// planes can have reads (WingOldFadeMask). both wings get the 3D whichever edge shows BG0, as the
+// control word's one wings bit says
 void SoftRenderer::DrawWingPlanes(const u32* line, u32* wing) const
 {
     u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
     if (effect == 1)
         effect = 0;
+    u32 oldFade = effect | (CurUnit->EVY << 16);
 
     for (int side = 0; side < 2; side++)
     {
@@ -425,18 +428,19 @@ void SoftRenderer::DrawWingPlanes(const u32* line, u32* wing) const
         u32 compmode = (line[512 + edge] >> 24) & 0xF;
         u32* planes = &wing[side * 3];
 
-        // compmodes 0 and 2-4 are 3D on top, with what's under it in plane 0 (flag 0x20: the backdrop)
+        // compmodes 0 and 2-4 are 3D on top, with what's under it in plane 0 (flag 0x20: the
+        // backdrop). they leave plane 2's bits 0-7 and 16-23 clear
         if (compmode <= 4 && compmode != 1 && (line[edge] >> 24) == 0x20)
         {
             planes[0] = line[edge];
             planes[1] = line[256 + edge];
-            planes[2] = line[512 + edge];
+            planes[2] = line[512 + edge] | oldFade;
         }
         else
         {
             planes[0] = 0;
             planes[1] = 0;
-            planes[2] = WingRaw3D | (effect << 24) | (CurUnit->EVY << 8);
+            planes[2] = WingRaw3D | oldFade;
         }
     }
 }
