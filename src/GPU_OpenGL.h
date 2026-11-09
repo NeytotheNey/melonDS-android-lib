@@ -28,6 +28,7 @@
 namespace melonDS
 {
 class GPU;
+struct Shadow2DRecorder;
 struct RenderSettings;
 class GLRenderer;
 class Renderer3D;
@@ -63,6 +64,9 @@ public:
     // makes the next frame redo the filtered 2D map (see Filter2DState::MapPasses), for a reset or
     // a savestate load. CPU state only too
     void ResetFilter2D() noexcept;
+    // makes the next frame that draws GPU 2D shadow lines upload all of their memory again, for a
+    // reset or a savestate load. CPU state only too
+    void ResetShadow2D() noexcept;
     // whether the capture pass would run now (see RunHiresCapture): above 1x, or at 1x in the
     // check mode (GPU::HiresCaptureDebug 2), and while the capture program hasn't failed. GPU
     // only records capture lines and flags VRAM display lines while it does (GPU::Start2DJob)
@@ -74,6 +78,10 @@ public:
     // the fragment shader sources, as assembled around kCompositePixelFS
     static std::string CompositorFS();
     static std::string HiresCaptureFS();
+    // the GPU 2D shadow programs' fragment shaders: 0 the middle-only composite, 1 the wide one,
+    // 2 the check one (planes at 1x), and the OBJ pass
+    static std::string Shadow2DFS(int variant);
+    static std::string Shadow2DObjFS();
 private:
     GLCompositor(GLuint CompShader) noexcept;
     int Scale = 0;
@@ -260,6 +268,61 @@ private:
     void FreeFilter2DTextures() noexcept;
     void FreeFilter2D() noexcept;
     void LogFilter2D(const GPU& gpu, int passes) noexcept;
+
+    // the GPU 2D shadow renderer (GPU_Shadow2D.h, docs/plan-gpu-2d-shadow.md), while GPU::Shadow2D is on.
+    // the recorder decides what a line can be drawn from, PrepareShadow2D which lines are drawn this
+    // frame (the copy of their blocks with Shadow2D::F_Drawn), uploads what they read and runs the OBJ
+    // pass, and RunShadow2D draws them over the compositor's output. everything is made the first time
+    // a frame draws a line and freed once the recorder is off. units 11-13 are its textures (14 is
+    // for the page log of increment 1b, 15 stays spare)
+    static constexpr int Shadow2DMemUnit = 11;
+    static constexpr int Shadow2DStateUnit = 12;
+    static constexpr int Shadow2DObjUnit = 13;
+    struct Shadow2DProgram
+    {
+        GLuint Program = 0;
+        GLint ScaleLoc = -1, WideOffsetLoc = -1, ObjOffsetLoc = -1;
+    };
+    struct Shadow2DState
+    {
+        GLuint MemTex = 0;                  // GL_R32UI 256 x Shadow2D::MemRows: flats, extended palettes, palette
+        u32 MemGeneration = 0;              // the recorder's Generation MemTex holds, 0 for none
+        GLuint StateTex = 0;                // GL_RGBA32UI 8x384: the frame's state blocks, F_Drawn set
+        GLuint ObjTex = 0, ObjDepth = 0, ObjFB = 0;  // GL_RG32UI ViewWidth x 384, and its 16-bit depth
+        int ObjW = 0;
+        GLuint InstanceBuffer = 0, InstanceVAO = 0;
+        GLuint QuadBuffer = 0, QuadVAO = 0;
+        GLuint CheckTex = 0, CheckFB = 0;   // GL_RGBA32UI 256x384, check mode only
+        GLuint ObjProgram = 0;
+        GLint ObjWLoc = -1, ObjWideOffsetLoc = -1;
+        std::array<Shadow2DProgram, 3> Comp {};  // middle only, wide, check (SHADOW2D_PLANES)
+        bool Failed = false;
+
+        std::vector<u32> State;             // the blocks as uploaded, 384 lines
+        std::vector<float> Quads;           // the row runs' triangles
+        int DrawnLines = 0;
+
+        // the GPU2D log, Shadow2DRecorder::Logging only
+        s64 LogStartNs = 0;
+        u32 LogFrames = 0;
+        std::array<u32, 32> LogReasons {};
+        u64 LogUploadBytes = 0;
+        u64 LogInstances = 0;
+        u32 CheckFrames = 0, Checks = 0, CheckLines = 0, Mismatches = 0;
+    };
+    Shadow2DState Shadow {};
+
+    int PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuffers, bool hiresDisplay, bool ctrlCopied) noexcept;
+    bool PrepareShadow2DResources() noexcept;
+    bool PrepareShadow2DProgram(int variant) noexcept;
+    void UploadShadow2D(const GPU& gpu, Shadow2DRecorder& rec) noexcept;
+    void RunShadow2DObj(const Shadow2DRecorder& rec) noexcept;
+    void BuildShadow2DQuads(bool check) noexcept;
+    void RunShadow2D(int backbuf) noexcept;
+    void CheckShadow2D(const GPU& gpu, int backbuf) noexcept;
+    void LogShadow2D(const GPU& gpu) noexcept;
+    void FreeShadow2DTextures() noexcept;
+    void FreeShadow2D() noexcept;
 
     GLuint CompVertexBufferID = 0;
     GLuint CompVertexArrayID = 0;

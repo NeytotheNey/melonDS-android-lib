@@ -37,6 +37,7 @@ class GPU;
 struct CaptureReadCounter;
 struct CaptureFlatDirty;
 struct GPU2DStats;
+struct Shadow2DRecorder;
 
 // debug only (GPU_CaptureReads.h): the flat VRAM copies' trackers, as GPU::MakeVRAMFlat_2DBG/OBJCoherent check them
 enum : u32
@@ -904,6 +905,15 @@ public:
     std::unique_ptr<GPU2DStats> Stats2D;
     void Set2DStatsLogging(bool enable) noexcept;
 
+    // debug only for now: the GPU 2D shadow renderer (GPU_Shadow2D.h, docs/plan-gpu-2d-shadow.md).
+    // the recorder notes each line's state while the jobs are built, and the GL compositor redraws
+    // the lines it can at output resolution, for display only. null while it's off, the default, so
+    // that's all it costs. mode 1 draws the lines that gain something, 2 every eligible line; log
+    // adds the GPU2D log line, check (with mode 2) the 1x readback; wide 1 lets every layer draw past
+    // the edge (debug.melonade.gpu2dwide). set between games, before the reset
+    std::unique_ptr<Shadow2DRecorder> Shadow2D;
+    void SetShadow2D(int mode, bool log, bool check, int wide) noexcept;
+
     void SetHiresCapture(bool enable) noexcept;
     // DoCapture, on every capture line it draws with HiresCapture on: the line's record entry
     HiresCaptureRecord& RecordHiresCaptureLine(u32 line, u32 captureCnt) noexcept;
@@ -959,8 +969,8 @@ private:
     void Start2DJob(GPU2D::LineJob& job) noexcept;
     void Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept;
     void Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept;
-    void MakeVRAMFlat_2DBGCoherent() noexcept;
-    void MakeVRAMFlat_2DOBJCoherent() noexcept;
+    void MakeVRAMFlat_2DBGCoherent(u32 line) noexcept;
+    void MakeVRAMFlat_2DOBJCoherent(u32 line) noexcept;
 
     // a job is either queued for the 2D thread (a ring slot), held for display capture (a
     // Deferred2DJobs slot) or drawn right away (Job2D)

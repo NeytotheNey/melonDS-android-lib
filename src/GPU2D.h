@@ -155,7 +155,12 @@ private:
 constexpr int AccelLineWords = 256*3 + 1;
 constexpr int WingPlanesWords = 6;
 constexpr int AccelWingPlanesStart = AccelLineWords * 192;
-constexpr int AccelFramebufferWords = AccelWingPlanesStart + WingPlanesWords * 192;
+// then the GPU 2D shadow renderer's per-line state (Shadow2DRecorder, GPU_Shadow2D.h): ShadowStateWords
+// per line, written when each line's job is built while the recorder is on. it's in the screen's
+// buffer for the same reason as the wing planes, and GPU::LogHash2D doesn't read it
+constexpr int ShadowStateWords = 32;
+constexpr int AccelShadowStateStart = AccelWingPlanesStart + WingPlanesWords * 192;
+constexpr int AccelFramebufferWords = AccelShadowStateStart + ShadowStateWords * 192;
 // in a wing's plane 2, next to the compmode (bits 24-27): show the 3D pixel as opaque, whatever
 // the 3D at the edge is (see SoftRenderer::DrawWingPlanes)
 constexpr u32 WingRaw3D = 1u << 28;

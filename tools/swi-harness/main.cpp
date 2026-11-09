@@ -51,10 +51,13 @@
 #include "FreeBIOS.h"
 #include "GPU.h"
 #include "GPU_2DStats.h"
+#include "GPU_Shadow2D.h"
+#include "GPU3D_Soft.h"
 #include "Savestate.h"
 #include "Platform.h"
 #include "HarnessLog.h"
 #include "WideCheck.h"
+#include "Shadow2DReplay.h"
 
 using namespace melonDS;
 
@@ -64,6 +67,7 @@ FILE* CoreLog = nullptr;
 bool CoreLogEnabled = true; // --no-core-log
 bool StopRequested = false;
 FILE* StatsLog = nullptr;   // --stats2d: the GPU2DSTATS lines, each after the frame it ends at
+FILE* Hash2DLog = nullptr;  // --hash2d: the HASH2D lines
 u32 CurFrame = 0;
 }
 
@@ -224,6 +228,13 @@ void Log(LogLevel level, const char* fmt, ...)
         fprintf(StatsLog, "frame=%u ", CurFrame + 1);
         va_start(args, fmt);
         vfprintf(StatsLog, fmt, args);
+        va_end(args);
+        return;
+    }
+    if (Hash2DLog && strncmp(fmt, "HASH2D", 6) == 0)
+    {
+        va_start(args, fmt);
+        vfprintf(Hash2DLog, fmt, args);
         va_end(args);
         return;
     }
@@ -425,6 +436,12 @@ void Usage()
         "  --sav <file>   copy this save into the cart at boot (saves are never written)\n"
         "  --stats2d N    GPU 2D counters on (GPU_2DStats.h), a GPU2DSTATS line per engine every N frames\n"
         "                 to stats2d.log\n"
+        "  --accel        draw 2D in the accelerated line format (software 3D, the wide check's 256 run),\n"
+        "                 as the GL renderers get it, so the GPU 2D shadow recorder writes its blocks\n"
+        "  --hash2d       log GPU::LogHash2D's HASH2D line every frame to hash2d.log\n"
+        "  --shadow2d N   the GPU 2D shadow recorder on (GPU_Shadow2D.h, mode all, with its self-check),\n"
+        "                 a SHADOW2D line every N frames to shadow2d.log: lines per reason, block errors\n"
+        "  --threaded2d   draw 2D on its own thread, as the app's threaded 2D setting does\n"
         "  --console dsi  DSi mode, set up like the app: --bios picks the DS-mode (NTR) BIOS, and\n"
         "                 --dsi <dir> holds the DSi bios9.bin, bios7.bin and firmware.bin\n"
         "  --dsi-bios official|free|file <dir>  the DSi (TWL) BIOS in DSi mode: the dumps in\n"
@@ -628,6 +645,8 @@ int main(int argc, char** argv)
     std::vector<Touch> touches;
     std::string savpath;
     u32 stats2d = 0;
+    bool accel = false, hash2d = false, threaded2d = false;
+    u32 shadow2d = 0;
     std::string console = "ds", dsidir, nandpath, dsibios = "official", dsibiosdir;
     bool nandreadonly = false;
     int rtc[6] = {2026, 1, 1, 12, 0, 0};
@@ -688,6 +707,10 @@ int main(int argc, char** argv)
         }
         else if (arg == "--sav") savpath = next();
         else if (arg == "--stats2d") stats2d = strtoul(next().c_str(), nullptr, 0);
+        else if (arg == "--accel") accel = true;
+        else if (arg == "--hash2d") hash2d = true;
+        else if (arg == "--shadow2d") shadow2d = strtoul(next().c_str(), nullptr, 0);
+        else if (arg == "--threaded2d") threaded2d = true;
         else if (arg == "--console") console = next();
         else if (arg == "--dump-mainram") dumpmainram = true;
         else if (arg == "--dump-range")
@@ -902,6 +925,19 @@ int main(int argc, char** argv)
     if (dsimode)
         printf("DSi BIOS: %s\n", dsibios == "free" ? "TWL FreeBIOS" : dsibios == "file" ? dsibiosdir.c_str() : "official dumps");
 
+    if (accel)
+    {
+        // as WideCheck.cpp's 256 run: the accelerated line format with software 3D
+        nds->GPU.GPU3D.WideCheck = 256;
+        nds->SetRenderer3D(std::make_unique<SoftRenderer>());
+    }
+    // before the reset, as the app sets its switches
+    if (shadow2d)
+    {
+        nds->GPU.SetShadow2D(2, false, false, 0);
+        nds->GPU.Shadow2D->SelfCheck = true;
+    }
+
     u32 romlen = (u32)rom.size();
     auto romdata = std::make_unique<u8[]>(romlen);
     memcpy(romdata.get(), rom.data(), romlen);
@@ -969,6 +1005,28 @@ int main(int argc, char** argv)
         }
     }
 
+    FILE* shadowLog = nullptr;
+    Shadow2DReplay replay;
+    if (shadow2d)
+    {
+        shadowLog = fopen((outdir + "/shadow2d.log").c_str(), "w");
+        replay.Log = shadowLog;
+        // needs the blocks, so only with --accel. not with --threaded2d either: line 192 can come
+        // before the 2D thread has drawn the last lines
+        if (accel && !threaded2d)
+        {
+            nds->GPU.Shadow2D->FrameHook = Shadow2DReplay::Frame;
+            nds->GPU.Shadow2D->FrameHookUser = &replay;
+        }
+    }
+    if (hash2d)
+    {
+        Hash2DLog = fopen((outdir + "/hash2d.log").c_str(), "w");
+        nds->GPU.Hash2DLogging = true;
+    }
+    if (threaded2d)
+        nds->GPU.SetThreaded2D(true);
+
     if (stats2d)
     {
         StatsLog = fopen((outdir + "/stats2d.log").c_str(), "w");
@@ -1013,6 +1071,31 @@ int main(int argc, char** argv)
             nds->ReleaseScreen();
 
         nds->RunFrame();
+
+        if (shadowLog && ((frame + 1) % shadow2d) == 0)
+        {
+            // what the recorder would let the compositor draw (its part of the decision), counted at
+            // line 192 of each frame (Shadow2DRecorder::CountFrame)
+            Shadow2DRecorder& rec = *nds->GPU.Shadow2D;
+            u32 total = 0;
+            for (u32 count : rec.ReasonCounts) total += count;
+            fprintf(shadowLog, "SHADOW2D frame=%u lines=%u eligible=%u blockerrors=%u instances=%llu cpu=",
+                frame + 1, total, rec.ReasonCounts[Shadow2D::R_None], rec.SelfCheckErrors, (unsigned long long)rec.CountedInstances);
+            bool first = true;
+            for (u32 i = 1; i < Shadow2D::R_Count; i++)
+            {
+                if (!rec.ReasonCounts[i]) continue;
+                fprintf(shadowLog, "%s%s:%u", first ? "" : ",", Shadow2D::ReasonName(i), rec.ReasonCounts[i]);
+                first = false;
+            }
+            fprintf(shadowLog, "%s replaylines=%llu replaymismatches=%llu stalemem=%llu\n", first ? "-" : "",
+                (unsigned long long)replay.Lines, (unsigned long long)replay.Mismatches, (unsigned long long)replay.MemMismatches);
+            replay.Lines = replay.Mismatches = replay.MemMismatches = 0;
+            fflush(shadowLog);
+            for (u32& count : rec.ReasonCounts) count = 0;
+            rec.SelfCheckErrors = 0;
+            rec.CountedInstances = 0;
+        }
 
         bool last = (frame + 1 == frames);
         if (last || (shotevery && ((frame + 1) % shotevery) == 0))
@@ -1065,7 +1148,10 @@ int main(int argc, char** argv)
     if (scfglog) fclose(scfglog);
     if (StatsLog) fclose(StatsLog);
     StatsLog = nullptr;
+    if (shadowLog) fclose(shadowLog);
     nds->Stop();
+    if (Hash2DLog) fclose(Hash2DLog);
+    Hash2DLog = nullptr;
     if (CoreLog) fclose(CoreLog);
     return 0;
 }

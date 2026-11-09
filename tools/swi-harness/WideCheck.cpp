@@ -53,9 +53,14 @@
 //   the middle and display capture on purpose: done in both runs (GPU2D_Soft DrawScanline_BGOBJ);
 // - the polygon RAM counts, reported (with how often the game read them).
 // The wings themselves are drawn by the GL compositor, so there's no wing picture here.
+//
+// SWI_HARNESS_SHADOW2D=on (the wide run) or both (both runs) also turns the GPU 2D shadow recorder on
+// (GPU_Shadow2D.h, mode all, with its self-check), which only records: every result has to stay as it
+// is. summary.txt then has a line with its block errors and how many lines it found eligible.
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <memory>
 #include <filesystem>
@@ -66,6 +71,7 @@
 #include "Args.h"
 #include "GPU.h"
 #include "GPU3D_Soft.h"
+#include "GPU_Shadow2D.h"
 #include "Savestate.h"
 
 using namespace melonDS;
@@ -87,7 +93,7 @@ bool ReadAll(const std::string& path, std::vector<u8>& out)
     return ok;
 }
 
-std::unique_ptr<NDS> Boot(const WideCheckOptions& opts, int width, const std::vector<u8>& rom, const std::vector<u8>& state)
+std::unique_ptr<NDS> Boot(const WideCheckOptions& opts, int width, const std::vector<u8>& rom, const std::vector<u8>& state, bool shadow2d)
 {
     NDSArgs args {}; // FreeBIOS and the generated firmware, as --bios free
     args.JIT = std::nullopt;
@@ -98,6 +104,11 @@ std::unique_ptr<NDS> Boot(const WideCheckOptions& opts, int width, const std::ve
     nds->GPU.GPU3D.WideCheckSqueezeBoxTest = opts.SqueezeBoxTest;
     nds->GPU.GPU3D.WideCheckEqualTiming = opts.EqualTiming;
     nds->SetRenderer3D(std::make_unique<SoftRenderer>()); // sizes the framebuffers for the switch
+    if (shadow2d)
+    {
+        nds->GPU.SetShadow2D(2, false, false, 0);
+        nds->GPU.Shadow2D->SelfCheck = true;
+    }
 
     auto romdata = std::make_unique<u8[]>(rom.size());
     memcpy(romdata.get(), rom.data(), rom.size());
@@ -207,7 +218,10 @@ int RunWideCheck(const WideCheckOptions& opts)
     if (!ReadAll(opts.RomPath, rom)) { fprintf(stderr, "can't read ROM %s\n", opts.RomPath.c_str()); return 2; }
     if (!opts.StatePath.empty() && !ReadAll(opts.StatePath, state)) { fprintf(stderr, "can't read %s\n", opts.StatePath.c_str()); return 2; }
 
-    std::unique_ptr<NDS> off = Boot(opts, 256, rom, state), on = Boot(opts, opts.Width, rom, state);
+    const char* shadowEnv = getenv("SWI_HARNESS_SHADOW2D");
+    bool shadowBoth = shadowEnv && !strcmp(shadowEnv, "both");
+    bool shadowOn = shadowEnv && (shadowBoth || !strcmp(shadowEnv, "on"));
+    std::unique_ptr<NDS> off = Boot(opts, 256, rom, state, shadowBoth), on = Boot(opts, opts.Width, rom, state, shadowOn);
     if (!off || !on) { fprintf(stderr, "can't boot the ROM%s\n", state.empty() ? "" : " or load the savestate"); return 2; }
     rom.clear();
     rom.shrink_to_fit();
@@ -380,6 +394,14 @@ int RunWideCheck(const WideCheckOptions& opts)
         "  (by at most %u polygons, %u vertices); the DISP3DCNT overflow flag differed in %u frames\n",
         g0.DroppedPolygons, g1.DroppedPolygons, g1.DroppedNativeFit, dropFrames, maxFrameDrops,
         nativeMisses, nativeMaxPolys, nativeMaxVerts, overflowFrames);
+    if (shadowOn)
+    {
+        const Shadow2DRecorder& rec = *on->GPU.Shadow2D;
+        u32 total = 0;
+        for (u32 count : rec.ReasonCounts) total += count;
+        AppendF(summary, "  GPU 2D shadow recorder on in %s: the on run's blocks had %u self-check errors, %u of %u lines eligible\n",
+            shadowBoth ? "both runs" : "the on run", rec.SelfCheckErrors, rec.ReasonCounts[Shadow2D::R_None], total);
+    }
     fputs(summary.c_str(), stdout);
     if (FILE* f = fopen((opts.OutDir + "/summary.txt").c_str(), "w")) { fputs(summary.c_str(), f); fclose(f); }
 

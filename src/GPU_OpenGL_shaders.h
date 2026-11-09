@@ -125,14 +125,19 @@ void main()
 )";
 
 // the compositor's fragment shader is kCompositorFS_Nearest_Head + kCompositePixelFS +
-// kCompositorFS_Nearest_Main (see GLCompositor::CompositorFS)
+// kCompositorFS_Nearest_Main + kCompositorFS_Nearest_Entry (see GLCompositor::CompositorFS). the GPU 2D
+// shadow programs (SHADOW2D) share all but the entry point (see GLCompositor::Shadow2DFS)
 const char* kCompositorFS_Nearest_Head = R"(#version 320 es
 
-#if defined(WIDE) || defined(FILTER2D)
+#if defined(WIDE) || defined(FILTER2D) || defined(SHADOW2D)
 // wide and filtered coordinates need more precision than mediump (which can be fp16) has
 precision highp float;
 #else
 precision mediump float;
+#endif
+#ifdef SHADOW2D
+// VRAM addresses and 32-bit words
+precision highp int;
 #endif
 precision mediump usampler2D;
 
@@ -165,14 +170,22 @@ uniform int uFilterIdentity;
 uniform highp usampler2D FilterMapTex;
 #endif
 
-#if defined(FILTER2D) && !defined(WIDE)
+#if defined(SHADOW2D)
+// the shadow programs draw row runs and have no varyings: their main() sets this first, from
+// gl_FragCoord, to what the compositor's vertex shader gives the pixel's center
+vec2 fTexcoord;
+#elif defined(FILTER2D) && !defined(WIDE)
 // as with the filter off, for the identity mode, which has to round the same way
 smooth in mediump vec2 fTexcoord;
 #else
 smooth in vec2 fTexcoord;
 #endif
 
+#ifdef SHADOW2D_PLANES
+layout(location = 0) out uvec4 oPlanes;
+#else
 layout(location = 0) out vec4 oColor;
+#endif
 )";
 
 // the rest of the compositor's fragment shader, after kCompositePixelFS
@@ -315,7 +328,10 @@ ivec4 FilterFetch3D(float xscroll, highp ivec2 subPixel)
 #endif
 }
 #endif
+)";
 
+// the compositor's entry point, after kCompositorFS_Nearest_Main
+const char* kCompositorFS_Nearest_Entry = R"(
 void main()
 {
 #ifdef WIDE
@@ -843,6 +859,464 @@ void main()
 )";
 
 
+
+// GPU 2D shadow renderer (docs/plan-gpu-2d-shadow.md, GPU_Shadow2D.h): what both its programs read.
+// MemTex (R32UI, 256 words a row) holds the flats, extended palettes and palette as Shadow2D::Page_*
+// lays them out, as of the frame's last line, and these are its row offsets. everything is integer
+// maths on whole words, and every field taken out of one is masked (the Adreno note at the end of
+// kHiresCaptureFS_Main), so a line comes out as SoftRenderer would draw it
+const char* kShadow2DMemFS = R"(
+uniform highp usampler2D MemTex;
+
+const int MemABG = 0;
+const int MemBBG = 512;
+const int MemAOBJ = 640;
+const int MemBOBJ = 896;
+const int MemABGExt = 1024;
+const int MemBBGExt = 1056;
+const int MemAOBJExt = 1088;
+const int MemBOBJExt = 1096;
+const int MemPal = 1104;
+
+uint MemWord(int base, int addr)
+{
+    return texelFetch(MemTex, ivec2((addr >> 2) & 255, base + (addr >> 10)), 0).r;
+}
+
+uint MemByte(int base, int addr)
+{
+    return (MemWord(base, addr) >> uint((addr & 3) * 8)) & 0xFFu;
+}
+
+uint MemHalf(int base, int addr)
+{
+    return (MemWord(base, addr) >> uint((addr & 2) * 8)) & 0xFFFFu;
+}
+
+// SoftRenderer::DrawPixel_Accel's plane word for a 15-bit color: green's low bit is the color's bit 15
+uint ColorWord(uint color, uint flag)
+{
+    uint r = (color & 0x1Fu) << 1;
+    uint g = ((color & 0x3E0u) >> 4) | ((color & 0x8000u) >> 15);
+    uint b = (color & 0x7C00u) >> 9;
+    return r | (g << 8) | (b << 16) | flag;
+}
+)";
+
+// the OBJ pass (GLCompositor::RunShadow2DObj): one quad per sprite instance (Shadow2D::Instance) into
+// ObjTex, at native resolution over the view's width (uWideOffset columns are left of X 0), rows
+// unit * 192 + sprite line. the depth is (priority, OAM index), lowest wins, which is
+// SoftRenderer::DrawSpritePixel's rule for opaque pixels
+const char* kShadow2DObjVS = R"(#version 320 es
+
+precision highp float;
+precision highp int;
+
+in ivec4 iGeom;     // X, the first line's ObjTex row, width, lines
+in uvec4 iSprite;   // the sprite's row on the first line, attributes 0-2
+in uvec4 iMisc;     // OAM index, DISPCNT, flags (unit B, OBJ window), height
+
+uniform int uObjW;
+uniform int uWideOffset;
+
+flat out ivec4 vGeom;
+flat out uvec4 vSprite;
+flat out uvec4 vMisc;
+
+void main()
+{
+    int x = iGeom.x + uWideOffset + ((gl_VertexID & 1) != 0 ? iGeom.z : 0);
+    int y = iGeom.y + ((gl_VertexID & 2) != 0 ? iGeom.w : 0);
+    uint key = ((iSprite.w >> 10) & 0x3u) * 128u + (iMisc.x & 0x7Fu);
+    float depth = (float(key) + 0.5) / 512.0;
+    gl_Position = vec4(float(x) / float(uObjW) * 2.0 - 1.0, float(y) / 384.0 * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    vGeom = iGeom;
+    vSprite = iSprite;
+    vMisc = iMisc;
+}
+)";
+
+const char* kShadow2DObjFS_Head = R"(#version 320 es
+
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+uniform int uWideOffset;
+
+flat in ivec4 vGeom;
+flat in uvec4 vSprite;
+flat in uvec4 vMisc;
+
+layout(location = 0) out uvec4 oObj;
+)";
+
+// SoftRenderer::DrawSprite_Normal for one pixel: R gets what it puts in OBJLine (color or palette
+// index, the flags, priority, opaque), an OBJ window sprite sets G (none are drawn until increment 4). transparent pixels draw nothing
+const char* kShadow2DObjFS_Main = R"(
+void main()
+{
+    ivec2 frag = ivec2(gl_FragCoord.xy);
+    int width = vGeom.z;
+    int xoff = frag.x - uWideOffset - vGeom.x;
+    if (xoff < 0 || xoff >= width)
+        discard;
+
+    int height = int(vMisc.w);
+    int ypos = int(vSprite.x) + (frag.y - vGeom.y);
+    uint attr0 = vSprite.y & 0xFFFFu;
+    uint attr1 = vSprite.z & 0xFFFFu;
+    uint attr2 = vSprite.w & 0xFFFFu;
+    uint dispcnt = vMisc.y;
+    bool unitB = (vMisc.z & 1u) != 0u;
+    bool window = (vMisc.z & 2u) != 0u;
+    int base = unitB ? MemBOBJ : MemAOBJ;
+    int mask = unitB ? 0x1FFFF : 0x3FFFF;
+
+    // the flips, as the CPU's stepping works out to
+    if ((attr1 & 0x2000u) != 0u)
+        ypos = height - 1 - ypos;
+    int x = (attr1 & 0x1000u) != 0u ? width - 1 - xoff : xoff;
+
+    uint pixelattr = ((attr2 & 0x0C00u) << 6) | 0xC0000u;
+    uint tilenum = attr2 & 0x03FFu;
+    uint mode = window ? 0u : ((attr0 >> 10) & 0x3u);
+    uint pixel;
+
+    if (mode == 3u)
+    {
+        // bitmap sprite. alpha 0 and the reserved mapping never become instances
+        uint alpha = (attr2 >> 12) & 0xFu;
+        pixelattr |= 0xC0000000u | ((alpha + 1u) << 24);
+
+        int addr;
+        if ((dispcnt & 0x40u) != 0u)
+            addr = int(tilenum << (7u + ((dispcnt >> 22) & 0x1u))) + ypos * width * 2;
+        else if ((dispcnt & 0x20u) != 0u)
+            addr = int(((tilenum & 0x01Fu) << 4) + ((tilenum & 0x3E0u) << 7)) + ypos * 256 * 2;
+        else
+            addr = int(((tilenum & 0x00Fu) << 4) + ((tilenum & 0x3F0u) << 7)) + ypos * 128 * 2;
+        addr += x * 2;
+
+        uint color = MemHalf(base, addr & mask);
+        if ((color & 0x8000u) == 0u)
+            discard;
+        pixel = color | pixelattr;
+    }
+    else
+    {
+        bool color256 = (attr0 & 0x2000u) != 0u;
+        int tile = int(tilenum);
+        if ((dispcnt & 0x10u) != 0u)
+        {
+            tile <<= int((dispcnt >> 20) & 0x3u);
+            tile += ((ypos >> 3) * (width >> 3)) << (color256 ? 1 : 0);
+        }
+        else
+            tile += (ypos >> 3) * 0x20;
+
+        pixelattr |= (mode == 1u) ? 0x80000000u : 0x10000000u;
+
+        uint color;
+        if (color256)
+        {
+            int addr = (tile << 5) + ((ypos & 0x7) << 3) + ((x >> 3) << 6) + (x & 0x7);
+            color = MemByte(base, addr & mask);
+            if ((dispcnt & 0x80000000u) == 0u)
+                pixelattr |= 0x1000u;
+            else
+                pixelattr |= (attr2 & 0xF000u) >> 4;
+        }
+        else
+        {
+            int addr = (tile << 5) + ((ypos & 0x7) << 2) + ((x >> 3) << 5) + ((x & 0x7) >> 1);
+            uint twoPixels = MemByte(base, addr & mask);
+            color = (x & 1) != 0 ? (twoPixels >> 4) : (twoPixels & 0xFu);
+            pixelattr |= 0x1000u | ((attr2 & 0xF000u) >> 8);
+        }
+
+        if (color == 0u)
+            discard;
+        pixel = color | pixelattr;
+    }
+
+    oObj = window ? uvec4(0u, 1u, 0u, 0u) : uvec4(pixel, 0u, 0u, 0u);
+}
+)";
+
+// the composite pass (GLCompositor::RunShadow2D): row-run quads over the output lines it draws, after
+// the compositor's own pass. kCompositorFS_Nearest_Head with SHADOW2D (and WIDE for a wide view, or
+// SHADOW2D_PLANES for the check program, at 1x into a 256x384 RGBA32UI target with no gap between
+// the screens) + kCompositePixelFS + kCompositorFS_Nearest_Main + kShadow2DMemFS + this. it rebuilds
+// the line's planes the way SoftRenderer::DrawScanline_BGOBJ does in increment 1 (text BGs, normal
+// sprites, no windows, no blending, no mosaic), then runs the compositor's own maths on them
+const char* kShadow2DVS = R"(#version 320 es
+
+in vec2 vPosition;
+
+void main()
+{
+    gl_Position = vec4(vPosition, 0.0, 1.0);
+}
+)";
+
+const char* kShadow2DFS_Main = R"(
+// each line's state block, GPU2D::ShadowStateWords words as Shadow2D::W_* has them, 8 texels a line,
+// with the compositor's drawn bit in word 0 (bit 31)
+uniform highp usampler2D LineStateTex;
+// the OBJ pass's output: R the OBJ line pixel, G the OBJ window
+uniform highp usampler2D ObjTex;
+// the columns ObjTex has left of X 0
+uniform int uObjOffset;
+
+#ifdef WIDE
+#define SHADOW_OFFSET uWideOffset
+#else
+#define SHADOW_OFFSET 0
+#endif
+
+// SoftRenderer::DrawBG_Text for one pixel, at native X nx (any int: past the edges it carries on
+// through the tilemap, as the CPU's X counter does), on line vcount. 0 is transparent (a drawn pixel
+// always has its BG's flag)
+uint TextBGPixel(int bg, int nx, int vcount, bool unitB, uint dispcnt, uint bgcnt, uint pos)
+{
+    int xoff = (int(pos & 0xFFFFu) + nx) & 0x1FF;
+    int yoff = (int((pos >> 16) & 0xFFFFu) + vcount) & 0x1FF;
+    int widexmask = (bgcnt & 0x4000u) != 0u ? 0x100 : 0;
+
+    int tileset, tilemap, mask, base;
+    if (unitB)
+    {
+        tileset = int((bgcnt & 0x003Cu) << 12);
+        tilemap = int((bgcnt & 0x1F00u) << 3);
+        mask = 0x1FFFF;
+        base = MemBBG;
+    }
+    else
+    {
+        tileset = int(((dispcnt & 0x07000000u) >> 8) + ((bgcnt & 0x003Cu) << 12));
+        tilemap = int(((dispcnt & 0x38000000u) >> 11) + ((bgcnt & 0x1F00u) << 3));
+        mask = 0x7FFFF;
+        base = MemABG;
+    }
+
+    if ((bgcnt & 0x8000u) != 0u)
+    {
+        tilemap += (yoff & 0x1F8) << 3;
+        if ((bgcnt & 0x4000u) != 0u)
+            tilemap += (yoff & 0x100) << 3;
+    }
+    else
+        tilemap += (yoff & 0xF8) << 3;
+
+    int tile = int(MemHalf(base, (tilemap + ((xoff & 0xF8) >> 2) + ((xoff & widexmask) << 3)) & mask));
+    int ty = (tile & 0x0800) != 0 ? 7 - (yoff & 0x7) : (yoff & 0x7);
+    int tx = (tile & 0x0400) != 0 ? 7 - (xoff & 0x7) : (xoff & 0x7);
+    int palBase = unitB ? 0x400 : 0;
+
+    uint color;
+    if ((bgcnt & 0x0080u) != 0u)
+    {
+        int pixels = tileset + ((tile & 0x03FF) << 6) + (ty << 3);
+        int c = int(MemByte(base, (pixels + tx) & mask));
+        if (c == 0)
+            return 0u;
+        if ((dispcnt & 0x40000000u) != 0u)
+        {
+            int slot = (bg < 2 && (bgcnt & 0x2000u) != 0u) ? (2 + bg) : bg;
+            color = MemHalf(unitB ? MemBBGExt : MemABGExt, slot * 8192 + ((tile >> 12) & 0xF) * 512 + c * 2);
+        }
+        else
+            color = MemHalf(MemPal, palBase + c * 2);
+    }
+    else
+    {
+        int pixels = tileset + ((tile & 0x03FF) << 5) + (ty << 2);
+        int b = int(MemByte(base, (pixels + (tx >> 1)) & mask));
+        int c = (tx & 0x1) != 0 ? (b >> 4) : (b & 0xF);
+        if (c == 0)
+            return 0u;
+        color = MemHalf(MemPal, palBase + ((((tile & 0xF000) >> 8) + c) * 2));
+    }
+
+    return ColorWord(color, 0x01000000u << uint(bg));
+}
+
+// SoftRenderer::InterleaveSprites's color for an opaque OBJ line pixel, with the BG pass's DISPCNT
+uint SpritePixel(uint obj, bool unitB, uint dispcnt)
+{
+    uint color;
+    if ((obj & 0x8000u) != 0u)
+        color = obj & 0x7FFFu;
+    else if ((dispcnt & 0x80000000u) != 0u && (obj & 0x1000u) == 0u)
+        color = MemHalf(unitB ? MemBOBJExt : MemAOBJExt, int(obj & 0xFFFu) * 2);
+    else
+        color = MemHalf(MemPal, (unitB ? 0x600 : 0x200) + int(obj & 0xFFu) * 2);
+    return ColorWord(color, obj & 0xFF000000u);
+}
+
+// a layer past the edge: only in its wide mode 1, within the BG's extents
+bool WideBG(int bg, int nx, uint modes, uint left, uint right)
+{
+    if (((modes >> uint(bg * 2)) & 0x3u) != 1u)
+        return false;
+    if (nx < 0)
+        return -nx <= int((left >> uint(bg * 8)) & 0xFFu);
+    return nx - 255 <= int((right >> uint(bg * 8)) & 0xFFu);
+}
+
+ivec4 PlaneBytes(uint word)
+{
+    return ivec4(int(word & 0xFFu), int((word >> 8) & 0xFFu), int((word >> 16) & 0xFFu), int((word >> 24) & 0xFFu));
+}
+
+#define PUSH(v) { if (found == 0) top = (v); else second = (v); found++; }
+
+void main()
+{
+    highp ivec2 frag = ivec2(gl_FragCoord.xy);
+    int scale = int(u3DScale);
+#ifdef SHADOW2D_PLANES
+    int screen = frag.y >= 192 ? 1 : 0;
+    int subY = frag.y - screen * 192;
+#else
+    // the output has 2 padding lines between the screens
+    int screen = frag.y >= 194 * scale ? 1 : 0;
+    int subY = frag.y - screen * 194 * scale;
+#endif
+    int line = subY / scale;
+    int row = screen * 192 + line;
+
+    uvec4 s0 = texelFetch(LineStateTex, ivec2(0, row), 0);  // flags, frame, DISPCNT, BGCNT 0-1
+    uint flags = s0.x;
+    if ((flags & 0x80000000u) == 0u)
+        discard;
+    uvec4 s1 = texelFetch(LineStateTex, ivec2(1, row), 0);  // BGCNT 2-3, BG0-2 scroll
+    uvec4 s2 = texelFetch(LineStateTex, ivec2(2, row), 0);  // BG3 scroll
+    uvec4 s6 = texelFetch(LineStateTex, ivec2(6, row), 0);  // EVY and backdrop, lines, wide modes, left extents
+    uvec4 s7 = texelFetch(LineStateTex, ivec2(7, row), 0);  // right extents
+
+    // the native X, floor(sub-pixel / scale), signed: the wings are negative or past 255
+    int subX = frag.x - SHADOW_OFFSET * scale;
+    int nx = subX >= 0 ? subX / scale : -((scale - 1 - subX) / scale);
+    fTexcoord = vec2((float(frag.x) + 0.5) / float(scale) - float(SHADOW_OFFSET),
+                     float(screen * 192) + (float(subY) + 0.5) / float(scale));
+
+    bool unitB = (flags & 0x1u) != 0u;
+    uint dispcnt = s0.z;
+    uint bgcnt[4] = uint[4](s0.w & 0xFFFFu, (s0.w >> 16) & 0xFFFFu, s1.x & 0xFFFFu, (s1.x >> 16) & 0xFFFFu);
+    uint pos[4] = uint[4](s1.y, s1.z, s1.w, s2.x);
+    int vcount = int(s6.y & 0xFFFFu);
+    uint textMask = (flags >> 12) & 0xFu;
+    bool bg0Is3D = (flags & 0x800u) != 0u;
+    bool wing = nx < 0 || nx > 255;
+
+    // the line's OBJ pixel, if the BG pass shows sprites (LayerEnable bit 4)
+    uint obj = 0u;
+    if ((flags & (0x10u << 3)) != 0u && (!wing || ((s6.z >> 8) & 0x3u) == 1u))
+    {
+        int ox = nx + uObjOffset;
+        if (ox >= 0 && ox < textureSize(ObjTex, 0).x)
+            obj = texelFetch(ObjTex, ivec2(ox, (unitB ? 192 : 0) + line), 0).r;
+        if ((obj & 0x40000u) == 0u)
+            obj = 0u;
+    }
+
+    // DrawScanlineBGMode's order backwards (priority 0 first, and in a priority the sprites, then
+    // BG0 to BG3): the first two opaque layers are the top of DrawPixel_Accel's stack, which is all
+    // the planes need without blending. the 3D layer is the placeholder, opaque everywhere
+    uint top = 0u, second = 0u;
+    int found = 0;
+    bool any2D = false;
+    for (int prio = 0; prio < 4 && found < 2; prio++)
+    {
+        if (obj != 0u && int((obj >> 16) & 0x3u) == prio)
+        {
+            PUSH(SpritePixel(obj, unitB, dispcnt))
+            any2D = true;
+        }
+        for (int bg = 0; bg < 4 && found < 2; bg++)
+        {
+            if (int(bgcnt[bg] & 0x3u) != prio)
+                continue;
+            if (bg == 0 && bg0Is3D)
+            {
+                PUSH(0x40000000u)
+                continue;
+            }
+            if (((textMask >> uint(bg)) & 0x1u) == 0u)
+                continue;
+            if (wing && !WideBG(bg, nx, s6.z, s6.w, s7.x))
+                continue;
+            uint pixel = TextBGPixel(bg, nx, vcount, unitB, dispcnt, bgcnt[bg], pos[bg]);
+            if (pixel != 0u)
+            {
+                PUSH(pixel)
+                any2D = true;
+            }
+        }
+    }
+    if (found < 2)
+        PUSH(ColorWord((s6.x >> 16) & 0xFFFFu, 0x20000000u))
+
+    // DrawScanline_BGOBJ's accelerated planes, with no blending: 3D on top (unit A only) takes the
+    // fade branch with effect 0, anything else the no-3D one. unit B's are ColorComposite's val1
+    uint p0, p1, p2;
+    if (!unitB && ((top >> 24) & 0xC0u) == 0x40u)
+    {
+        p0 = second;
+        p1 = second;
+        p2 = (s6.x & 0xFFu) << 8;
+    }
+    else
+    {
+        p0 = top;
+        p1 = 0u;
+        p2 = 0x07000000u;
+    }
+
+#ifdef SHADOW2D_PLANES
+    oPlanes = uvec4(p0, p1, p2, 0u);
+#else
+#ifdef WIDE
+    // a wing pixel with no 2D layer of its own is the compositor's, edge checks and all
+    if (wing && !any2D)
+    {
+        ivec4 wingPixel = WingPixel();
+        wingPixel.rgb <<= 2;
+        wingPixel.rgb |= (wingPixel.rgb >> 6);
+        oColor = vec4(vec3(wingPixel.bgr) / 255.0, 1.0);
+        return;
+    }
+#endif
+
+    // the rest is the compositor's main(), for a display mode 1 line
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
+    float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
+    ivec4 val1 = PlaneBytes(p0);
+    ivec4 val2 = PlaneBytes(p1);
+    ivec4 val3 = PlaneBytes(p2);
+
+    ivec4 _3dpix = ivec4(0);
+    if ((val3.a & 0xF) <= 4)
+        _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
+
+    bool opaque;
+    ivec4 pixel = CompositePixel(val1, val2, val3, _3dpix, opaque);
+
+    int brightmode = mbright.g >> 6;
+    int evy = min(mbright.r & 0x1F, 16);
+    if (brightmode == 1)
+        pixel += ((0x3F - pixel) * evy) >> 4;
+    else if (brightmode == 2)
+        pixel -= ((pixel * evy) + 0xF) >> 4;
+
+    pixel.rgb <<= 2;
+    pixel.rgb |= (pixel.rgb >> 6);
+    oColor = vec4(vec3(pixel.bgr) / 255.0, 1.0);
+#endif
+}
+)";
 
 const char* kCompositorFS_Linear = R"(#version 140
 

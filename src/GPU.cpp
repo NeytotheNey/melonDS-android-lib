@@ -29,6 +29,7 @@
 #include "GPU3D.h"
 #include "GPU_CaptureReads.h"
 #include "GPU_2DStats.h"
+#include "GPU_Shadow2D.h"
 
 namespace melonDS
 {
@@ -265,6 +266,17 @@ void GPU::Reset() noexcept
         CapReads->DropAll();
     if (Stats2D)
         Stats2D->Reset();
+    if (Shadow2D)
+    {
+        Shadow2D->Reset();
+        // the state blocks start out as no frame's (the fill above made them all ones)
+        if (GPU3D.UsesAccelLines())
+        {
+            for (int buf = 0; buf < 2; buf++)
+                for (int screen = 0; screen < 2; screen++)
+                    memset(&Framebuffer[buf][screen][GPU2D::AccelShadowStateStart], 0, GPU2D::ShadowStateWords * 192 * 4);
+        }
+    }
 
     OAMDirty = 0x3;
     PaletteDirty = 0xF;
@@ -369,6 +381,8 @@ void GPU::DoSavestate(Savestate* file) noexcept
             CapReads->DropAll();
         if (Stats2D)
             Stats2D->Reset();
+        if (Shadow2D)
+            Shadow2D->Reset();
         GPU3D.GetCurrentRenderer().SavestateLoaded();
     }
 }
@@ -387,6 +401,24 @@ void GPU::Set2DStatsLogging(bool enable) noexcept
         Stats2D = std::make_unique<GPU2DStats>();
     else if (!enable)
         Stats2D.reset();
+}
+
+void GPU::SetShadow2D(int mode, bool log, bool check, int wide) noexcept
+{
+    // nothing it records may be half a frame's when it starts or stops
+    Sync2D();
+    if (mode <= 0)
+    {
+        Shadow2D.reset();
+        return;
+    }
+    if (!Shadow2D)
+        Shadow2D = std::make_unique<Shadow2DRecorder>();
+    Shadow2D->Mode = mode >= 2 ? 2 : 1;
+    Shadow2D->Logging = log || check;
+    Shadow2D->Check = check;
+    Shadow2D->Wide = wide;
+    Shadow2D->Reset();
 }
 
 // out of line because GPU.h can't see NDS. the CPU doesn't run while an ARM9 DMA holds it stopped
@@ -607,6 +639,10 @@ void GPU::InitFramebuffers() noexcept
     memset(Framebuffer[1][1].get(), 0, fbsize*4);
 
     AssignFramebuffers();
+
+    // the blocks are gone with the old buffers, and a new renderer has a new compositor
+    if (Shadow2D)
+        Shadow2D->Reset();
 }
 
 
@@ -1353,12 +1389,16 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
 // for DrawScanline(line): call after PreDrawScanline, before PostDrawScanline
 void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
 {
-    MakeVRAMFlat_2DBGCoherent();
+    MakeVRAMFlat_2DBGCoherent(line);
 
     job.DrawBG = true;
     job.Line = line;
     job.BG[0] = GPU2D_A.State();
     job.BG[1] = GPU2D_B.State();
+
+    // debug only for now, see GPU_Shadow2D.h
+    if (Shadow2D)
+        Shadow2D->NoteLine(job, PaletteDirty);
 
     // debug only, see GPU_2DStats.h
     if (Stats2D)
@@ -1409,12 +1449,16 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
 // for DrawSprites(line): call after PostDrawScanline (or ResetOBJMosaicCounters for line 0)
 void GPU::Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept
 {
-    MakeVRAMFlat_2DOBJCoherent();
+    MakeVRAMFlat_2DOBJCoherent(line);
 
     job.DrawOBJ = true;
     job.SpriteLine = line;
     job.OBJ[0] = GPU2D_A.State();
     job.OBJ[1] = GPU2D_B.State();
+
+    // debug only for now, see GPU_Shadow2D.h
+    if (Shadow2D)
+        Shadow2D->NoteSprites(job, OAMDirty);
 
     // debug only, see GPU_2DStats.h
     if (Stats2D)
@@ -1429,7 +1473,7 @@ void GPU::Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept
 // the copies only change here, which is why CPU writes to BG/OBJ VRAM don't need the 2D barrier.
 // the dirty sets are all worked out first (that only touches emulator-thread state), and the
 // barrier only runs when a copy is about to change under lines the 2D thread hasn't drawn yet
-void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
+void GPU::MakeVRAMFlat_2DBGCoherent(u32 line) noexcept
 {
     auto bgDirtyA = VRAMDirty_ABG.DeriveState(VRAMMap_ABG, *this);
     auto bgExtPalDirtyA = VRAMDirty_ABGExtPal.DeriveState(VRAMMap_ABGExtPal, *this);
@@ -1459,6 +1503,15 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
         Stats2D->NoteBGDirty(1, bgDirtyB.Data, bgDirtyB.DataLength, bgExtPalDirtyB.Data, bgExtPalDirtyB.DataLength, objExtPalDirtyB.Data, objExtPalDirtyB.DataLength);
     }
 
+    // debug only for now, see GPU_Shadow2D.h: which pages the compositor has to upload again, and
+    // what they hold before the copies, to tell which ones really change
+    if (Shadow2D)
+    {
+        const u64* const bits[6] = {bgDirtyA.Data, bgExtPalDirtyA.Data, objExtPalDirtyA.Data, bgDirtyB.Data, bgExtPalDirtyB.Data, objExtPalDirtyB.Data};
+        const u32 words[6] = {bgDirtyA.DataLength, bgExtPalDirtyA.DataLength, objExtPalDirtyA.DataLength, bgDirtyB.DataLength, bgExtPalDirtyB.DataLength, objExtPalDirtyB.DataLength};
+        Shadow2D->NoteBGDirty(*this, line, bits, words);
+    }
+
     // with EngineBNoHold, held lines have no engine B part left to read engine B's copies
     bool dirtyA = bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA;
     bool dirtyB = bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB;
@@ -1472,6 +1525,9 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
     MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirtyB);
     MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirtyB);
 
+    if (Shadow2D)
+        Shadow2D->NoteBGCopied(*this);
+
     // debug only, see GPU_2DStats.h: which dirty pages really changed
     if (Stats2D)
     {
@@ -1484,7 +1540,7 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
     }
 }
 
-void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
+void GPU::MakeVRAMFlat_2DOBJCoherent(u32 line) noexcept
 {
     auto objDirtyA = VRAMDirty_AOBJ.DeriveState(VRAMMap_AOBJ, *this);
     auto objDirtyB = VRAMDirty_BOBJ.DeriveState(VRAMMap_BOBJ, *this);
@@ -1506,11 +1562,22 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
         Stats2D->NoteOBJDirty(1, objDirtyB.Data, objDirtyB.DataLength);
     }
 
+    // debug only for now, see GPU_Shadow2D.h
+    if (Shadow2D)
+    {
+        const u64* const bits[2] = {objDirtyA.Data, objDirtyB.Data};
+        const u32 words[2] = {objDirtyA.DataLength, objDirtyB.DataLength};
+        Shadow2D->NoteOBJDirty(*this, line, bits, words);
+    }
+
     if (EngineBNoHold ? ((objDirtyA && Is2DThreadBusy()) || (objDirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (objDirtyA || objDirtyB)))
         Sync2D(CapFlush_FlatOBJ);
 
     MakeVRAMFlat_AOBJCoherent(objDirtyA);
     MakeVRAMFlat_BOBJCoherent(objDirtyB);
+
+    if (Shadow2D)
+        Shadow2D->NoteOBJCopied(*this);
 
     if (Stats2D)
     {
@@ -2066,6 +2133,15 @@ void GPU::StartScanline(u32 line) noexcept
             // debug only, see GPU_CaptureReads.h: the Sync2D below ends the frame's held lines
             if (CapReads)
                 CapReads->NoteBarrier();
+
+            // debug only for now, see GPU_Shadow2D.h: the frame's sprite runs are complete, whenever
+            // the Blit comes. the swi-harness counts the frame's lines here, as it has no Blit
+            if (Shadow2D)
+            {
+                Shadow2D->Finalize();
+                if (Shadow2D->SelfCheck && GPU3D.UsesAccelLines())
+                    Shadow2D->CountFrame(*this, FrontBuffer ? 0 : 1);
+            }
 
             // the last lines are usually still being drawn here, and nothing below needs them until
             // the GL compositor reads the 2D back buffers (the Blit at the end, or at line 215), so

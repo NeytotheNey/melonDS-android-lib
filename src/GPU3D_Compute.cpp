@@ -422,6 +422,7 @@ void ComputeRenderer::Reset(GPU& gpu)
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
     CurGLCompositor.ResetFilter2D();
+    CurGLCompositor.ResetShadow2D();
     ClearBitmapDirty = 0x3;
     DropEarlyCapture();
 }
@@ -431,6 +432,7 @@ void ComputeRenderer::SavestateLoaded()
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
     CurGLCompositor.ResetFilter2D();
+    CurGLCompositor.ResetShadow2D();
     // line 0 reads the low res image back again, as it did before the early readback
     DropEarlyCapture();
 }

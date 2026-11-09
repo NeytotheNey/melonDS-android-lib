@@ -52,7 +52,9 @@ add_executable(swi-harness
     SWILog.cpp
     HarnessLog.h
     WideCheck.cpp
-    WideCheck.h)
+    WideCheck.h
+    Shadow2DReplay.cpp
+    Shadow2DReplay.h)
 
 target_include_directories(swi-harness PRIVATE "${MELONDS_ROOT}/src")
 target_link_libraries(swi-harness PRIVATE core)

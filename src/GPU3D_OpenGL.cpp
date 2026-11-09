@@ -353,6 +353,7 @@ void GLRenderer::Reset(GPU& gpu)
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
     CurGLCompositor.ResetFilter2D();
+    CurGLCompositor.ResetShadow2D();
     TexMemDirtyAll = true;
     TargetsChanged = true;
     EarlyCapture = false;
@@ -1887,6 +1888,7 @@ void GLRenderer::SavestateLoaded()
     CurGLCompositor.ResetWingHold();
     CurGLCompositor.ResetHiresCapture();
     CurGLCompositor.ResetFilter2D();
+    CurGLCompositor.ResetShadow2D();
     // line 0 reads back MainFramebuffer again, as it did before the early readback
     EarlyCapture = false;
 }
