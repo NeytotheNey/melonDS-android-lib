@@ -224,21 +224,20 @@ ivec4 WingPixel()
         float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
         ivec4 _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
 
-        // the old look, the 3D as it is, transparent or not, with its BLDCNT fade: on lines where
-        // the edge has no backdrop under the 3D (GPU2D::WingRaw3D), and where the 3D at the edge
-        // isn't transparent, as a squeezed screen-wide quad (Contra 4's fades) leaves the wing's
-        // 3D transparent where the edge's isn't. that's the 3D one native pixel in from the edge,
-        // as squeezed geometry ending at the screen's edge can miss column 255 (the same reason
-        // the 2D renderer gives the edge columns their neighbor's window mask). the fade is in
-        // plane 2's r (effect) and b (EVY), see GPU2D::WingOldFadeMask; planes 0 and 1 aren't read
-        bool oldLook = (val3.a & 0x10) != 0;
-        if (!oldLook)
-            oldLook = Fetch3D((side == 0 ? 1.5 : 254.5) + _3dxpos, mod(fTexcoord.y, 192.0)).a != 0;
-        if (oldLook)
-        {
-            val3 = ivec4(0, val3.b, 0, val3.r & 0x3);
+        // GPU2D::WingRaw3D: there's no backdrop under the 3D at the edge, so the wing shows the
+        // 3D as it is, transparent or not (then planes 0 and 1 are never read). otherwise the
+        // planes are the edge's, and the wing's transparent 3D only shows the backdrop where the
+        // edge does, through 3D that's transparent there too: a squeezed screen-wide quad (Contra
+        // 4's fades) leaves the wing's 3D transparent where the edge's isn't. elsewhere it shows
+        // the 3D as it is, while 3D with alpha is composited as the edge would composite it
+        // (compmode 4 blends it over the backdrop, 0, 2 and 3 fade it with the edge's effects).
+        // the edge's 3D is taken one native pixel in, as squeezed geometry ending at the screen's
+        // edge can miss column 255 (the same reason the 2D renderer gives the edge columns their
+        // neighbor's window mask)
+        if ((val3.a & 0x10) != 0)
             _3dpix.a = max(_3dpix.a, 1);
-        }
+        else if (_3dpix.a == 0 && Fetch3D((side == 0 ? 1.5 : 254.5) + _3dxpos, mod(fTexcoord.y, 192.0)).a != 0)
+            _3dpix.a = (val3.a & 0xF) == 4 ? 31 : 1;
 
         bool opaque;
         pixel = CompositePixel(val1, val2, val3, _3dpix, opaque);

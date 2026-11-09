@@ -409,18 +409,16 @@ void SoftRenderer::DrawScanline(u32 line, const UnitState* unit)
 // but the backdrop under it: it gets that column's planes, so it's composited as the edge pixel
 // would be with the wing's 3D pixel (blend or fade, and the backdrop where the 3D is transparent,
 // with the edge's window effects). the compositor still checks the 3D at the edge, which this
-// can't see: only if that's transparent does the wing use these planes (see WingPixel).
-// otherwise, and on lines where a 2D layer is over or under the 3D at the edge (WingRaw3D), the
-// wing keeps the old look: the 3D as it is, transparent or not, with its BLDCNT fade (BG0 as 1st
-// target, whatever the windows do), which is stashed for it in plane 2 where no compmode the
-// planes can have reads (WingOldFadeMask). both wings get the 3D whichever edge shows BG0, as the
-// control word's one wings bit says
+// can't see: where that isn't transparent, the wing's transparent 3D doesn't fall through to the
+// backdrop (see WingPixel). on lines where a 2D layer is over or under the 3D at the edge, the
+// wing keeps the old look (WingRaw3D): the 3D as it is, transparent or not, with its BLDCNT fade
+// (BG0 as 1st target, whatever the windows do). both wings get the 3D whichever edge shows BG0,
+// as the control word's one wings bit says
 void SoftRenderer::DrawWingPlanes(const u32* line, u32* wing) const
 {
     u32 effect = (CurUnit->BlendCnt & 0x0001) ? ((CurUnit->BlendCnt >> 6) & 0x3) : 0;
     if (effect == 1)
         effect = 0;
-    u32 oldFade = effect | (CurUnit->EVY << 16);
 
     for (int side = 0; side < 2; side++)
     {
@@ -428,19 +426,18 @@ void SoftRenderer::DrawWingPlanes(const u32* line, u32* wing) const
         u32 compmode = (line[512 + edge] >> 24) & 0xF;
         u32* planes = &wing[side * 3];
 
-        // compmodes 0 and 2-4 are 3D on top, with what's under it in plane 0 (flag 0x20: the
-        // backdrop). they leave plane 2's bits 0-7 and 16-23 clear
+        // compmodes 0 and 2-4 are 3D on top, with what's under it in plane 0 (flag 0x20: the backdrop)
         if (compmode <= 4 && compmode != 1 && (line[edge] >> 24) == 0x20)
         {
             planes[0] = line[edge];
             planes[1] = line[256 + edge];
-            planes[2] = line[512 + edge] | oldFade;
+            planes[2] = line[512 + edge];
         }
         else
         {
             planes[0] = 0;
             planes[1] = 0;
-            planes[2] = WingRaw3D | oldFade;
+            planes[2] = WingRaw3D | (effect << 24) | (CurUnit->EVY << 8);
         }
     }
 }
