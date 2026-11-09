@@ -50,6 +50,8 @@
 #include "SPI_Firmware.h"
 #include "FreeBIOS.h"
 #include "GPU.h"
+#include "GPU_2DStats.h"
+#include "Savestate.h"
 #include "Platform.h"
 #include "HarnessLog.h"
 #include "WideCheck.h"
@@ -61,6 +63,8 @@ namespace
 FILE* CoreLog = nullptr;
 bool CoreLogEnabled = true; // --no-core-log
 bool StopRequested = false;
+FILE* StatsLog = nullptr;   // --stats2d: the GPU2DSTATS lines, each after the frame it ends at
+u32 CurFrame = 0;
 }
 
 namespace melonDS::Platform
@@ -214,8 +218,16 @@ u64 FileLength(FileHandle* file)
 
 void Log(LogLevel level, const char* fmt, ...)
 {
-    if (!CoreLogEnabled) return;
     va_list args;
+    if (StatsLog && strncmp(fmt, "GPU2DSTATS", 10) == 0)
+    {
+        fprintf(StatsLog, "frame=%u ", CurFrame + 1);
+        va_start(args, fmt);
+        vfprintf(StatsLog, fmt, args);
+        va_end(args);
+        return;
+    }
+    if (!CoreLogEnabled) return;
     va_start(args, fmt);
     vfprintf(CoreLog ? CoreLog : stderr, fmt, args);
     va_end(args);
@@ -406,8 +418,13 @@ void Usage()
         "  --jit          use the JIT (needs a build with -DSWI_HARNESS_JIT=ON)\n"
         "  --firmware     load this firmware image instead of the generated one\n"
         "                 (still direct boot; for experiments, the BIOS diff uses the generated one)\n"
-        "  --tap KEY@FRAME  hold a key for 6 frames from FRAME (A B SELECT START RIGHT LEFT UP DOWN R L X Y),\n"
-        "                 can be repeated\n"
+        "  --tap KEY@FRAME[+N]  hold a key for 6 (or N) frames from FRAME (A B SELECT START RIGHT LEFT UP DOWN\n"
+        "                 R L X Y), can be repeated\n"
+        "  --touch X,Y@FRAME[+N]  touch the bottom screen at X,Y for 6 (or N) frames, can be repeated\n"
+        "  --state <file> load this savestate after boot (only read)\n"
+        "  --sav <file>   copy this save into the cart at boot (saves are never written)\n"
+        "  --stats2d N    GPU 2D counters on (GPU_2DStats.h), a GPU2DSTATS line per engine every N frames\n"
+        "                 to stats2d.log\n"
         "  --console dsi  DSi mode, set up like the app: --bios picks the DS-mode (NTR) BIOS, and\n"
         "                 --dsi <dir> holds the DSi bios9.bin, bios7.bin and firmware.bin\n"
         "  --dsi-bios official|free|file <dir>  the DSi (TWL) BIOS in DSi mode: the dumps in\n"
@@ -430,7 +447,6 @@ void Usage()
         "  --wide-check W the WideMelon check instead of an SWI log (FreeBIOS, DS mode): runs the\n"
         "                 game with the view 256 and W wide in lockstep and fails if the middle\n"
         "                 or anything the game can see differs (see WideCheck.cpp)\n"
-        "  --state <file> with --wide-check: load this savestate after boot\n"
         "  --box-test wide  with --wide-check: squeeze box tests as WideMelon does (memory is then\n"
         "                 only reported, since the game sees them)\n"
         "  --timing native  with --wide-check: time polygons as WideMelon does (by the native view's\n"
@@ -507,7 +523,22 @@ struct Tap
 {
     u32 Frame;
     u32 Key;
+    u32 Length = 6;
 };
+
+struct Touch
+{
+    u32 Frame, Length;
+    u16 X, Y;
+};
+
+// FRAME[+N], N defaulting to 6
+void ParseFrames(const std::string& str, u32& frame, u32& length)
+{
+    size_t plus = str.find('+');
+    frame = strtoul(str.substr(0, plus).c_str(), nullptr, 0);
+    length = (plus == std::string::npos) ? 6 : strtoul(str.substr(plus + 1).c_str(), nullptr, 0);
+}
 
 int KeyIndex(const std::string& name)
 {
@@ -594,6 +625,9 @@ int main(int argc, char** argv)
     u64 blobtotal = 2ull * 1024 * 1024 * 1024;
     bool jit = false;
     std::vector<Tap> taps;
+    std::vector<Touch> touches;
+    std::string savpath;
+    u32 stats2d = 0;
     std::string console = "ds", dsidir, nandpath, dsibios = "official", dsibiosdir;
     bool nandreadonly = false;
     int rtc[6] = {2026, 1, 1, 12, 0, 0};
@@ -634,8 +668,26 @@ int main(int argc, char** argv)
                 fprintf(stderr, "bad --tap %s\n", tap.c_str());
                 return 1;
             }
-            taps.push_back({(u32)strtoul(tap.substr(at + 1).c_str(), nullptr, 0), (u32)key});
+            Tap t {0, (u32)key};
+            ParseFrames(tap.substr(at + 1), t.Frame, t.Length);
+            taps.push_back(t);
         }
+        else if (arg == "--touch")
+        {
+            std::string val = next();
+            size_t at = val.find('@');
+            unsigned x = 0, y = 0;
+            if (at == std::string::npos || sscanf(val.c_str(), "%u,%u", &x, &y) != 2 || x > 255 || y > 191)
+            {
+                fprintf(stderr, "bad --touch %s\n", val.c_str());
+                return 1;
+            }
+            Touch t {0, 0, (u16)x, (u16)y};
+            ParseFrames(val.substr(at + 1), t.Frame, t.Length);
+            touches.push_back(t);
+        }
+        else if (arg == "--sav") savpath = next();
+        else if (arg == "--stats2d") stats2d = strtoul(next().c_str(), nullptr, 0);
         else if (arg == "--console") console = next();
         else if (arg == "--dump-mainram") dumpmainram = true;
         else if (arg == "--dump-range")
@@ -857,6 +909,19 @@ int main(int argc, char** argv)
     rom.shrink_to_fit();
 
     NDSCart::NDSCartArgs cartargs {};
+    if (!savpath.empty())
+    {
+        // a copy in memory; WriteNDSSave is a no-op, so the file is never written
+        std::vector<u8> sav;
+        if (!ReadFile(savpath, sav) || sav.empty())
+        {
+            fprintf(stderr, "can't read save %s\n", savpath.c_str());
+            return 1;
+        }
+        cartargs.SRAM = std::make_unique<u8[]>(sav.size());
+        memcpy(cartargs.SRAM.get(), sav.data(), sav.size());
+        cartargs.SRAMLength = (u32)sav.size();
+    }
     auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::move(cartargs));
     if (!cart)
     {
@@ -887,6 +952,30 @@ int main(int argc, char** argv)
         printf("cart unit code %02X, after direct boot: %s\n", header.UnitCode, SCFGState(dsi).c_str());
     }
 
+    if (!statepath.empty())
+    {
+        // a copy of the bytes, as in WideCheck.cpp: Savestate only reads
+        std::vector<u8> state;
+        if (!ReadFile(statepath, state))
+        {
+            fprintf(stderr, "can't read %s\n", statepath.c_str());
+            return 1;
+        }
+        Savestate st(state.data(), (u32)state.size(), false);
+        if (st.Error || !nds->DoSavestate(&st) || st.Error)
+        {
+            fprintf(stderr, "can't load savestate %s\n", statepath.c_str());
+            return 1;
+        }
+    }
+
+    if (stats2d)
+    {
+        StatsLog = fopen((outdir + "/stats2d.log").c_str(), "w");
+        nds->GPU.Set2DStatsLogging(true);
+        nds->GPU.Stats2D->LogFrames = stats2d;
+    }
+
     // main RAM only, written straight into the array like the direct boot does
     for (auto& poke : pokes)
         *(u32*)&nds->MainRAM[poke.first & nds->MainRAMMask] = poke.second;
@@ -906,12 +995,22 @@ int main(int argc, char** argv)
     for (u32 frame = 0; frame < frames && !StopRequested; frame++)
     {
         SWILog::SetFrame(frame);
+        CurFrame = frame;
 
         u32 keymask = 0xFFF;
         for (const Tap& tap : taps)
-            if (frame >= tap.Frame && frame < tap.Frame + 6)
+            if (frame >= tap.Frame && frame < tap.Frame + tap.Length)
                 keymask &= ~(1 << tap.Key);
         nds->SetKeyMask(keymask);
+
+        const Touch* touch = nullptr;
+        for (const Touch& t : touches)
+            if (frame >= t.Frame && frame < t.Frame + t.Length)
+                touch = &t;
+        if (touch)
+            nds->TouchScreen(touch->X, touch->Y);
+        else if (!touches.empty())
+            nds->ReleaseScreen();
 
         nds->RunFrame();
 
@@ -964,6 +1063,8 @@ int main(int argc, char** argv)
     }
     if (framelog) fclose(framelog);
     if (scfglog) fclose(scfglog);
+    if (StatsLog) fclose(StatsLog);
+    StatsLog = nullptr;
     nds->Stop();
     if (CoreLog) fclose(CoreLog);
     return 0;

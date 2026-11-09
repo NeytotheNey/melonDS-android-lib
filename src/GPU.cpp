@@ -1471,6 +1471,17 @@ void GPU::MakeVRAMFlat_2DBGCoherent() noexcept
     MakeVRAMFlat_BBGCoherent(bgDirtyB);
     MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirtyB);
     MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirtyB);
+
+    // debug only, see GPU_2DStats.h: which dirty pages really changed
+    if (Stats2D)
+    {
+        Stats2D->NoteCopied(0, GPU2DStats::Flat_BG, VRAMFlat_ABG, bgDirtyA.Data, bgDirtyA.DataLength);
+        Stats2D->NoteCopied(0, GPU2DStats::Flat_BGExtPal, VRAMFlat_ABGExtPal, bgExtPalDirtyA.Data, bgExtPalDirtyA.DataLength);
+        Stats2D->NoteCopied(0, GPU2DStats::Flat_OBJExtPal, VRAMFlat_AOBJExtPal, objExtPalDirtyA.Data, objExtPalDirtyA.DataLength);
+        Stats2D->NoteCopied(1, GPU2DStats::Flat_BG, VRAMFlat_BBG, bgDirtyB.Data, bgDirtyB.DataLength);
+        Stats2D->NoteCopied(1, GPU2DStats::Flat_BGExtPal, VRAMFlat_BBGExtPal, bgExtPalDirtyB.Data, bgExtPalDirtyB.DataLength);
+        Stats2D->NoteCopied(1, GPU2DStats::Flat_OBJExtPal, VRAMFlat_BOBJExtPal, objExtPalDirtyB.Data, objExtPalDirtyB.DataLength);
+    }
 }
 
 void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
@@ -1500,6 +1511,12 @@ void GPU::MakeVRAMFlat_2DOBJCoherent() noexcept
 
     MakeVRAMFlat_AOBJCoherent(objDirtyA);
     MakeVRAMFlat_BOBJCoherent(objDirtyB);
+
+    if (Stats2D)
+    {
+        Stats2D->NoteCopied(0, GPU2DStats::Flat_OBJ, VRAMFlat_AOBJ, objDirtyA.Data, objDirtyA.DataLength);
+        Stats2D->NoteCopied(1, GPU2DStats::Flat_OBJ, VRAMFlat_BOBJ, objDirtyB.Data, objDirtyB.DataLength);
+    }
 }
 
 // threaded 2D

@@ -20,6 +20,7 @@
 #define GPU_2DSTATS_H
 
 #include <chrono>
+#include <memory>
 #include <stdio.h>
 #include <string.h>
 
@@ -86,6 +87,13 @@ namespace melonDS
 //   uptotal all dirty pages of the frame's checks as avg,max KB per frame: BG, OBJ and extended palettes, between
 //           frames and mid-frame. a page dirty at two checks counts twice, as a renderer uploading from
 //           each check would send it twice. it's every check, including those on lines that don't show
+//   dirtymid real: BG, OBJ and extended palette pages dirty at lines 1-191, and of those the ones whose bytes
+//           changed (against a private copy of the flats), as frames with any,avg,max pages per frame. a page
+//           dirty at two lines counts twice. realpal: the same for the two 512-byte standard palette pages,
+//           without the backdrop color
+//   log logev: the page log's size per frame as frames with any,avg,max: distinct pages that really changed
+//           mid-frame (VRAM and palette), and all of their changes (real + realpal). logkb is log in KB.
+//           logboth logbothkb logbothev, on A only: the same for both engines together
 struct GPU2DStats
 {
     enum : u32
@@ -145,7 +153,14 @@ struct GPU2DStats
         Series UploadBG, UploadOBJ;     // in 512-byte pages
         Series BandsVisible;
         Series UploadTotal;             // in 512-byte pages
+        Series Dirty, Real, RealPal, Log, LogEvents, Both, BothEvents;  // pages
     };
+
+    // the flats per engine for real, as 512-byte pages: BG, BG and OBJ extended palettes, OBJ, then the
+    // standard palette's BG and OBJ pages
+    enum : u32 { Flat_BG = 0, Flat_BGExtPal, Flat_OBJExtPal, Flat_OBJ, Flat_Count };
+    static constexpr u32 FlatPages[2][Flat_Count] = {{1024, 64, 16, 512}, {256, 64, 16, 256}};
+    static constexpr u32 PalettePage = 1616, PageWords = (1618 + 63) / 64, ShadowPages = 1616 + 592;
 
     // sets of the visible lines, one bit each
     struct Frame
@@ -155,6 +170,8 @@ struct GPU2DStats
         u64 RotBG[3], RotOBJ[3], Mode1[3];
         u64 Visible[3];     // on, not forced blank and display mode 1
         u32 UploadPages;
+        u32 DirtyPages, RealPages, RealPalPages, LogPages;
+        u64 Logged[PageWords];
     };
 
     struct Engine
@@ -165,16 +182,62 @@ struct GPU2DStats
         u32 BGPages, OBJPages, ExtPages;    // what this line's checks of the flat copies found
         u8 Palette[0x400];      // as of the last line, since PaletteDirty and OAMDirty are never read
         u8 OAM[0x400];
+        u16 PendingBG[1104], PendingOBJ[512];   // pages that really changed at this line's checks
+        u32 NumPendingBG, NumPendingOBJ;
     };
 
     Engine Engines[2] {};
     bool SkipFrame = true;
     s64 LogStartNs = 0;
+    u32 Synced = 0;                 // flats whose private copy is whole, one bit per engine and Flat_
+    std::unique_ptr<u8[]> Shadow;   // the private copy, ShadowPages pages, kept over Reset
+    u32 LogFrames = 0;              // the swi-harness: a line every this many frames, not once a second. kept over Reset
 
     // GPU::Reset and a savestate load
     void Reset() noexcept
     {
+        std::unique_ptr<u8[]> shadow = std::move(Shadow);
+        u32 logFrames = LogFrames;
         *this = GPU2DStats();
+        Shadow = std::move(shadow);
+        LogFrames = logFrames;
+    }
+
+    // after the flat copy: which of the dirty pages really changed. the private copy is taken whole the
+    // first time, then only the dirty pages, and the flats only change at these copies
+    void NoteCopied(u32 num, u32 flat, const u8* data, const u64* bits, u32 words) noexcept
+    {
+        if (!Shadow)
+            Shadow = std::make_unique<u8[]>(ShadowPages * 512);
+        u32 base = 0;
+        for (u32 i = 0; i < flat; i++)
+            base += FlatPages[num][i];
+        u8* shadow = Shadow.get() + ((num ? 1616 : 0) + base) * 512;
+
+        u32 bit = 1u << (num * Flat_Count + flat);
+        if (!(Synced & bit))
+        {
+            memcpy(shadow, data, FlatPages[num][flat] * 512);
+            Synced |= bit;
+            return;
+        }
+
+        Engine& e = Engines[num];
+        for (u32 w = 0; w < words; w++)
+        {
+            for (u64 b = bits[w]; b; b &= b - 1)
+            {
+                u32 offset = (w * 64 + __builtin_ctzll(b)) * 512;
+                if (memcmp(shadow + offset, data + offset, 512) == 0)
+                    continue;
+                memcpy(shadow + offset, data + offset, 512);
+                u16 page = (u16)(base + offset / 512);
+                if (flat == Flat_OBJ)
+                    e.PendingOBJ[e.NumPendingOBJ++] = page;
+                else
+                    e.PendingBG[e.NumPendingBG++] = page;
+            }
+        }
     }
 
     // GPU::MakeVRAMFlat_2DBGCoherent, with the dirty sets it just worked out, which nothing else can get
@@ -208,6 +271,10 @@ struct GPU2DStats
     // GPU::FinishFrame
     void EndFrame() noexcept
     {
+        Period& a = Engines[0].Second;
+        a.Both.Add(Engines[0].Cur.LogPages + Engines[1].Cur.LogPages);
+        a.BothEvents.Add(Engines[0].Cur.RealPages + Engines[0].Cur.RealPalPages
+                         + Engines[1].Cur.RealPages + Engines[1].Cur.RealPalPages);
         for (Engine& e : Engines)
             FinishEngineFrame(e);
 
@@ -219,13 +286,21 @@ struct GPU2DStats
             return;
         }
 
-        s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (LogStartNs == 0)
+        if (LogFrames)
+        {
+            if (Engines[0].Second.Frames < LogFrames)
+                return;
+        }
+        else
+        {
+            s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (LogStartNs == 0)
+                LogStartNs = now;
+            if (now - LogStartNs < 1000000000)
+                return;
             LogStartNs = now;
-        if (now - LogStartNs < 1000000000)
-            return;
-        LogStartNs = now;
+        }
 
         for (u32 num = 0; num < 2; num++)
         {
@@ -241,6 +316,15 @@ private:
         for (u32 i = 0; i < words; i++)
             pages += __builtin_popcountll(bits[i]);
         return pages;
+    }
+
+    // a page that really changed mid-frame, which the page log would keep
+    static void LogPage(Engine& e, u32 page) noexcept
+    {
+        u64 bit = 1ull << (page & 63);
+        if (!(e.Cur.Logged[page >> 6] & bit))
+            e.Cur.LogPages++;
+        e.Cur.Logged[page >> 6] |= bit;
     }
 
     static void SetLine(u64* lines, u32 line) noexcept
@@ -295,9 +379,23 @@ private:
 
         const u8* palette = job.Palette + num * 0x400;
         bool backdrop = memcmp(e.Palette, palette, 2) != 0;
-        bool standard = memcmp(e.Palette + 2, palette + 2, 0x400 - 2) != 0;
+        bool palBG = memcmp(e.Palette + 2, palette + 2, 0x200 - 2) != 0;
+        bool palOBJ = memcmp(e.Palette + 0x200, palette + 0x200, 0x200) != 0;
+        bool standard = palBG || palOBJ;
         if (backdrop || standard)
             memcpy(e.Palette, palette, 0x400);
+
+        if (line != 0)
+        {
+            e.Cur.DirtyPages += e.BGPages + e.ExtPages;
+            e.Cur.RealPages += e.NumPendingBG;
+            e.Cur.RealPalPages += palBG + palOBJ;
+            for (u32 i = 0; i < e.NumPendingBG; i++)
+                LogPage(e, e.PendingBG[i]);
+            if (palBG) LogPage(e, PalettePage);
+            if (palOBJ) LogPage(e, PalettePage + 1);
+        }
+        e.NumPendingBG = 0;
 
         if (line == 0)
         {
@@ -427,6 +525,14 @@ private:
             memcpy(e.OAM, oam, 0x400);
 
         e.Cur.UploadPages += e.OBJPages;
+        if (line != 0)
+        {
+            e.Cur.DirtyPages += e.OBJPages;
+            e.Cur.RealPages += e.NumPendingOBJ;
+            for (u32 i = 0; i < e.NumPendingOBJ; i++)
+                LogPage(e, e.PendingOBJ[i]);
+        }
+        e.NumPendingOBJ = 0;
 
         if (line == 0)
         {
@@ -540,6 +646,11 @@ private:
         }
         s.BandsVisible.Add(bandsVisible);
         s.UploadTotal.Add(f.UploadPages);
+        s.Dirty.Add(f.DirtyPages);
+        s.Real.Add(f.RealPages);
+        s.RealPal.Add(f.RealPalPages);
+        s.Log.Add(f.LogPages);
+        s.LogEvents.Add(f.RealPages + f.RealPalPages);
 
         f = {};
     }
@@ -556,7 +667,7 @@ private:
 
     static void LogPeriod(const Period& s, u32 num) noexcept
     {
-        char text[1000];
+        char text[1400];
         char* p = text;
         const char* end = text + sizeof(text);
         double frames = s.Frames;
@@ -588,6 +699,18 @@ private:
                s.UploadOBJ.Sum * 0.5 / frames, s.UploadOBJ.Max * 0.5);
         appendChange("bandsvis", s.BandsVisible);
         Append(p, end, " uptotal=%.1f,%.1f", s.UploadTotal.Sum * 0.5 / frames, s.UploadTotal.Max * 0.5);
+        appendChange("dirtymid", s.Dirty);
+        appendChange("real", s.Real);
+        appendChange("realpal", s.RealPal);
+        appendChange("log", s.Log);
+        Append(p, end, " logkb=%.1f,%.1f", s.Log.Sum * 0.5 / frames, s.Log.Max * 0.5);
+        appendChange("logev", s.LogEvents);
+        if (!num)
+        {
+            appendChange("logboth", s.Both);
+            Append(p, end, " logbothkb=%.1f,%.1f", s.Both.Sum * 0.5 / frames, s.Both.Max * 0.5);
+            appendChange("logbothev", s.BothEvents);
+        }
 
         Platform::Log(Platform::LogLevel::Info, "GPU2DSTATS %s\n", text);
     }
