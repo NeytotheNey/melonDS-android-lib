@@ -30,6 +30,7 @@
 #include "GPU_OpenGL.h"
 
 #include "GPU3D_TexcacheOpenGL.h"
+#include "GPU3D_ComputeStats.h"
 
 #include "NonStupidBitfield.h"
 
@@ -81,6 +82,13 @@ public:
 
     void Blit(const GPU& gpu) override;
     void Stop(const GPU& gpu) override;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    void BeginGPUTimer(int pass) final { if (Stats) Stats->Begin(pass); }
+    void EndGPUTimer() final { if (Stats) Stats->End(); }
+#endif
+    [[nodiscard]] bool NeedsCaptureRedraw() const noexcept override { return PaceStale; }
+    void RedrawSkippedFrame(GPU& gpu) override;
 
     bool NeedsShaderCompile() override { return ShaderStepIdx != 33; }
     void ShaderCompileStep(int& current, int& count) override;
@@ -187,6 +195,26 @@ private:
     };
 
     int TileSize {};
+    // GPU::ComputeTileSize as of the last RenderFrame (0, 8, 16 or 32), the most threads a work
+    // group can have (a tile's worth rasterises it), and whether the fallback was logged
+    int ForcedTileSize = 0;
+    int MaxGroupThreads = 0;
+    bool TileFallbackLogged = false;
+    int TileSizeFor(int width, int scale, int forced) const noexcept;
+    // GPU::ComputeOpt as of the last RenderFrame, which the shaders are compiled for. it starts at
+    // GPU's default, so only a changed debug switch compiles them twice
+    static constexpr int ComputeOpt_Small = 1 << 3;
+    static constexpr int ComputeOpt_TexSkip = 1 << 4;
+    // a swap that brought the last swap's scene again, with the same registers, counts as an
+    // identical frame (GPU3D::RenderSceneRepeated)
+    static constexpr int ComputeOpt_SwapSkip = 1 << 5;
+    // pacing can leave a render out with HalfCamera on, while it has no in-between frames to make
+    // (HalfCamera::CanSkipRender)
+    static constexpr int ComputeOpt_HalfCamPace = 1 << 6;
+    // the bits that are defines in the shaders
+    static constexpr int ComputeOpt_Shaders = 0xF;
+    static constexpr int ComputeOpt_All = 0x7F;
+    int OptMask = ComputeOpt_All & ~ComputeOpt_SwapSkip;
     static constexpr int CoarseTileCountX = 8;
     int CoarseTileCountY {};
     int CoarseTileArea {};
@@ -279,6 +307,10 @@ private:
 #ifdef MELONADE_DEBUG_TOOLS
     // when RenderFrame last started (ns), for the capture stats
     s64 RenderFrameStartNs = 0;
+    // the COMPTIME and COMPPEAK logs (GPU::ComputeTimers and ComputePeaks). null while both are
+    // off, the default, and then nothing here makes a GL call for them
+    std::unique_ptr<ComputeStats> Stats;
+    void UpdateStats(const GPU& gpu);
 #endif
 
     u32 FramebufferCPU[256*192];
@@ -289,10 +321,60 @@ private:
     int MaxWorkTiles {};
     bool HiresCoordinates {};
     // the next frame is drawn even if it's the same: ResizeTargets made a new, empty Framebuffer,
-    // or the hi-res coordinates setting changed how the polygons are set up
+    // the hi-res coordinates setting changed how the polygons are set up, or a reset emptied the
+    // texture cache
     bool ForceRender = true;
+    // the texture cache was emptied (Reset) and nothing was drawn since, so what the image was
+    // drawn with isn't cached any more. for ComputeOpt_TexSkip
+    bool TexcacheEmptied = false;
+
+    // the COMPWHY log (GPU::ComputeWhy), zeroed with every line: why RenderFrame drew. a render
+    // can have several causes, and Sole counts the ones that had only that one
+    enum
+    {
+        Why_Flush, Why_Regs, Why_HalfCam, Why_Other, Why_TexInval, Why_TexDirty, Why_ClearBitmap,
+        Why_Force, Why_Stale, Why_Count
+    };
+    struct
+    {
+        s64 StartNs = 0;
+        u32 Frames = 0, Extra = 0, Renders = 0, Same = 0, Paced = 0, TexSaved = 0, SwapSaved = 0;
+        u32 FlushSame = 0, Captured = 0;
+        u32 Cause[Why_Count] {}, Sole[Why_Count] {};
+    } WhyLog;
+    // GPU3D::MidScenesSame as of the last COMPWHY line
+    u32 WhyMidSameSeen = 0;
+    void LogWhy(const GPU& gpu) noexcept;
 
     bool ColorDither = false;
+
+    // GPU::ComputePace: a fence for each render the GPU hasn't finished, oldest first. past the
+    // room for them the oldest is forgotten
+    static constexpr int MaxPaceFences = 8;
+    GLsync PaceFences[MaxPaceFences] {};
+    int PaceFenceCount = 0;
+    // the last render was left out for pacing (mode 2), so the image is older than the scene and
+    // the next render isn't skipped as identical. PaceRedraw is set while RedrawSkippedFrame draws
+    // it after all, and PaceRenderNs is when the last render was submitted
+    bool PaceStale = false;
+    bool PaceRedraw = false;
+    s64 PaceRenderNs = 0;
+    // line 0 read the 3D back for a display capture since the last render at line 215
+    bool CapturedSinceRender = false;
+    // the COMPPACE log, zeroed with every line
+    struct
+    {
+        s64 StartNs = 0, WaitNs = 0;
+        u32 Renders = 0, Skipped = 0, Kept = 0, Redraws = 0, Waits = 0, Timeouts = 0;
+        int MaxPending = 0;
+    } PaceLog;
+
+    void ResetPace() noexcept;
+    void DropPaceFences() noexcept;
+    void PopPaceFences(int count) noexcept;
+    void UpdatePace(const GPU& gpu) noexcept;
+    void WaitForPace() noexcept;
+    bool CanSkipForPace(const GPU& gpu, bool keep, bool captured) const noexcept;
 
     int RequestedViewWidth = 256;
     int ViewWidth = 256;

@@ -22,6 +22,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <vector>
 
 #include "Savestate.h"
 #include "FIFO.h"
@@ -196,6 +197,9 @@ public:
     void NoteDisplayCapture(u32 captureCnt) noexcept { if (HalfCam) HalfCam->NoteCapture(captureCnt); }
     [[nodiscard]] bool NeedsRealSceneRedraw() const noexcept { return HalfCam && HalfCam->NeedsRedraw(); }
     void RedrawRealScene(GPU& gpu) noexcept { HalfCam->Redraw(gpu); }
+    // GPU::ComputePace 2: whether leaving this frame's render out can't disturb HalfCamera (see
+    // HalfCamera::CanSkipRender). true without one
+    [[nodiscard]] bool CanHalfCameraSkipRender() const noexcept { return !HalfCam || HalfCam->CanSkipRender(); }
 private:
     friend class HalfCamera;
 
@@ -213,6 +217,20 @@ private:
 
     void UpdateClipMatrix() noexcept;
     void ResetRenderingState() noexcept;
+    // the latched state (the Render fields) was replaced outside of VBlank: by a reset, a loaded
+    // state or the rendering engine going off. the image the renderers hold isn't of it, so the
+    // frame isn't identical until one VBlank has gone by with it (RenderStateReplaced), and the
+    // scene copy of MatchRenderScene isn't the last latched scene any more
+    void MarkRenderStateReplaced() noexcept;
+    bool RenderStateReplaced = true;
+    // line 215 ran since the last VBlank (VCount215). not serialized: a loaded state marks the
+    // latched state replaced anyway, and a wrong value here only costs one render or one match
+    bool RenderedSinceVBlank = false;
+    // MatchRenderScene's copy of the last swap's scene: the view width, the polygon count, then
+    // each polygon's fields and its vertices'. SceneCopy only grows, SceneCopyWords is what's used
+    std::vector<u32> SceneCopy;
+    size_t SceneCopyWords = 0;
+    bool SceneCopyValid = false;
     void AddCycles(s32 num) noexcept;
     void NextVertexSlot() noexcept;
     void StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept;
@@ -377,6 +395,44 @@ public:
     u32 RenderClearAttr2 = 0;
 
     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
+    // debug only, for the compute renderer's COMPWHY log (GPU::ComputeWhy), not serialized: what
+    // the last VBlank found, which is 0 when it left RenderFrameIdentical alone. with
+    // SceneHashLogging a swap also hashes what the renderers draw the scene from, and one that
+    // brought the same scene as the swap before, with the same registers, gets FrameChange_FlushSame
+    enum : u8
+    {
+        FrameChange_Flush = 1 << 0,
+        FrameChange_FlushSame = 1 << 1,
+        FrameChange_Regs = 1 << 2,
+        FrameChange_HalfCam = 1 << 3,
+    };
+    u8 RenderFrameChange = 0;
+    bool SceneHashLogging = false;
+    u64 RenderSceneHash = 0;
+    [[nodiscard]] bool RenderRegsSame() const noexcept;
+    [[nodiscard]] u64 HashRenderScene() const noexcept;
+
+    // the compute renderer's (GPU::ComputeOpt bit 5), not serialized. RenderFrameIdentical is
+    // false for every swap, as upstream has it and as the other renderers count on. with
+    // SceneRepeatCheck, which the compute renderer sets at each RenderFrame and a renderer switch
+    // clears, a swap whose registers are the last latch's also compares its scene with a copy of
+    // the last swap's, by value (MatchRenderScene), and RenderSceneRepeated is set from VBlank to
+    // VBlank when that swap changed nothing a render reads. it then means what
+    // RenderFrameIdentical does, and everything that clears that one outside of VBlank clears both
+    // (MarkRenderFrameChanged)
+    bool SceneRepeatCheck = false;
+    bool RenderSceneRepeated = false;
+    // for the COMPWHY log: HalfCamera's in-between scenes that came out as the real one and
+    // weren't shown (HalfCamera::ShowReplayedScene), since the start
+    u32 MidScenesSame = 0;
+    void MarkRenderFrameChanged() noexcept
+    {
+        RenderFrameIdentical = false;
+        RenderSceneRepeated = false;
+    }
+    // whether RenderPolygonRAM and RenderViewWidth are what the copy has, field by field with the
+    // vertices by value. with save the copy becomes this scene, without it nothing changes
+    bool MatchRenderScene(bool save) noexcept;
     int RenderViewWidth = 256; // the view width RenderPolygonRAM was built for, not serialized either
 
     bool AbortFrame = false;
@@ -497,6 +553,18 @@ public:
     // hi-res display capture (GPU::HiresCapture): whether the GL compositor's capture pass would
     // run with this frame's capture (GLCompositor::RunsHiresCapture). off without a compositor
     [[nodiscard]] virtual bool RunsHiresCapture(int debug) const noexcept { return false; }
+
+    // debug only (GPU::ComputeTimers and ComputeSync): the GL compositor times its passes
+    // (ComputePass) through these, with the compute renderer's timers. a begin ends the pass before it
+    virtual void BeginGPUTimer(int pass) {}
+    virtual void EndGPUTimer() {}
+
+    // GPU::ComputePace 2: the last render was left out to let the GPU catch up, so the 3D image
+    // is older than the scene. GPU then has it drawn after all (RedrawSkippedFrame) at line 0
+    // before a display capture reads it back, and before the 3D state it's drawn from is cleared.
+    // the redraw is the render that was left out: same latched state, same textures
+    [[nodiscard]] virtual bool NeedsCaptureRedraw() const noexcept { return false; }
+    virtual void RedrawSkippedFrame(GPU& gpu) {}
 
 #ifdef MELONADE_DEBUG_TOOLS
     // debug builds only, for the frontend's CAPWAIT log, compute renderer only: summed over the

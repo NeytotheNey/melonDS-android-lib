@@ -30,6 +30,7 @@
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL.h"
+#include "GPU3D_ComputeStats.h"
 #include "GPU_CaptureReads.h"
 #include "GPU_HiresStream.h"
 #include "GPU_Shadow2D.h"
@@ -149,15 +150,7 @@ GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, 256*3 + 1, 192*2, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
 
-    glGenTextures(CompScreenOutputTex.size(), &CompScreenOutputTex[0]);
-    for (GLuint i : CompScreenOutputTex)
-    {
-        glBindTexture(GL_TEXTURE_2D, i);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    }
+    // the output textures are made by PrepareOutput, for the buffers that need one
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
@@ -214,6 +207,9 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     CompVertexArrayID(other.CompVertexArrayID),
     CompScreenInputTex(other.CompScreenInputTex),
     CompScreenOutputTex(other.CompScreenOutputTex),
+    OutputTexW(other.OutputTexW),
+    OutputTexH(other.OutputTexH),
+    OutputExternal(other.OutputExternal),
     CompScreenOutputFB(other.CompScreenOutputFB)
 {
     other.HeldWingsTex = {};
@@ -271,6 +267,9 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
 
         glDeleteTextures(CompScreenOutputTex.size(), &CompScreenOutputTex[0]);
         CompScreenOutputTex = other.CompScreenOutputTex;
+        OutputTexW = other.OutputTexW;
+        OutputTexH = other.OutputTexH;
+        OutputExternal = other.OutputExternal;
 
         glDeleteFramebuffers(CompScreenOutputFB.size(), &CompScreenOutputFB[0]);
         CompScreenOutputFB = other.CompScreenOutputFB;
@@ -385,27 +384,67 @@ void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
     // held wings are only reused at the width and scale they were made at
     ResetWingHold();
 
+    // a frontend's textures are at the old size, so the buffers go back to the compositor's own
+    // until it passes new ones. those are only made, or resized, once a frame is drawn into them
+    // (PrepareOutput)
     for (int i = 0; i < 2; i++)
     {
-        glBindTexture(GL_TEXTURE_2D, CompScreenOutputTex[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        // fill the padding
-        u8* zeroPixels = (u8*) calloc(1, ScreenW*2*scale*4);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192*scale, ScreenW, 2*scale, GL_RGBA, GL_UNSIGNED_BYTE, zeroPixels);
+        if (!OutputExternal[i])
+            continue;
 
-        GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
         glBindFramebuffer(GL_FRAMEBUFFER, CompScreenOutputFB[i]);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CompScreenOutputTex[i], 0);
-        glDrawBuffers(1, fbassign);
-        free(zeroPixels);
+        OutputExternal[i] = false;
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+// before a frame is drawn into a buffer: without a frontend texture (SetOutputTexture) it gets
+// the compositor's own, made here at the output's size, so the framebuffer is complete either way
+void GLCompositor::PrepareOutput(int buf) noexcept
+{
+    if (OutputExternal[buf] || (OutputTexW[buf] == ScreenW && OutputTexH[buf] == ScreenH))
+        return;
+
+    // unit 0 is bound again before anything is drawn (RenderFrame)
+    glActiveTexture(GL_TEXTURE0);
+    if (!CompScreenOutputTex[buf])
+    {
+        glGenTextures(1, &CompScreenOutputTex[buf]);
+        glBindTexture(GL_TEXTURE_2D, CompScreenOutputTex[buf]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    else
+    {
+        glBindTexture(GL_TEXTURE_2D, CompScreenOutputTex[buf]);
+    }
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    // fill the padding
+    u8* zeroPixels = (u8*) calloc(1, ScreenW*2*Scale*4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192*Scale, ScreenW, 2*Scale, GL_RGBA, GL_UNSIGNED_BYTE, zeroPixels);
+    free(zeroPixels);
+
+    GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
+    glBindFramebuffer(GL_FRAMEBUFFER, CompScreenOutputFB[buf]);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CompScreenOutputTex[buf], 0);
+    glDrawBuffers(1, fbassign);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    OutputTexW[buf] = ScreenW;
+    OutputTexH[buf] = ScreenH;
+}
+
 void GLCompositor::Stop(const GPU& gpu) noexcept
 {
-    for (int i = 0; i < 2; i++)
+    // a buffer that was never drawn into has no texture, so there's nothing to clear (and its
+    // framebuffer isn't complete)
+    bool hasOutput = OutputExternal[gpu.FrontBuffer] || CompScreenOutputTex[gpu.FrontBuffer];
+    for (int i = 0; hasOutput && i < 2; i++)
     {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[gpu.FrontBuffer]);
@@ -588,6 +627,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     int backbuf = gpu.FrontBuffer ^ 1;
     bool hasFramebuffers = gpu.Framebuffer[backbuf][0] && gpu.Framebuffer[backbuf][1];
 
+    // nothing to do while the frontend passes its own output texture
+    PrepareOutput(backbuf);
+
     // hi-res capture: a bank written since the last Blit loses its copy. GPU clears the write
     // masks right after this (GPU::HiresCaptureBlitDone), so they're folded in every frame, whether
     // or not a pass runs: otherwise a write in a frame that doesn't capture would be forgotten
@@ -615,7 +657,12 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     bool ctrlCopied = wingHold || hiresDisplay;
 
     // the GPU 2D shadow renderer: which lines it draws, what they read and the OBJ pass, before the
-    // output is bound too (it has targets of its own). its composite pass comes after the draw below
+    // output is bound too (it has targets of its own). its composite pass comes after the draw below.
+    // debug only: with the compute renderer's timers on, everything from here on but the
+    // compositor's own draw is timed as one pass
+    const bool timers = gpu.ComputeTimers || gpu.ComputeSync;
+    if (timers)
+        renderer.BeginGPUTimer(ComputePass::CompExtra);
     int shadowLines = PrepareShadow2D(gpu, backbuf, hasFramebuffers, hiresDisplay, ctrlCopied);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -714,7 +761,11 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
     glBindVertexArray(CompVertexArrayID);
+    if (timers)
+        renderer.BeginGPUTimer(ComputePass::Comp);
     glDrawArrays(GL_TRIANGLES, 0, 4*3);
+    if (timers)
+        renderer.BeginGPUTimer(ComputePass::CompExtra);
 
     // over the draw, before the held wings are copied, so they hold the shadow's 2D too
     if (shadowLines > 0)
@@ -726,6 +777,8 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // after the draw, which shows the copies as they were before this frame's capture
     if (gpu.HiresCapture)
         RunHiresCapture(gpu, backbuf);
+    if (timers)
+        renderer.EndGPUTimer();
     if (gpu.HiresCaptureDebug)
         LogHiresCapture();
     if (gpu.Filter2DLogging)
@@ -2091,10 +2144,22 @@ void GLCompositor::FreeShadow2D() noexcept
 
 void GLCompositor::SetOutputTexture(int buf, GLuint texture)
 {
+    // without a texture the buffer goes back to the compositor's own (see PrepareOutput)
+    OutputExternal[buf] = texture != 0;
+
     GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
     glBindFramebuffer(GL_FRAMEBUFFER, CompScreenOutputFB[buf]);
-    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture, 0);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, OutputExternal[buf] ? texture : CompScreenOutputTex[buf], 0);
     glDrawBuffers(1, fbassign);
+
+    // the buffer's own texture, if a frame had to be drawn into it since the last size change,
+    // isn't needed anymore
+    if (OutputExternal[buf] && CompScreenOutputTex[buf])
+    {
+        glDeleteTextures(1, &CompScreenOutputTex[buf]);
+        CompScreenOutputTex[buf] = 0;
+        OutputTexW[buf] = OutputTexH[buf] = 0;
+    }
 }
 
 void GLCompositor::BindOutputTexture(int buf)

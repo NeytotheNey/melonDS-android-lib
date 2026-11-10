@@ -281,6 +281,7 @@ void HalfCamera::NoteCapture(u32 captureCnt) noexcept
 bool HalfCamera::OnVBlank()
 {
     bool wasMid = IsMidActive || IsMidPictureStale;
+    IsAfterMid = wasMid;
     if (IsMidActive)
         RestoreRealScene();
 
@@ -350,13 +351,12 @@ void HalfCamera::OnSwap()
     if (reason == Reason_None)
     {
         Total.Replays++;
-        if (Replay(current, previous))
-        {
-            ShowReplayedScene();
-            Total.Interpolated++;
-        }
-        else
+        if (!Replay(current, previous))
             reason = Reason_Full;
+        else if (ShowReplayedScene())
+            Total.Interpolated++;
+        else
+            reason = Reason_Still;
 
         if (!IsQuiet)
         {
@@ -1297,7 +1297,8 @@ bool HalfCamera::Replay(const SceneInfo& current, const SceneInfo& previous)
     return shadow.NumPolygons > 0 && !(shadow.DispCnt & (1 << 13));
 }
 
-void HalfCamera::ShowReplayedScene()
+// false when the in-between scene came out as the real one, polygon for polygon, which then stays
+bool HalfCamera::ShowReplayedScene()
 {
     GPU3D& shadow = *Shadow;
 
@@ -1319,8 +1320,25 @@ void HalfCamera::ShowReplayedScene()
         [](const Polygon* a, const Polygon* b) { return a->SortKey < b->SortKey; });
 
     Main.RenderNumPolygons = shadow.NumPolygons;
+
+    // GPU::ComputeOpt bit 5: when this swap's scene was copied (GPU3D::VBlank just did, or the
+    // copy isn't valid), the in-between scene is compared with it. the same list by value draws
+    // the same picture, so the real one is shown: a frame like any other, which can then be left
+    // out as identical, and so can the one after it. anything else is an in-between frame as
+    // before, which is always drawn
+    if (Main.MatchRenderScene(false))
+    {
+        Main.MidScenesSame++;
+        Main.RenderPolygonRAM = RealList;
+        Main.RenderNumPolygons = RealNumPolygons;
+        return false;
+    }
+
+    // the list is no longer the swap's
+    Main.RenderSceneRepeated = false;
     MidNumPolygons = shadow.NumPolygons;
     IsMidActive = true;
+    return true;
 }
 
 void HalfCamera::RestoreRealScene()
@@ -1342,12 +1360,38 @@ void HalfCamera::BeforeRender()
         return;
 
     RestoreRealScene();
-    Main.RenderFrameIdentical = false;
+    Main.MarkRenderFrameChanged();
     FramesSinceCapture = 0;
     Total.CaptureAborted++;
     if (Total.Interpolated)
         Total.Interpolated--;
     Total.Skipped[Reason_Capture]++;
+}
+
+// GPU::ComputePace 2 (GPU::ComputeOpt bit 6): whether the render at line 215 can be left out for
+// pacing. nothing here reads the picture, so what a missing render can break is what's on screen
+// around an in-between frame: the in-between scene itself, the real scene that has to replace it
+// the frame after (or after a load, IsMidPictureStale), and the real scene before it, which the
+// in-between one is halfway from. the first two are this frame's. for the third, an in-between
+// scene needs the swaps on every other frame for 8 VBlanks (Decide), so the frame before one
+// always has 7 of those behind it: while the last 7 VBlanks alternate, nothing is left out, and
+// the picture going into an in-between frame is the scene before it. that also keeps a game that
+// runs at 30 waiting instead of skipping, as before, in-between scenes or not. a game that swaps
+// every frame, or never, can skip as it does without HalfCamera. paused, anything can be left out
+// whatever History says (it keeps running, so the lock can be there the moment it's on again):
+// pausing went through Invalidate and nothing is recorded meanwhile, so the first swap after it
+// has no stream (Analyze, HasStart) and the second has none to go from (Reason_Stream). an
+// in-between scene takes a third, and the frame before that one is no longer paused, so it falls
+// under the rule above
+bool HalfCamera::CanSkipRender() const noexcept
+{
+    if (IsMidActive || IsAfterMid || IsMidPictureStale)
+        return false;
+    if (IsPaused)
+        return true;
+
+    u32 recent = History & (LockMask >> 1);
+    return recent != (LockPattern & (LockMask >> 1)) && recent != ((LockPattern << 1) & (LockMask >> 1));
 }
 
 bool HalfCamera::NeedsRedraw() const noexcept
@@ -1366,14 +1410,14 @@ void HalfCamera::Redraw(GPU& gpu)
         // what's left after a load. a renderer switched since has no such picture
         IsMidPictureStale = false;
         Total.LoadRedrawn++;
-        Main.RenderFrameIdentical = false;
+        Main.MarkRenderFrameChanged();
         if (Main.CurrentRenderer->CanDrawReplayedScene())
             Main.CurrentRenderer->RenderFrame(gpu);
         return;
     }
 
     RestoreRealScene();
-    Main.RenderFrameIdentical = false;
+    Main.MarkRenderFrameChanged();
     FramesSinceCapture = 0;
     Total.CaptureRedrawn++;
     if (Total.Interpolated)
@@ -1388,7 +1432,7 @@ void HalfCamera::Invalidate()
     if (IsMidActive)
     {
         RestoreRealScene();
-        Main.RenderFrameIdentical = false;
+        Main.MarkRenderFrameChanged();
         // the renderer's output can still be the in-between picture, which a capture armed in a loaded
         // state would read back. it isn't drawn here, as this isn't always where GL can be used
         IsMidPictureStale = true;

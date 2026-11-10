@@ -27,6 +27,8 @@
 #include "GPU3D_Soft.h"
 #include "Platform.h"
 #include "GPU3D.h"
+#define XXH_STATIC_LINKING_ONLY
+#include "xxhash/xxhash.h"
 
 namespace melonDS
 {
@@ -172,6 +174,12 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
     CurrentRenderer = std::move(renderer);
     CurrentRenderer->Reset(NDS.GPU);
 
+    // the compute renderer's, which sets them again at its first RenderFrame. left on, the other
+    // renderers would hash and copy every scene for nothing
+    SceneHashLogging = false;
+    SceneRepeatCheck = false;
+    SceneCopyValid = false;
+
     // software only does 256, so don't keep squeezing geometry for it
     ViewWidth = RendererViewWidth();
 }
@@ -213,6 +221,13 @@ void GPU3D::ResetRenderingState() noexcept
 
     RenderClearAttr1 = 0x3F000000;
     RenderClearAttr2 = 0x00007FFF;
+}
+
+void GPU3D::MarkRenderStateReplaced() noexcept
+{
+    MarkRenderFrameChanged();
+    RenderStateReplaced = true;
+    SceneCopyValid = false;
 }
 
 void GPU3D::Reset() noexcept
@@ -287,6 +302,7 @@ void GPU3D::Reset() noexcept
     ClearAttr2 = 0x00007FFF;
 
     ResetRenderingState();
+    MarkRenderStateReplaced();
 
     AbortFrame = false;
 
@@ -631,6 +647,10 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->Var32(&TexParam);
     file->Var32(&TexPalette);
     RenderFrameIdentical = false;
+    // the state's scene isn't the one the renderers drew. the first VBlank would otherwise call a
+    // frame without a swap identical, going by the state's registers alone
+    if (!file->Saving)
+        MarkRenderStateReplaced();
     if (softRenderer && softRenderer->IsThreaded())
     {
         softRenderer->EnableRenderThread();
@@ -641,6 +661,12 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
 void GPU3D::SetEnabled(bool geometry, bool rendering) noexcept
 {
+    // the rendering engine going off empties the scene the last image was drawn from, so that
+    // image can't stand as identical: the empty scene is drawn once (see VBlank). only then, as
+    // every POWCNT1 write gets here and with the engine already off nothing changes
+    if (!rendering && RenderingEnabled)
+        MarkRenderStateReplaced();
+
     GeometryEnabled = geometry;
     RenderingEnabled = rendering;
 
@@ -2750,6 +2776,173 @@ bool YSort(Polygon* a, Polygon* b)
     return a->SortKey < b->SortKey;
 }
 
+// whether the registers a render reads are the ones the last render was latched with
+bool GPU3D::RenderRegsSame() const noexcept
+{
+    return RenderDispCnt == DispCnt
+        && RenderAlphaRef == AlphaRef
+        && RenderClearAttr1 == ClearAttr1
+        && RenderClearAttr2 == ClearAttr2
+        && RenderFogColor == FogColor
+        && RenderFogOffset == FogOffset * 0x200
+        && memcmp(RenderEdgeTable, EdgeTable, 8*2) == 0
+        && memcmp(RenderFogDensityTable + 1, FogDensityTable, 32) == 0
+        && memcmp(RenderToonTable, ToonTable, 32*2) == 0
+        // what VBlank derives from those. they only differ if something else wrote the Render fields
+        && RenderFogShift == ((DispCnt >> 8) & 0xF)
+        && RenderFogDensityTable[0] == FogDensityTable[0]
+        && RenderFogDensityTable[33] == FogDensityTable[31];
+}
+
+// GPU::ComputeOpt bit 5 (SceneRepeatCheck): compares the scene the renderers are about to draw
+// with the copy of the last swap's, and with save makes it the copy. everything a renderer can
+// read of a scene is in it: the view width, the polygon count, and for each polygon in list order
+// every field of Polygon and, for each of its vertices, every field of Vertex. by value and field
+// by field, as the two RAM banks take turns (so the pointers always differ) and the structs have
+// padding. vertices past NumVertices and polygons past the count aren't read by anything
+bool GPU3D::MatchRenderScene(bool save) noexcept
+{
+    // a field added to either struct has to be added below
+    static_assert(sizeof(Vertex) == 64, "MatchRenderScene compares every field of Vertex");
+    static_assert(sizeof(void*) != 8 || sizeof(Polygon) == 224, "MatchRenderScene compares every field of Polygon");
+    constexpr u32 PolygonWords = 13, VertexWords = 19;
+
+    u32 item[PolygonWords + 10 * VertexWords];
+    bool same = SceneCopyValid;
+    const size_t oldWords = SceneCopyWords;
+    size_t pos = 0;
+
+    if (!save && !same)
+        return false;
+
+    // compares up to the first difference, and with save writes from there on
+    auto put = [&](u32 count)
+    {
+        if (same && (pos + count > oldWords || memcmp(&SceneCopy[pos], item, count * sizeof(u32)) != 0))
+            same = false;
+        if (save && !same)
+        {
+            if (SceneCopy.size() < pos + count)
+                SceneCopy.resize(std::max<size_t>({pos + count, SceneCopy.size() * 2, 16384}));
+            memcpy(&SceneCopy[pos], item, count * sizeof(u32));
+        }
+        pos += count;
+    };
+
+    item[0] = (u32)RenderViewWidth;
+    item[1] = RenderNumPolygons;
+    put(2);
+
+    for (u32 i = 0; i < RenderNumPolygons && (save || same); i++)
+    {
+        const Polygon* poly = RenderPolygonRAM[i];
+        u32 numVertices = std::min<u32>(poly->NumVertices, 10);
+        u32* out = item;
+
+        *out++ = poly->NumVertices;
+        *out++ = (poly->WBuffer ? 1 : 0) | (poly->Degenerate ? 2 : 0) | (poly->FacingView ? 4 : 0)
+            | (poly->Translucent ? 8 : 0) | (poly->IsShadowMask ? 16 : 0) | (poly->IsShadow ? 32 : 0);
+        *out++ = poly->Attr;
+        *out++ = poly->TexParam;
+        *out++ = poly->TexPalette;
+        *out++ = (u32)poly->Type;
+        *out++ = poly->VTop;
+        *out++ = poly->VBottom;
+        *out++ = (u32)poly->YTop;
+        *out++ = (u32)poly->YBottom;
+        *out++ = (u32)poly->XTop;
+        *out++ = (u32)poly->XBottom;
+        *out++ = poly->SortKey;
+
+        for (u32 j = 0; j < numVertices; j++)
+        {
+            const Vertex* vertex = poly->Vertices[j];
+            *out++ = (u32)poly->FinalZ[j];
+            *out++ = (u32)poly->FinalW[j];
+            *out++ = (u32)vertex->Position[0];
+            *out++ = (u32)vertex->Position[1];
+            *out++ = (u32)vertex->Position[2];
+            *out++ = (u32)vertex->Position[3];
+            *out++ = (u32)vertex->Color[0];
+            *out++ = (u32)vertex->Color[1];
+            *out++ = (u32)vertex->Color[2];
+            *out++ = (u32)(s32)vertex->TexCoords[0];
+            *out++ = (u32)(s32)vertex->TexCoords[1];
+            *out++ = vertex->Clipped ? 1 : 0;
+            *out++ = (u32)vertex->FinalPosition[0];
+            *out++ = (u32)vertex->FinalPosition[1];
+            *out++ = (u32)vertex->FinalColor[0];
+            *out++ = (u32)vertex->FinalColor[1];
+            *out++ = (u32)vertex->FinalColor[2];
+            *out++ = (u32)vertex->HiresPosition[0];
+            *out++ = (u32)vertex->HiresPosition[1];
+        }
+
+        put((u32)(out - item));
+    }
+
+    // a shorter scene that matches the start of the copy isn't the same either
+    same = same && pos == oldWords;
+    if (save)
+    {
+        SceneCopyWords = pos;
+        SceneCopyValid = true;
+    }
+    return same;
+}
+
+// debug only (SceneHashLogging): a hash of the sorted polygons and their vertices as the renderers
+// read them, by value, as the two RAM banks take turns
+u64 GPU3D::HashRenderScene() const noexcept
+{
+    struct
+    {
+        u32 NumVertices, Attr, TexParam, TexPalette, VTop, VBottom, SortKey;
+        s32 YTop, YBottom, XTop, XBottom, Type;
+        u32 Flags;
+        s32 FinalZ[10], FinalW[10];
+        s32 Position[10][2], HiresPosition[10][2], Color[10][3], TexCoords[10][2];
+    } item;
+
+    u64 hash = XXH64(&RenderNumPolygons, sizeof(RenderNumPolygons), (u64)(u32)RenderViewWidth ^ ((u64)FlushAttributes << 32));
+    for (u32 i = 0; i < RenderNumPolygons; i++)
+    {
+        const Polygon* poly = RenderPolygonRAM[i];
+        memset(&item, 0, sizeof(item));
+        item.NumVertices = poly->NumVertices;
+        item.Attr = poly->Attr;
+        item.TexParam = poly->TexParam;
+        item.TexPalette = poly->TexPalette;
+        item.VTop = poly->VTop;
+        item.VBottom = poly->VBottom;
+        item.SortKey = poly->SortKey;
+        item.YTop = poly->YTop;
+        item.YBottom = poly->YBottom;
+        item.XTop = poly->XTop;
+        item.XBottom = poly->XBottom;
+        item.Type = poly->Type;
+        item.Flags = (poly->WBuffer ? 1 : 0) | (poly->Degenerate ? 2 : 0) | (poly->FacingView ? 4 : 0)
+            | (poly->Translucent ? 8 : 0) | (poly->IsShadowMask ? 16 : 0) | (poly->IsShadow ? 32 : 0);
+        for (u32 j = 0; j < poly->NumVertices && j < 10; j++)
+        {
+            const Vertex* vertex = poly->Vertices[j];
+            item.FinalZ[j] = poly->FinalZ[j];
+            item.FinalW[j] = poly->FinalW[j];
+            item.Position[j][0] = vertex->FinalPosition[0];
+            item.Position[j][1] = vertex->FinalPosition[1];
+            item.HiresPosition[j][0] = vertex->HiresPosition[0];
+            item.HiresPosition[j][1] = vertex->HiresPosition[1];
+            item.Color[j][0] = vertex->FinalColor[0];
+            item.Color[j][1] = vertex->FinalColor[1];
+            item.Color[j][2] = vertex->FinalColor[2];
+            item.TexCoords[j][0] = vertex->TexCoords[0];
+            item.TexCoords[j][1] = vertex->TexCoords[1];
+        }
+        hash = XXH64(&item, sizeof(item), hash);
+    }
+    return hash;
+}
+
 void GPU3D::VBlank() noexcept
 {
     if (VertexIdLog) VertexIdLog->OnVBlank();
@@ -2757,6 +2950,30 @@ void GPU3D::VBlank() noexcept
 
     // the in-between scene was last frame's, this one draws the scene itself unless a new one replaces it
     bool isAfterMidScene = HalfCam && HalfCam->OnVBlank();
+    RenderFrameChange = 0;
+    RenderSceneRepeated = false;
+
+    // a VCOUNT write can jump past line 215 or back below 192, and then nothing was asked to draw
+    // what the last VBlank latched: the image is older than that, as after a replaced state, and
+    // the scene copy is of a swap no render saw. normally line 215 runs between any two VBlanks
+    if (!RenderedSinceVBlank)
+    {
+        RenderStateReplaced = true;
+        SceneCopyValid = false;
+    }
+    RenderedSinceVBlank = false;
+
+    // the latched state was replaced since the last VBlank (MarkRenderStateReplaced), so whatever
+    // this one finds, the frame isn't the last one again
+    bool wasReplaced = RenderStateReplaced;
+    RenderStateReplaced = false;
+
+    // nothing is latched below while either engine is off, so the frame is drawn from the same
+    // state as the last one. it used to leave the flag as it was, which kept an old image up when
+    // the rendering engine went off after an identical frame, and drew every frame of a game that
+    // never turns it on
+    if (!GeometryEnabled || !RenderingEnabled)
+        RenderFrameIdentical = !wasReplaced;
 
     if (GeometryEnabled)
     {
@@ -2788,18 +3005,31 @@ void GPU3D::VBlank() noexcept
                 RenderNumPolygons = NumPolygons;
                 RenderViewWidth = ViewWidth;
                 RenderFrameIdentical = false;
+
+                // SceneRepeatCheck: the swap is the only thing in the way of an identical frame
+                // when the registers are the last latch's and the scene is the last swap's again.
+                // the copy is only kept up while that can be: after a swap with other registers,
+                // or one that wasn't looked at, the next one has nothing to match
+                if (SceneRepeatCheck && RenderRegsSame())
+                    RenderSceneRepeated = MatchRenderScene(true);
+                else
+                    SceneCopyValid = false;
+
+                RenderFrameChange = FrameChange_Flush;
+                if (SceneHashLogging)
+                {
+                    u64 hash = HashRenderScene();
+                    if (hash == RenderSceneHash && RenderRegsSame())
+                        RenderFrameChange |= FrameChange_FlushSame;
+                    RenderSceneHash = hash;
+                }
             }
             else
             {
-                RenderFrameIdentical = RenderDispCnt == DispCnt
-                    && RenderAlphaRef == AlphaRef
-                    && RenderClearAttr1 == ClearAttr1
-                    && RenderClearAttr2 == ClearAttr2
-                    && RenderFogColor == FogColor
-                    && RenderFogOffset == FogOffset * 0x200
-                    && memcmp(RenderEdgeTable, EdgeTable, 8*2) == 0
-                    && memcmp(RenderFogDensityTable + 1, FogDensityTable, 32) == 0
-                    && memcmp(RenderToonTable, ToonTable, 32*2) == 0;
+                bool regsSame = RenderRegsSame();
+                RenderFrameIdentical = regsSame && !wasReplaced;
+                if (!regsSame)
+                    RenderFrameChange = FrameChange_Regs;
             }
 
             RenderDispCnt = DispCnt;
@@ -2851,13 +3081,19 @@ void GPU3D::VBlank() noexcept
 
     // the renderers skip a frame that's the same as the last one, which would keep the in-between scene up
     if (isAfterMidScene)
-        RenderFrameIdentical = false;
+    {
+        MarkRenderFrameChanged();
+        RenderFrameChange |= FrameChange_HalfCam;
+    }
 }
 
 void GPU3D::VCount215(GPU& gpu) noexcept
 {
     if (HalfCam) HalfCam->BeforeRender();
 
+    // the renderer was given what the last VBlank latched (see VBlank). what it does with it, it
+    // keeps track of itself
+    RenderedSinceVBlank = true;
     CurrentRenderer->RenderFrame(gpu);
 }
 
