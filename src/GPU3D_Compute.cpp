@@ -637,11 +637,11 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
 
     MaxWorkTiles = TilesPerLine*TileLines*16;
 
-    for (int i = 0; i < tilememoryLayer_Num; i++)
-    {
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, TileMemory[i]);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, 4*TileSize*TileSize*MaxWorkTiles, nullptr, GL_DYNAMIC_DRAW);
-    }
+    // the tile memory starts at 6 of the 16 layers a tile has room for and grows from there
+    // (GrowWorkBuffers). White 2's overworld used 29k and NSMB's map 40k work tiles at 4x, and the
+    // CPU's bound ran 1.8 times what binning used on White 2's title, so 6 (74k at 4x) should hold
+    // both without growing. the title grows once or twice
+    AllocTileMemory(TilesPerLine*TileLines*6);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, FinalTileMemory);
     glBufferData(GL_SHADER_STORAGE_BUFFER, 4*3*2*ScreenWidth*ScreenHeight, nullptr, GL_DYNAMIC_DRAW);
@@ -680,14 +680,81 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     int maxYSpanIndices = 64*2048 * ScaleFactor;
     YSpanIndices.resize(maxYSpanIndices);
 
+    // the GPU's copies of those start at a 16th, 33k spans at 4x, where the overworld and the map
+    // used 18k and 20k. the polygon setup still stops at maxYSpanIndices, as it always has
+    AllocXSpans(maxYSpanIndices / 16);
+}
+
+// the tile memory layers, with room for this many work tiles. glBufferData orphans the old
+// storage, so a render still in flight keeps what it was bound to. nothing is kept from one render
+// to the next in them: Rasterise writes the work tiles that DepthBlend then reads
+void ComputeRenderer::AllocTileMemory(int workTiles)
+{
+    WorkTileRoom = workTiles;
+    for (int i = 0; i < tilememoryLayer_Num; i++)
+    {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, TileMemory[i]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)4*TileSize*TileSize*workTiles, nullptr, GL_DYNAMIC_DRAW);
+    }
+}
+
+// the X spans and the setup indices they're made from, one each per span. the texture buffer
+// is pointed at the setup indices' new storage again, in case a driver keeps the old size
+void ComputeRenderer::AllocXSpans(int spans)
+{
+    XSpanRoom = spans;
     glBindBuffer(GL_TEXTURE_BUFFER, YSpanIndicesTextureMemory);
-    glBufferData(GL_TEXTURE_BUFFER, maxYSpanIndices*2*4, nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_TEXTURE_BUFFER, (GLsizeiptr)spans*2*4, nullptr, GL_DYNAMIC_DRAW);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, XSpanSetupMemory);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(SpanSetupX)*maxYSpanIndices, nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)sizeof(SpanSetupX)*spans, nullptr, GL_DYNAMIC_DRAW);
 
     glBindTexture(GL_TEXTURE_BUFFER, YSpanIndicesTexture);
     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA16UI, YSpanIndicesTextureMemory);
+}
+
+// GPU::ComputeGrow, before a frame's dispatches: makes room for the work tiles and spans it could
+// need, from what the CPU set up, so nothing a frame draws depends on the room. binning makes at
+// most workTiles (RenderFrame's totalTileBound), as a polygon is only binned to a tile its x-spans
+// reach and InterpXSpans clamps those to their y-span's XMin and XMax, which lie inside the
+// polygon's XMin and XMax that the bound's tiles cover. so Rasterise never writes past the room, and the MaxWorkTiles clamp in the shaders stays
+// what it was. InterpXSpans runs whole groups of 32, which the room's step keeps inside. a buffer
+// that grows gets a quarter more than asked, rounded up to the step, so a scene settles after a
+// grow or two, and it never shrinks until the targets change
+void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
+{
+    auto roomFor = [](u32 need, int step, int max)
+    {
+        s64 room = (s64)need + need / 4;
+        room = (room + step - 1) / step * step;
+        return (int)std::min(room, (s64)max);
+    };
+
+    // binning stops at MaxWorkTiles, the most there is room for
+    u32 workNeed = std::min(workTiles, (u32)MaxWorkTiles);
+    if (workNeed > (u32)WorkTileRoom)
+    {
+        // a step is a layer: one work tile for every tile
+        int room = roomFor(workNeed, TilesPerLine*TileLines, MaxWorkTiles);
+#ifdef MELONADE_DEBUG_TOOLS
+        Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d\n",
+            WorkTileRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize);
+#endif
+        AllocTileMemory(room);
+    }
+
+    int maxSpans = (int)YSpanIndices.size();
+    spans = std::min(spans, (u32)maxSpans);
+    if (spans > (u32)XSpanRoom)
+    {
+        // a 64th of the most, a multiple of 32
+        int room = roomFor(spans, maxSpans / 64, maxSpans);
+#ifdef MELONADE_DEBUG_TOOLS
+        Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d\n",
+            XSpanRoom, room, maxSpans, spans, ScaleFactor);
+#endif
+        AllocXSpans(room);
+    }
 }
 
 void ComputeRenderer::VCount144(GPU& gpu)
@@ -946,8 +1013,8 @@ void ComputeRenderer::UpdateStats(const GPU& gpu)
         Stats = std::make_unique<ComputeStats>(timers, peaks, sync);
     }
 
-    Stats->FrameStart(RenderFrameStartNs, ScaleFactor, TileSize, (u32)MaxWorkTiles, (u32)YSpanIndices.size(),
-        (u32)MaxYSpanSetups, (u32)MaxVariants);
+    Stats->FrameStart(RenderFrameStartNs, ScaleFactor, TileSize, (u32)MaxWorkTiles, (u32)WorkTileRoom,
+        (u32)YSpanIndices.size(), (u32)XSpanRoom, (u32)MaxYSpanSetups, (u32)MaxVariants);
 }
 #endif
 
@@ -1363,8 +1430,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     u32 numVariants = 0, prevVariant, prevTexLayer;
     Variant variants[MaxVariants];
     // for the direct dispatches: how many tiles each variant's polygons could be binned to, from
-    // their bounding boxes. binning normally makes no more work than this, and if it does the shaders
-    // loop over the rest, so it only decides how many work groups are launched
+    // their bounding boxes. binning makes no more work than this (see GrowWorkBuffers), which also
+    // sizes the tile memory by it. the shaders would still loop over any more, so for the
+    // dispatches it only decides how many work groups are launched
     u32 variantTileBound[MaxVariants];
     u32 totalTileBound = 0;
 
@@ -1625,6 +1693,14 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     if (numYSpans > 0)
     {
+        // before anything is uploaded or bound: the tile memory and the X spans get room for what
+        // this frame could need. with GPU::ComputeGrow off they take the most at the first frame
+        // with polygons, as before
+        if (gpu.ComputeGrow)
+            GrowWorkBuffers(totalTileBound, (u32)numSetupIndices);
+        else
+            GrowWorkBuffers((u32)MaxWorkTiles, (u32)maxSetupIndices);
+
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, YSpanSetupMemory);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(SpanSetupY)*numYSpans, YSpanSetups);
 
@@ -1912,7 +1988,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
                 }
                 glBindBuffer(GL_COPY_READ_BUFFER, 0);
             }
-            Stats->NoteWorkTiles(wanted, (u32)MaxWorkTiles);
+            Stats->NoteWorkTiles(wanted, (u32)MaxWorkTiles, (u32)WorkTileRoom, totalTileBound);
         }
     }
 #endif
