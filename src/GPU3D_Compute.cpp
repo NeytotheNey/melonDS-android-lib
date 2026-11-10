@@ -70,6 +70,17 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
         shaderName += define;
         shaderName += ',';
     }
+    // GPU::ComputeOpt: a define for each bit. with none of them the source is what it was
+    static const char* const optDefines[] = {"OptLinearNoDivide", "OptFieldLoads", "OptSecondLayer", "OptSmall"};
+    for (int bit = 0; bit < 4; bit++)
+    {
+        if (OptMask & (1 << bit))
+        {
+            shaderSource += "#define ";
+            shaderSource += optDefines[bit];
+            shaderSource += '\n';
+        }
+    }
     shaderSource += "#define ScreenWidth ";
     shaderSource += std::to_string(ScreenWidth);
     shaderSource += "\n#define ScreenHeight ";
@@ -243,6 +254,10 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     GLint64 maxBufferSize = 0;
     glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBufferSize);
     result->MaxBufferSize = maxBufferSize;
+    // for a forced tile size (TileSizeFor)
+    GLint maxGroupThreads = 0;
+    glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &maxGroupThreads);
+    result->MaxGroupThreads = maxGroupThreads;
 
     //glDebugMessageCallback(blah, NULL);
     //glEnable(GL_DEBUG_OUTPUT);
@@ -307,6 +322,11 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
 
 ComputeRenderer::~ComputeRenderer()
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    // its queries, while the context is still current
+    Stats.reset();
+#endif
+    DropPaceFences();
     Texcache.Reset();
 
     // On Adreno, deleting a buffer doesn't give its memory back right away: the driver keeps the
@@ -417,6 +437,10 @@ void ComputeRenderer::DeleteShaders()
 void ComputeRenderer::Reset(GPU& gpu)
 {
     Texcache.Reset();
+    TexcacheEmptied = true;
+    // what the image was drawn with is gone, so the next frame is drawn whatever GPU3D says of it.
+    // it used to take the caller dirtying all of VRAM after this to get there (TexcacheEmptied)
+    ForceRender = true;
     // held WideMelon wings and hi-res capture copies belong to the old scene, and so does the
     // filtered 2D map
     CurGLCompositor.ResetWingHold();
@@ -424,6 +448,8 @@ void ComputeRenderer::Reset(GPU& gpu)
     CurGLCompositor.ResetFilter2D();
     ClearBitmapDirty = 0x3;
     DropEarlyCapture();
+    DropPaceFences();
+    ResetPace();
 }
 
 void ComputeRenderer::SavestateLoaded()
@@ -433,6 +459,7 @@ void ComputeRenderer::SavestateLoaded()
     CurGLCompositor.ResetFilter2D();
     // line 0 reads the low res image back again, as it did before the early readback
     DropEarlyCapture();
+    ResetPace();
 }
 
 // the tile size for a scale: starting at 4.5x it doubles every time the scale doubles
@@ -459,6 +486,30 @@ static int InternalWidthFor(int width, int scale, int tileSize)
     return width;
 }
 
+// debug.melonade.computetile: the size it forces, 0 for none
+static int ForcedTileSizeOf(const GPU& gpu)
+{
+    int size = gpu.ComputeTileSize;
+    return (size == 8 || size == 16 || size == 32) ? size : 0;
+}
+
+// the tile size of a target: the one the scale picks, or the forced one where that can work. a
+// work group rasterises a tile with a thread per pixel, and the work tiles have to fit SortWork's
+// dispatch and the WorkDescs (see TargetFits). the rest follows from the size: the coarse tiles
+// divide 192 lines at any scale for all three sizes, and InternalWidthFor rounds the width up
+int ComputeRenderer::TileSizeFor(int width, int scale, int forced) const noexcept
+{
+    int tileSize = TileSizeForScale(scale);
+    if (forced == 0 || forced == tileSize)
+        return tileSize;
+    if (MaxGroupThreads > 0 && forced * forced > MaxGroupThreads)
+        return tileSize;
+
+    s64 screenW = (s64)InternalWidthFor(width, scale, forced) * scale;
+    s64 maxWorkTiles = (screenW / forced) * (192 * scale / forced) * 16;
+    return maxWorkTiles <= 65535 * 32 ? forced : tileSize;
+}
+
 bool ComputeRenderer::TargetFits(int width, int scale) const noexcept
 {
     if (width == WideMelon::NativeWidth)
@@ -468,7 +519,7 @@ bool ComputeRenderer::TargetFits(int width, int scale) const noexcept
 
     // the biggest work buffer is a tile memory layer: 4*TileSize^2 bytes for each of the
     // MaxWorkTiles (16 per tile), so 64 bytes per pixel of the rounded up target
-    int tileSize = TileSizeForScale(scale);
+    int tileSize = TileSizeFor(width, scale, ForcedTileSize);
     s64 screenW = (s64)InternalWidthFor(width, scale, tileSize) * scale;
     s64 largestBuffer = 64 * screenW * (192 * scale);
 
@@ -560,7 +611,13 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     TargetWidth = targetWidth;
     ScreenHeight = 192 * ScaleFactor;
 
-    TileSize = TileSizeForScale(ScaleFactor);
+    TileSize = TileSizeFor(TargetWidth, ScaleFactor, ForcedTileSize);
+    if (ForcedTileSize != 0 && TileSize != ForcedTileSize && !TileFallbackLogged)
+    {
+        TileFallbackLogged = true;
+        Platform::Log(Platform::LogLevel::Warn, "Compute: %d px tiles can't work at %dx%d (%d threads a group at most), using %d px\n",
+            ForcedTileSize, TargetWidth, ScaleFactor, MaxGroupThreads, TileSize);
+    }
 
     std::printf("Scale: %d\n", ScaleFactor);
     std::printf("TileSize: %d\n", TileSize);
@@ -607,6 +664,7 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     glDeleteTextures(1, &SpareFramebuffer);
     KeptFramebuffer = SpareFramebuffer = 0;
     DropEarlyCapture();
+    DropPaceFences();
 
     if (Framebuffer != 0)
         glDeleteTextures(1, &Framebuffer);
@@ -871,12 +929,226 @@ s32 ComputeRenderer::WideVertexX(s32 hiresx) const
     return HiresCoordinates ? (x * ScaleFactor) >> 4 : (x >> 4) * ScaleFactor;
 }
 
+#ifdef MELONADE_DEBUG_TOOLS
+// debug.melonade.computetimers, computepeaks and computesync, at the start of every RenderFrame:
+// makes the stats when a switch is on (again if one changed), drops them when all are off, and lets
+// them read the finished queries and log. computesync turns the other two off
+void ComputeRenderer::UpdateStats(const GPU& gpu)
+{
+    bool sync = gpu.ComputeSync;
+    bool timers = gpu.ComputeTimers && !sync;
+    bool peaks = gpu.ComputePeaks && !sync;
+    if (!Stats || Stats->WantTimers != timers || Stats->WantPeaks != peaks || Stats->Sync != sync)
+    {
+        Stats.reset();
+        if (!timers && !peaks && !sync)
+            return;
+        Stats = std::make_unique<ComputeStats>(timers, peaks, sync);
+    }
+
+    Stats->FrameStart(RenderFrameStartNs, ScaleFactor, TileSize, (u32)MaxWorkTiles, (u32)YSpanIndices.size(),
+        (u32)MaxYSpanSetups, (u32)MaxVariants);
+}
+#endif
+
+void ComputeRenderer::DropPaceFences() noexcept
+{
+    for (int i = 0; i < PaceFenceCount; i++)
+        glDeleteSync(PaceFences[i]);
+    PaceFenceCount = 0;
+}
+
+// the oldest count fences are done with
+void ComputeRenderer::PopPaceFences(int count) noexcept
+{
+    for (int i = 0; i < count; i++)
+        glDeleteSync(PaceFences[i]);
+    PaceFenceCount -= count;
+    std::copy(PaceFences + count, PaceFences + count + PaceFenceCount, PaceFences);
+}
+
+// GPU::ComputePace, at the start of every RenderFrame: drops the fences of the renders the GPU has
+// finished, which leaves one for each that's still unfinished, and logs once a second. the GPU
+// runs them in order, so it stops at the first that isn't done. the polls don't flush: every fence
+// was flushed when it was made (see RenderFrame). a poll that fails counts as done, so it can't
+// get stuck
+void ComputeRenderer::UpdatePace(const GPU& gpu) noexcept
+{
+    if (gpu.ComputePace == 0)
+    {
+        DropPaceFences();
+        return;
+    }
+
+    int done = 0;
+    while (done < PaceFenceCount && glClientWaitSync(PaceFences[done], 0, 0) != GL_TIMEOUT_EXPIRED)
+        done++;
+    PopPaceFences(done);
+    PaceLog.MaxPending = std::max(PaceLog.MaxPending, PaceFenceCount);
+
+    // debug only (debug.melonade.computepace), once a second: renders were submitted, skipped were
+    // left out for pacing, kept had two or more unfinished renders ahead and couldn't be left out
+    // (mode 2, they wait instead), redraws are skipped renders drawn after all (RedrawSkippedFrame).
+    // waits and timeouts count the waits and the ones that gave up
+    if (!gpu.ComputePaceLog)
+        return;
+    s64 now = SteadyNowNs();
+    if (PaceLog.StartNs == 0)
+        PaceLog.StartNs = now;
+    if (now - PaceLog.StartNs >= 1000000000)
+    {
+        Platform::Log(Platform::LogLevel::Info, "COMPPACE mode=%d renders=%u skipped=%u kept=%u redraws=%u waits=%u "
+            "wait_ms=%.1f timeouts=%u maxpending=%d\n",
+            gpu.ComputePace, PaceLog.Renders, PaceLog.Skipped, PaceLog.Kept, PaceLog.Redraws, PaceLog.Waits,
+            PaceLog.WaitNs / 1e6, PaceLog.Timeouts, PaceLog.MaxPending);
+        PaceLog = {};
+        PaceLog.StartNs = now;
+    }
+}
+
+// GPU::ComputePace: holds the emulator thread until at most one earlier render is unfinished. like
+// GetLine's wait for the capture readback, it polls and yields for up to GPU::CaptureSpinUs first, so
+// the thread's clock doesn't drop over a short wait, and only sleeps in the driver for what's left
+// of a longer one. 100 ms at most in all, so a fence that never signals can't hang the thread. the
+// fences were flushed when they were made, so the polls don't flush
+void ComputeRenderer::WaitForPace() noexcept
+{
+    s64 start = SteadyNowNs();
+    s64 spinEnd = start + (s64)CaptureSpinUs * 1000;
+    s64 deadline = start + 100000000;
+    PaceLog.Waits++;
+    while (PaceFenceCount > 1)
+    {
+        s64 now = SteadyNowNs();
+        if (now >= deadline)
+        {
+            PaceLog.Timeouts++;
+            break;
+        }
+
+        bool spin = now < spinEnd;
+        if (glClientWaitSync(PaceFences[0], 0, spin ? 0 : (GLuint64)(deadline - now)) != GL_TIMEOUT_EXPIRED)
+            PopPaceFences(1);
+        else if (spin)
+            std::this_thread::yield();
+    }
+    PaceLog.WaitNs += SteadyNowNs() - start;
+}
+
+// debug only (debug.melonade.computewhy), once a second, from RenderFrame:
+//   frames extra   RenderFrame calls at line 215, and the others (redraws for a capture, HalfCamera)
+//   renders        calls that drew
+//   same           calls left out as identical to the image
+//   paced          calls left out for pacing (GPU::ComputePace 2)
+//   texsaved       of same, the ones where texture or palette VRAM was written (ComputeOpt_TexSkip)
+//   swapsaved      of same, the ones with a swap, whose scene and registers were the last swap's
+//                  again (ComputeOpt_SwapSkip). with HalfCamera that's also the swaps whose
+//                  in-between scene came out as the real one
+//   midsame        HalfCamera's in-between scenes that came out as the real scene, polygon for
+//                  polygon, and so weren't shown (ComputeOpt_SwapSkip). its own HALFCAM line has
+//                  them under still, but the Smooth 30 FPS setting doesn't log that one
+// then a/b for each thing that kept a render from being left out as identical: a the renders
+// it applied to, b the ones where nothing else did
+//   flush          a SWAP_BUFFERS brought a new polygon list. flushsame is how many of those had
+//                  the same scene (GPU3D::HashRenderScene) and registers as the swap before. with
+//                  ComputeOpt_SwapSkip those are left out (swapsaved) and don't count here, unless
+//                  HalfCamera drew an in-between scene for this swap or the frame before, or the
+//                  swap before came with other registers and so wasn't copied
+//   regs           no swap, but a register the render reads changed (GPU3D::RenderRegsSame)
+//   halfcam        the frame after one of HalfCamera's in-between scenes
+//   other          not identical for anything else: HalfCamera outside of VBlank, or the first
+//                  frame after a loaded state, a reset or the rendering engine going off
+//   texinval       a cached texture's VRAM changed (or the cache was emptied by a reset)
+//   texdirty       texture or palette VRAM was written, but no cached texture changed. only a
+//                  cause with ComputeOpt_TexSkip off
+//   clrbmp         the clear bitmap's VRAM was written while the bitmap is on
+//   force          new targets, a changed setting or the first frame (ForceRender)
+//   stale          the render before was left out for pacing, redraws included (PaceStale)
+// captured is the renders in frames whose line 0 read the 3D back for a display capture. nothing
+// in RenderFrame draws because of one, so it's no cause
+void ComputeRenderer::LogWhy(const GPU& gpu) noexcept
+{
+    s64 now = SteadyNowNs();
+    if (WhyLog.StartNs == 0)
+        WhyLog.StartNs = now;
+    if (now - WhyLog.StartNs < 1000000000)
+        return;
+
+    static const char* const names[Why_Count] = {"flush", "regs", "halfcam", "other", "texinval", "texdirty", "clrbmp", "force", "stale"};
+    char causes[256];
+    int length = 0;
+    for (int i = 0; i < Why_Count; i++)
+    {
+        length += snprintf(causes + length, sizeof(causes) - length, " %s=%u/%u", names[i], WhyLog.Cause[i], WhyLog.Sole[i]);
+        if (i == Why_Flush)
+            length += snprintf(causes + length, sizeof(causes) - length, " flushsame=%u", WhyLog.FlushSame);
+    }
+    Platform::Log(Platform::LogLevel::Info, "COMPWHY frames=%u extra=%u renders=%u same=%u paced=%u texsaved=%u swapsaved=%u midsame=%u%s captured=%u opt=%d\n",
+        WhyLog.Frames, WhyLog.Extra, WhyLog.Renders, WhyLog.Same, WhyLog.Paced, WhyLog.TexSaved, WhyLog.SwapSaved,
+        gpu.GPU3D.MidScenesSame - WhyMidSameSeen, causes, WhyLog.Captured, OptMask);
+    WhyMidSameSeen = gpu.GPU3D.MidScenesSame;
+    WhyLog = {};
+    WhyLog.StartNs = now;
+}
+
+// GPU::ComputePace 2: whether this render can be left out, which it can't when a display capture
+// may read its 3D back: a render outside of line 215 is a redraw for one, a frame that captured
+// most likely does again (as GPU::CaptureHeldThisFrame has it), and the game may have armed the next
+// one already. a capture armed later gets a redraw at line 0 (RedrawSkippedFrame). nor into new
+// targets or with settings that changed (ForceRender), nor with HalfCamera while it counts on its
+// scenes being drawn (HalfCamera::CanSkipRender; without ComputeOpt_HalfCamPace, whenever there is
+// one), nor when the last render is half a second old by the clock on the wall,
+// whatever the fences say (the clock, as fast-forward runs many frames in that time)
+bool ComputeRenderer::CanSkipForPace(const GPU& gpu, bool keep, bool captured) const noexcept
+{
+    u32 captureCnt = gpu.GPU2D_A.CaptureCnt;
+    bool captureArmed = (captureCnt & (1u << 31)) && ((captureCnt >> 29) & 0x3) != 1;
+    bool halfCamIdle = gpu.GPU3D.GetHalfCamera() == 0
+        || ((OptMask & ComputeOpt_HalfCamPace) && gpu.GPU3D.CanHalfCameraSkipRender());
+    return gpu.VCount == 215 && !PaceRedraw && !ForceRender && !keep && !captured && !captureArmed
+        && halfCamIdle && SteadyNowNs() - PaceRenderNs < 500000000;
+}
+
+// a render that was left out for pacing, drawn after all: RenderFrame then draws what line 215
+// would have, from the 3D state latched at VBlank and the textures as line 215 left them
+void ComputeRenderer::RedrawSkippedFrame(GPU& gpu)
+{
+    if (!PaceStale)
+        return;
+
+    PaceRedraw = true;
+    RenderFrame(gpu);
+    PaceRedraw = false;
+}
+
+// a reset or a savestate load: the scene a render was left out of is gone, so there's nothing to
+// redraw, and the next render is drawn whatever it looks like
+void ComputeRenderer::ResetPace() noexcept
+{
+    if (PaceStale)
+        ForceRender = true;
+    PaceStale = false;
+    CapturedSinceRender = false;
+}
+
 void ComputeRenderer::RenderFrame(GPU& gpu)
 {
 #ifdef MELONADE_DEBUG_TOOLS
     RenderFrameStartNs = SteadyNowNs();
+    if (gpu.ComputeTimers || gpu.ComputePeaks || gpu.ComputeSync || Stats)
+        UpdateStats(gpu);
 #endif
     CaptureSpinUs = gpu.CaptureSpinUs;
+    // the COMPWHY log tells a swap with the same scene from one with a new scene
+    gpu.GPU3D.SceneHashLogging = gpu.ComputeWhy;
+
+    // GPU::ComputePace: leaves a fence for each earlier render the GPU hasn't finished
+    if (gpu.ComputePace != 0 || PaceFenceCount != 0)
+        UpdatePace(gpu);
+    // whether line 0 of this frame read the 3D back, for CanSkipForPace
+    bool captured = CapturedSinceRender;
+    if (gpu.VCount == 215)
+        CapturedSinceRender = false;
 
     bool keep = KeepRequested;
     KeepRequested = false;
@@ -886,8 +1158,20 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     // the targets match the polygons drawn here (see FrameTargetWidth). this is inside RunFrame,
     // so the shaders for the new width are compiled right here. with a Blit after it
     // (KeepFrameForBlit), only when the targets stay as they are
+    // GPU::ComputeTileSize is only known here, and a change of tile size takes new targets too
+    ForcedTileSize = ForcedTileSizeOf(gpu);
+    // the same for GPU::ComputeOpt, whose bits are defines in the shaders. only a debug switch
+    // changes it, so it's the same compile as for a new target
+    int optMask = gpu.ComputeOpt & ComputeOpt_All;
+    bool optChanged = ((optMask ^ OptMask) & ComputeOpt_Shaders) != 0;
+    OptMask = optMask;
+    // ComputeOpt_SwapSkip: has GPU3D compare each swap's scene with the one before, from the next
+    // VBlank on. a swap that changed nothing a render reads then counts like a frame without one
+    gpu.GPU3D.SceneRepeatCheck = (OptMask & ComputeOpt_SwapSkip) != 0;
+    bool identical = gpu.GPU3D.RenderFrameIdentical
+        || ((OptMask & ComputeOpt_SwapSkip) && gpu.GPU3D.RenderSceneRepeated);
     int targetWidth = FrameTargetWidth(gpu);
-    if (targetWidth != TargetWidth)
+    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSize) != TileSize || optChanged)
     {
         keep = false;
         ResizeTargets(ScaleFactor, HiresCoordinates, targetWidth);
@@ -901,12 +1185,117 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     assert(!NeedsShaderCompile());
     // new targets are empty (here or after SetRenderSettings), so they're drawn even if the frame is the same
-    u8 clrBitmapDirty;
-    if (!Texcache.Update(gpu, clrBitmapDirty) && gpu.GPU3D.RenderFrameIdentical && !ForceRender)
+    // nor is a frame the same as the image when the render before it was left out for pacing
+    // a redraw of a render left out for pacing (RedrawSkippedFrame) has to draw what line 215 would
+    // have. the texture cache was updated there and nothing else changes the flat VRAM copies, so
+    // it's left alone: what was written since waits for the next line 215, clear bitmap bits too
+    bool redraw = PaceRedraw && PaceStale;
+    u8 clrBitmapDirty = 0;
+    bool texInvalidated = false;
+    bool vramDirty = !redraw && Texcache.Update(gpu, clrBitmapDirty, texInvalidated);
+    // ComputeOpt_TexSkip: a write to texture or palette VRAM only counts when it can change what
+    // the same polygons look like. a render only reads VRAM through the texture cache and the
+    // clear bitmap. every texture the last render drew with was cached by it, and an entry only
+    // leaves the cache in Update (texInvalidated) or Reset (TexcacheEmptied), so without those a
+    // render now would find the same entries with the same texels, however stale. the clear
+    // bitmap is only read, and only uploaded, while the mode is on, and its bits are kept below
+    bool clearBitmapChanged = (gpu.GPU3D.RenderDispCnt & (1<<14)) && (ClearBitmapDirty | clrBitmapDirty) != 0;
+    bool texChanged = vramDirty;
+    if (OptMask & ComputeOpt_TexSkip)
+        texChanged = vramDirty && (texInvalidated || TexcacheEmptied || clearBitmapChanged);
+
+    // debug only: what keeps this frame from being left out as identical, a bit per Why_ cause
+    u32 why = 0;
+    if (gpu.ComputeWhy)
     {
+        LogWhy(gpu);
+        if (gpu.VCount == 215 && !PaceRedraw)
+            WhyLog.Frames++;
+        else
+            WhyLog.Extra++;
+
+        u8 change = gpu.GPU3D.RenderFrameChange;
+        if (!identical)
+        {
+            if (change & GPU3D::FrameChange_Flush) why |= 1 << Why_Flush;
+            if (change & GPU3D::FrameChange_Regs) why |= 1 << Why_Regs;
+            if (change & GPU3D::FrameChange_HalfCam) why |= 1 << Why_HalfCam;
+            // HalfCamera outside of VBlank, or the latched state was replaced (a loaded state,
+            // a reset, the rendering engine going off)
+            if (change == 0) why |= 1 << Why_Other;
+        }
+        if (texChanged)
+        {
+            if (texInvalidated || TexcacheEmptied) why |= 1 << Why_TexInval;
+            else if (clearBitmapChanged) why |= 1 << Why_ClearBitmap;
+            else why |= 1 << Why_TexDirty;
+        }
+        if (ForceRender) why |= 1 << Why_Force;
+        if (PaceStale) why |= 1 << Why_Stale;
+    }
+
+    // identical: what GPU3D latched at VBlank is what it latched the VBlank before, registers and
+    // scene. without a swap (RenderFrameIdentical), or with one that brought the same polygons
+    // with the same vertices in the same order (RenderSceneRepeated). either way a render would
+    // read the same latched state as the last one, the same cached textures and clear bitmap
+    // (texChanged) and the same settings and targets (ForceRender), and write the same pixels into
+    // the image and the low res one a display capture reads back, so both are left as they are
+    if (!redraw && !texChanged && identical && !ForceRender && !PaceStale)
+    {
+        // with ComputeOpt_TexSkip the clear bitmap's VRAM can have been written while the mode is
+        // off. as in a render, the bits wait for the mode
+        ClearBitmapDirty |= clrBitmapDirty;
+        if (gpu.ComputeWhy)
+        {
+            WhyLog.Same++;
+            WhyLog.TexSaved += vramDirty;
+            WhyLog.SwapSaved += !gpu.GPU3D.RenderFrameIdentical;
+        }
+#ifdef MELONADE_DEBUG_TOOLS
+        if (Stats)
+            Stats->Sec.Skipped++;
+#endif
         return;
     }
+
+    if (gpu.ComputePace != 0 && PaceFenceCount >= 2)
+    {
+        if (gpu.ComputePace == 2 && CanSkipForPace(gpu, keep, captured))
+        {
+            // left out like an identical frame: the image, the low res one and the kept one stay
+            // as they are. unlike there the scene did change, so the texture cache's clear bitmap
+            // bits are kept for the next render, and PaceStale makes sure there is one even if the
+            // frames after this are identical to the one that wasn't drawn
+            ClearBitmapDirty |= clrBitmapDirty;
+            PaceStale = true;
+            PaceLog.Skipped++;
+            WhyLog.Paced += gpu.ComputeWhy;
+            return;
+        }
+
+        // it has to be drawn, so the queue is kept short by waiting
+        if (gpu.ComputePace == 2)
+            PaceLog.Kept++;
+        WaitForPace();
+    }
+
+    if (gpu.ComputeWhy)
+    {
+        WhyLog.Renders++;
+        WhyLog.Captured += captured;
+        WhyLog.FlushSame += (why & (1 << Why_Flush)) && (gpu.GPU3D.RenderFrameChange & GPU3D::FrameChange_FlushSame);
+        for (int i = 0; i < Why_Count; i++)
+        {
+            WhyLog.Cause[i] += (why >> i) & 1;
+            WhyLog.Sole[i] += why == (1u << i);
+        }
+    }
+
+    if (redraw)
+        PaceLog.Redraws++;
+    PaceStale = false;
     ForceRender = false;
+    TexcacheEmptied = false;
 
     // the final pass writes every texel of the image, so the spare one needs nothing else
     if (keep)
@@ -1321,6 +1710,17 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(MetaUniform), &meta);
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, MetaUniformMemory);
 
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Stats)
+    {
+        Stats->NoteFrame((u32)numPolygons, numVariants, numYSpans > 0 ? numVariants : 0, (u32)numSetupIndices, (u32)numYSpans, totalTileBound,
+            numPolygons < (int)gpu.GPU3D.RenderNumPolygons);
+        Stats->BeginSet(false);
+    }
+#endif
+
+    // the GPU timers (GPU::ComputeTimers): each pass runs up to the next BeginGPUTimer
+    BeginGPUTimer(ComputePass::Clear);
     glUseProgram(ShaderClearCoarseBinMask);
     glDispatchCompute(TilesPerLine*TileLines/ClearCoarseBinMaskLocalSize, 1, 1);
 
@@ -1342,22 +1742,26 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         glDispatchCompute((numVariants+31)/32, 1, 1);
 
         // calculate x-spans
+        BeginGPUTimer(ComputePass::Interp);
         glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
         glUseProgram(ShaderInterpXSpans[wbuffer]);
         glDispatchCompute((numSetupIndices + 31) / 32, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // bin polygons
+        BeginGPUTimer(ComputePass::Bin);
         glUseProgram(ShaderBinCombined);
         glDispatchCompute(((numPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // calculate list offsets
+        BeginGPUTimer(ComputePass::Offs);
         glUseProgram(ShaderCalculateWorkListOffset);
         glDispatchCompute((numVariants + 31) / 32, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // sort shader work
+        BeginGPUTimer(ComputePass::Sort);
         glUseProgram(ShaderSortWork);
         if (directDispatch)
         {
@@ -1373,6 +1777,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         }
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
+        // one timer over every variant's dispatch
+        BeginGPUTimer(ComputePass::Rast);
         glActiveTexture(GL_TEXTURE0);
 
         for (int i = 0; i < tilememoryLayer_Num; i++)
@@ -1435,7 +1841,10 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
                 glUniform1ui(UniformIdxCurVariant, i);
                 glUniform1ui(UniformIdxColorDither, ColorDither ? 1 : 0);
-                glUniform2f(UniformIdxTextureSize, 1.f / variants[i].Width, 1.f / variants[i].Height);
+                // OptSmall: the texcoords' 4 fraction bits come off here instead of in the shader.
+                // the sizes are powers of two, so nothing is rounded
+                float texcoordScale = (OptMask & ComputeOpt_Small) ? 1.f / 16.f : 1.f;
+                glUniform2f(UniformIdxTextureSize, texcoordScale / variants[i].Width, texcoordScale / variants[i].Height);
                 if (directDispatch)
                 {
                     // a group per work tile, split across Y and Z like CalcOffsets does. at least
@@ -1454,6 +1863,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
+    BeginGPUTimer(ComputePass::Depth);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[0]);
     glActiveTexture(GL_TEXTURE1);
@@ -1465,6 +1875,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
+    BeginGPUTimer(ComputePass::Final);
     glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glBindImageTexture(1, LowResFramebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
     u32 finalPassShader = 0;
@@ -1479,6 +1890,44 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glDispatchCompute(ScreenWidth/32, ScreenHeight, 1);
     // the compositor reads the 3D image with texelFetch, and capture reads the low res one with glReadPixels
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Stats)
+    {
+        Stats->EndSet();
+        if (Stats->WantPeaks)
+        {
+            // what binning asked for is VariantWorkCount[0].w, which only the GPU knows. mapping
+            // it waits for the GPU. without polygons nothing was binned and the count is an old one
+            u32 wanted = 0;
+            if (numYSpans > 0)
+            {
+                glBindBuffer(GL_COPY_READ_BUFFER, BinResultMemory);
+                const u32* counts = (const u32*)glMapBufferRange(GL_COPY_READ_BUFFER,
+                    offsetof(BinResultHeader, VariantWorkCount), 4 * sizeof(u32), GL_MAP_READ_BIT);
+                if (counts)
+                {
+                    wanted = counts[3];
+                    glUnmapBuffer(GL_COPY_READ_BUFFER);
+                }
+                glBindBuffer(GL_COPY_READ_BUFFER, 0);
+            }
+            Stats->NoteWorkTiles(wanted, (u32)MaxWorkTiles);
+        }
+    }
+#endif
+
+    // GPU::ComputePace: signals when the GPU has finished this render. flushed right away, so a
+    // poll never finds it unflushed: the frontend's frame-end flush doesn't run while the DS sleeps
+    if (gpu.ComputePace != 0)
+    {
+        if (PaceFenceCount == MaxPaceFences)
+            PopPaceFences(1);
+        PaceFences[PaceFenceCount++] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+        PaceRenderNs = SteadyNowNs();
+        PaceLog.Renders++;
+    }
 
     glBindSampler(0, 0);
 
@@ -1626,7 +2075,8 @@ int ComputeRenderer::FrameTargetWidth(const GPU& gpu) noexcept
 // Blit reads the image as it was
 bool ComputeRenderer::KeepFrameForBlit(const GPU& gpu)
 {
-    if (FrameTargetWidth(gpu) != TargetWidth)
+    int targetWidth = FrameTargetWidth(gpu);
+    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSizeOf(gpu)) != TileSize)
         return false;
 
     KeepRequested = true;
@@ -1665,6 +2115,9 @@ void ComputeRenderer::PrepareEarlyCaptureFrame()
 // have deleted it. without use, or once it's stale, GetLine's stay as they are
 bool ComputeRenderer::TakeEarlyCaptureFrame(bool use)
 {
+    // this frame reads the 3D back, here or with the PrepareCaptureFrame that follows
+    CapturedSinceRender |= use;
+
     if (!use || !EarlyCapture)
     {
         DropEarlyCapture();
@@ -1707,7 +2160,16 @@ void ComputeRenderer::BindOutputTexture(int buffer)
 
 void ComputeRenderer::Blit(const GPU &gpu)
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    // the compositor's GPU timers, which it starts through BeginGPUTimer
+    if (Stats)
+        Stats->BeginSet(true);
+#endif
     CurGLCompositor.RenderFrame(gpu, *this);
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Stats)
+        Stats->EndSet();
+#endif
 
     // the compositor and its hi-res capture pass were the last to read the kept image. the final
     // pass that next writes it comes later in command order, the same as it always followed the

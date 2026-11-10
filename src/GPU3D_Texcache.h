@@ -80,10 +80,14 @@ public:
     
         u32 startEntry = startBit >> 6;
         u64 entriesCount = ((startBit + bitsCount + 0x3F) >> 6) - startEntry;
+        // a range that runs past the end of its VRAM wraps to the start (as MaskedHash reads it),
+        // so the words of the dirty bits wrap too: there are a 64th as many words as bits. the
+        // mask used to be the bit count's, which read past the array instead and could miss a write
+        const u32 entryMask = (vramSize / VRAMDirtyGranularity / 64) - 1;
         for (u32 j = startEntry; j < startEntry + entriesCount; j++)
         {
             // the hash covers the whole range, so the first dirty piece decides
-            if (GetRangedBitMask(j, startBit, bitsCount) & dirty[j & ((vramSize / VRAMDirtyGranularity)-1)])
+            if (GetRangedBitMask(j, startBit, bitsCount) & dirty[j & entryMask])
                 return MaskedHash(vram, vramSize, start, size) != oldHash;
         }
 
@@ -91,9 +95,14 @@ public:
     }
 
     // clrBitmapDirty gets bit 0 when texture slot 2 (the clear colour bitmap) changed and
-    // bit 1 for slot 3 (the clear depth bitmap)
-    bool Update(GPU& gpu, u8& clrBitmapDirty)
+    // bit 1 for slot 3 (the clear depth bitmap).
+    // returns whether texture or palette VRAM was written since the last call, whatever was
+    // written. invalidated is set when that dropped a texture from the cache: without it every
+    // texture drawn before is still cached as it was uploaded, so the same polygons look the same
+    bool Update(GPU& gpu, u8& clrBitmapDirty, bool& invalidated)
     {
+        invalidated = false;
+
         auto textureDirty = gpu.VRAMDirty_Texture.DeriveState(gpu.VRAMMap_Texture, gpu);
         auto texPalDirty = gpu.VRAMDirty_TexPal.DeriveState(gpu.VRAMMap_TexPal, gpu);
 
@@ -150,6 +159,7 @@ public:
                 it++;
                 continue;
             invalidate:
+                invalidated = true;
                 FreeTextures[entry.WidthLog2][entry.HeightLog2].push_back(entry.Texture);
 
                 //printf("invalidating texture %d\n", entry.ImageDescriptor);
@@ -220,7 +230,9 @@ public:
             entry.TextureRAMStart[1] = slot1addr;
             entry.TextureRAMSize[1] = width*height/16*2;
             entry.TexPalStart = palBase*16;
-            entry.TexPalSize = 0x10000;
+            // a block's palette index goes to 0x3FFF, and its four colors start at 4 bytes times
+            // that (ConvertCompressedTexture), so the last one ends at 0x10004
+            entry.TexPalSize = 0x10004;
 
             ConvertCompressedTexture<outputFmt_RGB6A5>(width, height, DecodingBuffer, addr, slot1addr, entry.TexPalStart, gpu);
         }

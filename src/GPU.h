@@ -827,6 +827,52 @@ public:
     // GPU write indirect arguments, which Adreno's driver waits on (see ComputeRenderer::RenderFrame).
     // only turned off by a debug switch, to compare
     bool ComputeDirectDispatch = true;
+    // debug only, compute renderer: logs a COMPTIME line once a second with the GPU time of each
+    // pass and of the compositor, from GL timer queries (GPU3D_ComputeStats.h)
+    bool ComputeTimers = false;
+    // debug only, compute renderer: logs a COMPPEAK line once a second with the most a frame used
+    // of the work buffers. it reads binning's work count back every frame, which waits for the GPU,
+    // so it isn't for use with ComputeTimers or a speed test
+    bool ComputePeaks = false;
+    // debug only, compute renderer: logs a COMPSYNC line once a second with each pass timed on the
+    // CPU between two glFinish calls, for drivers whose timer queries read 0 around compute
+    // dispatches. much slower than normal, and it turns ComputeTimers and ComputePeaks off
+    bool ComputeSync = false;
+    // compute renderer: keeps the emulator thread from queueing renders faster than the GPU
+    // finishes them, going by a fence after each one (ComputeRenderer::UpdatePace). without it a
+    // scene with no capture readback to hold the thread back got the driver's queue over half a
+    // second deep on an Adreno 640. 0 off. 1 waits before a render until at most one earlier render
+    // is unfinished. 2 leaves the render out instead while two or more are, and keeps showing the
+    // last 3D image, when that's safe (ComputeRenderer::CanSkipForPace), and waits like 1 when it
+    // isn't. only changed by a debug switch, which also turns the COMPPACE log line on
+    int ComputePace = 2;
+    bool ComputePaceLog = false;
+    // debug only, compute renderer: 8, 16 or 32 forces that tile size at any scale where it can
+    // work, for A/B runs. 0 is the size the scale picks (TileSizeForScale)
+    int ComputeTileSize = 0;
+    // compute renderer: shader changes that cut GPU work without changing a pixel, a bit each
+    // (the Opt defines in GPU3D_Compute_shaders.h). all but bit 5 on in every build, only changed
+    // by a debug switch, to compare or to find the one behind a wrong pixel. 0 is the shaders as
+    // they were.
+    // bit 0: Rasterise skips the perspective factor's divide where it isn't used (a linear span
+    // with z-buffering). bit 1: Rasterise reads only the polygon and span words its coverage test
+    // needs, and the rest for covered pixels. bit 2: DepthBlend only stores the second layer
+    // values the final pass reads (see there). bit 3: Rasterise drops a branch no covered pixel
+    // takes and gets the texture size's 1/16 from the CPU. bit 4 isn't a shader's: a frame with
+    // the same polygons isn't drawn again for a write to texture or palette VRAM that changed no
+    // cached texture (nor the clear bitmap while that's on), see ComputeRenderer::RenderFrame.
+    // bit 5: nor for a SWAP_BUFFERS that brought exactly the last swap's scene again with the same
+    // registers (GPU3D::MatchRenderScene). bit 6: with Smooth 30 FPS on, pacing can leave a render
+    // out as it does without it, except around in-between frames and while the swaps come every
+    // other frame (HalfCamera::CanSkipRender)
+    // bit 5 is off: it halves the renders but costs frame-time spikes on the OnePlus 7 Pro at 4x
+    // (see docs/plan-compute-efficiency.md). 0x7F turns it on
+    int ComputeOpt = 0x5F;
+    // debug only, compute renderer: logs a COMPWHY line once a second on how many frames were
+    // drawn, how many were left out as identical, and what kept the drawn ones from that
+    // (ComputeRenderer::LogWhy). it also has GPU3D hash every scene, to tell a swap that brought
+    // the same polygons again
+    bool ComputeWhy = false;
     // compute renderer (Renderer3D::FlushAfterCaptureBlit): in frames that hold capture lines,
     // flush right after the line-192 Blit, so the GPU runs the compositor while it would otherwise
     // idle (after the capture map) until the line-215 flush, instead of ahead of the 3D there.

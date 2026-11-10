@@ -162,6 +162,8 @@ public:
     // anything after a load that interrupted an in-between frame
     [[nodiscard]] bool NeedsRedraw() const noexcept;
     void Redraw(GPU& gpu);
+    // at line 215: whether the renderer can leave this render out to let the GPU catch up
+    [[nodiscard]] bool CanSkipRender() const noexcept;
 
     // a reset or a state load: nothing recorded so far can be trusted
     void Invalidate();
@@ -238,7 +240,7 @@ private:
     void FixReadbackLoad(u32 recordIndex);
     void CountDiagnostics(const SceneInfo& current, const SceneInfo& previous);
     [[nodiscard]] bool IsNearOnScreen(const s32* clip, const s32* wordsA, const s32* wordsB, double maxX, double maxY) const;
-    void ShowReplayedScene();
+    bool ShowReplayedScene();
     void RestoreRealScene();
     void LogScene(const SceneInfo& current, const SceneInfo& previous, Reason reason) const;
     void LogSecond(Clock::time_point now);
@@ -302,6 +304,8 @@ private:
     bool IsMidActive = false;
     // Invalidate ended an in-between frame, and the renderer's output can still be that picture
     bool IsMidPictureStale = false;
+    // what the last OnVBlank returned: this frame's render replaces an in-between picture
+    bool IsAfterMid = false;
     u32 MidNumPolygons = 0;
     u32 RealNumPolygons = 0;
     std::array<Polygon*, 2048> RealList {};

@@ -1150,6 +1150,12 @@ void GPU::SetPowerCnt(u32 val) noexcept
     // renders after it. dual-screen 3D games flip bit 15 every VBlank
     Sync2D(CapFlush_PowCnt, false);
 
+    // ComputePace 2: a render left out for pacing can still be asked for at line 0, and turning the
+    // rendering engine off clears the 3D state it would be drawn from. so it's drawn now. a reset or
+    // a savestate load has dropped it by the time it gets here
+    if (!(val & (1<<2)) && GPU3D.RenderingEnabled && GPU3D.GetCurrentRenderer().NeedsCaptureRedraw())
+        GPU3D.GetCurrentRenderer().RedrawSkippedFrame(*this);
+
     GPU2D_A.SetEnabled(val & (1<<1));
     GPU2D_B.SetEnabled(val & (1<<9));
     GPU3D.SetEnabled(val & (1<<3), val & (1<<2));
@@ -2041,6 +2047,18 @@ void GPU::StartScanline(u32 line) noexcept
                 if (Deferred2DPending)
                     Flush2DDeferred(CapFlush_HalfCam);
                 GPU3D.RedrawRealScene(*this);
+            }
+
+            // ComputePace 2: the same for a capture armed after a render that was skipped to let
+            // the GPU catch up, which would read an older scene's 3D back. the test is VBlankEnd's
+            if ((GPU2D_A.CaptureCnt & (1u << 31)) && ((GPU2D_A.CaptureCnt >> 29) & 0x3) != 1
+                && GPU3D.GetCurrentRenderer().NeedsCaptureRedraw())
+            {
+                if (BlitPending || BlitAfter3DPending)
+                    Sync2D(CapFlush_LateBlit);
+                if (Deferred2DPending)
+                    Flush2DDeferred(CapFlush_HalfCam);
+                GPU3D.GetCurrentRenderer().RedrawSkippedFrame(*this);
             }
 
             GPU2D_Renderer->VBlankEnd(&GPU2D_A, &GPU2D_B);

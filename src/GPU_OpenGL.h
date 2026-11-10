@@ -272,8 +272,18 @@ private:
     std::array<CompVertex, 2*3*2> CompVertices {};
 
     GLuint CompScreenInputTex = 0;
+    // the compositor's own output textures only exist while a buffer is drawn into without a
+    // frontend texture (see PrepareOutput): at 4x they're 6 MiB each, and a frontend that passes
+    // its own through SetOutputTexture every frame never draws into them. OutputTexW/H is the
+    // size of the one a buffer has, 0 without one
     std::array<GLuint, 2> CompScreenOutputTex {};
+    std::array<int, 2> OutputTexW {}, OutputTexH {};
+    // each framebuffer draws into the frontend's texture while OutputExternal is set, and into
+    // CompScreenOutputTex (nothing while that's 0) otherwise
+    std::array<bool, 2> OutputExternal {};
     std::array<GLuint, 2> CompScreenOutputFB {};
+
+    void PrepareOutput(int buf) noexcept;
 };
 
 }

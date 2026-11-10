@@ -1124,11 +1124,69 @@ int DitherColor(int c, int threshold)
 void RasteriseTile(uint workIdx)
 {
     uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + workIdx];
+#ifdef OptFieldLoads
+    // only the words the coverage test needs are read up front, the rest once the pixel is
+    // covered. the values are the same ones
+    uint polygonIdx = bitfieldExtract(workDesc.y, 0, 11);
+    int polyYTop = Polygons[polygonIdx].YTop;
+    int polyYBot = Polygons[polygonIdx].YBot;
+#else
     Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, 11)];
+#endif
     ivec2 position = ivec2(int(bitfieldExtract(workDesc.x, 0, 16)), int(bitfieldExtract(workDesc.x, 16, 16))) + ivec2(gl_LocalInvocationID.xy);
     int tileOffset = int(bitfieldExtract(workDesc.y, 11, 21)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
 
     uint color = 0U;
+#ifdef OptFieldLoads
+    if (position.y >= polyYTop && position.y < polyYBot)
+    {
+        int polyFirstXSpan = Polygons[polygonIdx].FirstXSpan;
+        int xspanIdx = polyFirstXSpan + (position.y - polyYTop);
+        int spanX0 = XSpanSetups[xspanIdx].X0;
+        int spanX1 = XSpanSetups[xspanIdx].X1;
+        int spanInsideStart = XSpanSetups[xspanIdx].InsideStart;
+        int spanInsideEnd = XSpanSetups[xspanIdx].InsideEnd;
+        uint spanFlags = XSpanSetups[xspanIdx].Flags;
+
+        bool insideLeftEdge = position.x < spanInsideStart;
+        bool insideRightEdge = position.x >= spanInsideEnd;
+        bool insidePolygonInside = !insideLeftEdge && !insideRightEdge;
+
+        if (position.x >= spanX0 && position.x < spanX1
+            && ((insideLeftEdge && (spanFlags & XSpanSetup_FillLeft) != 0U)
+                || (insideRightEdge && (spanFlags & XSpanSetup_FillRight) != 0U)
+                || (insidePolygonInside && (spanFlags & XSpanSetup_FillInside) != 0U)))
+        {
+            // XMin to Variant aren't used here
+            Polygon polygon = Polygon(polyFirstXSpan, polyYTop, polyYBot, 0, 0, 0, 0, 0,
+                Polygons[polygonIdx].Attr, Polygons[polygonIdx].TextureLayer);
+
+            XSpanSetup xspan;
+            xspan.X0 = spanX0;
+            xspan.X1 = spanX1;
+            xspan.InsideStart = spanInsideStart;
+            xspan.InsideEnd = spanInsideEnd;
+            xspan.EdgeCovL = XSpanSetups[xspanIdx].EdgeCovL;
+            xspan.EdgeCovR = XSpanSetups[xspanIdx].EdgeCovR;
+            xspan.XRecip = XSpanSetups[xspanIdx].XRecip;
+            xspan.Flags = spanFlags;
+            xspan.Z0 = XSpanSetups[xspanIdx].Z0;
+            xspan.Z1 = XSpanSetups[xspanIdx].Z1;
+            xspan.W0 = XSpanSetups[xspanIdx].W0;
+            xspan.W1 = XSpanSetups[xspanIdx].W1;
+            xspan.ColorR0 = XSpanSetups[xspanIdx].ColorR0;
+            xspan.ColorG0 = XSpanSetups[xspanIdx].ColorG0;
+            xspan.ColorB0 = XSpanSetups[xspanIdx].ColorB0;
+            xspan.ColorR1 = XSpanSetups[xspanIdx].ColorR1;
+            xspan.ColorG1 = XSpanSetups[xspanIdx].ColorG1;
+            xspan.ColorB1 = XSpanSetups[xspanIdx].ColorB1;
+            xspan.TexcoordU0 = XSpanSetups[xspanIdx].TexcoordU0;
+            xspan.TexcoordV0 = XSpanSetups[xspanIdx].TexcoordV0;
+            xspan.TexcoordU1 = XSpanSetups[xspanIdx].TexcoordU1;
+            xspan.TexcoordV1 = XSpanSetups[xspanIdx].TexcoordV1;
+            xspan.CovLInitial = XSpanSetups[xspanIdx].CovLInitial;
+            xspan.CovRInitial = XSpanSetups[xspanIdx].CovRInitial;
+#else
     if (position.y >= polygon.YTop && position.y < polygon.YBot)
     {
         XSpanSetup xspan = XSpanSetups[polygon.FirstXSpan + (position.y - polygon.YTop)];
@@ -1142,6 +1200,7 @@ void RasteriseTile(uint workIdx)
                 || (insideRightEdge && (xspan.Flags & XSpanSetup_FillRight) != 0U)
                 || (insidePolygonInside && (xspan.Flags & XSpanSetup_FillInside) != 0U)))
         {
+#endif
             uint attr = 0U;
             if (position.y == polygon.YTop)
                 attr |= 0x4U;
@@ -1178,6 +1237,8 @@ void RasteriseTile(uint workIdx)
             uint z;
             int u, v, vr, vg, vb;
 
+// a covered pixel has X0 <= x < X1, so X0 is never X1 here
+#ifndef OptSmall
             if (xspan.X0 == xspan.X1)
             {
                 z = uint(xspan.Z0);
@@ -1188,8 +1249,17 @@ void RasteriseTile(uint workIdx)
                 vb = xspan.ColorB0;
             }
             else
+#endif
             {
+#if defined(OptLinearNoDivide) && defined(ZBuffer)
+                // z-buffering only uses the factor for a perspective span's attributes, so a
+                // linear one skips the divide
+                int ifactor = 0;
+                if ((xspan.Flags & XSpanSetup_Linear) == 0U)
+                    ifactor = CalcYFactorX(xspan, position.x);
+#else
                 int ifactor = CalcYFactorX(xspan, position.x);
+#endif
                 int idiff = xspan.X1 - xspan.X0;
                 int i = position.x - xspan.X0;
 
@@ -1260,7 +1330,13 @@ void RasteriseTile(uint workIdx)
             b = uint(vb);
 
 #ifdef UseTexture
+#ifdef OptSmall
+            // InvTextureSize has the 1/16 in it (RenderFrame). both are powers of two, so the
+            // product is exact either way
+            vec2 uvf = vec2(ivec2(u, v)) * InvTextureSize;
+#else
             vec2 uvf = vec2(ivec2(u, v)) * vec2(1.0 / 16.0) * InvTextureSize;
+#endif
 
             uvec4 texcolor = texture(CurrentTexture, vec3(uvf, polygon.TextureLayer));
 #ifdef Decal
@@ -1566,12 +1642,30 @@ void main()
     ProcessCoarseMask(linearTile, coarseMaskHi, uint(BinStride/2), color, depth, attr, stencil, prevIsShadowMask);
 
     int resultOffset = int(gl_GlobalInvocationID.x) + int(gl_GlobalInvocationID.y) * ScreenWidth;
+#ifdef OptSecondLayer
+    // only the final pass reads this, and it's picked by the same DispCnt: the second layer's
+    // color is only used with anti-aliasing (bit 4), its depth and attributes only when fog (bit 7)
+    // is on as well. what isn't stored keeps an older frame's values, which nothing reads
+    ResultValue[ResultColorStart+uint(resultOffset)] = color.x;
+    ResultValue[ResultDepthStart+uint(resultOffset)] = depth.x;
+    ResultValue[ResultAttrStart+uint(resultOffset)] = attr.x;
+    if ((DispCnt & (1U<<4)) != 0U)
+    {
+        ResultValue[ResultColorStart+uint(resultOffset)+uint(FramebufferStride)] = color.y;
+        if ((DispCnt & (1U<<7)) != 0U)
+        {
+            ResultValue[ResultDepthStart+uint(resultOffset)+uint(FramebufferStride)] = depth.y;
+            ResultValue[ResultAttrStart+uint(resultOffset)+uint(FramebufferStride)] = attr.y;
+        }
+    }
+#else
     ResultValue[ResultColorStart+uint(resultOffset)] = color.x;
     ResultValue[ResultColorStart+uint(resultOffset)+uint(FramebufferStride)] = color.y;
     ResultValue[ResultDepthStart+uint(resultOffset)] = depth.x;
     ResultValue[ResultDepthStart+uint(resultOffset)+uint(FramebufferStride)] = depth.y;
     ResultValue[ResultAttrStart+uint(resultOffset)] = attr.x;
     ResultValue[ResultAttrStart+uint(resultOffset)+uint(FramebufferStride)] = attr.y;
+#endif
 }
 
 )";
