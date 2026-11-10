@@ -129,6 +129,12 @@ private:
     };
 
     GLuint TileMemory[tilememoryLayer_Num] {};
+    // how many of them the shaders use, set by ResizeTargets from GPU::ComputeOpt: 2 with the
+    // attributes packed into the color layer (ComputeOpt_PackAttr, the default), 1 when that layer
+    // holds the depth as well (ComputeOpt_OneTileBuffer), or all three as it was before those.
+    // TileLayersAlloc is how many have storage. it starts at what OptMask's first value gives
+    int TileLayers = 2;
+    int TileLayersAlloc = 0;
     GLuint FinalTileMemory {};
 
     u32 DummyLine[256] = {};
@@ -202,7 +208,8 @@ private:
     bool TileFallbackLogged = false;
     int TileSizeFor(int width, int scale, int forced) const noexcept;
     // GPU::ComputeOpt as of the last RenderFrame, which the shaders are compiled for. it starts at
-    // GPU's default, so only a changed debug switch compiles them twice
+    // GPU's default (0xDF), so only a changed debug switch compiles them twice, and the first
+    // ResizeTargets already gives the tile memory the default's two layers
     static constexpr int ComputeOpt_Small = 1 << 3;
     static constexpr int ComputeOpt_TexSkip = 1 << 4;
     // a swap that brought the last swap's scene again, with the same registers, counts as an
@@ -211,10 +218,19 @@ private:
     // pacing can leave a render out with HalfCamera on, while it has no in-between frames to make
     // (HalfCamera::CanSkipRender)
     static constexpr int ComputeOpt_HalfCamPace = 1 << 6;
-    // the bits that are defines in the shaders
+    // Rasterise puts a pixel's attributes in the bits its color leaves free, so the tile memory
+    // has no attribute layer (Tilebuffers in the shaders)
+    static constexpr int ComputeOpt_PackAttr = 1 << 7;
+    // with ComputeOpt_PackAttr: color and depth share one buffer, where that fits a storage block.
+    // off by default, and OptMask never has it without ComputeOpt_PackAttr
+    static constexpr int ComputeOpt_OneTileBuffer = 1 << 8;
+    // the bits that are defines in the shaders as they are. bits 7 and 8 are as well, but by the
+    // tile memory layout they give (TileLayersFor), which is what a change of them is told by
     static constexpr int ComputeOpt_Shaders = 0xF;
-    static constexpr int ComputeOpt_All = 0x7F;
-    int OptMask = ComputeOpt_All & ~ComputeOpt_SwapSkip;
+    static constexpr int ComputeOpt_All = 0x1FF;
+    int OptMask = ComputeOpt_All & ~(ComputeOpt_SwapSkip | ComputeOpt_OneTileBuffer);
+    // how many tile memory buffers those bits give at the current tile size and MaxWorkTiles
+    int TileLayersFor(int optMask) const noexcept;
     static constexpr int CoarseTileCountX = 8;
     int CoarseTileCountY {};
     int CoarseTileArea {};

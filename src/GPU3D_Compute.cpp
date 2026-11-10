@@ -81,6 +81,12 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
             shaderSource += '\n';
         }
     }
+    // bits 7 and 8 go by the tile memory's layout, as one buffer can fall back to two
+    // (TileLayersFor). with all three layers the source is what it was
+    if (TileLayers < tilememoryLayer_Num)
+        shaderSource += "#define OptPackAttr\n";
+    if (TileLayers == 1)
+        shaderSource += "#define OptOneTileBuffer\n";
     shaderSource += "#define ScreenWidth ";
     shaderSource += std::to_string(ScreenWidth);
     shaderSource += "\n#define ScreenHeight ";
@@ -520,7 +526,8 @@ bool ComputeRenderer::TargetFits(int width, int scale) const noexcept
         return false;
 
     // the biggest work buffer is a tile memory layer: 4*TileSize^2 bytes for each of the
-    // MaxWorkTiles (16 per tile), so 64 bytes per pixel of the rounded up target
+    // MaxWorkTiles (16 per tile), so 64 bytes per pixel of the rounded up target. the one buffer
+    // of ComputeOpt_OneTileBuffer is twice that, and only used where it fits (TileLayersFor)
     int tileSize = TileSizeFor(width, scale, ForcedTileSize);
     s64 screenW = (s64)InternalWidthFor(width, scale, tileSize) * scale;
     s64 largestBuffer = 64 * screenW * (192 * scale);
@@ -639,6 +646,14 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
 
     MaxWorkTiles = TilesPerLine*TileLines*16;
 
+    // the tile memory's layout, which the shaders compiled after this are built for
+    TileLayers = TileLayersFor(OptMask);
+#ifdef MELONADE_DEBUG_TOOLS
+    // the only way to tell that one buffer fell back to two
+    Platform::Log(Platform::LogLevel::Info, "COMPTILES buffers=%d opt=%d scale=%d tile=%d maxblock=%lld\n",
+        TileLayers, OptMask, ScaleFactor, TileSize, (long long)MaxBufferSize);
+#endif
+
     // the tile memory starts at 6 of the 16 layers a tile has room for and grows from there
     // (GrowWorkBuffers). White 2's overworld used 29k and NSMB's map 40k work tiles at 4x, and the
     // CPU's bound ran 1.8 times what binning used on White 2's title, so 6 (74k at 4x) should hold
@@ -687,16 +702,43 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     AllocXSpans(maxYSpanIndices / 16);
 }
 
+// the tile memory's layout for GPU::ComputeOpt's bits 7 and 8: a color, a depth and an attribute
+// layer (12 bytes a pixel), color and depth with the attributes packed into the color
+// (ComputeOpt_PackAttr, 8 bytes), or those two in one buffer (ComputeOpt_OneTileBuffer). that one
+// is twice a layer's size, so where it's too big at MaxWorkTiles for a storage block, or for
+// glBufferData's int, it stays two
+int ComputeRenderer::TileLayersFor(int optMask) const noexcept
+{
+    if (!(optMask & ComputeOpt_PackAttr))
+        return tilememoryLayer_Num;
+
+    s64 oneBuffer = (s64)MaxWorkTiles * TileSize * TileSize * 8;
+    bool fits = oneBuffer <= INT32_MAX && (MaxBufferSize <= 0 || oneBuffer <= MaxBufferSize);
+    return ((optMask & ComputeOpt_OneTileBuffer) && fits) ? 1 : 2;
+}
+
 // the tile memory layers, with room for this many work tiles. glBufferData orphans the old
 // storage, so a render still in flight keeps what it was bound to. nothing is kept from one render
-// to the next in them: Rasterise writes the work tiles that DepthBlend then reads
+// to the next in them: Rasterise writes the work tiles that DepthBlend then reads.
+// only the first TileLayers of them are used: a word per pixel in each, or two in the one buffer
+// that holds color and depth. a layer that isn't used never gets storage, and one that an
+// earlier layout used is shrunk like the destructor does, which is what frees it on Adreno.
+// that comes first, so a change of layout doesn't hold the old layers while the new ones are made
 void ComputeRenderer::AllocTileMemory(int workTiles)
 {
     WorkTileRoom = workTiles;
-    for (int i = 0; i < tilememoryLayer_Num; i++)
+    for (int i = TileLayers; i < TileLayersAlloc; i++)
     {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, TileMemory[i]);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)4*TileSize*TileSize*workTiles, nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 4, nullptr, GL_DYNAMIC_DRAW);
+    }
+    TileLayersAlloc = TileLayers;
+
+    GLsizeiptr size = (GLsizeiptr)(TileLayers == 1 ? 8 : 4)*TileSize*TileSize*workTiles;
+    for (int i = 0; i < TileLayers; i++)
+    {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, TileMemory[i]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, size, nullptr, GL_DYNAMIC_DRAW);
     }
 }
 
@@ -1230,9 +1272,13 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     // GPU::ComputeTileSize is only known here, and a change of tile size takes new targets too
     ForcedTileSize = ForcedTileSizeOf(gpu);
     // the same for GPU::ComputeOpt, whose bits are defines in the shaders. only a debug switch
-    // changes it, so it's the same compile as for a new target
+    // changes it, so it's the same compile as for a new target. that also gives the tile memory
+    // the layout of its bits 7 and 8, which only count when they change it: bit 8 does nothing
+    // without bit 7, or where one buffer doesn't fit
     int optMask = gpu.ComputeOpt & ComputeOpt_All;
-    bool optChanged = ((optMask ^ OptMask) & ComputeOpt_Shaders) != 0;
+    if (!(optMask & ComputeOpt_PackAttr))
+        optMask &= ~ComputeOpt_OneTileBuffer;
+    bool optChanged = ((optMask ^ OptMask) & ComputeOpt_Shaders) != 0 || TileLayersFor(optMask) != TileLayers;
     OptMask = optMask;
     // ComputeOpt_SwapSkip: has GPU3D compare each swap's scene with the one before, from the next
     // VBlank on. a swap that changed nothing a render reads then counts like a frame without one
@@ -1859,7 +1905,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         BeginGPUTimer(ComputePass::Rast);
         glActiveTexture(GL_TEXTURE0);
 
-        for (int i = 0; i < tilememoryLayer_Num; i++)
+        for (int i = 0; i < TileLayers; i++)
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2+i, TileMemory[i]);
 
         // rasterise

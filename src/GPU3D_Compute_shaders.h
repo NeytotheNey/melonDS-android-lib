@@ -312,7 +312,32 @@ const uint WorkDescsSortedStart = WorkDescsUnsortedStart+uint(MaxWorkTiles);
 
 )"};
 
+/*
+    what Rasterise leaves for DepthBlend, for every pixel of a work tile: a color, a depth and
+    an attribute word, each in a buffer of its own.
+
+    OptPackAttr: there are no attribute words. a tile color is r, g and b in 6 bits and alpha
+    in 5, at bits 0, 8, 16 and 24, which leaves bits 6-7, 14-15, 22-23 and 29-31 free. the
+    attributes are 4 edge flags at bits 0-3 and a 5 bit coverage at bits 8-12, so they fit:
+        attribute bits 2-3 and 10-11 at color bits 6-7 and 14-15 (4 up)
+        attribute bits 0-1 and 8-9 at color bits 22-23 and 30-31 (22 up)
+        attribute bit 12 at color bit 29 (17 up)
+    with those three shifts no free bit lands on an attribute bit that isn't its own, so both
+    ways it's three shifts of the whole word and one mask. no two shifts can do it. the colors
+    stay where DepthBlend's blending wants them.
+
+    OptOneTileBuffer (only with OptPackAttr): a pixel's color and depth words are side by side
+    in one buffer, twice the size
+*/
 const std::string Tilebuffers{R"(
+#ifdef OptOneTileBuffer
+layout (std430, binding = 2) buffer ColorTileBuffer
+{
+    uint ColorDepthTiles[];
+};
+#define TileColor(i) ColorDepthTiles[uint(i)*2U]
+#define TileDepth(i) ColorDepthTiles[uint(i)*2U+1U]
+#else
 layout (std430, binding = 2) buffer ColorTileBuffer
 {
     uint ColorTiles[];
@@ -321,10 +346,30 @@ layout (std430, binding = 3) buffer DepthTileBuffer
 {
     uint DepthTiles[];
 };
+#ifndef OptPackAttr
 layout (std430, binding = 4) buffer AttrTileBuffer
 {
     uint AttrTiles[];
 };
+#endif
+#define TileColor(i) ColorTiles[i]
+#define TileDepth(i) DepthTiles[i]
+#endif
+
+#ifdef OptPackAttr
+const uint TileColorMask = 0x1F3F3F3FU;
+
+uint PackTileAttr(uint attr)
+{
+    return ((attr << 4) | (attr << 22) | (attr << 17)) & ~TileColorMask;
+}
+
+uint UnpackTileAttr(uint tile)
+{
+    tile &= ~TileColorMask;
+    return ((tile >> 4) | (tile >> 22) | (tile >> 17)) & 0x1F0FU;
+}
+#endif
 
 )"};
 
@@ -1376,18 +1421,25 @@ void RasteriseTile(uint workIdx)
             if (a > uint(AlphaRef))
             {
                 color = r | (g << 8) | (b << 16) | (a << 24);
+#ifdef OptPackAttr
+                // alpha is 1 to 31 here, so the word still isn't 0. the color mask only does
+                // something to a channel past its bits, which would end up in the attributes
+                color = (color & TileColorMask) | PackTileAttr(attr);
+#endif
 
-                DepthTiles[tileOffset] = z;
+                TileDepth(tileOffset) = z;
+#ifndef OptPackAttr
                 AttrTiles[tileOffset] = attr;
+#endif
             }
 #else
             color = 0xFFFFFFFFU; // doesn't really matter as long as it's not 0
-            DepthTiles[tileOffset] = z;
+            TileDepth(tileOffset) = z;
 #endif
         }
     }
 
-    ColorTiles[tileOffset] = color;
+    TileColor(tileOffset) = color;
 }
 
 void main()
@@ -1471,7 +1523,7 @@ void ProcessCoarseMask(int linearTile, uint coarseMask, uint coarseOffset,
             fineMask &= ~(1U << fineIdx);
 
             uint pixelindex = uint(tileInnerOffset) + workIdx * uint(TileSize) * uint(TileSize);
-            uint tileColor = ColorTiles[pixelindex];
+            uint tileColor = TileColor(pixelindex);
             workIdx++;
 
             uint polygonIdx = fineIdx + (coarseBit + coarseOffset) * 32U;
@@ -1486,8 +1538,10 @@ void ProcessCoarseMask(int linearTile, uint coarseMask, uint coarseOffset,
 
                 bool equalDepthTest = (polygonAttr & (1U << 14)) != 0U;
 
-                uint tileDepth = DepthTiles[pixelindex];
+                uint tileDepth = TileDepth(pixelindex);
+#ifndef OptPackAttr
                 uint tileAttr = AttrTiles[pixelindex];
+#endif
 
                 uint dstattr = attr.x;
 
@@ -1538,7 +1592,15 @@ void ProcessCoarseMask(int linearTile, uint coarseMask, uint coarseOffset,
                     uint srcA = tileColor & 0x1F000000U;
                     if (srcA == 0x1F000000U)
                     {
+#ifdef OptPackAttr
+                        // only an opaque pixel's attributes are used, and only here is the
+                        // color taken whole. a blend masks the channels it reads, and a shadow
+                        // mask's 0xFFFFFFFF never gets here
+                        srcAttr |= UnpackTileAttr(tileColor);
+                        tileColor &= TileColorMask;
+#else
                         srcAttr |= tileAttr;
+#endif
 
                         if (!writeSecondLayer)
                         {

@@ -856,9 +856,9 @@ public:
     // work, for A/B runs. 0 is the size the scale picks (TileSizeForScale)
     int ComputeTileSize = 0;
     // compute renderer: shader changes that cut GPU work without changing a pixel, a bit each
-    // (the Opt defines in GPU3D_Compute_shaders.h). all but bit 5 on in every build, only changed
-    // by a debug switch, to compare or to find the one behind a wrong pixel. 0 is the shaders as
-    // they were.
+    // (the Opt defines in GPU3D_Compute_shaders.h). all but bits 5 and 8 on in every build, only
+    // changed by a debug switch, to compare or to find the one behind a wrong pixel. 0 is the
+    // shaders as they were.
     // bit 0: Rasterise skips the perspective factor's divide where it isn't used (a linear span
     // with z-buffering). bit 1: Rasterise reads only the polygon and span words its coverage test
     // needs, and the rest for covered pixels. bit 2: DepthBlend only stores the second layer
@@ -869,10 +869,16 @@ public:
     // bit 5: nor for a SWAP_BUFFERS that brought exactly the last swap's scene again with the same
     // registers (GPU3D::MatchRenderScene). bit 6: with Smooth 30 FPS on, pacing can leave a render
     // out as it does without it, except around in-between frames and while the swaps come every
-    // other frame (HalfCamera::CanSkipRender)
+    // other frame (HalfCamera::CanSkipRender). bit 7: Rasterise stores a pixel's edge flags and
+    // coverage in the 9 bits its 6-6-6-5 color leaves free, so the tile memory has two layers of
+    // 4 bytes a pixel and not three. bit 8, only with bit 7: those two are one buffer with a
+    // pixel's color and depth side by side, where that fits GL_MAX_SHADER_STORAGE_BLOCK_SIZE
+    // (ComputeRenderer::TileLayersFor), and it does nothing without bit 7
     // bit 5 is off: it halves the renders but costs frame-time spikes on the OnePlus 7 Pro at 4x
-    // (see docs/plan-compute-efficiency.md). 0x7F turns it on
-    int ComputeOpt = 0x5F;
+    // (see docs/plan-compute-efficiency.md). 0xFF turns it on
+    // bit 8 is off: one buffer measured no faster than two on the OnePlus 7 Pro at 4x. 0x1DF
+    // turns it on. 0x5F is the tile memory with three layers, as it was
+    int ComputeOpt = 0xDF;
     // debug only, compute renderer: logs a COMPWHY line once a second on how many frames were
     // drawn, how many were left out as identical, and what kept the drawn ones from that
     // (ComputeRenderer::LogWhy). it also has GPU3D hash every scene, to tell a swap that brought
