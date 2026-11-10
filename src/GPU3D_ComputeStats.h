@@ -82,7 +82,12 @@ namespace melonDS
 //   wanted          what binning asked for (VariantWorkCount[0].w), anything past b was dropped
 //   overflow        frames where it asked for more than b
 //   bound           the CPU's bounding box estimate of wanted (the direct dispatch sizes)
-//   xspans a/b      setup indices, which is one X span each, of the room for them
+//   room            the work tiles the tile memory has room for now (GPU::ComputeGrow, b at most)
+//   pastroom        frames whose work tiles went past the room they had. should stay 0: the room
+//                   grows to the bound first
+//   pastbound       frames where wanted went past bound. should stay 0, the room counts on it
+//   xspans a/b      setup indices, which is one X span each, of the most the polygon setup takes
+//   xroom           the X spans their buffers have room for now (b at most)
 //   yspans a/b      Y span setups, of MaxYSpanSetups
 //   variants a/b    of MaxVariants
 //   polys           polygons drawn
@@ -111,7 +116,7 @@ struct ComputeStats
         u64 PassNs[ComputePass::Count] {};
 
         u32 PeakWanted = 0, PeakBound = 0, PeakXSpans = 0, PeakYSpans = 0, PeakVariants = 0, PeakPolys = 0;
-        u32 Overflowed = 0, Cut = 0;
+        u32 Overflowed = 0, Cut = 0, PastRoom = 0, PastBound = 0;
     };
 
     // the switches as they were when this was made. Sync is never on with the other two
@@ -139,7 +144,8 @@ struct ComputeStats
     }
 
     // at the start of every RenderFrame
-    void FrameStart(s64 now, int scale, int tileSize, u32 maxWorkTiles, u32 maxXSpans, u32 maxYSpans, u32 maxVariants)
+    void FrameStart(s64 now, int scale, int tileSize, u32 maxWorkTiles, u32 workTileRoom, u32 maxXSpans, u32 xSpanRoom,
+                    u32 maxYSpans, u32 maxVariants)
     {
         if (Timers)
             Collect();
@@ -154,10 +160,11 @@ struct ComputeStats
         if (WantPeaks)
         {
             Platform::Log(Platform::LogLevel::Info, "COMPPEAK frames=%u worktiles=%u/%u wanted=%u overflow=%u bound=%u "
-                "xspans=%u/%u yspans=%u/%u variants=%u/%u polys=%u cut=%u scale=%d tile=%d\n",
+                "room=%u pastroom=%u pastbound=%u xspans=%u/%u xroom=%u yspans=%u/%u variants=%u/%u polys=%u cut=%u "
+                "scale=%d tile=%d\n",
                 Sec.Frames, std::min(Sec.PeakWanted, maxWorkTiles), maxWorkTiles, Sec.PeakWanted, Sec.Overflowed, Sec.PeakBound,
-                Sec.PeakXSpans, maxXSpans, Sec.PeakYSpans, maxYSpans, Sec.PeakVariants, maxVariants, Sec.PeakPolys, Sec.Cut,
-                scale, tileSize);
+                workTileRoom, Sec.PastRoom, Sec.PastBound, Sec.PeakXSpans, maxXSpans, xSpanRoom, Sec.PeakYSpans, maxYSpans,
+                Sec.PeakVariants, maxVariants, Sec.PeakPolys, Sec.Cut, scale, tileSize);
         }
 
         Sec = {};
@@ -179,10 +186,14 @@ struct ComputeStats
         Sec.Cut += cut;
     }
 
-    void NoteWorkTiles(u32 wanted, u32 maxWorkTiles)
+    // what binning asked for, against what the frame had: the most binning writes, the room the tile
+    // memory had and the CPU's bound
+    void NoteWorkTiles(u32 wanted, u32 maxWorkTiles, u32 workTileRoom, u32 bound)
     {
         Sec.PeakWanted = std::max(Sec.PeakWanted, wanted);
         Sec.Overflowed += wanted > maxWorkTiles;
+        Sec.PastRoom += std::min(wanted, maxWorkTiles) > workTileRoom;
+        Sec.PastBound += wanted > bound;
     }
 
     // the queries of one RenderFrame or one Blit, from here to EndSet

@@ -319,6 +319,12 @@ private:
     int TilesPerLine {}, TileLines {};
     int ScaleFactor = -1;
     int MaxWorkTiles {};
+    // the room the work buffers have now, which TargetFits and the shaders don't know about: the
+    // tile memory layers in work tiles (MaxWorkTiles at most), the X spans and their setup indices
+    // in spans (YSpanIndices.size() at most). ResizeTargets starts them small and GrowWorkBuffers
+    // makes them bigger before a frame that could need more (GPU::ComputeGrow)
+    int WorkTileRoom {};
+    int XSpanRoom {};
     bool HiresCoordinates {};
     // the next frame is drawn even if it's the same: ResizeTargets made a new, empty Framebuffer,
     // the hi-res coordinates setting changed how the polygons are set up, or a reset emptied the
@@ -396,6 +402,9 @@ private:
     bool TargetFits(int width, int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
     void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth);
+    void AllocTileMemory(int workTiles);
+    void AllocXSpans(int spans);
+    void GrowWorkBuffers(u32 workTiles, u32 spans);
     int FrameTargetWidth(const GPU& gpu) noexcept;
     void KeepFramebuffer() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer, GLsync& fence) noexcept;

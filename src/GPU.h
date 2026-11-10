@@ -828,6 +828,10 @@ public:
     // GPU write indirect arguments, which Adreno's driver waits on (see ComputeRenderer::RenderFrame).
     // only turned off by a debug switch, to compare
     bool ComputeDirectDispatch = true;
+    // compute renderer: the tile memory and X span buffers start small and grow before a frame whose
+    // polygons could need more (ComputeRenderer::GrowWorkBuffers), instead of always taking the most
+    // a frame could use (about 190 MB at 4x). only turned off by a debug switch, to compare
+    bool ComputeGrow = true;
     // debug only, compute renderer: logs a COMPTIME line once a second with the GPU time of each
     // pass and of the compositor, from GL timer queries (GPU3D_ComputeStats.h)
     bool ComputeTimers = false;
