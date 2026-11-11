@@ -96,6 +96,7 @@ if (ENABLE_OGLRENDERER)
         GPU_OpenGL_shaders.h
         GPU3D_OpenGL.cpp
         GPU3D_Compute.cpp
+        GPU3D_ComputeRooms.cpp
         GPU3D_TexcacheOpenGL.cpp
         GPU3D_TexcacheOpenGL.h
         GPU3D_OpenGL_shaders.h

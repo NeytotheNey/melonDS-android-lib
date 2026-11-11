@@ -20,6 +20,7 @@
 #define MELONDS_UTILS_H
 
 #include <memory>
+#include <string>
 #include "types.h"
 #include <utility>
 
@@ -37,6 +38,10 @@ std::pair<std::unique_ptr<u8[]>, u32> PadToPowerOf2(std::unique_ptr<u8[]>&& data
 std::pair<std::unique_ptr<u8[]>, u32> PadToPowerOf2(const u8* data, u32 len) noexcept;
 
 std::unique_ptr<u8[]> CopyToUnique(const u8* data, u32 len) noexcept;
+
+// writes a whole file to path + ".tmp" and renames it over path, so a crash or a full disk halfway
+// leaves the old file or none, never half of one. for the caches the frontend gives a path for
+bool ReplaceFile(const std::string& path, const u8* data, size_t size) noexcept;
 
 template <typename T>
 T GetMSBit(T val)

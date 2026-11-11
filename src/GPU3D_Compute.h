@@ -31,6 +31,7 @@
 
 #include "GPU3D_TexcacheOpenGL.h"
 #include "GPU3D_ComputeStats.h"
+#include "GPU3D_ComputeRooms.h"
 
 #include "NonStupidBitfield.h"
 
@@ -342,6 +343,15 @@ private:
     // that failed leaves 0, and a frame that needs more than there is isn't drawn
     int WorkTileRoom {};
     int XSpanRoom {};
+    // GPU::ComputeGrow and GPU::ComputeRooms, and the cart's game code and header CRC (0 for none),
+    // from Reset: what the rooms remembered for this game are found by (ComputeWorkRooms)
+    bool UseRooms = false;
+    u32 RoomGameCode = 0;
+    u32 RoomHeaderCRC = 0;
+    // Reset saw another cart while the rooms were set up for the last one's key, until ResizeTargets
+    bool RoomsKeyChanged = false;
+    ComputeWorkRooms::Key RoomKey() const noexcept;
+    void ShrinkWorkBuffers() noexcept;
     // after a grow that failed, how many more grows are left out (GrowRetryIn), and how many
     // were left out last time, which doubles with every failure in a row
     int GrowRetryIn = 0;
