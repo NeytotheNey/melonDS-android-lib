@@ -831,6 +831,11 @@ public:
     // polygons could need more (ComputeRenderer::GrowWorkBuffers), instead of always taking the most
     // a frame could use (about 190 MB at 4x). only turned off by a debug switch, to compare
     bool ComputeGrow = true;
+    // compute renderer: load programs compiled before from their binaries (OpenGL::CompileComputeProgram)
+    // instead of compiling them again at game start and at each scale, width or layout change. it
+    // needs a file the frontend sets (OpenGL::SetShaderCachePath). read when the renderer is set or
+    // reset; only turned off by a debug switch, which also leaves the file alone
+    bool ShaderCache = true;
     // debug only, compute renderer: logs a COMPTIME line once a second with the GPU time of each
     // pass and of the compositor, from GL timer queries (GPU3D_ComputeStats.h)
     bool ComputeTimers = false;

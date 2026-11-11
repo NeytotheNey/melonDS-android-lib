@@ -28,8 +28,26 @@
 namespace melonDS::OpenGL
 {
 
-void LoadShaderCache();
-void SaveShaderCache();
+// what the compute program cache did for a batch of CompileComputeProgram calls
+struct ShaderCacheStats
+{
+    u32 Programs = 0;
+    // loaded from a binary, compiled as there was none, compiled as the driver turned its binary
+    // down, compiled as there's no cache (no path, or a driver without binary formats)
+    u32 Hits = 0, Misses = 0, Rejected = 0, Uncached = 0;
+    u64 BytesLoaded = 0, BytesSaved = 0;
+};
+
+// the file the compute program cache lives in, which the frontend picks (private storage it may
+// lose, like Android's cache dir). empty, the default, is no cache. the file is read at the first
+// CompileComputeProgram that asks for the cache
+void SetShaderCachePath(const std::string& path);
+// writes the file again if programs were added since it was read or written (or hits moved stale
+// last-used stamps, see CompileComputeProgram), dropping the least
+// recently used past its cap. once at the end of a batch of compiles, not after each program
+void SaveShaderCache(ShaderCacheStats& stats);
+// frees the programs held in memory, which the next lookup reads from the file again
+void ReleaseShaderCache();
 
 struct AttributeTarget
 {
@@ -44,7 +62,9 @@ bool CompileVertexFragmentProgram(GLuint& result,
     const std::initializer_list<AttributeTarget>& vertexInAttrs,
     const std::initializer_list<AttributeTarget>& fragmentOutAttrs);
 
-bool CompileComputeProgram(GLuint& result, const std::string& source, const std::string& name);
+// with a cache, a program compiled before from the same source on the same driver is loaded from
+// its binary instead, and a new one is kept for next time (counted in it)
+bool CompileComputeProgram(GLuint& result, const std::string& source, const std::string& name, ShaderCacheStats* cache = nullptr);
 
 }
 

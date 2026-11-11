@@ -122,7 +122,7 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     //    fclose(f);
     //}
 
-    return OpenGL::CompileComputeProgram(shader, shaderSource.c_str(), shaderName.c_str());
+    return OpenGL::CompileComputeProgram(shader, shaderSource.c_str(), shaderName.c_str(), UseShaderCache ? &ShaderBatch : nullptr);
 }
 
 void ComputeRenderer::ShaderCompileStep(int& current, int& count)
@@ -130,6 +130,38 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
     current = ShaderStepIdx;
     ShaderStepIdx++;
     count = 33;
+
+    // a batch is the 33 programs of one configuration. the Android frontend and RenderFrame compile
+    // them all at once, the Qt one a step per frame
+    if (current == 0)
+    {
+        ShaderBatch = {};
+        ShaderBatchNs = 0;
+    }
+    s64 start = SteadyNowNs();
+    CompileShaderStep(current);
+    // one write for the batch, with the programs it added or the stamps it moved. then the binaries
+    // leave memory until the next batch reads the file again, rather than sit there all game
+    if (current == count - 1 && UseShaderCache)
+    {
+        OpenGL::SaveShaderCache(ShaderBatch);
+        OpenGL::ReleaseShaderCache();
+    }
+    ShaderBatchNs += SteadyNowNs() - start;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (current == count - 1)
+    {
+        Platform::Log(Platform::LogLevel::Info, "COMPSHADER programs=%d hits=%u misses=%u rejected=%u uncached=%u ms=%.1f loaded=%llu saved=%llu cache=%d scale=%d width=%d tile=%d opt=%d\n",
+            count, ShaderBatch.Hits, ShaderBatch.Misses, ShaderBatch.Rejected, ShaderBatch.Uncached,
+            ShaderBatchNs / 1e6, (unsigned long long)ShaderBatch.BytesLoaded, (unsigned long long)ShaderBatch.BytesSaved,
+            UseShaderCache ? 1 : 0, ScaleFactor, TargetWidth, TileSize, OptMask);
+    }
+#endif
+}
+
+void ComputeRenderer::CompileShaderStep(int current)
+{
     switch (current)
     {
     case 0:
@@ -391,6 +423,8 @@ ComputeRenderer::~ComputeRenderer()
         glDeleteSync(EarlyCaptureFence);
 
     DeleteShaders();
+    // the binaries in memory are only for compiles, and the file has every one a batch added
+    OpenGL::ReleaseShaderCache();
 }
 
 void ComputeRenderer::DeleteShaders()
@@ -442,6 +476,8 @@ void ComputeRenderer::DeleteShaders()
 
 void ComputeRenderer::Reset(GPU& gpu)
 {
+    // set before the first compile, which comes before the first RenderFrame
+    UseShaderCache = gpu.ShaderCache;
     Texcache.Reset();
     TexcacheEmptied = true;
     // what the image was drawn with is gone, so the next frame is drawn whatever GPU3D says of it.
