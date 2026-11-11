@@ -20,7 +20,9 @@
 #define GPU3D_COMPUTE
 
 #include <cstddef>
+#include <initializer_list>
 #include <memory>
+#include <vector>
 
 #include "types.h"
 
@@ -328,7 +330,43 @@ private:
     // off, the default, and then nothing here makes a GL call for them
     std::unique_ptr<ComputeStats> Stats;
     void UpdateStats(const GPU& gpu);
+
+    // the COMPSLOW line: RenderFrame's CPU time by phase, logged for a frame over 30 ms, with how
+    // many programs it was the first to dispatch since they were compiled (DispatchedPrograms)
+    struct SlowPhases
+    {
+        s64 Pace, Resize, Warm, Texcache, ClearBitmap, Setup, TexGet, Grow, Upload, Bin, Rast, Final, End;
+    };
+    SlowPhases Slow {};
+    s64 SlowLast = 0;
+    int SlowFirsts = 0;
+    std::vector<GLuint> DispatchedPrograms;
+    void SlowLap(s64& phase) noexcept;
+    void NoteProgram(GLuint program);
+    void LogSlow(int numPolygons, u32 numVariants, u32 tileBound, int setupIndices) noexcept;
+
+    // the computewarm experiment (GPU::ComputeWarm): at the first RenderFrame after the targets
+    // were set up, every byte of the work buffers is written once and each program dispatched
+    // once with nothing to do, logged as COMPWARM. a grow writes the grown buffers the same way
+    bool WarmEnabled = false;
+    bool WarmPending = false;
+    GLuint ShaderWarmZero = 0;
+    bool WarmZeroFailed = false;
+    // 1x1 images the final pass writes to while warming (RGBA8 and RGBA8UI)
+    GLuint WarmScratch[2] {};
+    bool WarmZeroReady();
+    u64 ZeroBuffer(GLuint buffer) noexcept;
+    double TouchBuffers(std::initializer_list<GLuint> buffers, u64& bytes) noexcept;
+    void Warm();
 #endif
+    // glUseProgram, which debug builds also count for COMPSLOW
+    void UseProgram(GLuint program)
+    {
+        glUseProgram(program);
+#ifdef MELONADE_DEBUG_TOOLS
+        NoteProgram(program);
+#endif
+    }
 
     u32 FramebufferCPU[256*192];
 
