@@ -37,9 +37,11 @@ namespace melonDS
 #ifdef MELONADE_DEBUG_TOOLS
 #define GL_TIMER(pass) do { if (Timers) Timers->Begin(GLPass::pass); } while (0)
 #define FRAG_PASS(pass) do { if (FragCounter) SetFragPass(GLFragCounter::Frag_##pass); } while (0)
+#define TRANS_SKIPPED(field) do { if (TransStats) TransStats->Sec.field++; } while (0)
 #else
 #define GL_TIMER(pass) do {} while (0)
 #define FRAG_PASS(pass) do {} while (0)
+#define TRANS_SKIPPED(field) do {} while (0)
 #endif
 
 bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount)
@@ -332,6 +334,33 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 1024, 48, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, NULL);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+#ifdef MELONADE_DEBUG_TOOLS
+    // for a later experiment (pass 2's rule for clear alpha 0 done in the shader, see
+    // docs/plan-gpu-discovery.md T1): whether the shader could read the color target. one name at a
+    // time with glGetStringi, which GLES 3 and a desktop core profile both have (glGetString's list
+    // is GL_INVALID_ENUM on the latter), compared whole, since the EXT one is a prefix of its
+    // non-coherent sibling
+    {
+        GLint numExtensions = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &numExtensions);
+        auto hasExtension = [numExtensions](const char* name)
+        {
+            for (GLint e = 0; e < numExtensions; e++)
+            {
+                const char* extension = (const char*)glGetStringi(GL_EXTENSIONS, (GLuint)e);
+                if (extension && strcmp(extension, name) == 0)
+                    return true;
+            }
+            return false;
+        };
+        Platform::Log(Platform::LogLevel::Info, "GLTRANS: framebuffer fetch GL_EXT_shader_framebuffer_fetch=%d "
+            "GL_ARM_shader_framebuffer_fetch=%d GL_EXT_shader_framebuffer_fetch_non_coherent=%d\n",
+            hasExtension("GL_EXT_shader_framebuffer_fetch") ? 1 : 0,
+            hasExtension("GL_ARM_shader_framebuffer_fetch") ? 1 : 0,
+            hasExtension("GL_EXT_shader_framebuffer_fetch_non_coherent") ? 1 : 0);
+    }
+#endif
 
     return result;
 }
@@ -1007,6 +1036,150 @@ void GLRenderer::SetPolygonDepthBias(u32 polyattr)
     SetDepthBias(bias);
 }
 
+// GPU::GLTransSkip bit 1: the AlphaClass_* of each byte of an A3I5 ([0]) or A5I3 ([1]) texel, with
+// the alpha the shader gets from it (TextureFetch_A3I5, TextureFetch_A5I3): 31 passes the opaque
+// draw's discard, 1-30 the translucent draw's, 0 neither
+struct TexelAlphaTables
+{
+    u8 Class[2][256];
+
+    TexelAlphaTables()
+    {
+        for (int b = 0; b < 256; b++)
+        {
+            int a3i5 = ((b & 0xE0) >> 3) + ((b & 0xE0) >> 6);
+            int a5i3 = (b & 0xF8) >> 3;
+            int alpha[2] = { a3i5, a5i3 };
+            for (int t = 0; t < 2; t++)
+            {
+                if (alpha[t] == 31)    Class[t][b] = 1; // AlphaClass_Full
+                else if (alpha[t] > 0) Class[t][b] = 2; // AlphaClass_Partial
+                else                   Class[t][b] = 0;
+            }
+        }
+    }
+};
+static const TexelAlphaTables kTexelAlpha;
+
+// the classes of a need-opaque polygon's texture: every texel of its width x height, which is every
+// texel any wrap or flip mode can reach (TexcoordWrap keeps s and t inside), at the address the shader
+// reads it from (TexParam's low 16 bits x 8 plus the texel index, one byte a texel) in the same copy
+// TexMem is uploaded from. a texture reaching past TexMem's 512 KB has texelFetch read out of range,
+// which GL leaves undefined, so it gets both classes. once a frame per texture (TexAlphaKey)
+u8 GLRenderer::TextureAlphaClass(const u8* vram, u32 texparam)
+{
+    u32 key = texparam & 0x1FF0FFFF; // address, size, format: wrap, flip and color 0 don't change it
+    u32 slot = (key * 2654435761u) >> 20; // TexAlphaSlots = 4096, more than polygons, so never full
+    while (TexAlphaStamp[slot] == TexAlphaFrame)
+    {
+        if (TexAlphaKey[slot] == key)
+            return TexAlphaValue[slot];
+        slot = (slot + 1) & (TexAlphaSlots - 1);
+    }
+
+    u32 format = (texparam >> 26) & 0x7;
+    u32 addr = (texparam & 0xFFFF) << 3;
+    u32 texels = (8u << ((texparam >> 20) & 0x7)) * (8u << ((texparam >> 23) & 0x7));
+
+    u8 value = AlphaClass_Full | AlphaClass_Partial;
+    u32 scanned = 0; // bytes read, for GLTRANS
+    if ((format == 1 || format == 6) && addr + texels <= sizeof(GPU::VRAMFlat_Texture))
+    {
+        const u8* table = kTexelAlpha.Class[format == 6];
+        const u8* p = vram + addr;
+        value = 0;
+        // in blocks, so it can stop once both are found
+        for (u32 i = 0; i < texels && value != (AlphaClass_Full | AlphaClass_Partial); i += 256)
+        {
+            u32 end = std::min(i + 256, texels);
+            u8 acc = 0;
+            for (u32 j = i; j < end; j++)
+                acc |= table[p[j]];
+            value |= acc;
+            scanned = end;
+        }
+    }
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (TransStats)
+    {
+        TransStats->Sec.Textures += scanned > 0;
+        TransStats->Sec.Texels += scanned;
+    }
+#else
+    (void)scanned;
+#endif
+
+    TexAlphaStamp[slot] = TexAlphaFrame;
+    TexAlphaKey[slot] = key;
+    TexAlphaValue[slot] = value;
+    return value;
+}
+
+// GPU::GLTransSkip bit 1, before the passes: TransAlphaClass for every polygon. a need-opaque polygon
+// (translucent, polygon alpha 31, so an A3I5 or A5I3 texture) goes by FinalColor in the shader: with
+// texturing off (DISP3DCNT bit 0) or decal (mode 1, and shadow, mode 3, which takes the decal path)
+// the fragment's alpha is the vertex color's, 31, so only the opaque draw passes. modulate and
+// toon/highlight (modes 0 and 2) multiply it by the texel's, so the texture's classes decide. the
+// texture is read with texelFetch, nothing filters or interpolates texel alpha (TextureLookup_Linear
+// isn't used), and there's no alpha test in these shaders
+void GLRenderer::ClassifyTransAlpha(const GPU& gpu)
+{
+#ifdef MELONADE_DEBUG_TOOLS
+    s64 start = TransStats ? GLStatsNowNs() : 0;
+#endif
+    if (++TexAlphaFrame == 0)
+    {
+        // the stamps wrapped: forget them all
+        memset(TexAlphaStamp, 0, sizeof(TexAlphaStamp));
+        TexAlphaFrame = 1;
+    }
+
+    bool texturing = (gpu.GPU3D.RenderDispCnt & (1<<0)) != 0;
+    const u8* vram = gpu.VRAMFlat_Texture;
+
+    for (int i = 0; i < NumFinalPolys; i++)
+    {
+        const Polygon* polygon = PolygonList[i].PolyData;
+        u32 attr = polygon->Attr;
+        if (polygon->IsShadowMask || !polygon->Translucent || (attr & 0x001F0000) != 0x001F0000)
+        {
+            TransAlphaClass[i] = AlphaClass_Full | AlphaClass_Partial;
+            continue;
+        }
+
+        u32 format = (polygon->TexParam >> 26) & 0x7;
+        u32 blendmode = (attr >> 4) & 0x3;
+        u8 value;
+        if (!texturing || format == 0 || (blendmode & 1))
+            value = AlphaClass_Full;
+        else
+            value = TextureAlphaClass(vram, polygon->TexParam);
+        TransAlphaClass[i] = value;
+
+#ifdef MELONADE_DEBUG_TOOLS
+        if (TransStats)
+        {
+            GLTransStats::Counters& sec = TransStats->Sec;
+            sec.NeedOpaque++;
+            if (value == AlphaClass_Full)          sec.Full++;
+            else if (value == AlphaClass_Partial)  sec.Partial++;
+            else if (value != 0)                   sec.Mixed++;
+            else                                   sec.Neither++;
+        }
+#endif
+    }
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (TransStats)
+    {
+        s64 ns = GLStatsNowNs() - start;
+        TransStats->Sec.ScanNs += ns;
+        TransStats->Sec.PeakScanNs = std::max(TransStats->Sec.PeakScanNs, ns);
+    }
+#endif
+}
+
 void GLRenderer::LogFrameStats(const GPU3D& gpu3d)
 {
     // debug: what kinds of polygons the frame has, to find what a game draws its shadows with
@@ -1187,14 +1360,40 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
     glLineWidth(1.0);
 
+    // GPU::GLTransSkip bit 1: which of a need-opaque polygon's two draws can pass a fragment (see
+    // ClassifyTransAlpha). a draw that would discard all of them changes nothing, and every draw after
+    // it sets all the state it uses. shadows keep their translucent draws, which do the stencil work
+    bool alphaClasses = (GLTransSkip & 2) != 0;
+    // redrawn: bit 0 already leaves the opaque draw out
+    auto needsDraws = [&](int i, bool needopaque, bool redrawn, bool& drawopaque, bool& drawtrans)
+    {
+        drawopaque = needopaque && !redrawn;
+        drawtrans = true;
+        if (!needopaque || !alphaClasses) return;
+
+        u8 value = TransAlphaClass[i];
+        if (drawopaque && !(value & AlphaClass_Full))
+        {
+            drawopaque = false;
+            TRANS_SKIPPED(Skip1Opaque);
+        }
+        if (!(value & AlphaClass_Partial) && !PolygonList[i].PolyData->IsShadow)
+        {
+            drawtrans = false;
+            TRANS_SKIPPED(Skip1Trans);
+        }
+    };
+
     if (NumOpaqueFinalPolys > -1)
     {
+        bool clear0 = (gpu3d.RenderClearAttr1 & 0x001F0000) == 0;
+
         // pass 2: if needed, render translucent pixels that are against background pixels
         // when background alpha is zero, those need to be rendered with blending disabled
         // (with a clear bitmap this still tests the clear attribute's alpha, not the bitmap's
         // per-pixel alpha; upstream's GL renderer has the same gap)
 
-        if ((gpu3d.RenderClearAttr1 & 0x001F0000) == 0)
+        if (clear0)
         {
             GL_TIMER(Clear0);
             FRAG_PASS(Clear0);
@@ -1235,7 +1434,10 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     else
                         glDepthFunc(GL_LESS);
 
-                    if (needopaque)
+                    bool drawopaque, drawtrans;
+                    needsDraws(i, needopaque, false, drawopaque, drawtrans);
+
+                    if (drawopaque)
                     {
                         UseRenderShader(wbuffer, RenderMode_Opaque);
 
@@ -1252,6 +1454,16 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                         SetPolygonDepthBias(polyattr);
                         RenderSinglePolygon(i);
                     }
+                    else if (needopaque)
+                    {
+                        // the one piece of the left-out draw's state that's used after it: this
+                        // pass's translucent draws (not shadows) keep the blend state they find, which
+                        // a shadow before them can have turned on
+                        glDisable(GL_BLEND);
+                    }
+
+                    // only a need-opaque polygon, which is drawn on its own
+                    if (!drawtrans) { i++; continue; }
 
                     UseRenderShader(wbuffer, RenderMode_Translucent);
 
@@ -1409,7 +1621,22 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                 else
                     glDepthFunc(GL_LESS);
 
-                if (needopaque)
+                // GPU::GLTransSkip bit 0: pass 2 drew this opaque part already, with the same
+                // program, vertices and bias (0 without bit 14), so a fragment that survives the
+                // discard now did then, and stored its depth or failed against a nearer one. every
+                // depth write since was under GL_LESS or GL_LEQUAL (a depth-equal one moved nearer,
+                // never farther), and masks, the stencil clears and the shadows' stencil draws write
+                // no depth, so the depth there is still at most this fragment's. GL_LESS fails, and
+                // with the stencil test ALWAYS and KEEP on a depth fail, the draw writes nothing.
+                // a depth-equal polygon's GL_LEQUAL can pass again, so it's still drawn
+                bool redrawn = needopaque && clear0 && (GLTransSkip & 1) && !(polyattr & (1<<14));
+                if (redrawn)
+                    TRANS_SKIPPED(Skip0);
+
+                bool drawopaque, drawtrans;
+                needsDraws(i, needopaque, redrawn, drawopaque, drawtrans);
+
+                if (drawopaque)
                 {
                     UseRenderShader(wbuffer, RenderMode_Opaque);
 
@@ -1426,6 +1653,9 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     SetPolygonDepthBias(polyattr);
                     RenderSinglePolygon(i);
                 }
+
+                // only a need-opaque polygon that isn't a shadow, which is drawn on its own
+                if (!drawtrans) { i++; continue; }
 
                 UseRenderShader(wbuffer, RenderMode_Translucent);
 
@@ -1592,6 +1822,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
 #ifdef MELONADE_DEBUG_TOOLS
     if (gpu.GLTimers || Timers || gpu.SceneStats == 2 || FragCounter)
         UpdateDebugStats(gpu);
+
+    // GLTRANS goes with SCENESTATS
+    if (gpu.SceneStats && !TransStats)
+        TransStats = std::make_unique<GLTransStats>();
+    else if (!gpu.SceneStats && TransStats)
+        TransStats.reset();
+    if (TransStats)
+        TransStats->FrameStart(GLStatsNowNs(), gpu.GLTransSkip);
 #endif
     bool keep = KeepRequested;
     KeepRequested = false;
@@ -1658,6 +1896,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
     ShadowMaskLineClear = gpu.ShadowMaskLineClear;
     ShadowMaskDepthTest = gpu.ShadowMaskDepthTest;
     EqualDepthMargin = gpu.EqualDepthMargin;
+    GLTransSkip = gpu.GLTransSkip;
 
     // debug: log the last frame's masks and shadows, its queries should be done by now
     if (NumShadowLogEntries) FlushShadowLog();
@@ -1867,6 +2106,18 @@ void GLRenderer::RenderFrame(GPU& gpu)
         glBindVertexArray(VertexArrayID);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, NumIndices * 2, IndexBuffer);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
+
+        // VRAMFlat_Texture is what TexMem was just brought up to date from
+        bool classify = (GLTransSkip & 2) != 0;
+#ifdef MELONADE_DEBUG_TOOLS
+        if (TransStats)
+        {
+            TransStats->Sec.Frames++;
+            classify = true;
+        }
+#endif
+        if (classify)
+            ClassifyTransAlpha(gpu);
 
 #ifdef MELONADE_DEBUG_TOOLS
         if (FragCounter)

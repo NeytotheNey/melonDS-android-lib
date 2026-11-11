@@ -822,6 +822,14 @@ public:
     // OpenGL renderer: all other depth-equal polygons get the far side of the DS margin too
     // (see GLRenderer::SetPolygonDepthBias). only turned off by a debug switch, to compare
     bool EqualDepthMargin = true;
+    // OpenGL renderer, experiment T1 (docs/plan-gpu-discovery.md): leave out translucent-pass draws
+    // that can't change a pixel, a bit each, for A/B runs against hash3d. 0 draws as before.
+    // bit 0: with the clear-alpha-0 pass, pass 3 doesn't draw a need-opaque polygon's opaque part
+    // again (not depth-equal ones), since pass 2 drew it and depth only went down since. bit 1: a
+    // need-opaque polygon's opaque draw is left out when its texture has no texel that ends up at
+    // alpha 31, its translucent draw (not a shadow's) when none ends up at 1-30
+    // (GLRenderer::ClassifyTransAlpha). only changed by a debug switch, set before the game runs
+    int GLTransSkip = 0;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;
     // compute renderer: size the SortWork and Rasterise dispatches on the CPU instead of having the

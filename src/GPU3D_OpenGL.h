@@ -126,6 +126,8 @@ private:
     void ClearShadowMaskLines(const Polygon* polygon, const bool* lastWasMask) const;
     void SetDepthBias(float bias);
     void SetPolygonDepthBias(u32 polyattr);
+    void ClassifyTransAlpha(const GPU& gpu);
+    u8 TextureAlphaClass(const u8* vram, u32 texparam);
     void LogFrameStats(const GPU3D& gpu3d);
     int BeginShadowLogQuery();
     void LogShadowPolygon(char type, int i, int query);
@@ -232,6 +234,25 @@ private:
     bool ShadowMaskLineClear = true;
     bool ShadowMaskDepthTest = true;
     bool EqualDepthMargin = true;
+    // set per frame from GPU::GLTransSkip
+    int GLTransSkip = 0;
+
+    // GPU::GLTransSkip bit 1: what a need-opaque polygon's fragments can come out as (AlphaClass_*),
+    // per PolygonList entry, filled by ClassifyTransAlpha before the passes. both bits for every
+    // other polygon, and for a texture the scan couldn't vouch for
+    enum
+    {
+        AlphaClass_Full = 1,    // some fragment can have alpha 31: the opaque draw can pass it
+        AlphaClass_Partial = 2, // some can have alpha 1-30: the translucent draw can pass it
+    };
+    u8 TransAlphaClass[2048] {};
+    // the frame's scanned textures (by TexParam's address, size and format), so polygons sharing one
+    // scan it once. a slot is in use when its stamp is this frame's
+    static constexpr int TexAlphaSlots = 4096;
+    u32 TexAlphaKey[TexAlphaSlots] {};
+    u32 TexAlphaStamp[TexAlphaSlots] {};
+    u8 TexAlphaValue[TexAlphaSlots] {};
+    u32 TexAlphaFrame = 0;
 
     // debug only (GPU::ShadowLogFrames): the masks and shadows of a frame, logged at the start of
     // the next one so their occlusion queries are done by then
@@ -287,6 +308,8 @@ private:
     GLint FragPassLoc[2] {-1, -1};
     // HASH3D (GPU::Hash3DLogging)
     std::unique_ptr<Hash3DReadback> Hash3D;
+    // GLTRANS (GPU::SceneStats, with GPU::GLTransSkip)
+    std::unique_ptr<GLTransStats> TransStats;
 
     void UpdateDebugStats(const GPU& gpu);
     void SetupFragCount();

@@ -610,6 +610,62 @@ private:
     s64 LogStartNs = 0;
 };
 
+// debug builds only, OpenGL renderer, GPU::SceneStats: the GLTRANS log, on experiment T1
+// (GPU::GLTransSkip, docs/plan-gpu-discovery.md). the classes are counted whatever the switch is, the
+// skips only when it's on. SCENESTATS is the CPU's view of the scene for any renderer, so this is
+// its own line.
+//
+// GLTRANS, once a second, every value per drawn frame (renders with polygons RenderFrame didn't skip):
+//   frames gltrans     those frames, and the switch
+//   needopaque         translucent polygons with polygon alpha 31 (an A3I5 or A5I3 texture), drawn
+//                      opaque and then translucent in each translucent pass
+//   full partial mixed neither
+//                      of those, the ones whose fragments can only come out at alpha 31, only at
+//                      1-30, at both, or at neither (every texel alpha 0). textures that couldn't be
+//                      scanned count as mixed
+//   textures texels    textures scanned (once a frame each), and their texels
+//   skip0              pass 3 opaque redraws bit 0 left out
+//   skip1_opaque skip1_trans
+//                      opaque and translucent draws bit 1 left out (both passes; not ones bit 0 did)
+//   scan_us peak_scan_us
+//                      CPU µs of the classification, and the most in one frame
+struct GLTransStats
+{
+    struct Counters
+    {
+        u32 Frames = 0;
+        u64 NeedOpaque = 0, Full = 0, Partial = 0, Mixed = 0, Neither = 0, Textures = 0, Texels = 0;
+        u64 Skip0 = 0, Skip1Opaque = 0, Skip1Trans = 0;
+        s64 ScanNs = 0, PeakScanNs = 0;
+    };
+    Counters Sec;
+
+    // at the start of every RenderFrame
+    void FrameStart(s64 now, int mode)
+    {
+        if (LogStartNs == 0)
+            LogStartNs = now;
+        if (now - LogStartNs < 1000000000)
+            return;
+
+        if (Sec.Frames > 0)
+        {
+            double per = 1.0 / Sec.Frames;
+            Platform::Log(Platform::LogLevel::Info, "GLTRANS frames=%u gltrans=%d needopaque=%.1f full=%.1f partial=%.1f "
+                "mixed=%.1f neither=%.1f textures=%.1f texels=%.0f skip0=%.1f skip1_opaque=%.1f skip1_trans=%.1f "
+                "scan_us=%.1f peak_scan_us=%.1f\n",
+                Sec.Frames, mode, Sec.NeedOpaque * per, Sec.Full * per, Sec.Partial * per, Sec.Mixed * per,
+                Sec.Neither * per, Sec.Textures * per, Sec.Texels * per, Sec.Skip0 * per, Sec.Skip1Opaque * per,
+                Sec.Skip1Trans * per, Sec.ScanNs * per / 1000.0, Sec.PeakScanNs / 1000.0);
+        }
+        Sec = {};
+        LogStartNs = now;
+    }
+
+private:
+    s64 LogStartNs = 0;
+};
+
 }
 
 #endif
