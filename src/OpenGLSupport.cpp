@@ -17,6 +17,7 @@
 */
 
 #include "OpenGLSupport.h"
+#include "Utils.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -353,26 +354,8 @@ void SaveShaderCache(ShaderCacheStats& stats)
     u64 checksum = XXH3_64bits(buffer.data() + ShaderCacheHeaderBytes, buffer.size() - ShaderCacheHeaderBytes);
     memcpy(&buffer[24], &checksum, sizeof(checksum));
 
-    // a whole new file under another name that then replaces the old one, so a crash or a full disk
-    // halfway leaves the old file or none, never half of one
-    std::string tempPath = ShaderCachePath + ".tmp";
-    Platform::FileHandle* file = Platform::OpenFile(tempPath, Platform::FileMode::Write);
-    bool written = false;
-    if (file)
+    if (!ReplaceFile(ShaderCachePath, buffer.data(), buffer.size()))
     {
-        written = Platform::FileWrite(buffer.data(), buffer.size(), 1, file) == 1;
-        written = Platform::FileFlush(file) && written;
-        written = Platform::CloseFile(file) && written;
-    }
-    if (written && std::rename(tempPath.c_str(), ShaderCachePath.c_str()) != 0)
-    {
-        // Windows doesn't rename over a file that exists
-        std::remove(ShaderCachePath.c_str());
-        written = std::rename(tempPath.c_str(), ShaderCachePath.c_str()) == 0;
-    }
-    if (!written)
-    {
-        std::remove(tempPath.c_str());
         LogShaderCacheProblem("OpenGL: couldn't write the compute program cache (%zu bytes)", buffer.size());
         return;
     }

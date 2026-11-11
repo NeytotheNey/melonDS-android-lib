@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <iterator>
 #include <thread>
 #include <utility>
@@ -30,6 +31,8 @@
 #include "WideMelon.h"
 
 #include "OpenGLSupport.h"
+#include "NDS.h"
+#include "NDSCart.h"
 
 #include "GPU3D_Compute_shaders.h"
 
@@ -478,6 +481,27 @@ void ComputeRenderer::Reset(GPU& gpu)
 {
     // set before the first compile, which comes before the first RenderFrame
     UseShaderCache = gpu.ShaderCache;
+    // and before the targets' first setup (SetRenderSettings), which starts the rooms. without
+    // ComputeGrow the rooms are the most at the first frame, so there's nothing to remember.
+    // a cart without a game code (homebrew) or no cart has no rooms. DSiWare is loaded as a cart
+    // here (MelonInstance::loadRom), so it has them
+    UseRooms = gpu.ComputeGrow && gpu.ComputeRooms;
+    u32 gameCode = 0, headerCRC = 0;
+    if (const NDSCart::CartCommon* cart = gpu.NDS.GetNDSCart())
+    {
+        const NDSHeader& header = cart->GetHeader();
+        if (header.GameCodeAsU32() != 0 && memcmp(header.GameCode, "####", 4) != 0)
+        {
+            gameCode = header.GameCodeAsU32();
+            headerCRC = header.HeaderCRC16;
+        }
+    }
+    // another cart with the renderer kept (the Qt frontend can): the rooms in use are the last
+    // game's, so they aren't remembered for this one until ResizeTargets starts its own
+    if ((gameCode != RoomGameCode || headerCRC != RoomHeaderCRC) && ScaleFactor != -1)
+        RoomsKeyChanged = true;
+    RoomGameCode = gameCode;
+    RoomHeaderCRC = headerCRC;
     Texcache.Reset();
     TexcacheEmptied = true;
     // what the image was drawn with is gone, so the next frame is drawn whatever GPU3D says of it.
@@ -694,9 +718,24 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     // (GrowWorkBuffers). White 2's overworld used 29k and NSMB's map 40k work tiles at 4x, and the
     // CPU's bound ran 1.8 times what binning used on White 2's title, so 6 (74k at 4x) should hold
     // both without growing. the title grows once or twice. if it fails the room is 0, and the
-    // first frame with polygons grows it right away, whatever the grows before these targets did
+    // first frame with polygons grows it right away, whatever the grows before these targets did.
+    // a game that grew past where they start before, at the same scale, width and layout, starts
+    // at the rooms it grew to (ComputeWorkRooms), so that grow is part of the first frame's setup
+    // and not a hitch mid-game, as on White 2's title. they have the grow's quarter of headroom in
+    // them already, so nothing is added. a room that doesn't fit now is the usual start
     GrowRetryIn = GrowRetryWait = 0;
-    AllocTileMemory(TilesPerLine*TileLines*6);
+    // eh those are pretty bad guesses
+    // though real hw shouldn't be eable to render all 2048 polygons on every line either
+    int maxYSpanIndices = 64*2048 * ScaleFactor;
+    YSpanIndices.resize(maxYSpanIndices);
+    int startTiles = TilesPerLine*TileLines*6;
+    int startSpans = maxYSpanIndices / 16;
+    int roomTiles = 0, roomSpans = 0;
+    bool roomsFound = UseRooms && ComputeWorkRooms::Find(RoomKey(), roomTiles, roomSpans);
+    // the rooms are allocated last, as they're the only checked allocations here and the biggest:
+    // a remembered room must not take the memory the unchecked ones below need. the old rooms'
+    // storage is let go first, as the destructor does, so it isn't held through all of them
+    ShrinkWorkBuffers();
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, FinalTileMemory);
     glBufferData(GL_SHADER_STORAGE_BUFFER, 4*3*2*ScreenWidth*ScreenHeight, nullptr, GL_DYNAMIC_DRAW);
@@ -730,14 +769,37 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     // it's empty, so the next frame has to fill it even if it's the same
     ForceRender = true;
 
-    // eh those are pretty bad guesses
-    // though real hw shouldn't be eable to render all 2048 polygons on every line either
-    int maxYSpanIndices = 64*2048 * ScaleFactor;
-    YSpanIndices.resize(maxYSpanIndices);
+    s64 allocStart = SteadyNowNs();
+    if (!(roomsFound && roomTiles > startTiles && AllocTileMemory(std::min(roomTiles, MaxWorkTiles))))
+        AllocTileMemory(startTiles);
+    s64 tileAllocNs = SteadyNowNs() - allocStart;
 
-    // the GPU's copies of those start at a 16th, 33k spans at 4x, where the overworld and the map
-    // used 18k and 20k. the polygon setup still stops at maxYSpanIndices, as it always has
-    AllocXSpans(maxYSpanIndices / 16);
+    // the GPU's copies of the span indices start at a 16th, 33k spans at 4x, where the overworld and
+    // the map used 18k and 20k, or at the remembered room. the polygon setup still stops at
+    // maxYSpanIndices, as it always has
+    allocStart = SteadyNowNs();
+    if (!(roomsFound && roomSpans > startSpans && AllocXSpans(std::min(roomSpans, maxYSpanIndices))))
+        AllocXSpans(startSpans);
+    s64 spanAllocNs = SteadyNowNs() - allocStart;
+    // the rooms are this key's from here on (see Reset)
+    RoomsKeyChanged = false;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    char code[5] = {};
+    memcpy(code, &RoomGameCode, 4);
+    Platform::Log(Platform::LogLevel::Info, "COMPROOMS game=%s crc=%04x scale=%d width=%d tile=%d layers=%d use=%d found=%d remembered=%d/%d start worktiles=%d xspans=%d of %d/%d ms=%.1f/%.1f\n",
+        RoomGameCode ? code : "none", RoomHeaderCRC, ScaleFactor, TargetWidth, TileSize, TileLayers, UseRooms ? 1 : 0, roomsFound ? 1 : 0,
+        roomTiles, roomSpans, WorkTileRoom, XSpanRoom, MaxWorkTiles, maxYSpanIndices, tileAllocNs / 1e6, spanAllocNs / 1e6);
+#else
+    (void)tileAllocNs;
+    (void)spanAllocNs;
+#endif
+}
+
+ComputeWorkRooms::Key ComputeRenderer::RoomKey() const noexcept
+{
+    return { RoomGameCode, RoomHeaderCRC, (u32)ScaleFactor, (u32)TileSize, (u32)TileLayers, (u32)TargetWidth,
+        (u32)MaxWorkTiles, (u32)YSpanIndices.size() };
 }
 
 // the tile memory's layout for GPU::ComputeOpt's bits 7 and 8: a color, a depth and an attribute
@@ -791,6 +853,24 @@ static bool WorkBufferData(GLenum target, GLsizeiptr size, const char* what)
             what, (long long)size, failures);
 #endif
     return false;
+}
+
+// gives the tile memory layers and the X span buffers 4 bytes, which is what frees their storage
+// on Adreno (see the destructor), with no room in them until AllocTileMemory and AllocXSpans
+void ComputeRenderer::ShrinkWorkBuffers() noexcept
+{
+    for (int i = 0; i < TileLayersAlloc; i++)
+    {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, TileMemory[i]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 4, nullptr, GL_DYNAMIC_DRAW);
+    }
+    TileLayersAlloc = 0;
+    WorkTileRoom = 0;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, XSpanSetupMemory);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 4, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_TEXTURE_BUFFER, YSpanIndicesTextureMemory);
+    glBufferData(GL_TEXTURE_BUFFER, 4, nullptr, GL_DYNAMIC_DRAW);
+    XSpanRoom = 0;
 }
 
 // the tile memory layers, with room for this many work tiles. glBufferData orphans the old
@@ -896,13 +976,13 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         // a step is a layer: one work tile for every tile
         int step = TilesPerLine*TileLines;
         int room = roomFor(workNeed, step, MaxWorkTiles, true);
-#ifdef MELONADE_DEBUG_TOOLS
-        Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d\n",
-            WorkTileRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize);
-#endif
         int oldRoom = WorkTileRoom;
+        [[maybe_unused]] s64 start = SteadyNowNs();
         failed |= !grow(&ComputeRenderer::AllocTileMemory, oldRoom, room, roomFor(workNeed, step, MaxWorkTiles, false));
 #ifdef MELONADE_DEBUG_TOOLS
+        // the calls' wall-clock time, to tell the allocation from the first dispatch that touches it
+        Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d ms=%.1f\n",
+            oldRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize, (SteadyNowNs() - start) / 1e6);
         if (WorkTileRoom != room)
             Platform::Log(Platform::LogLevel::Warn, "COMPGROW worktiles wanted %d, has %d (was %d)\n",
                 room, WorkTileRoom, oldRoom);
@@ -914,13 +994,12 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         // a 64th of the most, a multiple of 32
         int step = maxSpans / 64;
         int room = roomFor(spans, step, maxSpans, true);
-#ifdef MELONADE_DEBUG_TOOLS
-        Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d\n",
-            XSpanRoom, room, maxSpans, spans, ScaleFactor);
-#endif
         int oldRoom = XSpanRoom;
+        [[maybe_unused]] s64 start = SteadyNowNs();
         failed |= !grow(&ComputeRenderer::AllocXSpans, oldRoom, room, roomFor(spans, step, maxSpans, false));
 #ifdef MELONADE_DEBUG_TOOLS
+        Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d ms=%.1f\n",
+            oldRoom, room, maxSpans, spans, ScaleFactor, (SteadyNowNs() - start) / 1e6);
         if (XSpanRoom != room)
             Platform::Log(Platform::LogLevel::Warn, "COMPGROW xspans wanted %d, has %d (was %d)\n",
                 room, XSpanRoom, oldRoom);
@@ -930,6 +1009,12 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
     // from 16 grows (a quarter second while every frame tries) up to 512
     GrowRetryWait = failed ? std::clamp(GrowRetryWait * 2, 16, 512) : 0;
     GrowRetryIn = GrowRetryWait;
+
+    // the rooms there are now, which were all allocated (a grow that failed went back to the old
+    // room or 0), so the next start of this game begins there. this frame hitched already, and
+    // it's the only place the file is written apart from a stale stamp at the targets' setup
+    if (UseRooms && !RoomsKeyChanged)
+        ComputeWorkRooms::Remember(RoomKey(), WorkTileRoom, XSpanRoom);
 }
 
 void ComputeRenderer::VCount144(GPU& gpu)

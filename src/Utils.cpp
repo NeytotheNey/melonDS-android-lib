@@ -18,10 +18,35 @@
 
 #include "Utils.h"
 
+#include <cstdio>
 #include <string.h>
+
+#include "Platform.h"
 
 namespace melonDS
 {
+bool ReplaceFile(const std::string& path, const u8* data, size_t size) noexcept
+{
+    std::string tempPath = path + ".tmp";
+    Platform::FileHandle* file = Platform::OpenFile(tempPath, Platform::FileMode::Write);
+    bool written = false;
+    if (file)
+    {
+        written = Platform::FileWrite(data, size, 1, file) == 1;
+        written = Platform::FileFlush(file) && written;
+        written = Platform::CloseFile(file) && written;
+    }
+    if (written && std::rename(tempPath.c_str(), path.c_str()) != 0)
+    {
+        // Windows doesn't rename over a file that exists
+        std::remove(path.c_str());
+        written = std::rename(tempPath.c_str(), path.c_str()) == 0;
+    }
+    if (!written)
+        std::remove(tempPath.c_str());
+    return written;
+}
+
 std::pair<std::unique_ptr<u8[]>, u32> PadToPowerOf2(std::unique_ptr<u8[]>&& data, u32 len) noexcept
 {
     if (data == nullptr || len == 0)

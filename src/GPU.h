@@ -832,6 +832,11 @@ public:
     // polygons could need more (ComputeRenderer::GrowWorkBuffers), instead of always taking the most
     // a frame could use (about 190 MB at 4x). only turned off by a debug switch, to compare
     bool ComputeGrow = true;
+    // compute renderer, with ComputeGrow: start the work buffers at the room the game grew to last
+    // time at the same scale, width and layout (GPU3D_ComputeRooms.h), so a grow that's sure to come
+    // happens at the first frame and not mid-game. read when the renderer is set or reset; only
+    // turned off by a debug switch, which also leaves the rooms file alone
+    bool ComputeRooms = true;
     // compute renderer: load programs compiled before from their binaries (OpenGL::CompileComputeProgram)
     // instead of compiling them again at game start and at each scale, width or layout change. it
     // needs a file the frontend sets (OpenGL::SetShaderCachePath). read when the renderer is set or
