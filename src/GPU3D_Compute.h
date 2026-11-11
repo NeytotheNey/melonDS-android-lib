@@ -417,7 +417,14 @@ private:
     GLCompositor CurGLCompositor;
 
     int ShaderStepIdx = 0;
+    // GPU::ShaderCache, from Reset
+    bool UseShaderCache = true;
+    // what the program cache did for the batch of compiles in progress, for its save at the end
+    // and the COMPSHADER line
+    OpenGL::ShaderCacheStats ShaderBatch {};
+    s64 ShaderBatchNs = 0;
 
+    void CompileShaderStep(int step);
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
