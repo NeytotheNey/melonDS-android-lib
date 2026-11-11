@@ -836,6 +836,11 @@ public:
     // happens at the first frame and not mid-game. read when the renderer is set or reset; only
     // turned off by a debug switch, which also leaves the rooms file alone
     bool ComputeRooms = true;
+    // debug only, compute renderer: an experiment for the hitch at a game's first heavy 3D frame.
+    // at the first frame after the targets are set up, write all of the work buffers once and
+    // dispatch every program once with nothing to do, and do the same for a grown buffer, logging
+    // COMPWARM. off in the core; debug builds turn it on (DebugProperties)
+    bool ComputeWarm = false;
     // compute renderer: load programs compiled before from their binaries (OpenGL::CompileComputeProgram)
     // instead of compiling them again at game start and at each scale, width or layout change. it
     // needs a file the frontend sets (OpenGL::SetShaderCachePath). read when the renderer is set or

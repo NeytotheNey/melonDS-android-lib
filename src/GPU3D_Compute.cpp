@@ -44,6 +44,13 @@ static s64 SteadyNowNs()
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// debug builds: adds the time since the last lap to one of RenderFrame's COMPSLOW phases
+#ifdef MELONADE_DEBUG_TOOLS
+#define SLOW_LAP(phase) SlowLap(Slow.phase)
+#else
+#define SLOW_LAP(phase) ((void)0)
+#endif
+
 ComputeRenderer::ComputeRenderer(GLCompositor&& compositor)
     : Renderer3D(true), Texcache(TexcacheOpenGLLoader()), CurGLCompositor(std::move(compositor))
 {}
@@ -426,6 +433,10 @@ ComputeRenderer::~ComputeRenderer()
         glDeleteSync(EarlyCaptureFence);
 
     DeleteShaders();
+#ifdef MELONADE_DEBUG_TOOLS
+    glDeleteProgram(ShaderWarmZero);
+    glDeleteTextures(2, WarmScratch);
+#endif
     // the binaries in memory are only for compiles, and the file has every one a batch added
     OpenGL::ReleaseShaderCache();
 }
@@ -475,6 +486,10 @@ void ComputeRenderer::DeleteShaders()
         glDeleteProgram(*program);
         *program = 0;
     }
+#ifdef MELONADE_DEBUG_TOOLS
+    // the next programs' first dispatches count again (COMPSLOW)
+    DispatchedPrograms.clear();
+#endif
 }
 
 void ComputeRenderer::Reset(GPU& gpu)
@@ -486,6 +501,9 @@ void ComputeRenderer::Reset(GPU& gpu)
     // a cart without a game code (homebrew) or no cart has no rooms. DSiWare is loaded as a cart
     // here (MelonInstance::loadRom), so it has them
     UseRooms = gpu.ComputeGrow && gpu.ComputeRooms;
+#ifdef MELONADE_DEBUG_TOOLS
+    WarmEnabled = gpu.ComputeWarm;
+#endif
     u32 gameCode = 0, headerCRC = 0;
     if (const NDSCart::CartCommon* cart = gpu.NDS.GetNDSCart())
     {
@@ -781,6 +799,10 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     s64 spanAllocNs = SteadyNowNs() - allocStart;
     // the rooms are this key's from here on (see Reset)
     RoomsKeyChanged = false;
+#ifdef MELONADE_DEBUG_TOOLS
+    // the programs for these targets are compiled after this, so the warm-up waits for RenderFrame
+    WarmPending = true;
+#endif
 
 #ifdef MELONADE_DEBUG_TOOLS
     char code[5] = {};
@@ -978,9 +1000,15 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         [[maybe_unused]] s64 start = SteadyNowNs();
         failed |= !grow(&ComputeRenderer::AllocTileMemory, oldRoom, room, roomFor(workNeed, step, MaxWorkTiles, false));
 #ifdef MELONADE_DEBUG_TOOLS
-        // the calls' wall-clock time, to tell the allocation from the first dispatch that touches it
-        Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d ms=%.1f\n",
-            oldRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize, (SteadyNowNs() - start) / 1e6);
+        // the calls' wall-clock time, to tell the allocation from the first dispatch that touches
+        // it, and with computewarm the time to write the new storage once (touch, -1 without)
+        double allocMs = (SteadyNowNs() - start) / 1e6;
+        double touchMs = -1;
+        u64 touchBytes = 0;
+        if (WarmEnabled && WorkTileRoom > oldRoom)
+            touchMs = TouchBuffers({ TileMemory[0], TileMemory[1], TileMemory[2] }, touchBytes);
+        Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d ms=%.1f touch=%.1f bytes=%llu\n",
+            oldRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize, allocMs, touchMs, (unsigned long long)touchBytes);
         if (WorkTileRoom != room)
             Platform::Log(Platform::LogLevel::Warn, "COMPGROW worktiles wanted %d, has %d (was %d)\n",
                 room, WorkTileRoom, oldRoom);
@@ -996,8 +1024,13 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         [[maybe_unused]] s64 start = SteadyNowNs();
         failed |= !grow(&ComputeRenderer::AllocXSpans, oldRoom, room, roomFor(spans, step, maxSpans, false));
 #ifdef MELONADE_DEBUG_TOOLS
-        Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d ms=%.1f\n",
-            oldRoom, room, maxSpans, spans, ScaleFactor, (SteadyNowNs() - start) / 1e6);
+        double allocMs = (SteadyNowNs() - start) / 1e6;
+        double touchMs = -1;
+        u64 touchBytes = 0;
+        if (WarmEnabled && XSpanRoom > oldRoom)
+            touchMs = TouchBuffers({ XSpanSetupMemory, YSpanIndicesTextureMemory }, touchBytes);
+        Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d ms=%.1f touch=%.1f bytes=%llu\n",
+            oldRoom, room, maxSpans, spans, ScaleFactor, allocMs, touchMs, (unsigned long long)touchBytes);
         if (XSpanRoom != room)
             Platform::Log(Platform::LogLevel::Warn, "COMPGROW xspans wanted %d, has %d (was %d)\n",
                 room, XSpanRoom, oldRoom);
@@ -1014,6 +1047,231 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
     if (UseRooms && !RoomsKeyChanged)
         ComputeWorkRooms::Remember(RoomKey(), WorkTileRoom, XSpanRoom);
 }
+
+#ifdef MELONADE_DEBUG_TOOLS
+void ComputeRenderer::SlowLap(s64& phase) noexcept
+{
+    s64 now = SteadyNowNs();
+    phase += now - SlowLast;
+    SlowLast = now;
+}
+
+void ComputeRenderer::NoteProgram(GLuint program)
+{
+    if (std::find(DispatchedPrograms.begin(), DispatchedPrograms.end(), program) != DispatchedPrograms.end())
+        return;
+    DispatchedPrograms.push_back(program);
+    SlowFirsts++;
+}
+
+// one line for a RenderFrame over 30 ms, 20 at most a run. setup is the polygon setup without
+// texget, the texture cache's lookups (where a new texture is decoded and uploaded)
+void ComputeRenderer::LogSlow(int numPolygons, u32 numVariants, u32 tileBound, int setupIndices) noexcept
+{
+    static int logged = 0;
+    s64 total = SteadyNowNs() - RenderFrameStartNs;
+    if (total <= 30000000 || logged >= 20)
+        return;
+    logged++;
+    auto ms = [](s64 ns) { return ns / 1e6; };
+    Platform::Log(Platform::LogLevel::Info, "COMPSLOW ms=%.1f pace=%.1f resize=%.1f warm=%.1f texcache=%.1f clearbmp=%.1f setup=%.1f texget=%.1f grow=%.1f upload=%.1f bin=%.1f rast=%.1f final=%.1f end=%.1f polys=%d variants=%u firsts=%d worktiles=%u/%d spans=%d/%d scale=%d tile=%d computewarm=%d\n",
+        ms(total), ms(Slow.Pace), ms(Slow.Resize), ms(Slow.Warm), ms(Slow.Texcache), ms(Slow.ClearBitmap), ms(Slow.Setup - Slow.TexGet), ms(Slow.TexGet),
+        ms(Slow.Grow), ms(Slow.Upload), ms(Slow.Bin), ms(Slow.Rast), ms(Slow.Final), ms(Slow.End), numPolygons, numVariants, SlowFirsts,
+        tileBound, WorkTileRoom, setupIndices, XSpanRoom, ScaleFactor, TileSize, WarmEnabled ? 1 : 0);
+}
+
+// a program that writes 0 to every word of the buffer at binding 0. not one of the 33, as it
+// doesn't depend on the targets: compiled once a renderer, without the program cache, whose file
+// would cost more to read than this does to compile
+bool ComputeRenderer::WarmZeroReady()
+{
+    if (ShaderWarmZero == 0 && !WarmZeroFailed)
+    {
+        static const char* const source = R"(#version 320 es
+layout (local_size_x = 64) in;
+layout (std430, binding = 0) writeonly buffer ZeroBuffer
+{
+    uint Words[];
+};
+void main()
+{
+    uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 64u + gl_LocalInvocationIndex;
+    if (i < uint(Words.length()))
+        Words[i] = 0u;
+}
+)";
+        WarmZeroFailed = !OpenGL::CompileComputeProgram(ShaderWarmZero, source, "WarmZero");
+    }
+    return ShaderWarmZero != 0;
+}
+
+// queues the zero program over all of a buffer's storage and returns its size, or 0 when it has
+// none or is bigger than a storage block may be (the renderer binds none that big)
+u64 ComputeRenderer::ZeroBuffer(GLuint buffer) noexcept
+{
+    if (buffer == 0)
+        return 0;
+    GLint64 size = 0;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+    glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &size);
+    if (size < 4 || (MaxBufferSize > 0 && size > MaxBufferSize))
+        return 0;
+    u64 groups = ((u64)size / 4 + 63) / 64;
+    u64 x = std::min<u64>(groups, 65535);
+    u64 y = (groups + x - 1) / x;
+    if (y > 65535)
+        return 0;
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    glDispatchCompute((GLuint)x, (GLuint)y, 1);
+    return (u64)size;
+}
+
+// writes every byte of these buffers once on the GPU and waits for it, so committing their pages
+// happens here and not at the first render that touches them. what was queued before is waited
+// for first, outside the time. -1 when there's no zero program
+double ComputeRenderer::TouchBuffers(std::initializer_list<GLuint> buffers, u64& bytes) noexcept
+{
+    bytes = 0;
+    if (!WarmZeroReady())
+        return -1;
+    glFinish();
+    s64 start = SteadyNowNs();
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    glUseProgram(ShaderWarmZero);
+    for (GLuint buffer : buffers)
+        bytes += ZeroBuffer(buffer);
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    glFinish();
+    // RenderFrame binds its own before every dispatch, this is what it leaves there
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, RenderPolygonMemory);
+    return (SteadyNowNs() - start) / 1e6;
+}
+
+// the warm-up (GPU::ComputeWarm), at the first RenderFrame after ResizeTargets, once the programs
+// are compiled. a: every work buffer written once (TouchBuffers). none of them holds anything a
+// render reads before writing it in the same render: the tile memory, the X spans and the final
+// tile memory are written by the passes before the ones that read them, the setup indices are
+// uploaded, and of the bin results the coarse masks are cleared at every render, the masks and
+// offsets are only read where this render's coarse bits are set, and the variant counts are
+// cleared or written by this render's passes. b: each of the 33 programs dispatched as one group
+// with nothing to do, after a, which makes every count 0: no polygons and no variants in the
+// uniform block (which every render uploads again), and the variant counts the rasterisers loop
+// over are 0. what they write anyway goes where a render writes again first (a coarse tile's
+// masks, 32 X spans, one tile of the final tile memory), and the final pass writes 1x1 scratch
+// images, where the rest of its stores are out of bounds and dropped. b needs a, so it's left out
+// without the zero program
+void ComputeRenderer::Warm()
+{
+    s64 compileStart = SteadyNowNs();
+    WarmZeroReady();
+    double compileMs = (SteadyNowNs() - compileStart) / 1e6;
+
+    u64 bytes = 0;
+    double memoryMs = TouchBuffers({ TileMemory[0], TileMemory[1], TileMemory[2], XSpanSetupMemory, YSpanIndicesTextureMemory,
+        FinalTileMemory, BinResultMemory, WorkDescMemory }, bytes);
+
+    double programsMs = -1;
+    int programs = 0;
+    // InterpXSpans writes 32 X spans, which a failed allocation (room 0, a 4 byte buffer) has no
+    // room for. a render never gets there then (RenderFrame's grow check), so neither does this
+    if (memoryMs >= 0 && XSpanRoom >= 32)
+    {
+        s64 start = SteadyNowNs();
+        if (WarmScratch[0] == 0)
+        {
+            GLint texture = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+            glGenTextures(2, WarmScratch);
+            glBindTexture(GL_TEXTURE_2D, WarmScratch[0]);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+            glBindTexture(GL_TEXTURE_2D, WarmScratch[1]);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 1, 1);
+            glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+        }
+
+        MetaUniform meta {};
+        glBindBuffer(GL_UNIFORM_BUFFER, MetaUniformMemory);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(MetaUniform), &meta);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, MetaUniformMemory);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, RenderPolygonMemory);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, XSpanSetupMemory);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, YSpanSetupMemory);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, FinalTileMemory);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, BinResultMemory);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, WorkDescMemory);
+
+        auto dispatch = [&](GLuint program)
+        {
+            if (program == 0)
+                return;
+            UseProgram(program);
+            glDispatchCompute(1, 1, 1);
+            programs++;
+        };
+
+        // in RenderFrame's order, with its barriers
+        dispatch(ShaderClearCoarseBinMask);
+        dispatch(ShaderClearIndirectWorkCount);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        // the setup indices are 0 now, so this reads polygon 0 and Y span 0
+        glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
+        dispatch(ShaderInterpXSpans[0]);
+        dispatch(ShaderInterpXSpans[1]);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        dispatch(ShaderBinCombined);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        dispatch(ShaderCalculateWorkListOffset);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        dispatch(ShaderSortWork);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        for (int i = 0; i < TileLayers; i++)
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2+i, TileMemory[i]);
+        GLuint rasterisers[] =
+        {
+            ShaderRasteriseNoTexture[0], ShaderRasteriseNoTexture[1],
+            ShaderRasteriseNoTextureToon[0], ShaderRasteriseNoTextureToon[1],
+            ShaderRasteriseNoTextureHighlight[0], ShaderRasteriseNoTextureHighlight[1],
+            ShaderRasteriseUseTextureDecal[0], ShaderRasteriseUseTextureDecal[1],
+            ShaderRasteriseUseTextureModulate[0], ShaderRasteriseUseTextureModulate[1],
+            ShaderRasteriseUseTextureToon[0], ShaderRasteriseUseTextureToon[1],
+            ShaderRasteriseUseTextureHighlight[0], ShaderRasteriseUseTextureHighlight[1],
+            ShaderRasteriseShadowMask[0], ShaderRasteriseShadowMask[1],
+        };
+        for (GLuint program : rasterisers)
+        {
+            if (program == 0)
+                continue;
+            UseProgram(program);
+            // RenderFrame sets it for every variant before it dispatches
+            glUniform1ui(UniformIdxCurVariant, 0);
+            glDispatchCompute(1, 1, 1);
+            programs++;
+        }
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        dispatch(ShaderDepthBlend[0]);
+        dispatch(ShaderDepthBlend[1]);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glBindImageTexture(0, WarmScratch[0], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        glBindImageTexture(1, WarmScratch[1], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
+        for (GLuint program : ShaderFinalPass)
+            dispatch(program);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        glFinish();
+        programsMs = (SteadyNowNs() - start) / 1e6;
+
+        // what a render leaves bound, which it binds again before it dispatches anyway
+        glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        glBindImageTexture(1, LowResFramebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, YSpanSetupMemory);
+    }
+
+    Platform::Log(Platform::LogLevel::Info, "COMPWARM compile=%.1f memory=%.1f bytes=%llu programs=%.1f dispatched=%d scale=%d width=%d tile=%d worktiles=%d xspans=%d\n",
+        compileMs, memoryMs, (unsigned long long)bytes, programsMs, programs, ScaleFactor, TargetWidth, TileSize, WorkTileRoom, XSpanRoom);
+}
+#endif
 
 void ComputeRenderer::VCount144(GPU& gpu)
 {
@@ -1460,6 +1718,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 {
 #ifdef MELONADE_DEBUG_TOOLS
     RenderFrameStartNs = SteadyNowNs();
+    Slow = {};
+    SlowLast = RenderFrameStartNs;
+    SlowFirsts = 0;
     if (gpu.ComputeTimers || gpu.ComputePeaks || gpu.ComputeSync || Stats)
         UpdateStats(gpu);
 #endif
@@ -1470,6 +1731,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     // GPU::ComputePace: leaves a fence for each earlier render the GPU hasn't finished
     if (gpu.ComputePace != 0 || PaceFenceCount != 0)
         UpdatePace(gpu);
+    SLOW_LAP(Pace);
     // whether line 0 of this frame read the 3D back, for CanSkipForPace
     bool captured = CapturedSinceRender;
     if (gpu.VCount == 215)
@@ -1508,6 +1770,18 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         while (NeedsShaderCompile())
             ShaderCompileStep(current, count);
     }
+    SLOW_LAP(Resize);
+#ifdef MELONADE_DEBUG_TOOLS
+    // after the targets' setup and the compile (above, or the frontend's before RunFrame), before
+    // anything of this frame. that's the game's first frame, under a black screen
+    if (WarmPending)
+    {
+        WarmPending = false;
+        if (WarmEnabled)
+            Warm();
+    }
+    SLOW_LAP(Warm);
+#endif
 
     WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
@@ -1522,6 +1796,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     u8 clrBitmapDirty = 0;
     bool texInvalidated = false;
     bool vramDirty = !redraw && Texcache.Update(gpu, clrBitmapDirty, texInvalidated);
+    SLOW_LAP(Texcache);
     // ComputeOpt_TexSkip: a write to texture or palette VRAM only counts when it can change what
     // the same polygons look like. a render only reads VRAM through the texture cache and the
     // clear bitmap. every texture the last render drew with was cached by it, and an entry only
@@ -1607,6 +1882,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             PaceLog.Kept++;
         WaitForPace();
     }
+    SLOW_LAP(Pace);
 
     if (gpu.ComputeWhy)
     {
@@ -1670,6 +1946,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
         ClearBitmapDirty = 0;
     }
+    SLOW_LAP(ClearBitmap);
 
     int numYSpans = 0;
     int numSetupIndices = 0;
@@ -1735,7 +2012,14 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             // we always need to look up the texture to get the layer of the array texture
             if (enableTextureMaps && (polygon->TexParam >> 26) & 0x7)
             {
+#ifdef MELONADE_DEBUG_TOOLS
+                // a texture the cache doesn't have yet is decoded and uploaded here
+                s64 texStart = SteadyNowNs();
+#endif
                 Texcache.GetTexture(gpu, polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant);
+#ifdef MELONADE_DEBUG_TOOLS
+                Slow.TexGet += SteadyNowNs() - texStart;
+#endif
                 bool wrapS = (polygon->TexParam >> 16) & 1;
                 bool wrapT = (polygon->TexParam >> 17) & 1;
                 bool mirrorS = (polygon->TexParam >> 18) & 1;
@@ -1953,6 +2237,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         //assert(RenderPolygons[i].Variant < numVariants);
     }*/
 
+    SLOW_LAP(Setup);
     if (numYSpans > 0)
     {
         // before anything is uploaded or bound: the tile memory and the X spans get room for what
@@ -1962,6 +2247,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             GrowWorkBuffers(totalTileBound, (u32)numSetupIndices);
         else
             GrowWorkBuffers((u32)MaxWorkTiles, (u32)maxSetupIndices);
+        SLOW_LAP(Grow);
 
         // a grow that failed can leave less room than binning and InterpXSpans could use, and the
         // shaders only stop at MaxWorkTiles, so the frame isn't drawn: the image stays as the last
@@ -1977,6 +2263,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
                 KeptFramebuffer = 0;
             }
             ForceRender = true;
+#ifdef MELONADE_DEBUG_TOOLS
+            LogSlow(numPolygons, numVariants, totalTileBound, numSetupIndices);
+#endif
             return;
         }
 
@@ -2064,6 +2353,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glBindBuffer(GL_UNIFORM_BUFFER, MetaUniformMemory);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(MetaUniform), &meta);
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, MetaUniformMemory);
+    SLOW_LAP(Upload);
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Stats)
@@ -2076,7 +2366,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     // the GPU timers (GPU::ComputeTimers): each pass runs up to the next BeginGPUTimer
     BeginGPUTimer(ComputePass::Clear);
-    glUseProgram(ShaderClearCoarseBinMask);
+    UseProgram(ShaderClearCoarseBinMask);
     glDispatchCompute(TilesPerLine*TileLines/ClearCoarseBinMaskLocalSize, 1, 1);
 
     bool wbuffer = false;
@@ -2093,31 +2383,31 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         const bool directDispatch = gpu.ComputeDirectDispatch;
         const GLbitfield commandBarrier = directDispatch ? 0 : GL_COMMAND_BARRIER_BIT;
 
-        glUseProgram(ShaderClearIndirectWorkCount);
+        UseProgram(ShaderClearIndirectWorkCount);
         glDispatchCompute((numVariants+31)/32, 1, 1);
 
         // calculate x-spans
         BeginGPUTimer(ComputePass::Interp);
         glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
-        glUseProgram(ShaderInterpXSpans[wbuffer]);
+        UseProgram(ShaderInterpXSpans[wbuffer]);
         glDispatchCompute((numSetupIndices + 31) / 32, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // bin polygons
         BeginGPUTimer(ComputePass::Bin);
-        glUseProgram(ShaderBinCombined);
+        UseProgram(ShaderBinCombined);
         glDispatchCompute(((numPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // calculate list offsets
         BeginGPUTimer(ComputePass::Offs);
-        glUseProgram(ShaderCalculateWorkListOffset);
+        UseProgram(ShaderCalculateWorkListOffset);
         glDispatchCompute((numVariants + 31) / 32, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         // sort shader work
         BeginGPUTimer(ComputePass::Sort);
-        glUseProgram(ShaderSortWork);
+        UseProgram(ShaderSortWork);
         if (directDispatch)
         {
             // a thread per work tile, binning stops at MaxWorkTiles (TargetFits keeps that to 65535
@@ -2132,6 +2422,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         }
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
+        SLOW_LAP(Bin);
         // one timer over every variant's dispatch
         BeginGPUTimer(ComputePass::Rast);
         glActiveTexture(GL_TEXTURE0);
@@ -2190,7 +2481,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
                 assert(shader != 0);
                 if (shader != prevShader)
                 {
-                    glUseProgram(shader);
+                    UseProgram(shader);
                     prevShader = shader;
                 }
 
@@ -2217,6 +2508,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         }
     }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    SLOW_LAP(Rast);
 
     BeginGPUTimer(ComputePass::Depth);
     glActiveTexture(GL_TEXTURE0);
@@ -2226,7 +2518,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glActiveTexture(GL_TEXTURE0);
 
     // compose final image
-    glUseProgram(ShaderDepthBlend[wbuffer]);
+    UseProgram(ShaderDepthBlend[wbuffer]);
     glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
@@ -2241,10 +2533,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     if (gpu.GPU3D.RenderDispCnt & (1<<5))
         finalPassShader |= 0x1;
     
-    glUseProgram(ShaderFinalPass[finalPassShader]);
+    UseProgram(ShaderFinalPass[finalPassShader]);
     glDispatchCompute(ScreenWidth/32, ScreenHeight, 1);
     // the compositor reads the 3D image with texelFetch, and capture reads the low res one with glReadPixels
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+    SLOW_LAP(Final);
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Stats)
@@ -2285,6 +2578,10 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     }
 
     glBindSampler(0, 0);
+#ifdef MELONADE_DEBUG_TOOLS
+    SLOW_LAP(End);
+    LogSlow(numPolygons, numVariants, totalTileBound, numSetupIndices);
+#endif
 
     /*u64 starttime = armGetSystemTick();
     EmuQueue.waitIdle();
