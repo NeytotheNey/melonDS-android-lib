@@ -823,16 +823,17 @@ public:
     // (see GLRenderer::SetPolygonDepthBias). only turned off by a debug switch, to compare
     bool EqualDepthMargin = true;
     // OpenGL renderer, experiment T1 (docs/plan-gpu-discovery.md): leave out translucent-pass draws
-    // that can't change a pixel, a bit each, for A/B runs against hash3d. 0 draws as before.
+    // that can't change a pixel, a bit each. 3 is the default in every build (pixel-exact on the
+    // Fold and OnePlus, 4-15% fewer GPU cycles); 0 draws as before, for A/B runs against hash3d.
     // bit 0: with the clear-alpha-0 pass, pass 3 doesn't draw a need-opaque polygon's opaque part
     // again (not depth-equal ones), since pass 2 drew it and depth only went down since. bit 1: a
     // need-opaque polygon's opaque draw is left out when its texture has no texel that ends up at
     // alpha 31, its translucent draw (not a shadow's) when none ends up at 1-30
     // (GLRenderer::ClassifyTransAlpha). bit 2 (T1c): with GL_EXT_shader_framebuffer_fetch, the
     // clear-alpha-0 pass is left out and pass 3's translucent draws skip blending where the
-    // destination alpha is 0 (GLRenderer::FetchClear0). only changed by a debug switch, set before
-    // the game runs
-    int GLTransSkip = 0;
+    // destination alpha is 0 (GLRenderer::FetchClear0); off by default, it didn't pay off reliably.
+    // only changed by a debug switch, set before the game runs
+    int GLTransSkip = 3;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;
     // compute renderer: size the SortWork and Rasterise dispatches on the CPU instead of having the
