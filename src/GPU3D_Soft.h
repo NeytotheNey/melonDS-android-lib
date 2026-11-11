@@ -40,6 +40,7 @@ public:
     void RenderFrame(GPU& gpu) override;
     void RestartFrame(GPU& gpu) override;
     u32* GetLine(int line) override;
+    void QueueHash3D(GPU& gpu, u32 frame) override;
 
     void SetupRenderThread(GPU& gpu);
     void EnableRenderThread();
@@ -485,6 +486,10 @@ private:
 
     bool FrameIdentical;
     bool ForceRender = true;
+
+    // debug only (GPU::Hash3DLogging): the render line 215 started is hashed at VCount144, once it's done
+    bool Hash3DPending = false;
+    u32 Hash3DFrame = 0;
 
     // threading
 

@@ -900,6 +900,22 @@ public:
     // (ComputeRenderer::LogWhy). it also has GPU3D hash every scene, to tell a swap that brought
     // the same polygons again
     bool ComputeWhy = false;
+    // debug only, GPU discovery (docs/plan-gpu-discovery.md, all set before the game runs):
+    // OpenGL renderer: 1 logs a GLTIME line once a second with each pass's GPU time from GL timer
+    // queries, 2 the same passes timed on the CPU between glFinish calls (much slower, shares only)
+    int GLTimers = 0;
+    // 1 logs a SCENESTATS line once a second on the scenes line 215 renders, from the CPU's polygon
+    // data (GPU3D_SceneStats.h), with any renderer. 2 also has the OpenGL renderer count the fragments
+    // its render shaders run and the pixels polygons cover (SCENEFRAGS), which slows it down
+    int SceneStats = 0;
+    // compute renderer: logs a COMPDEPTH line once a second on what DepthBlend does per pixel
+    bool ComputeDepthStats = false;
+    // logs a HASH3D line per frame with a checksum of the 3D image at native resolution, numbered like
+    // HASH2D (Renderer3D::QueueHash3D)
+    bool Hash3DLogging = false;
+    // the frame HASH2D numbers (counted while Hash2DLogging or Hash3DLogging is on): the one running
+    // now, from its line 0 to the end of line 262
+    [[nodiscard]] u32 GetHashFrame() const noexcept { return Hash2DFrame; }
     // compute renderer (Renderer3D::FlushAfterCaptureBlit): in frames that hold capture lines,
     // flush right after the line-192 Blit, so the GPU runs the compositor while it would otherwise
     // idle (after the capture map) until the line-215 flush, instead of ahead of the 3D there.

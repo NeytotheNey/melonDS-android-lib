@@ -25,16 +25,27 @@
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL_shaders.h"
+#include "GPU3D_ComputeStats.h"
 #include "Platform.h"
 #include "WideMelon.h"
 
 namespace melonDS
 {
 
-bool GLRenderer::BuildRenderShader(bool wbuffer)
+// debug only: GLTIME's passes (GPU::GLTimers, a pass runs up to the next one) and SCENEFRAGS'
+// counters (GPU::SceneStats 2). nothing while their switches are off, and nothing in release builds
+#ifdef MELONADE_DEBUG_TOOLS
+#define GL_TIMER(pass) do { if (Timers) Timers->Begin(GLPass::pass); } while (0)
+#define FRAG_PASS(pass) do { if (FragCounter) SetFragPass(GLFragCounter::Frag_##pass); } while (0)
+#else
+#define GL_TIMER(pass) do {} while (0)
+#define FRAG_PASS(pass) do {} while (0)
+#endif
+
+bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount)
 {
     char shadername[32];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c", wbuffer?'W':'Z');
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s", wbuffer?'W':'Z', fragCount ? "Count" : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
@@ -49,6 +60,21 @@ bool GLRenderer::BuildRenderShader(bool wbuffer)
     fsbuf += kShaderHeader;
     fsbuf += wbufdef;
     fsbuf += kRenderFSCommon;
+#ifdef MELONADE_DEBUG_TOOLS
+    if (fragCount)
+    {
+        // debug only: the counter declarations, and the count first thing in main
+        fsbuf += kRenderFSFragCount;
+        std::string fs = kRenderFS;
+        size_t mainPos = fs.find("void main()");
+        size_t brace = mainPos == std::string::npos ? std::string::npos : fs.find('{', mainPos);
+        if (brace == std::string::npos)
+            return false;
+        fs.insert(brace + 1, kRenderFSFragCountHit);
+        fsbuf += fs;
+    }
+    else
+#endif
     fsbuf += kRenderFS;
 
     GLuint prog;
@@ -77,6 +103,9 @@ bool GLRenderer::BuildRenderShader(bool wbuffer)
 
     RenderShader[id] = prog;
     RenderModeULoc[id] = glGetUniformLocation(prog, "uRenderMode");
+#ifdef MELONADE_DEBUG_TOOLS
+    FragPassLoc[id] = fragCount ? glGetUniformLocation(prog, "uFragPass") : -1;
+#endif
 
     return true;
 }
@@ -344,6 +373,15 @@ GLRenderer::~GLRenderer()
     glDeleteProgram(FinalPassFogShader);
 
     if (ShadowLogQueries[0]) glDeleteQueries(64, ShadowLogQueries);
+
+#ifdef MELONADE_DEBUG_TOOLS
+    // their GL objects, while the context is still current
+    glDeleteProgram(CoverShader);
+    glDeleteProgram(CoverAlphaShader);
+    Timers.reset();
+    FragCounter.reset();
+    Hash3D.reset();
+#endif
 }
 
 void GLRenderer::Reset(GPU& gpu)
@@ -1075,6 +1113,8 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
     // pass 1: opaque pixels
 
+    GL_TIMER(Opaque);
+    FRAG_PASS(Opaque);
     UseRenderShader(wbuffer, RenderMode_Opaque);
     glLineWidth(1.0);
 
@@ -1156,6 +1196,8 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
         if ((gpu3d.RenderClearAttr1 & 0x001F0000) == 0)
         {
+            GL_TIMER(Clear0);
+            FRAG_PASS(Clear0);
             glDisable(GL_BLEND);
 
             for (int i = 0; i < NumFinalPolys; )
@@ -1262,6 +1304,9 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         }
 
         // pass 3: translucent pixels
+
+        GL_TIMER(Trans);
+        FRAG_PASS(Trans);
 
         // with ShadowMaskLineClear, the shadow bits are cleared per line like the software renderer:
         // a mask clears its lines unless the last polygon on that line (in list order, drawn in this
@@ -1456,8 +1501,19 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         }
     }
 
+#ifdef MELONADE_DEBUG_TOOLS
+    // SCENEFRAGS' covered count with a clear alpha of 0 goes by the color's alpha, before fog changes
+    // it (the other case counts by stencil after the frame, see RenderFrame)
+    if (FragCounter && (gpu3d.RenderClearAttr1 & 0x001F0000) == 0)
+        CountCoveredByAlpha();
+#endif
+
     if (gpu3d.RenderDispCnt & 0x00A0) // fog/edge enabled
     {
+        // the depth buffer's detach goes with the first of them
+        if (gpu3d.RenderDispCnt & (1<<5)) GL_TIMER(Edge);
+        else                              GL_TIMER(Fog);
+
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
@@ -1497,6 +1553,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         {
             // fog
 
+            if (gpu3d.RenderDispCnt & (1<<5)) GL_TIMER(Fog);
             glUseProgram(FinalPassFogShader);
 
             if (gpu3d.RenderDispCnt & (1<<6))
@@ -1532,6 +1589,10 @@ static bool AnyDirty(const NonStupidBitField<Size>& dirty, u32 start, u32 count)
 
 void GLRenderer::RenderFrame(GPU& gpu)
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    if (gpu.GLTimers || Timers || gpu.SceneStats == 2 || FragCounter)
+        UpdateDebugStats(gpu);
+#endif
     bool keep = KeepRequested;
     KeepRequested = false;
     // an earlier readback is of the frame this replaces (a skipped one too, to keep it simple)
@@ -1564,8 +1625,20 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // nothing changed since the last frame: MainFramebuffer still holds it, so Blit and the
     // capture readback keep working from it (upstream's GL renderer skips the same way)
     if (!textureChanged && !texPalChanged && !TargetsChanged && gpu.GPU3D.RenderFrameIdentical)
+    {
+#ifdef MELONADE_DEBUG_TOOLS
+        if (Timers)
+            Timers->Sec.Skipped++;
+#endif
         return;
+    }
     TargetsChanged = false;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+        Timers->BeginSet(GLTimerStats::Set_Render);
+#endif
+    GL_TIMER(Upload);
 
     if (keep)
         KeepColorBuffer();
@@ -1717,6 +1790,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // clear buffers
     // TODO: check whether 'clear polygon ID' affects translucent polyID
     // (for example when alpha is 1..30)
+    GL_TIMER(Clear);
     {
         u32 polyid = (gpu.GPU3D.RenderClearAttr1 >> 24) & 0x3F;
 
@@ -1768,6 +1842,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
     if (gpu.GPU3D.RenderNumPolygons)
     {
+        GL_TIMER(Upload);
         // render shit here
         int npolys = 0;
         int firsttrans = -1;
@@ -1793,11 +1868,28 @@ void GLRenderer::RenderFrame(GPU& gpu)
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, NumIndices * 2, IndexBuffer);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
 
+#ifdef MELONADE_DEBUG_TOOLS
+        if (FragCounter)
+            FragCounter->Ring.BeginFrame(GLFragCounter::Binding, ScreenW * ScreenH);
+#endif
         RenderSceneChunk(gpu.GPU3D, 0, 192);
+#ifdef MELONADE_DEBUG_TOOLS
+        if (FragCounter)
+        {
+            // with a clear alpha of 0 RenderSceneChunk counted them already
+            if ((gpu.GPU3D.RenderClearAttr1 & 0x001F0000) != 0)
+                CountCoveredPixels();
+            FragCounter->Ring.EndFrame();
+        }
+#endif
     }
     else
         NumFinalPolys = 0;
 
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+        Timers->EndSet();
+#endif
     if (ShadowLogActive) LogFrameStats(gpu.GPU3D);
 }
 
@@ -1816,6 +1908,13 @@ void GLRenderer::PrepareCaptureFrame()
 // a capture sees
 void GLRenderer::ReadBackCaptureFrame(GLuint pixelBuffer) noexcept
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+    {
+        Timers->BeginSet(GLTimerStats::Set_Capture);
+        Timers->Begin(GLPass::Capture);
+    }
+#endif
     glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DownscaleFramebuffer);
@@ -1830,6 +1929,10 @@ void GLRenderer::ReadBackCaptureFrame(GLuint pixelBuffer) noexcept
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pixelBuffer);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, DownscaleFramebuffer);
     glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+        Timers->EndSet();
+#endif
 }
 
 void GLRenderer::FlushCommands()
@@ -1839,7 +1942,16 @@ void GLRenderer::FlushCommands()
 
 void GLRenderer::Blit(const GPU& gpu)
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    // the compositor's GPU timers, which it starts through BeginGPUTimer
+    if (Timers)
+        Timers->BeginSet(GLTimerStats::Set_Blit);
+#endif
     CurGLCompositor.RenderFrame(gpu, *this);
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+        Timers->EndSet();
+#endif
 
     // the compositor and its hi-res capture pass were the last to read the kept frame, and GL
     // keeps their reads ahead of the render that next draws into it
@@ -1926,5 +2038,231 @@ void GLRenderer::SetupAccelFrame()
     // the 3D frame of the Blit's own frame, kept while the next one is drawn (see KeepFrameForBlit)
     glBindTexture(GL_TEXTURE_2D, KeptColorTex ? KeptColorTex : ColorBufferTex);
 }
+
+// debug only (GPU::GLTimers): the compositor's draw (ComputePass::Comp) and everything else it runs
+// (ComputePass::CompExtra), in the Blit's set
+void GLRenderer::BeginGPUTimer(int pass)
+{
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+        Timers->Begin(pass == ComputePass::Comp ? GLPass::Comp : GLPass::CompExtra);
+#endif
+}
+
+void GLRenderer::EndGPUTimer()
+{
+#ifdef MELONADE_DEBUG_TOOLS
+    if (Timers)
+        Timers->End();
+#endif
+}
+
+// debug only (GPU::Hash3DLogging): the frame RenderFrame left in MainFramebuffer (drawn or kept as
+// identical), downscaled into the capture's target the way the capture readback does it, and read back
+// into the hash ring. the capture readbacks blit into that target again before they read it
+void GLRenderer::QueueHash3D(GPU& gpu, u32 frame)
+{
+#ifdef MELONADE_DEBUG_TOOLS
+    if (!Hash3D)
+        Hash3D = std::make_unique<Hash3DReadback>(true);
+
+    GLint readFB = 0, drawFB = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFB);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFB);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor)
+        glDisable(GL_SCISSOR_TEST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DownscaleFramebuffer);
+    GLenum bufferAttachment = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1, &bufferAttachment);
+    int captureX = ((TargetWidth - WideMelon::NativeWidth) / 2) * ScaleFactor;
+    glBlitFramebuffer(captureX, 0, captureX + WideMelon::NativeWidth * ScaleFactor, ScreenH,
+                      0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, DownscaleFramebuffer);
+    Hash3D->Queue(frame);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readFB);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)drawFB);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+#endif
+}
+
+#ifdef MELONADE_DEBUG_TOOLS
+// at the start of every RenderFrame while GPU::GLTimers or GPU::SceneStats 2 is on, or their stats
+// still exist: makes the timers when the switch is on (again if it changed), drops them when it's
+// off, sets up the fragment counter once, and lets them read finished results and log
+void GLRenderer::UpdateDebugStats(const GPU& gpu)
+{
+    int mode = (gpu.GLTimers == 1 || gpu.GLTimers == 2) ? gpu.GLTimers : 0;
+    if (!Timers || Timers->Mode != mode)
+    {
+        Timers.reset();
+        if (mode != 0)
+            Timers = std::make_unique<GLTimerStats>(mode);
+    }
+
+    if (gpu.SceneStats == 2 && !FragCountTried)
+    {
+        FragCountTried = true;
+        SetupFragCount();
+    }
+
+    s64 now = GLStatsNowNs();
+    if (Timers)
+        Timers->FrameStart(now, ScaleFactor);
+    if (FragCounter)
+        FragCounter->FrameStart(now);
+}
+
+// GPU::SceneStats 2: the render programs are rebuilt as their counting builds, for the rest of the
+// renderer's life. needs SSBOs in fragment shaders, which GLES 3.1 and 3.2 allow a driver to leave out
+void GLRenderer::SetupFragCount()
+{
+    GLint fragmentBlocks = 0, bindings = 0;
+    glGetIntegerv(GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, &fragmentBlocks);
+    glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &bindings);
+    if (fragmentBlocks < 1 || bindings < 1)
+    {
+        Platform::Log(Platform::LogLevel::Warn, "SCENEFRAGS: no SSBOs in fragment shaders here (GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS=%d, "
+            "bindings=%d), scenestats 2 runs as 1\n", fragmentBlocks, bindings);
+        return;
+    }
+
+    GLuint cover = 0, coverAlpha = 0;
+    if (!OpenGL::CompileVertexFragmentProgram(cover, kCoverVS, kCoverFS, "CoverShader", {{"vPosition", 0}}, {{"oColor", 0}}))
+    {
+        Platform::Log(Platform::LogLevel::Warn, "SCENEFRAGS: the cover program didn't build, scenestats 2 runs as 1\n");
+        return;
+    }
+    if (!OpenGL::CompileComputeProgram(coverAlpha, kCoverAlphaCS, "CoverAlphaShader"))
+    {
+        glDeleteProgram(cover);
+        Platform::Log(Platform::LogLevel::Warn, "SCENEFRAGS: the alpha cover program didn't build, scenestats 2 runs as 1\n");
+        return;
+    }
+
+    GLuint normal[2] = { RenderShader[0], RenderShader[1] };
+    if (!BuildRenderShader(false, true))
+    {
+        glDeleteProgram(cover);
+        glDeleteProgram(coverAlpha);
+        Platform::Log(Platform::LogLevel::Warn, "SCENEFRAGS: the counting render programs didn't build, scenestats 2 runs as 1\n");
+        return;
+    }
+    if (!BuildRenderShader(true, true))
+    {
+        // back to the normal Z-buffer one
+        glDeleteProgram(RenderShader[0]);
+        BuildRenderShader(false, false);
+        glDeleteProgram(normal[0]);
+        glDeleteProgram(cover);
+        glDeleteProgram(coverAlpha);
+        Platform::Log(Platform::LogLevel::Warn, "SCENEFRAGS: the counting render programs didn't build, scenestats 2 runs as 1\n");
+        return;
+    }
+    glDeleteProgram(normal[0]);
+    glDeleteProgram(normal[1]);
+    CurShaderID = -1;
+    CurRenderMode = -1;
+
+    CoverShader = cover;
+    CoverAlphaShader = coverAlpha;
+    CoverAlphaSizeLoc = glGetUniformLocation(coverAlpha, "uSize");
+    glUseProgram(coverAlpha);
+    glUniform1i(glGetUniformLocation(coverAlpha, "uColor"), 3);
+    FragCounter = std::make_unique<GLFragCounter>();
+    Platform::Log(Platform::LogLevel::Info, "SCENEFRAGS: counting fragments with an atomic per fragment, which slows the renderer down\n");
+}
+
+// the counter the render programs add to from here on, set in both
+void GLRenderer::SetFragPass(int pass)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        if (FragPassLoc[i] >= 0)
+            glProgramUniform1i(RenderShader[i], FragPassLoc[i], pass);
+    }
+}
+
+// after the frame's last draw: counts the pixels whose stencil a polygon wrote (see GLFragCounter),
+// and leaves the state as it found it
+void GLRenderer::CountCoveredPixels()
+{
+    GLboolean colorMask[2][4];
+    glGetBooleani_v(GL_COLOR_WRITEMASK, 0, colorMask[0]);
+    glGetBooleani_v(GL_COLOR_WRITEMASK, 1, colorMask[1]);
+    GLboolean depthMask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+    GLint depthFunc = 0, stencilFunc = 0, stencilRef = 0, stencilValueMask = 0, stencilWriteMask = 0;
+    GLint stencilFail = 0, stencilDepthFail = 0, stencilPass = 0, program = 0, vertexArray = 0;
+    glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+    glGetIntegerv(GL_STENCIL_FUNC, &stencilFunc);
+    glGetIntegerv(GL_STENCIL_REF, &stencilRef);
+    glGetIntegerv(GL_STENCIL_VALUE_MASK, &stencilValueMask);
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &stencilWriteMask);
+    glGetIntegerv(GL_STENCIL_FAIL, &stencilFail);
+    glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &stencilDepthFail);
+    glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &stencilPass);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vertexArray);
+    GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean stencilTest = glIsEnabled(GL_STENCIL_TEST);
+
+    glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_NOTEQUAL, 0x7F, 0x7F);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilMask(0);
+
+    glUseProgram(CoverShader);
+    glBindVertexArray(ClearVertexArrayID);
+    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+
+    glColorMaski(0, colorMask[0][0], colorMask[0][1], colorMask[0][2], colorMask[0][3]);
+    glColorMaski(1, colorMask[1][0], colorMask[1][1], colorMask[1][2], colorMask[1][3]);
+    glDepthFunc(depthFunc);
+    glDepthMask(depthMask);
+    glStencilFunc(stencilFunc, stencilRef, stencilValueMask);
+    glStencilOp(stencilFail, stencilDepthFail, stencilPass);
+    glStencilMask(stencilWriteMask);
+    if (!depthTest)
+        glDisable(GL_DEPTH_TEST);
+    if (!stencilTest)
+        glDisable(GL_STENCIL_TEST);
+    glUseProgram(program);
+    glBindVertexArray(vertexArray);
+}
+
+// with a clear alpha of 0, before fog: the pixels of the color target with alpha (see kCoverAlphaCS).
+// with the clear bitmap, its own pixels with alpha count too. leaves the state as it found it
+void GLRenderer::CountCoveredByAlpha()
+{
+    GLint program = 0, activeTexture = 0, texture = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+    glActiveTexture(GL_TEXTURE3);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+
+    glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
+    glUseProgram(CoverAlphaShader);
+    glUniform2i(CoverAlphaSizeLoc, ScreenW, ScreenH);
+    glDispatchCompute((ScreenW + 15) / 16, (ScreenH + 15) / 16, 1);
+
+    glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+    glActiveTexture((GLenum)activeTexture);
+    glUseProgram(program);
+    CurShaderID = -1;
+    CurRenderMode = -1;
+}
+#endif
 
 }

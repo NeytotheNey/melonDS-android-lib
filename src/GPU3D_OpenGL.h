@@ -22,6 +22,8 @@
 #include "GPU3D.h"
 #include "GPU_OpenGL.h"
 #include "OpenGLSupport.h"
+#include "GPU3D_GLStats.h"
+#include "GPU3D_Hash3D.h"
 
 namespace melonDS
 {
@@ -73,6 +75,12 @@ public:
     void BindOutputTexture(int buffer) override;
     void SavestateLoaded() override;
 
+    // debug only: the compositor's passes for GPU::GLTimers, and GPU::Hash3DLogging (no-ops in
+    // release builds)
+    void BeginGPUTimer(int pass) override;
+    void EndGPUTimer() override;
+    void QueueHash3D(GPU& gpu, u32 frame) override;
+
     static std::unique_ptr<GLRenderer> New() noexcept;
 private:
     // Used by New()
@@ -99,7 +107,8 @@ private:
     GLCompositor CurGLCompositor;
     RendererPolygon PolygonList[2048] {};
 
-    bool BuildRenderShader(bool wbuffer);
+    // fragCount: the debug build that counts fragments (GPU::SceneStats 2, GLFragCounter)
+    bool BuildRenderShader(bool wbuffer, bool fragCount = false);
     void UseRenderShader(bool wbuffer, int mode);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
@@ -262,6 +271,29 @@ private:
 
     GLuint MainFramebuffer {}, DownscaleFramebuffer {};
     u32 Framebuffer[256*192] {};
+
+#ifdef MELONADE_DEBUG_TOOLS
+    // GPU discovery (docs/plan-gpu-discovery.md), all null while their switches are off, and then
+    // nothing here makes a GL call for them. GLTIME (GPU::GLTimers)
+    std::unique_ptr<GLTimerStats> Timers;
+    // SCENEFRAGS (GPU::SceneStats 2): set up once, at the first frame with the switch on. while it
+    // exists, RenderShader holds the counting builds, FragPassLoc their uFragPass
+    std::unique_ptr<GLFragCounter> FragCounter;
+    bool FragCountTried = false;
+    GLuint CoverShader = 0;
+    // the covered count when the clear alpha is 0 (kCoverAlphaCS), and its uSize
+    GLuint CoverAlphaShader = 0;
+    GLint CoverAlphaSizeLoc = -1;
+    GLint FragPassLoc[2] {-1, -1};
+    // HASH3D (GPU::Hash3DLogging)
+    std::unique_ptr<Hash3DReadback> Hash3D;
+
+    void UpdateDebugStats(const GPU& gpu);
+    void SetupFragCount();
+    void SetFragPass(int pass);
+    void CountCoveredPixels();
+    void CountCoveredByAlpha();
+#endif
 };
 }
 #endif

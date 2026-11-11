@@ -658,9 +658,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     // the GPU 2D shadow renderer: which lines it draws, what they read and the OBJ pass, before the
     // output is bound too (it has targets of its own). its composite pass comes after the draw below.
-    // debug only: with the compute renderer's timers on, everything from here on but the
+    // debug only: with the compute or OpenGL renderer's timers on, everything from here on but the
     // compositor's own draw is timed as one pass
-    const bool timers = gpu.ComputeTimers || gpu.ComputeSync;
+    const bool timers = gpu.ComputeTimers || gpu.ComputeSync || gpu.GLTimers;
     if (timers)
         renderer.BeginGPUTimer(ComputePass::CompExtra);
     int shadowLines = PrepareShadow2D(gpu, backbuf, hasFramebuffers, hiresDisplay, ctrlCopied);

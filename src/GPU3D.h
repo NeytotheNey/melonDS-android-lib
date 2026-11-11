@@ -28,6 +28,7 @@
 #include "FIFO.h"
 #include "GPU3D_VertexId.h"
 #include "GPU3D_HalfCamera.h"
+#include "GPU3D_SceneStats.h"
 
 namespace melonDS
 {
@@ -310,6 +311,10 @@ private:
     void WideDropsOnSwap() noexcept;
     void WideDropsOnVBlank() noexcept;
 
+    // the SCENESTATS line (GPU::SceneStats), at each line 215 and once a second
+    SceneStatsCounters SceneStatsSec {};
+    void NoteSceneStats(const GPU& gpu) noexcept;
+
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;
     std::unique_ptr<HalfCamera> HalfCam;
@@ -558,6 +563,12 @@ public:
     // (ComputePass) through these, with the compute renderer's timers. a begin ends the pass before it
     virtual void BeginGPUTimer(int pass) {}
     virtual void EndGPUTimer() {}
+
+    // debug only (GPU::Hash3DLogging), right after RenderFrame at line 215: logs, now or some frames
+    // later, a HASH3D line with a checksum of the 3D image this render left (LogHash3D, in GetLine's
+    // pixel format, at native resolution), as frame, the HASH2D frame that shows it. nothing may wait
+    // on the GPU for it. without an override no line is logged
+    virtual void QueueHash3D(GPU& gpu, u32 frame) {}
 
     // GPU::ComputePace 2: the last render was left out to let the GPU catch up, so the 3D image
     // is older than the scene. GPU then has it drawn after all (RedrawSkippedFrame) at line 0

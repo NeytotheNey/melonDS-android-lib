@@ -55,6 +55,81 @@ ComputeRenderer::ComputeRenderer(GLCompositor&& compositor)
     : Renderer3D(true), Texcache(TexcacheOpenGLLoader()), CurGLCompositor(std::move(compositor))
 {}
 
+#ifdef MELONADE_DEBUG_TOOLS
+// debug only (GPU::ComputeDepthStats, ComputeDepthCounter): DepthBlend with its counters, made from
+// the real source by inserting them at its lines, so the source without them stays as it is. false
+// when a line it looks for isn't there (DepthBlend changed), and then nothing is counted
+static bool AddDepthStats(std::string& src)
+{
+    size_t start = src.find("void ProcessCoarseMask(");
+    if (start == std::string::npos)
+        return false;
+    auto insertAt = [&](const char* anchor, const char* text, bool after) -> bool
+    {
+        size_t pos = src.find(anchor, start);
+        if (pos == std::string::npos)
+            return false;
+        src.insert(after ? pos + strlen(anchor) : pos, text);
+        return true;
+    };
+
+    // walking a polygon's work tile, finding a colored pixel there, failing the first depth test (a
+    // shadow mask's sets the stencil)
+    if (!insertAt("workIdx++;", " DepthStatsVisited++;", true)) return false;
+    {
+        size_t pos = src.find("if (tileColor != 0U)", start);
+        size_t brace = pos == std::string::npos ? std::string::npos : src.find('{', pos);
+        if (brace == std::string::npos) return false;
+        src.insert(brace + 1, " DepthStatsColored++;");
+    }
+    if (!insertAt("if ((dstattr & 0x3U) == 0U || writeSecondLayer)", "DepthStatsFailed++; ", false)) return false;
+    {
+        const char* anchor = "stencil = 0x1U;";
+        size_t pos = src.find(anchor, start);
+        if (pos == std::string::npos) return false;
+        src.replace(pos, strlen(anchor), "{ stencil = 0x1U; DepthStatsFailed++; }");
+    }
+    {
+        const char* anchor = "void main()";
+        size_t pos = src.find(anchor, start);
+        if (pos == std::string::npos) return false;
+        src.replace(pos, strlen(anchor), "void DepthBlendMain()");
+    }
+
+    // the counters, declared before the functions that count, and a main that sums them per work group
+    size_t decl = src.find("void PlotTranslucent(");
+    if (decl == std::string::npos || decl > start)
+        return false;
+    src.insert(decl,
+        "layout (std430, binding = 8) buffer DepthStatsBuffer { uint DepthStatsCount[]; };\n"
+        "shared uint DepthStatsShared[3];\n"
+        "uint DepthStatsVisited = 0U, DepthStatsColored = 0U, DepthStatsFailed = 0U;\n\n");
+    src +=
+        "\nvoid main()\n"
+        "{\n"
+        "    if (gl_LocalInvocationIndex == 0U)\n"
+        "    {\n"
+        "        DepthStatsShared[0] = 0U; DepthStatsShared[1] = 0U; DepthStatsShared[2] = 0U;\n"
+        "    }\n"
+        "    memoryBarrierShared();\n"
+        "    barrier();\n"
+        "    DepthBlendMain();\n"
+        "    atomicAdd(DepthStatsShared[0], DepthStatsVisited);\n"
+        "    atomicAdd(DepthStatsShared[1], DepthStatsColored);\n"
+        "    atomicAdd(DepthStatsShared[2], DepthStatsFailed);\n"
+        "    memoryBarrierShared();\n"
+        "    barrier();\n"
+        "    if (gl_LocalInvocationIndex == 0U)\n"
+        "    {\n"
+        "        atomicAdd(DepthStatsCount[0], DepthStatsShared[0]);\n"
+        "        atomicAdd(DepthStatsCount[1], DepthStatsShared[1]);\n"
+        "        atomicAdd(DepthStatsCount[2], DepthStatsShared[2]);\n"
+        "    }\n"
+        "}\n";
+    return true;
+}
+#endif
+
 bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, const std::initializer_list<const char*>& defines)
 {
     std::string shaderFileName = "shader_";
@@ -122,6 +197,26 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     }
 
     shaderSource += ComputeRendererShaders::Common;
+#ifdef MELONADE_DEBUG_TOOLS
+    // debug only: DepthBlend with the COMPDEPTH counters (GPU::ComputeDepthStats)
+    if (DepthStatsOn && &source == &ComputeRendererShaders::DepthBlend)
+    {
+        std::string counted = source;
+        if (AddDepthStats(counted))
+        {
+            shaderSource += counted;
+            shaderName += "DepthStats,";
+        }
+        else
+        {
+            Platform::Log(Platform::LogLevel::Warn, "COMPDEPTH: DepthBlend's source isn't what the counters expect, staying off\n");
+            DepthStatsOn = false;
+            DepthStatsFailed = true;
+            shaderSource += source;
+        }
+    }
+    else
+#endif
     shaderSource += source;
 
     std::string filePath = "/data/data/me.magnum.melonds.dev/files/" + shaderFileName + ".txt";
@@ -377,6 +472,8 @@ ComputeRenderer::~ComputeRenderer()
 #ifdef MELONADE_DEBUG_TOOLS
     // its queries, while the context is still current
     Stats.reset();
+    Hash3D.reset();
+    DepthCounter.reset();
 #endif
     DropPaceFences();
     Texcache.Reset();
@@ -1453,6 +1550,85 @@ void ComputeRenderer::UpdateStats(const GPU& gpu)
     Stats->FrameStart(RenderFrameStartNs, ScaleFactor, TileSize, (u32)MaxWorkTiles, (u32)WorkTileRoom,
         (u32)YSpanIndices.size(), (u32)XSpanRoom, (u32)MaxYSpanSetups, (u32)MaxVariants);
 }
+
+// debug.melonade.computedepth, at every RenderFrame while it's on or its counter exists: rebuilds the
+// two DepthBlend programs with the counters when it goes on (and without when it goes off), outside
+// of the program cache, and lets the counter read finished frames and log
+void ComputeRenderer::UpdateDepthStats(const GPU& gpu)
+{
+    bool want = gpu.ComputeDepthStats && !DepthStatsFailed;
+    if (want != DepthStatsOn)
+    {
+        if (want)
+        {
+            // the counters take the SSBO binding after the ones the passes use (0 to 7)
+            GLint bindings = 0, computeBlocks = 0;
+            glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &bindings);
+            glGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS, &computeBlocks);
+            if (bindings <= (GLint)ComputeDepthCounter::Binding)
+            {
+                Platform::Log(Platform::LogLevel::Warn, "COMPDEPTH: no free SSBO binding (GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS=%d), staying off\n", bindings);
+                DepthStatsFailed = true;
+                return;
+            }
+            Platform::Log(Platform::LogLevel::Info, "COMPDEPTH: DepthBlend counts its work (bindings=%d computeblocks=%d)\n", bindings, computeBlocks);
+        }
+
+        // both builds first, and only both replace the ones there are
+        DepthStatsOn = want;
+        bool cache = UseShaderCache;
+        UseShaderCache = false;
+        GLuint programs[2] {};
+        bool built = CompileShader(programs[0], ComputeRendererShaders::DepthBlend, {"DepthBlend", "ZBuffer"})
+            && CompileShader(programs[1], ComputeRendererShaders::DepthBlend, {"DepthBlend", "WBuffer"});
+        UseShaderCache = cache;
+        // CompileShader turns DepthStatsOn off when the source didn't take the counters
+        if (built && DepthStatsOn == want)
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                glDeleteProgram(ShaderDepthBlend[i]);
+                ShaderDepthBlend[i] = programs[i];
+            }
+        }
+        else
+        {
+            // a failed build leaves 0, which glDeleteProgram ignores
+            glDeleteProgram(programs[0]);
+            glDeleteProgram(programs[1]);
+            if (want)
+            {
+                if (!built)
+                    Platform::Log(Platform::LogLevel::Warn, "COMPDEPTH: DepthBlend with the counters didn't build, staying off\n");
+                DepthStatsFailed = true;
+            }
+            // the programs there are stay, built the way DepthStatsOn was before
+            DepthStatsOn = !want;
+        }
+    }
+
+    if (DepthStatsOn && !DepthCounter)
+        DepthCounter = std::make_unique<ComputeDepthCounter>();
+    else if (!DepthStatsOn)
+        DepthCounter.reset();
+    if (DepthCounter)
+        DepthCounter->FrameStart(SteadyNowNs(), ScaleFactor);
+}
+
+// GPU::Hash3DLogging: the low res image the final pass wrote, the one display capture reads back,
+// which a render left out (identical or paced) leaves as it was
+void ComputeRenderer::QueueHash3D(GPU& gpu, u32 frame)
+{
+    if (!Hash3D)
+        Hash3D = std::make_unique<Hash3DReadback>(false);
+
+    GLint readFB = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFB);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureFrameBuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, LowResFramebuffer, 0);
+    Hash3D->Queue(frame);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readFB);
+}
 #endif
 
 void ComputeRenderer::DropPaceFences() noexcept
@@ -1692,6 +1868,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             ShaderCompileStep(current, count);
     }
     SLOW_LAP(Resize);
+#ifdef MELONADE_DEBUG_TOOLS
+    // after the compile above, which builds DepthBlend with the counters too while they're on
+    if (gpu.ComputeDepthStats || DepthStatsOn || DepthCounter)
+        UpdateDepthStats(gpu);
+#endif
     // after the targets' setup and the compile (above, or the frontend's before RunFrame), before
     // anything of this frame. that's the game's first frame, under a black screen
     if (WarmPending)
@@ -2437,9 +2618,17 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glActiveTexture(GL_TEXTURE0);
 
     // compose final image
+#ifdef MELONADE_DEBUG_TOOLS
+    if (DepthCounter)
+        DepthCounter->Ring.BeginFrame(ComputeDepthCounter::Binding, ScreenWidth * ScreenHeight);
+#endif
     UseProgram(ShaderDepthBlend[wbuffer]);
     glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+#ifdef MELONADE_DEBUG_TOOLS
+    if (DepthCounter)
+        DepthCounter->Ring.EndFrame();
+#endif
 
     BeginGPUTimer(ComputePass::Final);
     glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);

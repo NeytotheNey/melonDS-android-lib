@@ -34,6 +34,8 @@
 #include "GPU3D_TexcacheOpenGL.h"
 #include "GPU3D_ComputeStats.h"
 #include "GPU3D_ComputeRooms.h"
+#include "GPU3D_GLStats.h"
+#include "GPU3D_Hash3D.h"
 
 #include "NonStupidBitfield.h"
 
@@ -89,6 +91,7 @@ public:
 #ifdef MELONADE_DEBUG_TOOLS
     void BeginGPUTimer(int pass) final { if (Stats) Stats->Begin(pass); }
     void EndGPUTimer() final { if (Stats) Stats->End(); }
+    void QueueHash3D(GPU& gpu, u32 frame) final;
 #endif
     [[nodiscard]] bool NeedsCaptureRedraw() const noexcept override { return PaceStale; }
     void RedrawSkippedFrame(GPU& gpu) override;
@@ -330,6 +333,14 @@ private:
     // off, the default, and then nothing here makes a GL call for them
     std::unique_ptr<ComputeStats> Stats;
     void UpdateStats(const GPU& gpu);
+    // HASH3D (GPU::Hash3DLogging), made at the first frame it's on
+    std::unique_ptr<Hash3DReadback> Hash3D;
+    // COMPDEPTH (GPU::ComputeDepthStats): DepthBlend is built with its counters while DepthStatsOn,
+    // set at RenderFrame from the switch (once it's off on a driver that can't, it stays off)
+    bool DepthStatsOn = false;
+    bool DepthStatsFailed = false;
+    std::unique_ptr<ComputeDepthCounter> DepthCounter;
+    void UpdateDepthStats(const GPU& gpu);
 
     // the COMPSLOW line: RenderFrame's CPU time by phase, logged for a frame over 30 ms, with how
     // many programs it was the first to dispatch since they were compiled (DispatchedPrograms)

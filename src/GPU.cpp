@@ -1967,6 +1967,8 @@ void GPU::FinishFrame(u32 lines) noexcept
 
     if (Hash2DLogging)
         LogHash2D();
+    else if (Hash3DLogging)
+        Hash2DFrame++; // what LogHash2D counts, so HASH3D lines are numbered the same without it
 
     FrontBuffer = FrontBuffer ? 0 : 1;
     AssignFramebuffers();
@@ -2017,8 +2019,16 @@ void GPU::LogHash2D() noexcept
         hash[screen] = h;
     }
 
-    Log(LogLevel::Info, "HASH2D frame=%u top=%016llX bottom=%016llX\n",
-        Hash2DFrame++, (unsigned long long)hash[0], (unsigned long long)hash[1]);
+    // two call sites taking turns, like LogHash3D: the Android frontend lets 50 lines a second through
+    // from one, and a game at 60 FPS needs a line every frame. the formats differ (the %.0s prints
+    // nothing), so the linker can't fold them into one
+    u32 frame = Hash2DFrame++;
+    if (frame & 1)
+        Log(LogLevel::Info, "HASH2D frame=%u top=%016llX bottom=%016llX%.0s\n",
+            frame, (unsigned long long)hash[0], (unsigned long long)hash[1], "");
+    else
+        Log(LogLevel::Info, "HASH2D frame=%u top=%016llX bottom=%016llX\n",
+            frame, (unsigned long long)hash[0], (unsigned long long)hash[1]);
 }
 
 void GPU::BlankFrame() noexcept

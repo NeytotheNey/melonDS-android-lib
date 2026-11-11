@@ -23,6 +23,7 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#include "GPU3D_Hash3D.h"
 
 namespace melonDS
 {
@@ -113,6 +114,9 @@ SoftRenderer::SoftRenderer() noexcept
 
 SoftRenderer::~SoftRenderer()
 {
+    // debug only: a render hashed at the next VCount144, which won't come
+    if (Hash3DPending)
+        LogHash3DDropped(Hash3DFrame, "rendererclosed");
     StopRenderThread();
 
     Platform::Semaphore_Free(Sema_RenderStart);
@@ -1741,8 +1745,28 @@ void SoftRenderer::RenderPolygons(const GPU& gpu, bool threaded, Polygon** polyg
 
 void SoftRenderer::VCount144(GPU& gpu)
 {
-    if (RenderThreadRunning.load(std::memory_order_relaxed) && !gpu.GPU3D.AbortFrame)
+    bool threaded = RenderThreadRunning.load(std::memory_order_relaxed);
+    if (threaded && !gpu.GPU3D.AbortFrame)
         Platform::Semaphore_Wait(Sema_RenderDone);
+
+    // debug only: the render is done here, threaded or not, unless it was aborted
+    if (Hash3DPending)
+    {
+        Hash3DPending = false;
+        if (threaded && gpu.GPU3D.AbortFrame)
+            LogHash3DDropped(Hash3DFrame, "aborted");
+        else
+            LogHash3D(Hash3DFrame, Hash3DImage(&ColorBuffer[FirstPixelOffset], ScanlineWidth));
+    }
+}
+
+void SoftRenderer::QueueHash3D(GPU& gpu, u32 frame)
+{
+    // one render at a time: a second line 215 before a VCount144 replaces the first, which is logged
+    if (Hash3DPending)
+        LogHash3DDropped(Hash3DFrame, "replaced");
+    Hash3DPending = true;
+    Hash3DFrame = frame;
 }
 
 void SoftRenderer::RenderFrame(GPU& gpu)

@@ -811,5 +811,91 @@ void main()
 #endif
 }
 )";
+
+#ifdef MELONADE_DEBUG_TOOLS
+// debug only (GPU::SceneStats 2, GLFragCounter): GLRenderer::BuildRenderShader's counting build puts
+// this between kRenderFSCommon and kRenderFS, and kRenderFSFragCountHit first in kRenderFS's main.
+// the normal build's source stays as it is
+const char* kRenderFSFragCount = R"(
+
+layout(std430, binding = 0) buffer FragCounts
+{
+    uint uFragCount[];
+};
+uniform int uFragPass;
+)";
+
+const char* kRenderFSFragCountHit = "\n    atomicAdd(uFragCount[uFragPass], 1u);\n";
+
+// the covered pixel count: drawn over the whole target with the stencil test set to pass where a
+// polygon drew, and early fragment tests so only those run
+const char* kCoverVS = kShaderHeader R"(
+
+in vec2 vPosition;
+
+void main()
+{
+    gl_Position = vec4(vPosition, 0.0, 1.0);
+}
+)";
+
+const char* kCoverFS = kShaderHeader R"(
+
+precision highp float;
+
+layout(early_fragment_tests) in;
+
+layout(std430, binding = 0) buffer FragCounts
+{
+    uint uFragCount[];
+};
+
+layout(location = 0) out vec4 oColor;
+
+void main()
+{
+    atomicAdd(uFragCount[3], 1u);
+    oColor = vec4(0.0);
+}
+)";
+
+// the covered pixel count when the clear plane's alpha is 0, where the shadow masks of pass 2 leave
+// stencil values the count above can't tell from polygons: every polygon pixel has alpha 1 or more
+// then and a clear pixel 0, so it counts the color target's pixels with alpha, before fog changes it
+const char* kCoverAlphaCS = kShaderHeader R"(
+
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform highp sampler2D uColor;
+uniform ivec2 uSize;
+
+layout(std430, binding = 0) buffer FragCounts
+{
+    uint uFragCount[];
+};
+
+shared uint sCovered;
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        sCovered = 0u;
+    memoryBarrierShared();
+    barrier();
+
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x < uSize.x && pos.y < uSize.y && texelFetch(uColor, pos, 0).a > 0.0)
+        atomicAdd(sCovered, 1u);
+
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u)
+        atomicAdd(uFragCount[3], sCovered);
+}
+)";
+#endif
 }
 #endif // GPU3D_OPENGL_SHADERS_H

@@ -3091,10 +3091,124 @@ void GPU3D::VCount215(GPU& gpu) noexcept
 {
     if (HalfCam) HalfCam->BeforeRender();
 
+    // debug only, the scene being rendered, whatever the renderer does with it
+    if (gpu.SceneStats)
+        NoteSceneStats(gpu);
+
     // the renderer was given what the last VBlank latched (see VBlank). what it does with it, it
     // keeps track of itself
     RenderedSinceVBlank = true;
     CurrentRenderer->RenderFrame(gpu);
+
+    // debug only: this frame's HASH2D number is GetHashFrame() until the frame ends, and the next
+    // frame shows this render
+    if (gpu.Hash3DLogging)
+        CurrentRenderer->QueueHash3D(gpu, gpu.GetHashFrame() + 1);
+}
+
+// debug only (GPU::SceneStats), see GPU3D_SceneStats.h for the fields
+void GPU3D::NoteSceneStats(const GPU& gpu) noexcept
+{
+    SceneStatsCounters& sec = SceneStatsSec;
+    s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (sec.LogStartNs == 0)
+        sec.LogStartNs = now;
+
+    if (now - sec.LogStartNs >= 1000000000 && sec.Frames > 0)
+    {
+        double perFrame = 1.0 / sec.Frames;
+        double od = (sec.OverdrawOpaque + sec.OverdrawTrans) * perFrame;
+        Platform::Log(Platform::LogLevel::Info, "SCENESTATS frames=%u identical=%u nopolys=%u bg3d=%u tex=%u hl=%u atest=%u "
+            "blend=%u aa=%u edge=%u fog=%u fogalpha=%u bitmap=%u wbuffer=%u polys=%.1f opaque=%.1f trans=%.1f shadow=%.1f "
+            "mask=%.1f textured=%.1f untextured=%.1f lines=%.1f od=%.3f od_opaque=%.3f od_trans=%.3f od_mask=%.3f "
+            "peakpolys=%u peakod=%.3f width=%d\n",
+            sec.Frames, sec.Identical, sec.NoPolys, sec.BG3D, sec.Tex, sec.Highlight, sec.AlphaTest, sec.Blend, sec.AA,
+            sec.Edge, sec.Fog, sec.FogAlpha, sec.Bitmap, sec.WBuffer, sec.Polys * perFrame, sec.Opaque * perFrame,
+            sec.Trans * perFrame, sec.Shadow * perFrame, sec.Mask * perFrame, sec.Textured * perFrame,
+            sec.Untextured * perFrame, sec.Lines * perFrame, od, sec.OverdrawOpaque * perFrame,
+            sec.OverdrawTrans * perFrame, sec.OverdrawMask * perFrame, sec.PeakPolys, sec.PeakOverdraw, sec.Width);
+        sec = {};
+        sec.LogStartNs = now;
+    }
+    else if (now - sec.LogStartNs >= 1000000000)
+        sec.LogStartNs = now;
+
+    u32 dispCnt = RenderDispCnt;
+    sec.Frames++;
+    sec.Identical += RenderFrameIdentical;
+    sec.BG3D += (gpu.GPU2D_A.DispCnt & (1<<3)) != 0;
+    sec.Tex += (dispCnt & (1<<0)) != 0;
+    sec.Highlight += (dispCnt & (1<<1)) != 0;
+    sec.AlphaTest += (dispCnt & (1<<2)) != 0;
+    sec.Blend += (dispCnt & (1<<3)) != 0;
+    sec.AA += (dispCnt & (1<<4)) != 0;
+    sec.Edge += (dispCnt & (1<<5)) != 0;
+    sec.FogAlpha += (dispCnt & (1<<6)) != 0;
+    sec.Fog += (dispCnt & (1<<7)) != 0;
+    sec.Bitmap += (dispCnt & (1<<14)) != 0;
+    sec.Width = RenderViewWidth;
+
+    if (RenderNumPolygons == 0)
+    {
+        sec.NoPolys++;
+        return;
+    }
+    sec.WBuffer += RenderPolygonRAM[0]->WBuffer;
+
+    // twice the area, in native pixels of the (squeezed) view
+    s64 area2[3] = {};
+    u32 polys = 0;
+    for (u32 i = 0; i < RenderNumPolygons; i++)
+    {
+        const Polygon* polygon = RenderPolygonRAM[i];
+        if (polygon->Degenerate)
+            continue;
+        polys++;
+
+        int kind; // 0 opaque, 1 translucent or shadow, 2 shadow mask
+        if (polygon->IsShadowMask)
+        {
+            kind = 2;
+            sec.Mask++;
+        }
+        else if (polygon->Translucent)
+        {
+            kind = 1;
+            if (polygon->IsShadow) sec.Shadow++;
+            else                   sec.Trans++;
+        }
+        else
+        {
+            kind = 0;
+            sec.Opaque++;
+        }
+
+        if ((dispCnt & (1<<0)) && ((polygon->TexParam >> 26) & 0x7) != 0) sec.Textured++;
+        else                                                              sec.Untextured++;
+        sec.Lines += polygon->Type == 1;
+
+        s64 sum = 0;
+        u32 n = polygon->NumVertices;
+        for (u32 j = 0; j < n; j++)
+        {
+            const Vertex* a = polygon->Vertices[j];
+            const Vertex* b = polygon->Vertices[(j + 1) < n ? (j + 1) : 0];
+            sum += (s64)a->FinalPosition[0] * b->FinalPosition[1] - (s64)b->FinalPosition[0] * a->FinalPosition[1];
+        }
+        area2[kind] += sum < 0 ? -sum : sum;
+    }
+
+    // FinalPosition is the native 256x192 frame, with a wide view squeezed into it by 256/W (only
+    // HiresPosition holds the wide X), so the area over 256x192 is the share of the whole view, wide or not
+    double screen2 = 2.0 * 256 * 192;
+    double od[3] = { area2[0] / screen2, area2[1] / screen2, area2[2] / screen2 };
+    sec.Polys += polys;
+    sec.OverdrawOpaque += od[0];
+    sec.OverdrawTrans += od[1];
+    sec.OverdrawMask += od[2];
+    sec.PeakPolys = std::max(sec.PeakPolys, polys);
+    sec.PeakOverdraw = std::max(sec.PeakOverdraw, od[0] + od[1]);
 }
 
 void GPU3D::WideDropsOnSwap() noexcept

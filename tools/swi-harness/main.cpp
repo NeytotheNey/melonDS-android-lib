@@ -68,6 +68,7 @@ bool CoreLogEnabled = true; // --no-core-log
 bool StopRequested = false;
 FILE* StatsLog = nullptr;   // --stats2d: the GPU2DSTATS lines, each after the frame it ends at
 FILE* Hash2DLog = nullptr;  // --hash2d: the HASH2D lines
+FILE* Hash3DLog = nullptr;  // --hash3d: the HASH3D lines (software 3D)
 u32 CurFrame = 0;
 }
 
@@ -235,6 +236,13 @@ void Log(LogLevel level, const char* fmt, ...)
     {
         va_start(args, fmt);
         vfprintf(Hash2DLog, fmt, args);
+        va_end(args);
+        return;
+    }
+    if (Hash3DLog && strncmp(fmt, "HASH3D", 6) == 0)
+    {
+        va_start(args, fmt);
+        vfprintf(Hash3DLog, fmt, args);
         va_end(args);
         return;
     }
@@ -439,6 +447,8 @@ void Usage()
         "  --accel        draw 2D in the accelerated line format (software 3D, the wide check's 256 run),\n"
         "                 as the GL renderers get it, so the GPU 2D shadow recorder writes its blocks\n"
         "  --hash2d       log GPU::LogHash2D's HASH2D line every frame to hash2d.log\n"
+        "  --hash3d       log the software 3D image's HASH3D line every frame to hash3d.log\n"
+        "  --scenestats   GPU::SceneStats 1: a SCENESTATS line once a second (wall clock) to the core log\n"
         "  --shadow2d N   the GPU 2D shadow recorder on (GPU_Shadow2D.h, mode all, with its self-check),\n"
         "                 a SHADOW2D line every N frames to shadow2d.log: lines per reason, block errors\n"
         "  --threaded2d   draw 2D on its own thread, as the app's threaded 2D setting does\n"
@@ -647,7 +657,7 @@ int main(int argc, char** argv)
     std::vector<Touch> touches;
     std::string savpath;
     u32 stats2d = 0;
-    bool accel = false, hash2d = false, threaded2d = false, bnohold = false;
+    bool accel = false, hash2d = false, hash3d = false, scenestats = false, threaded2d = false, bnohold = false;
     u32 shadow2d = 0;
     std::string console = "ds", dsidir, nandpath, dsibios = "official", dsibiosdir;
     bool nandreadonly = false;
@@ -711,6 +721,8 @@ int main(int argc, char** argv)
         else if (arg == "--stats2d") stats2d = strtoul(next().c_str(), nullptr, 0);
         else if (arg == "--accel") accel = true;
         else if (arg == "--hash2d") hash2d = true;
+        else if (arg == "--hash3d") hash3d = true;
+        else if (arg == "--scenestats") scenestats = true;
         else if (arg == "--shadow2d") shadow2d = strtoul(next().c_str(), nullptr, 0);
         else if (arg == "--threaded2d") threaded2d = true;
         else if (arg == "--bnohold") bnohold = true;
@@ -1029,6 +1041,13 @@ int main(int argc, char** argv)
         Hash2DLog = fopen((outdir + "/hash2d.log").c_str(), "w");
         nds->GPU.Hash2DLogging = true;
     }
+    if (hash3d)
+    {
+        Hash3DLog = fopen((outdir + "/hash3d.log").c_str(), "w");
+        nds->GPU.Hash3DLogging = true;
+    }
+    if (scenestats)
+        nds->GPU.SceneStats = 1;
     if (threaded2d)
         nds->GPU.SetThreaded2D(true);
 
@@ -1157,6 +1176,8 @@ int main(int argc, char** argv)
     nds->Stop();
     if (Hash2DLog) fclose(Hash2DLog);
     Hash2DLog = nullptr;
+    if (Hash3DLog) fclose(Hash3DLog);
+    Hash3DLog = nullptr;
     if (CoreLog) fclose(CoreLog);
     return 0;
 }
