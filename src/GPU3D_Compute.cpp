@@ -655,7 +655,9 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     // the tile memory starts at 6 of the 16 layers a tile has room for and grows from there
     // (GrowWorkBuffers). White 2's overworld used 29k and NSMB's map 40k work tiles at 4x, and the
     // CPU's bound ran 1.8 times what binning used on White 2's title, so 6 (74k at 4x) should hold
-    // both without growing. the title grows once or twice
+    // both without growing. the title grows once or twice. if it fails the room is 0, and the
+    // first frame with polygons grows it right away, whatever the grows before these targets did
+    GrowRetryIn = GrowRetryWait = 0;
     AllocTileMemory(TilesPerLine*TileLines*6);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, FinalTileMemory);
@@ -715,14 +717,53 @@ int ComputeRenderer::TileLayersFor(int optMask) const noexcept
     return ((optMask & ComputeOpt_OneTileBuffer) && fits) ? 1 : 2;
 }
 
+// glBufferData for the work buffers, which grow mid-game (GrowWorkBuffers), and whether the buffer
+// really got the storage. the error flags are drained first, so an older error isn't taken for
+// this one. nothing else in the core reads them, but debug builds log what was drained so it isn't
+// lost. GL_BUFFER_SIZE is a second look, as the GL's state is undefined after GL_OUT_OF_MEMORY
+static bool WorkBufferData(GLenum target, GLsizeiptr size, const char* what)
+{
+    // a lost context can keep returning errors, so this stops somewhere
+    for (int i = 0; i < 16; i++)
+    {
+        GLenum old = glGetError();
+        if (old == GL_NO_ERROR)
+            break;
+#ifdef MELONADE_DEBUG_TOOLS
+        Platform::Log(Platform::LogLevel::Warn, "COMPGLERR 0x%04x before the %s allocation\n", old, what);
+#endif
+    }
+
+    glBufferData(target, size, nullptr, GL_DYNAMIC_DRAW);
+    GLenum err = glGetError();
+    GLint64 real = -1;
+    glGetBufferParameteri64v(target, GL_BUFFER_SIZE, &real);
+    if (err == GL_NO_ERROR && real == (GLint64)size)
+        return true;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    Platform::Log(Platform::LogLevel::Warn, "COMPGROW %s failed: %lld bytes, buffer has %lld, error 0x%04x\n",
+        what, (long long)size, (long long)real, err);
+#else
+    // the 1st, 2nd, 4th, 8th... failure, which the backoff in GrowWorkBuffers spaces out anyway
+    static u32 failures = 0;
+    failures++;
+    if ((failures & (failures - 1)) == 0)
+        Platform::Log(Platform::LogLevel::Warn, "Compute renderer: no GPU memory for the %s (%lld bytes), 3D frames that need it are skipped (%u failures)\n",
+            what, (long long)size, failures);
+#endif
+    return false;
+}
+
 // the tile memory layers, with room for this many work tiles. glBufferData orphans the old
 // storage, so a render still in flight keeps what it was bound to. nothing is kept from one render
 // to the next in them: Rasterise writes the work tiles that DepthBlend then reads.
 // only the first TileLayers of them are used: a word per pixel in each, or two in the one buffer
 // that holds color and depth. a layer that isn't used never gets storage, and one that an
 // earlier layout used is shrunk like the destructor does, which is what frees it on Adreno.
-// that comes first, so a change of layout doesn't hold the old layers while the new ones are made
-void ComputeRenderer::AllocTileMemory(int workTiles)
+// that comes first, so a change of layout doesn't hold the old layers while the new ones are made.
+// when a layer doesn't get its storage the room is 0, as the layers may be left with none
+bool ComputeRenderer::AllocTileMemory(int workTiles)
 {
     WorkTileRoom = workTiles;
     for (int i = TileLayers; i < TileLayersAlloc; i++)
@@ -736,23 +777,35 @@ void ComputeRenderer::AllocTileMemory(int workTiles)
     for (int i = 0; i < TileLayers; i++)
     {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, TileMemory[i]);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, size, nullptr, GL_DYNAMIC_DRAW);
+        if (!WorkBufferData(GL_SHADER_STORAGE_BUFFER, size, "tile memory"))
+        {
+            WorkTileRoom = 0;
+            return false;
+        }
     }
+    return true;
 }
 
 // the X spans and the setup indices they're made from, one each per span. the texture buffer
-// is pointed at the setup indices' new storage again, in case a driver keeps the old size
-void ComputeRenderer::AllocXSpans(int spans)
+// is pointed at the setup indices' new storage again, in case a driver keeps the old size.
+// the room is 0 when either doesn't get its storage
+bool ComputeRenderer::AllocXSpans(int spans)
 {
     XSpanRoom = spans;
     glBindBuffer(GL_TEXTURE_BUFFER, YSpanIndicesTextureMemory);
-    glBufferData(GL_TEXTURE_BUFFER, (GLsizeiptr)spans*2*4, nullptr, GL_DYNAMIC_DRAW);
+    bool ok = WorkBufferData(GL_TEXTURE_BUFFER, (GLsizeiptr)spans*2*4, "setup indices");
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, XSpanSetupMemory);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)sizeof(SpanSetupX)*spans, nullptr, GL_DYNAMIC_DRAW);
+    if (ok)
+    {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, XSpanSetupMemory);
+        ok = WorkBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)sizeof(SpanSetupX)*spans, "x spans");
+    }
 
     glBindTexture(GL_TEXTURE_BUFFER, YSpanIndicesTexture);
     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA16UI, YSpanIndicesTextureMemory);
+    if (!ok)
+        XSpanRoom = 0;
+    return ok;
 }
 
 // GPU::ComputeGrow, before a frame's dispatches: makes room for the work tiles and spans it could
@@ -762,41 +815,83 @@ void ComputeRenderer::AllocXSpans(int spans)
 // polygon's XMin and XMax that the bound's tiles cover. so Rasterise never writes past the room, and the MaxWorkTiles clamp in the shaders stays
 // what it was. InterpXSpans runs whole groups of 32, which the room's step keeps inside. a buffer
 // that grows gets a quarter more than asked, rounded up to the step, so a scene settles after a
-// grow or two, and it never shrinks until the targets change
+// grow or two, and it never shrinks until the targets change.
+// a grow that fails is tried again at what's needed, without the quarter, and then the room
+// there was is allocated again, as the failed glBufferData may have left the buffer with nothing
+// (0 if even that fails). RenderFrame then leaves out a frame that needs more than the room. the
+// next grows are left out for a while, twice as long with every failure in a row, so a scene that
+// keeps not fitting doesn't stall each frame on allocations that fail, but it's tried again
 void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
 {
-    auto roomFor = [](u32 need, int step, int max)
+    auto roomFor = [](u32 need, int step, int max, bool headroom)
     {
-        s64 room = (s64)need + need / 4;
+        s64 room = (s64)need + (headroom ? need / 4 : 0);
         room = (room + step - 1) / step * step;
         return (int)std::min(room, (s64)max);
+    };
+    auto grow = [this](bool (ComputeRenderer::*alloc)(int), int oldRoom, int room, int exact)
+    {
+        if ((this->*alloc)(room))
+            return true;
+        if (exact < room && (this->*alloc)(exact))
+            return true;
+        if (oldRoom > 0)
+            (this->*alloc)(oldRoom);
+        return false;
     };
 
     // binning stops at MaxWorkTiles, the most there is room for
     u32 workNeed = std::min(workTiles, (u32)MaxWorkTiles);
+    int maxSpans = (int)YSpanIndices.size();
+    spans = std::min(spans, (u32)maxSpans);
+    if (workNeed <= (u32)WorkTileRoom && spans <= (u32)XSpanRoom)
+        return;
+    if (GrowRetryIn > 0)
+    {
+        GrowRetryIn--;
+        return;
+    }
+
+    bool failed = false;
     if (workNeed > (u32)WorkTileRoom)
     {
         // a step is a layer: one work tile for every tile
-        int room = roomFor(workNeed, TilesPerLine*TileLines, MaxWorkTiles);
+        int step = TilesPerLine*TileLines;
+        int room = roomFor(workNeed, step, MaxWorkTiles, true);
 #ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d\n",
             WorkTileRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize);
 #endif
-        AllocTileMemory(room);
+        int oldRoom = WorkTileRoom;
+        failed |= !grow(&ComputeRenderer::AllocTileMemory, oldRoom, room, roomFor(workNeed, step, MaxWorkTiles, false));
+#ifdef MELONADE_DEBUG_TOOLS
+        if (WorkTileRoom != room)
+            Platform::Log(Platform::LogLevel::Warn, "COMPGROW worktiles wanted %d, has %d (was %d)\n",
+                room, WorkTileRoom, oldRoom);
+#endif
     }
 
-    int maxSpans = (int)YSpanIndices.size();
-    spans = std::min(spans, (u32)maxSpans);
     if (spans > (u32)XSpanRoom)
     {
         // a 64th of the most, a multiple of 32
-        int room = roomFor(spans, maxSpans / 64, maxSpans);
+        int step = maxSpans / 64;
+        int room = roomFor(spans, step, maxSpans, true);
 #ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d\n",
             XSpanRoom, room, maxSpans, spans, ScaleFactor);
 #endif
-        AllocXSpans(room);
+        int oldRoom = XSpanRoom;
+        failed |= !grow(&ComputeRenderer::AllocXSpans, oldRoom, room, roomFor(spans, step, maxSpans, false));
+#ifdef MELONADE_DEBUG_TOOLS
+        if (XSpanRoom != room)
+            Platform::Log(Platform::LogLevel::Warn, "COMPGROW xspans wanted %d, has %d (was %d)\n",
+                room, XSpanRoom, oldRoom);
+#endif
     }
+
+    // from 16 grows (a quarter second while every frame tries) up to 512
+    GrowRetryWait = failed ? std::clamp(GrowRetryWait * 2, 16, 512) : 0;
+    GrowRetryIn = GrowRetryWait;
 }
 
 void ComputeRenderer::VCount144(GPU& gpu)
@@ -1746,6 +1841,23 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             GrowWorkBuffers(totalTileBound, (u32)numSetupIndices);
         else
             GrowWorkBuffers((u32)MaxWorkTiles, (u32)maxSetupIndices);
+
+        // a grow that failed can leave less room than binning and InterpXSpans could use, and the
+        // shaders only stop at MaxWorkTiles, so the frame isn't drawn: the image stays as the last
+        // render left it (a kept one goes back to being the image), and the next frame is drawn
+        // even if it's the same. nothing was dispatched yet, and the clear bitmap and the texture
+        // cache it updated are what the next render reads anyway
+        if (std::min(totalTileBound, (u32)MaxWorkTiles) > (u32)WorkTileRoom || numSetupIndices > XSpanRoom)
+        {
+            if (keep)
+            {
+                SpareFramebuffer = Framebuffer;
+                Framebuffer = KeptFramebuffer;
+                KeptFramebuffer = 0;
+            }
+            ForceRender = true;
+            return;
+        }
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, YSpanSetupMemory);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(SpanSetupY)*numYSpans, YSpanSetups);

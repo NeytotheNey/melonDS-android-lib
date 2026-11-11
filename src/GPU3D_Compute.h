@@ -338,13 +338,18 @@ private:
     // the room the work buffers have now, which TargetFits and the shaders don't know about: the
     // tile memory layers in work tiles (MaxWorkTiles at most), the X spans and their setup indices
     // in spans (YSpanIndices.size() at most). ResizeTargets starts them small and GrowWorkBuffers
-    // makes them bigger before a frame that could need more (GPU::ComputeGrow)
+    // makes them bigger before a frame that could need more (GPU::ComputeGrow). an allocation
+    // that failed leaves 0, and a frame that needs more than there is isn't drawn
     int WorkTileRoom {};
     int XSpanRoom {};
+    // after a grow that failed, how many more grows are left out (GrowRetryIn), and how many
+    // were left out last time, which doubles with every failure in a row
+    int GrowRetryIn = 0;
+    int GrowRetryWait = 0;
     bool HiresCoordinates {};
     // the next frame is drawn even if it's the same: ResizeTargets made a new, empty Framebuffer,
-    // the hi-res coordinates setting changed how the polygons are set up, or a reset emptied the
-    // texture cache
+    // the hi-res coordinates setting changed how the polygons are set up, a reset emptied the
+    // texture cache, or the last frame wasn't drawn for want of room (GrowWorkBuffers)
     bool ForceRender = true;
     // the texture cache was emptied (Reset) and nothing was drawn since, so what the image was
     // drawn with isn't cached any more. for ComputeOpt_TexSkip
@@ -418,8 +423,8 @@ private:
     bool TargetFits(int width, int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
     void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth);
-    void AllocTileMemory(int workTiles);
-    void AllocXSpans(int spans);
+    bool AllocTileMemory(int workTiles);
+    bool AllocXSpans(int spans);
     void GrowWorkBuffers(u32 workTiles, u32 spans);
     int FrameTargetWidth(const GPU& gpu) noexcept;
     void KeepFramebuffer() noexcept;
