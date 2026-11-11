@@ -828,7 +828,10 @@ public:
     // again (not depth-equal ones), since pass 2 drew it and depth only went down since. bit 1: a
     // need-opaque polygon's opaque draw is left out when its texture has no texel that ends up at
     // alpha 31, its translucent draw (not a shadow's) when none ends up at 1-30
-    // (GLRenderer::ClassifyTransAlpha). only changed by a debug switch, set before the game runs
+    // (GLRenderer::ClassifyTransAlpha). bit 2 (T1c): with GL_EXT_shader_framebuffer_fetch, the
+    // clear-alpha-0 pass is left out and pass 3's translucent draws skip blending where the
+    // destination alpha is 0 (GLRenderer::FetchClear0). only changed by a debug switch, set before
+    // the game runs
     int GLTransSkip = 0;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;

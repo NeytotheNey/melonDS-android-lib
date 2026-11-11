@@ -629,11 +629,17 @@ private:
 //                      opaque and translucent draws bit 1 left out (both passes; not ones bit 0 did)
 //   scan_us peak_scan_us
 //                      CPU µs of the classification, and the most in one frame
+//   clear0_frames fetch_frames
+//                      counts, not per frame: frames with a clear alpha of 0 and translucent
+//                      polygons (the ones that need the clear0 pass), and of those the ones bit 2
+//                      drew without it, with framebuffer fetch. fetch_frames stays 0 without
+//                      GL_EXT_shader_framebuffer_fetch
 struct GLTransStats
 {
     struct Counters
     {
         u32 Frames = 0;
+        u32 Clear0Frames = 0, FetchFrames = 0;
         u64 NeedOpaque = 0, Full = 0, Partial = 0, Mixed = 0, Neither = 0, Textures = 0, Texels = 0;
         u64 Skip0 = 0, Skip1Opaque = 0, Skip1Trans = 0;
         s64 ScanNs = 0, PeakScanNs = 0;
@@ -653,10 +659,11 @@ struct GLTransStats
             double per = 1.0 / Sec.Frames;
             Platform::Log(Platform::LogLevel::Info, "GLTRANS frames=%u gltrans=%d needopaque=%.1f full=%.1f partial=%.1f "
                 "mixed=%.1f neither=%.1f textures=%.1f texels=%.0f skip0=%.1f skip1_opaque=%.1f skip1_trans=%.1f "
-                "scan_us=%.1f peak_scan_us=%.1f\n",
+                "scan_us=%.1f peak_scan_us=%.1f clear0_frames=%u fetch_frames=%u\n",
                 Sec.Frames, mode, Sec.NeedOpaque * per, Sec.Full * per, Sec.Partial * per, Sec.Mixed * per,
                 Sec.Neither * per, Sec.Textures * per, Sec.Texels * per, Sec.Skip0 * per, Sec.Skip1Opaque * per,
-                Sec.Skip1Trans * per, Sec.ScanNs * per / 1000.0, Sec.PeakScanNs / 1000.0);
+                Sec.Skip1Trans * per, Sec.ScanNs * per / 1000.0, Sec.PeakScanNs / 1000.0,
+                Sec.Clear0Frames, Sec.FetchFrames);
         }
         Sec = {};
         LogStartNs = now;

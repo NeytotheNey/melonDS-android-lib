@@ -107,9 +107,11 @@ private:
     GLCompositor CurGLCompositor;
     RendererPolygon PolygonList[2048] {};
 
-    // fragCount: the debug build that counts fragments (GPU::SceneStats 2, GLFragCounter)
-    bool BuildRenderShader(bool wbuffer, bool fragCount = false);
-    void UseRenderShader(bool wbuffer, int mode);
+    // fragCount: the debug build that counts fragments (GPU::SceneStats 2, GLFragCounter). fetch: the
+    // framebuffer fetch build (GPU::GLTransSkip bit 2), RenderShader[2 + wbuffer]
+    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false);
+    void UseRenderShader(bool wbuffer, int mode, bool fetch = false);
+    bool PrepareFetchShaders();
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
     u32 WideVertexX(s32 hiresx) const;
@@ -148,13 +150,23 @@ private:
 
     // [0]: Z-buffer, [1]: W-buffer; the pass is selected with uRenderMode. uDepthBias is
     // cached per program: GL keeps a program's uniforms across glUseProgram, so the cache
-    // only has to follow what this code set
-    GLuint RenderShader[2] {};
-    GLint RenderModeULoc[2] {};
-    GLint DepthBiasLoc[2] {};
-    float DepthBias[2] {};
+    // only has to follow what this code set. [2] and [3]: their framebuffer fetch builds
+    // (GPU::GLTransSkip bit 2), only translucent draws use them, made at the first frame that
+    // wants them (PrepareFetchShaders). bit 0 of an index is always W-buffering
+    GLuint RenderShader[4] {};
+    GLint RenderModeULoc[4] {};
+    GLint DepthBiasLoc[4] {};
+    float DepthBias[4] {};
     int CurShaderID = -1;
     int CurRenderMode = -1;
+
+    // GL_EXT_shader_framebuffer_fetch is listed (checked at init). FetchShadersTried: a build of
+    // RenderShader[2] and [3] was tried since they were last dropped
+    bool HasFramebufferFetch = false;
+    bool FetchShadersTried = false;
+    // set per frame: GPU::GLTransSkip bit 2 with a clear alpha of 0, the extension and its programs.
+    // the clear0 pass is left out and pass 3 does its work (RenderSceneChunk)
+    bool FetchClear0 = false;
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
@@ -305,7 +317,7 @@ private:
     // the covered count when the clear alpha is 0 (kCoverAlphaCS), and its uSize
     GLuint CoverAlphaShader = 0;
     GLint CoverAlphaSizeLoc = -1;
-    GLint FragPassLoc[2] {-1, -1};
+    GLint FragPassLoc[4] {-1, -1, -1, -1};
     // HASH3D (GPU::Hash3DLogging)
     std::unique_ptr<Hash3DReadback> Hash3D;
     // GLTRANS (GPU::SceneStats, with GPU::GLTransSkip)

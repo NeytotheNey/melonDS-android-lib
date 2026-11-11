@@ -44,10 +44,11 @@ namespace melonDS
 #define TRANS_SKIPPED(field) do {} while (0)
 #endif
 
-bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount)
+bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch)
 {
-    char shadername[32];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s", wbuffer?'W':'Z', fragCount ? "Count" : "");
+    char shadername[40];
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
+        fragCount ? "Count" : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
@@ -60,6 +61,9 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount)
 
     std::string fsbuf;
     fsbuf += kShaderHeader;
+    // GPU::GLTransSkip bit 2: only built when the extension is listed (PrepareFetchShaders)
+    if (fetch)
+        fsbuf += "\n#extension GL_EXT_shader_framebuffer_fetch : require\n#define FramebufferFetch";
     fsbuf += wbufdef;
     fsbuf += kRenderFSCommon;
 #ifdef MELONADE_DEBUG_TOOLS
@@ -98,7 +102,7 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount)
     uni_id = glGetUniformLocation(prog, "TexPalMem");
     glUniform1i(uni_id, 1);
 
-    int id = (int)wbuffer;
+    int id = (int)wbuffer + (fetch ? 2 : 0);
     DepthBiasLoc[id] = glGetUniformLocation(prog, "uDepthBias");
     glUniform1f(DepthBiasLoc[id], 0.0f);
     DepthBias[id] = 0.0f;
@@ -112,9 +116,42 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount)
     return true;
 }
 
-void GLRenderer::UseRenderShader(bool wbuffer, int mode)
+// GPU::GLTransSkip bit 2: RenderShader[2] and [3], built the first time a frame wants them (so a
+// session that never sets the bit compiles nothing more), as counting builds while SCENEFRAGS
+// counts. false without the extension, or when they don't build (logged once)
+bool GLRenderer::PrepareFetchShaders()
 {
-    int id = (int)wbuffer;
+    if (!HasFramebufferFetch)
+        return false;
+    if (RenderShader[2] && RenderShader[3])
+        return true;
+    if (FetchShadersTried)
+        return false;
+    FetchShadersTried = true;
+
+    bool fragCount = false;
+#ifdef MELONADE_DEBUG_TOOLS
+    fragCount = FragCounter != nullptr;
+#endif
+    if (!BuildRenderShader(false, fragCount, true) || !BuildRenderShader(true, fragCount, true))
+    {
+        glDeleteProgram(RenderShader[2]);
+        glDeleteProgram(RenderShader[3]);
+        RenderShader[2] = RenderShader[3] = 0;
+        Platform::Log(Platform::LogLevel::Warn, "GLTRANS: the framebuffer fetch programs didn't build, gltrans 4 stays off\n");
+        CurShaderID = -1;
+        return false;
+    }
+
+    // BuildRenderShader leaves its program in use
+    CurShaderID = -1;
+    CurRenderMode = -1;
+    return true;
+}
+
+void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch)
+{
+    int id = (int)wbuffer + (fetch ? 2 : 0);
     if (CurShaderID != id)
     {
         glUseProgram(RenderShader[id]);
@@ -335,12 +372,11 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-#ifdef MELONADE_DEBUG_TOOLS
-    // for a later experiment (pass 2's rule for clear alpha 0 done in the shader, see
-    // docs/plan-gpu-discovery.md T1): whether the shader could read the color target. one name at a
-    // time with glGetStringi, which GLES 3 and a desktop core profile both have (glGetString's list
-    // is GL_INVALID_ENUM on the latter), compared whole, since the EXT one is a prefix of its
-    // non-coherent sibling
+    // GPU::GLTransSkip bit 2 (T1c, docs/plan-gpu-discovery.md): whether the shader can read the
+    // color target, coherently. one name at a time with glGetStringi, which GLES 3 and a desktop core
+    // profile both have (glGetString's list is GL_INVALID_ENUM on the latter), compared whole, since
+    // the EXT one is a prefix of its non-coherent sibling. only the EXT one is used: the ARM one reads
+    // color only and has its own rules with more than one color target
     {
         GLint numExtensions = 0;
         glGetIntegerv(GL_NUM_EXTENSIONS, &numExtensions);
@@ -354,13 +390,15 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
             }
             return false;
         };
+        result->HasFramebufferFetch = hasExtension("GL_EXT_shader_framebuffer_fetch");
+#ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "GLTRANS: framebuffer fetch GL_EXT_shader_framebuffer_fetch=%d "
             "GL_ARM_shader_framebuffer_fetch=%d GL_EXT_shader_framebuffer_fetch_non_coherent=%d\n",
-            hasExtension("GL_EXT_shader_framebuffer_fetch") ? 1 : 0,
+            result->HasFramebufferFetch ? 1 : 0,
             hasExtension("GL_ARM_shader_framebuffer_fetch") ? 1 : 0,
             hasExtension("GL_EXT_shader_framebuffer_fetch_non_coherent") ? 1 : 0);
-    }
 #endif
+    }
 
     return result;
 }
@@ -391,7 +429,7 @@ GLRenderer::~GLRenderer()
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 4; i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -1031,7 +1069,7 @@ void GLRenderer::SetPolygonDepthBias(u32 polyattr)
     // than the DS would. set right before every draw, for the shader in use
     float bias = 0.0f;
     if (EqualDepthMargin && (polyattr & (1<<14)))
-        bias = CurShaderID ? -255.0f : -512.0f;
+        bias = (CurShaderID & 1) ? -255.0f : -512.0f;
 
     SetDepthBias(bias);
 }
@@ -1388,12 +1426,34 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     {
         bool clear0 = (gpu3d.RenderClearAttr1 & 0x001F0000) == 0;
 
+        // GPU::GLTransSkip bit 2 (FetchClear0, set in RenderFrame, which also cleared the stencil to
+        // 0xBF for it): no pass 2. pass 3 draws what it did, in polygon order:
+        // * non-shadow translucent draws use the framebuffer fetch program with blending off, which
+        //   writes the source as it is where the destination alpha is 0 (the clear plane, so per
+        //   pixel with a clear bitmap) and blends like the fixed-function state elsewhere. the
+        //   attr target only gets the fog bit, 0 blended or not
+        // * pass 3's stencil test (NOTEQUAL 0x40|id over 0x7F) already keeps a polygon from drawing
+        //   twice where it drew, and a later one with the same ID from drawing over it, as pass 2's
+        //   marks did. the clear plane's 0xBF keeps 0x7F from looking like translucent ID 63
+        // * a need-opaque polygon's opaque part is drawn by pass 3, so bit 0 doesn't apply
+        // * shadows keep their pass 3 draws with fixed-function blending. pass 2 drew the ones
+        //   with the clear plane's ID over shadowed clear pixels blended as well, and pass 3 then
+        //   drew them there again
+        bool pass2 = clear0 && !FetchClear0;
+#ifdef MELONADE_DEBUG_TOOLS
+        if (TransStats && clear0)
+        {
+            TransStats->Sec.Clear0Frames++;
+            TransStats->Sec.FetchFrames += FetchClear0;
+        }
+#endif
+
         // pass 2: if needed, render translucent pixels that are against background pixels
         // when background alpha is zero, those need to be rendered with blending disabled
         // (with a clear bitmap this still tests the clear attribute's alpha, not the bitmap's
         // per-pixel alpha; upstream's GL renderer has the same gap)
 
-        if (clear0)
+        if (pass2)
         {
             GL_TIMER(Clear0);
             FRAG_PASS(Clear0);
@@ -1628,8 +1688,9 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                 // never farther), and masks, the stencil clears and the shadows' stencil draws write
                 // no depth, so the depth there is still at most this fragment's. GL_LESS fails, and
                 // with the stencil test ALWAYS and KEEP on a depth fail, the draw writes nothing.
-                // a depth-equal polygon's GL_LEQUAL can pass again, so it's still drawn
-                bool redrawn = needopaque && clear0 && (GLTransSkip & 1) && !(polyattr & (1<<14));
+                // a depth-equal polygon's GL_LEQUAL can pass again, so it's still drawn. without
+                // pass 2 (bit 2) this is the only opaque draw
+                bool redrawn = needopaque && pass2 && (GLTransSkip & 1) && !(polyattr & (1<<14));
                 if (redrawn)
                     TRANS_SKIPPED(Skip0);
 
@@ -1657,7 +1718,9 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                 // only a need-opaque polygon that isn't a shadow, which is drawn on its own
                 if (!drawtrans) { i++; continue; }
 
-                UseRenderShader(wbuffer, RenderMode_Translucent);
+                // bit 2: the framebuffer fetch program, for all but shadows
+                bool fetch = FetchClear0 && !rp->PolyData->IsShadow;
+                UseRenderShader(wbuffer, RenderMode_Translucent, fetch);
 
                 GLboolean transfog;
                 if (!(polyattr & (1<<15))) transfog = fogenable;
@@ -1707,7 +1770,9 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                 }
                 else
                 {
-                    glEnable(GL_BLEND);
+                    // the fetch program blends itself
+                    if (fetch) glDisable(GL_BLEND);
+                    else       glEnable(GL_BLEND);
                     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
                     glColorMaski(1, GL_FALSE, GL_FALSE, transfog, GL_FALSE);
 
@@ -1897,6 +1962,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     ShadowMaskDepthTest = gpu.ShadowMaskDepthTest;
     EqualDepthMargin = gpu.EqualDepthMargin;
     GLTransSkip = gpu.GLTransSkip;
+    // GPU::GLTransSkip bit 2: without the extension, or when its programs don't build, the frame
+    // draws as without the bit
+    FetchClear0 = (GLTransSkip & 4) && (gpu.GPU3D.RenderClearAttr1 & 0x001F0000) == 0 && PrepareFetchShaders();
 
     // debug: log the last frame's masks and shadows, its queries should be done by now
     if (NumShadowLogEntries) FlushShadowLog();
@@ -2033,8 +2101,12 @@ void GLRenderer::RenderFrame(GPU& gpu)
     {
         u32 polyid = (gpu.GPU3D.RenderClearAttr1 >> 24) & 0x3F;
 
+        // the clear plane's stencil is 0xFF. FetchClear0 (no pass 2) makes it 0xBF: pass 3's
+        // translucent test (NOTEQUAL 0x40|id over 0x7F) would take 0x7F for translucent ID 63 and
+        // keep those polygons off the clear plane, where pass 2 drew them. bit 6 is read by nothing
+        // else in that frame (CountCoveredPixels runs with a clear alpha other than 0)
         glDepthFunc(GL_ALWAYS);
-        glStencilFunc(GL_ALWAYS, 0xFF, 0xFF);
+        glStencilFunc(GL_ALWAYS, FetchClear0 ? 0xBF : 0xFF, 0xFF);
         glStencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE);
 
         if (gpu.GPU3D.RenderDispCnt & (1<<14))
@@ -2418,6 +2490,13 @@ void GLRenderer::SetupFragCount()
     }
     glDeleteProgram(normal[0]);
     glDeleteProgram(normal[1]);
+    // the framebuffer fetch builds (GPU::GLTransSkip bit 2) are made again as counting builds the
+    // next time a frame wants them
+    glDeleteProgram(RenderShader[2]);
+    glDeleteProgram(RenderShader[3]);
+    RenderShader[2] = RenderShader[3] = 0;
+    FragPassLoc[2] = FragPassLoc[3] = -1;
+    FetchShadersTried = false;
     CurShaderID = -1;
     CurRenderMode = -1;
 
@@ -2433,9 +2512,9 @@ void GLRenderer::SetupFragCount()
 // the counter the render programs add to from here on, set in both
 void GLRenderer::SetFragPass(int pass)
 {
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 4; i++)
     {
-        if (FragPassLoc[i] >= 0)
+        if (RenderShader[i] && FragPassLoc[i] >= 0)
             glProgramUniform1i(RenderShader[i], FragPassLoc[i], pass);
     }
 }

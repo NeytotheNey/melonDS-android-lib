@@ -343,7 +343,13 @@ smooth in vec4 fColor;
 smooth in vec2 fTexcoord;
 flat in ivec3 fPolygonAttr;
 
+#ifdef FramebufferFetch
+// GPU::GLTransSkip bit 2 (GLRenderer::BuildRenderShader's fetch build): oColor starts out as the
+// color target's value (GL_EXT_shader_framebuffer_fetch)
+layout(location = 0) inout highp vec4 oColor;
+#else
 layout(location = 0) out vec4 oColor;
+#endif
 layout(location = 1) out vec4 oAttr;
 
 int TexcoordWrap(int c, int maxc, int mode)
@@ -801,6 +807,18 @@ void main()
 
             oAttr.b = 0.0;
             oAttr.a = 1.0;
+
+#ifdef FramebufferFetch
+            // the blend GLRenderer's fixed-function state does (GL_FUNC_ADD with SRC_ALPHA,
+            // ONE_MINUS_SRC_ALPHA when DISP3DCNT bit 3 is on, ONE, ZERO when off; GL_MAX on alpha),
+            // done here with blending off so a destination alpha of 0 can write the source as it is,
+            // like the software renderer's AlphaBlend and the clear0 pass this replaces. the same
+            // expression as the blend equation, so rounding should match it
+            vec4 dst = oColor;
+            if (dst.a > 0.0 && (uDispCnt & (1<<3)) != 0)
+                col.rgb = col.rgb * col.a + dst.rgb * (1.0 - col.a);
+            col.a = max(col.a, dst.a);
+#endif
         }
 
         oColor = col;
