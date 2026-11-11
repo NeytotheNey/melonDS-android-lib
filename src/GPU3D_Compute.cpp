@@ -150,6 +150,10 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
     }
     s64 start = SteadyNowNs();
     CompileShaderStep(current);
+    // the zero program for Warm, which doesn't depend on the targets, goes through the program
+    // cache with the batch while its file is read anyway
+    if (current == count - 1 && WarmEnabled)
+        WarmZeroReady(UseShaderCache ? &ShaderBatch : nullptr);
     // one write for the batch, with the programs it added or the stamps it moved. then the binaries
     // leave memory until the next batch reads the file again, rather than sit there all game
     if (current == count - 1 && UseShaderCache)
@@ -433,10 +437,7 @@ ComputeRenderer::~ComputeRenderer()
         glDeleteSync(EarlyCaptureFence);
 
     DeleteShaders();
-#ifdef MELONADE_DEBUG_TOOLS
     glDeleteProgram(ShaderWarmZero);
-    glDeleteTextures(2, WarmScratch);
-#endif
     // the binaries in memory are only for compiles, and the file has every one a batch added
     OpenGL::ReleaseShaderCache();
 }
@@ -501,9 +502,7 @@ void ComputeRenderer::Reset(GPU& gpu)
     // a cart without a game code (homebrew) or no cart has no rooms. DSiWare is loaded as a cart
     // here (MelonInstance::loadRom), so it has them
     UseRooms = gpu.ComputeGrow && gpu.ComputeRooms;
-#ifdef MELONADE_DEBUG_TOOLS
     WarmEnabled = gpu.ComputeWarm;
-#endif
     u32 gameCode = 0, headerCRC = 0;
     if (const NDSCart::CartCommon* cart = gpu.NDS.GetNDSCart())
     {
@@ -801,10 +800,9 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     s64 spanAllocNs = SteadyNowNs() - allocStart;
     // the rooms are this key's from here on (see Reset)
     RoomsKeyChanged = false;
-#ifdef MELONADE_DEBUG_TOOLS
-    // the programs for these targets are compiled after this, so the warm-up waits for RenderFrame
+    // the programs for these targets are compiled after this, so the buffers are written at the
+    // next RenderFrame (Warm)
     WarmPending = true;
-#endif
 
 #ifdef MELONADE_DEBUG_TOOLS
     char code[5] = {};
@@ -1001,14 +999,15 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         int oldRoom = WorkTileRoom;
         [[maybe_unused]] s64 start = SteadyNowNs();
         failed |= !grow(&ComputeRenderer::AllocTileMemory, oldRoom, room, roomFor(workNeed, step, MaxWorkTiles, false));
-#ifdef MELONADE_DEBUG_TOOLS
         // the calls' wall-clock time, to tell the allocation from the first dispatch that touches
-        // it, and with computewarm the time to write the new storage once (touch, -1 without)
-        double allocMs = (SteadyNowNs() - start) / 1e6;
-        double touchMs = -1;
+        // it. then the new storage is written once (GPU::ComputeWarm), which debug builds time
+        // (touch, -1 without)
+        [[maybe_unused]] double allocMs = (SteadyNowNs() - start) / 1e6;
+        [[maybe_unused]] double touchMs = -1;
         u64 touchBytes = 0;
         if (WarmEnabled && WorkTileRoom > oldRoom)
             touchMs = TouchBuffers({ TileMemory[0], TileMemory[1], TileMemory[2] }, touchBytes);
+#ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d ms=%.1f touch=%.1f bytes=%llu\n",
             oldRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize, allocMs, touchMs, (unsigned long long)touchBytes);
         if (WorkTileRoom != room)
@@ -1025,12 +1024,12 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         int oldRoom = XSpanRoom;
         [[maybe_unused]] s64 start = SteadyNowNs();
         failed |= !grow(&ComputeRenderer::AllocXSpans, oldRoom, room, roomFor(spans, step, maxSpans, false));
-#ifdef MELONADE_DEBUG_TOOLS
-        double allocMs = (SteadyNowNs() - start) / 1e6;
-        double touchMs = -1;
+        [[maybe_unused]] double allocMs = (SteadyNowNs() - start) / 1e6;
+        [[maybe_unused]] double touchMs = -1;
         u64 touchBytes = 0;
         if (WarmEnabled && XSpanRoom > oldRoom)
             touchMs = TouchBuffers({ XSpanSetupMemory, YSpanIndicesTextureMemory }, touchBytes);
+#ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d ms=%.1f touch=%.1f bytes=%llu\n",
             oldRoom, room, maxSpans, spans, ScaleFactor, allocMs, touchMs, (unsigned long long)touchBytes);
         if (XSpanRoom != room)
@@ -1082,10 +1081,13 @@ void ComputeRenderer::LogSlow(int numPolygons, u32 numVariants, u32 tileBound, i
         tileBound, WorkTileRoom, setupIndices, XSpanRoom, ScaleFactor, TileSize, WarmEnabled ? 1 : 0);
 }
 
+#endif
+
 // a program that writes 0 to every word of the buffer at binding 0. not one of the 33, as it
-// doesn't depend on the targets: compiled once a renderer, without the program cache, whose file
-// would cost more to read than this does to compile
-bool ComputeRenderer::WarmZeroReady()
+// doesn't depend on the targets: compiled once a renderer, at the end of the first batch so it goes
+// through the program cache with it, or here without the cache if that didn't happen. one that
+// doesn't compile only leaves the buffers to be written by the first renders, as before
+bool ComputeRenderer::WarmZeroReady(OpenGL::ShaderCacheStats* cache)
 {
     if (ShaderWarmZero == 0 && !WarmZeroFailed)
     {
@@ -1095,14 +1097,21 @@ layout (std430, binding = 0) writeonly buffer ZeroBuffer
 {
     uint Words[];
 };
+layout (location = 0) uniform uint WordCount;
 void main()
 {
     uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 64u + gl_LocalInvocationIndex;
-    if (i < uint(Words.length()))
+    if (i < WordCount)
         Words[i] = 0u;
 }
 )";
-        WarmZeroFailed = !OpenGL::CompileComputeProgram(ShaderWarmZero, source, "WarmZero");
+        WarmZeroFailed = !OpenGL::CompileComputeProgram(ShaderWarmZero, source, "WarmZero", cache);
+        static bool warned = false;
+        if (WarmZeroFailed && !warned)
+        {
+            warned = true;
+            Platform::Log(Platform::LogLevel::Warn, "Compute renderer: the zero program didn't compile, so the work buffers aren't written ahead of the first renders\n");
+        }
     }
     return ShaderWarmZero != 0;
 }
@@ -1124,156 +1133,66 @@ u64 ComputeRenderer::ZeroBuffer(GLuint buffer) noexcept
     if (y > 65535)
         return 0;
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+    // the last row of groups goes past the end, so the program stops at the buffer's words
+    glUniform1ui(0, (GLuint)((u64)size / 4));
     glDispatchCompute((GLuint)x, (GLuint)y, 1);
     return (u64)size;
 }
 
-// writes every byte of these buffers once on the GPU and waits for it, so committing their pages
-// happens here and not at the first render that touches them. what was queued before is waited
-// for first, outside the time. -1 when there's no zero program
+// writes every byte of these buffers once on the GPU, queued ahead of the renders that use them,
+// so committing their pages happens here and not in the middle of the first render that touches
+// them. none of them holds anything a render reads before writing it in the same render (see
+// Warm), so the zeros change nothing. debug builds wait for it to time it, with what was queued
+// before waited for first, outside the time; release builds don't, and return 0. -1 when there's
+// no zero program
 double ComputeRenderer::TouchBuffers(std::initializer_list<GLuint> buffers, u64& bytes) noexcept
 {
     bytes = 0;
-    if (!WarmZeroReady())
+    if (!WarmZeroReady(nullptr))
         return -1;
+#ifdef MELONADE_DEBUG_TOOLS
     glFinish();
     s64 start = SteadyNowNs();
-    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+#endif
     glUseProgram(ShaderWarmZero);
     for (GLuint buffer : buffers)
         bytes += ZeroBuffer(buffer);
+    // the renders after read and write them as storage, read the setup indices as a texture
+    // buffer and upload them with glBufferSubData
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
-    glFinish();
     // RenderFrame binds its own before every dispatch, this is what it leaves there
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, RenderPolygonMemory);
+#ifdef MELONADE_DEBUG_TOOLS
+    glFinish();
     return (SteadyNowNs() - start) / 1e6;
+#else
+    return 0;
+#endif
 }
 
-// the warm-up (GPU::ComputeWarm), at the first RenderFrame after ResizeTargets, once the programs
-// are compiled. a: every work buffer written once (TouchBuffers). none of them holds anything a
-// render reads before writing it in the same render: the tile memory, the X spans and the final
-// tile memory are written by the passes before the ones that read them, the setup indices are
-// uploaded, and of the bin results the coarse masks are cleared at every render, the masks and
-// offsets are only read where this render's coarse bits are set, and the variant counts are
-// cleared or written by this render's passes. b: each of the 33 programs dispatched as one group
-// with nothing to do, after a, which makes every count 0: no polygons and no variants in the
-// uniform block (which every render uploads again), and the variant counts the rasterisers loop
-// over are 0. what they write anyway goes where a render writes again first (a coarse tile's
-// masks, 32 X spans, one tile of the final tile memory), and the final pass writes 1x1 scratch
-// images, where the rest of its stores are out of bounds and dropped. b needs a, so it's left out
-// without the zero program
+// GPU::ComputeWarm, at the first RenderFrame after ResizeTargets, once the programs are compiled:
+// every work buffer written once (TouchBuffers). none of them holds anything a render reads before
+// writing it in the same render: the tile memory, the X spans and the final tile memory are
+// written by the passes before the ones that read them, the setup indices are uploaded, the work
+// descriptions are written by binning and sorting, and of the bin results the coarse masks are
+// cleared at every render, the masks and offsets are only read where this render's coarse bits
+// are set, and the variant counts are cleared or written by this render's passes
 void ComputeRenderer::Warm()
 {
-    s64 compileStart = SteadyNowNs();
-    WarmZeroReady();
-    double compileMs = (SteadyNowNs() - compileStart) / 1e6;
-
     u64 bytes = 0;
-    double memoryMs = TouchBuffers({ TileMemory[0], TileMemory[1], TileMemory[2], XSpanSetupMemory, YSpanIndicesTextureMemory,
+    // a room of 0 is an allocation that failed, which may have left its buffers in any state, so
+    // they're left alone (0 is skipped), and so are the tile layers this layout doesn't use
+    auto layer = [this](int i) { return WorkTileRoom > 0 && i < TileLayers ? TileMemory[i] : 0; };
+    GLuint xspans = XSpanRoom > 0 ? XSpanSetupMemory : 0;
+    GLuint setupIndices = XSpanRoom > 0 ? YSpanIndicesTextureMemory : 0;
+    [[maybe_unused]] double memoryMs = TouchBuffers({ layer(0), layer(1), layer(2), xspans, setupIndices,
         FinalTileMemory, BinResultMemory, WorkDescMemory }, bytes);
 
-    double programsMs = -1;
-    int programs = 0;
-    // InterpXSpans writes 32 X spans, which a failed allocation (room 0, a 4 byte buffer) has no
-    // room for. a render never gets there then (RenderFrame's grow check), so neither does this
-    if (memoryMs >= 0 && XSpanRoom >= 32)
-    {
-        s64 start = SteadyNowNs();
-        if (WarmScratch[0] == 0)
-        {
-            GLint texture = 0;
-            glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
-            glGenTextures(2, WarmScratch);
-            glBindTexture(GL_TEXTURE_2D, WarmScratch[0]);
-            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
-            glBindTexture(GL_TEXTURE_2D, WarmScratch[1]);
-            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 1, 1);
-            glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
-        }
-
-        MetaUniform meta {};
-        glBindBuffer(GL_UNIFORM_BUFFER, MetaUniformMemory);
-        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(MetaUniform), &meta);
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, MetaUniformMemory);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, RenderPolygonMemory);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, XSpanSetupMemory);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, YSpanSetupMemory);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, FinalTileMemory);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, BinResultMemory);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, WorkDescMemory);
-
-        auto dispatch = [&](GLuint program)
-        {
-            if (program == 0)
-                return;
-            UseProgram(program);
-            glDispatchCompute(1, 1, 1);
-            programs++;
-        };
-
-        // in RenderFrame's order, with its barriers
-        dispatch(ShaderClearCoarseBinMask);
-        dispatch(ShaderClearIndirectWorkCount);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        // the setup indices are 0 now, so this reads polygon 0 and Y span 0
-        glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
-        dispatch(ShaderInterpXSpans[0]);
-        dispatch(ShaderInterpXSpans[1]);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        dispatch(ShaderBinCombined);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        dispatch(ShaderCalculateWorkListOffset);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        dispatch(ShaderSortWork);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-        for (int i = 0; i < TileLayers; i++)
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2+i, TileMemory[i]);
-        GLuint rasterisers[] =
-        {
-            ShaderRasteriseNoTexture[0], ShaderRasteriseNoTexture[1],
-            ShaderRasteriseNoTextureToon[0], ShaderRasteriseNoTextureToon[1],
-            ShaderRasteriseNoTextureHighlight[0], ShaderRasteriseNoTextureHighlight[1],
-            ShaderRasteriseUseTextureDecal[0], ShaderRasteriseUseTextureDecal[1],
-            ShaderRasteriseUseTextureModulate[0], ShaderRasteriseUseTextureModulate[1],
-            ShaderRasteriseUseTextureToon[0], ShaderRasteriseUseTextureToon[1],
-            ShaderRasteriseUseTextureHighlight[0], ShaderRasteriseUseTextureHighlight[1],
-            ShaderRasteriseShadowMask[0], ShaderRasteriseShadowMask[1],
-        };
-        for (GLuint program : rasterisers)
-        {
-            if (program == 0)
-                continue;
-            UseProgram(program);
-            // RenderFrame sets it for every variant before it dispatches
-            glUniform1ui(UniformIdxCurVariant, 0);
-            glDispatchCompute(1, 1, 1);
-            programs++;
-        }
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-        dispatch(ShaderDepthBlend[0]);
-        dispatch(ShaderDepthBlend[1]);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-        glBindImageTexture(0, WarmScratch[0], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-        glBindImageTexture(1, WarmScratch[1], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
-        for (GLuint program : ShaderFinalPass)
-            dispatch(program);
-        glMemoryBarrier(GL_ALL_BARRIER_BITS);
-        glFinish();
-        programsMs = (SteadyNowNs() - start) / 1e6;
-
-        // what a render leaves bound, which it binds again before it dispatches anyway
-        glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-        glBindImageTexture(1, LowResFramebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, YSpanSetupMemory);
-    }
-
-    Platform::Log(Platform::LogLevel::Info, "COMPWARM compile=%.1f memory=%.1f bytes=%llu programs=%.1f dispatched=%d scale=%d width=%d tile=%d worktiles=%d xspans=%d\n",
-        compileMs, memoryMs, (unsigned long long)bytes, programsMs, programs, ScaleFactor, TargetWidth, TileSize, WorkTileRoom, XSpanRoom);
-}
+#ifdef MELONADE_DEBUG_TOOLS
+    Platform::Log(Platform::LogLevel::Info, "COMPWARM memory=%.1f bytes=%llu scale=%d width=%d tile=%d worktiles=%d xspans=%d\n",
+        memoryMs, (unsigned long long)bytes, ScaleFactor, TargetWidth, TileSize, WorkTileRoom, XSpanRoom);
 #endif
+}
 
 void ComputeRenderer::VCount144(GPU& gpu)
 {
@@ -1773,7 +1692,6 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             ShaderCompileStep(current, count);
     }
     SLOW_LAP(Resize);
-#ifdef MELONADE_DEBUG_TOOLS
     // after the targets' setup and the compile (above, or the frontend's before RunFrame), before
     // anything of this frame. that's the game's first frame, under a black screen
     if (WarmPending)
@@ -1783,7 +1701,6 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             Warm();
     }
     SLOW_LAP(Warm);
-#endif
 
     WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;

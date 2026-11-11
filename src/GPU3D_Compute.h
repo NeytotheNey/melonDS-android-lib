@@ -344,21 +344,21 @@ private:
     void SlowLap(s64& phase) noexcept;
     void NoteProgram(GLuint program);
     void LogSlow(int numPolygons, u32 numVariants, u32 tileBound, int setupIndices) noexcept;
+#endif
 
-    // the computewarm experiment (GPU::ComputeWarm): at the first RenderFrame after the targets
-    // were set up, every byte of the work buffers is written once and each program dispatched
-    // once with nothing to do, logged as COMPWARM. a grow writes the grown buffers the same way
-    bool WarmEnabled = false;
+    // GPU::ComputeWarm, from Reset: at the first RenderFrame after the targets were set up, every
+    // byte of the work buffers is written once on the GPU (Warm), and a grow writes the grown
+    // ones, so the driver commits their pages there and not in the middle of a game's first heavy
+    // render. debug builds wait for it and log COMPWARM and COMPGROW's touch
+    bool WarmEnabled = true;
     bool WarmPending = false;
+    // the program that writes the zeros, compiled with the batch (CompileShaderStep) or at Warm
     GLuint ShaderWarmZero = 0;
     bool WarmZeroFailed = false;
-    // 1x1 images the final pass writes to while warming (RGBA8 and RGBA8UI)
-    GLuint WarmScratch[2] {};
-    bool WarmZeroReady();
+    bool WarmZeroReady(OpenGL::ShaderCacheStats* cache);
     u64 ZeroBuffer(GLuint buffer) noexcept;
     double TouchBuffers(std::initializer_list<GLuint> buffers, u64& bytes) noexcept;
     void Warm();
-#endif
     // glUseProgram, which debug builds also count for COMPSLOW
     void UseProgram(GLuint program)
     {
