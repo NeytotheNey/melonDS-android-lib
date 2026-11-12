@@ -435,6 +435,23 @@ private:
 
     bool ColorDither = false;
 
+    // Mali diagnostics (docs/shelved/compute-on-mali.md): GPU::ComputeBin and ComputeSSBO as the
+    // programs are compiled for (a change recompiles them at RenderFrame, like ComputeOpt), and
+    // GPU::ComputeCheck's readback (RunCheck): its own program and scratch buffer, made at the
+    // first check, and the renders with polygons counted to pick every Nth
+    int BinMode = 0;
+    bool SetupSSBO = false;
+    int CalcMode = 0;
+    // GPU::ComputeFlat as compiled: starts at GPU's default, so only the switch compiles twice
+    int FlatMode = 1;
+    GLint MaxTexBufferSize = 0;
+    GLuint ShaderCheckSetup = 0;
+    bool CheckSetupFailed = false;
+    GLuint CheckScratch = 0;
+    GLsizeiptr CheckScratchSize = 0;
+    u32 CheckRenders = 0;
+    void RunCheck(int numPolygons, u32 numVariants, int numSetupIndices, u32 totalTileBound);
+
     // GPU::ComputePace: a fence for each render the GPU hasn't finished, oldest first. past the
     // room for them the oldest is forgotten
     static constexpr int MaxPaceFences = 8;

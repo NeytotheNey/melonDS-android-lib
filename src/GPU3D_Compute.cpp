@@ -19,6 +19,7 @@
 #include "GPU3D_Compute.h"
 
 #include <assert.h>
+#include <cstdarg>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -155,6 +156,21 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
         shaderName += define;
         shaderName += ',';
     }
+    // GPU::ComputeBin and ComputeSSBO, Mali diagnostics: defines in the two programs they change
+    if (&source == &ComputeRendererShaders::BinCombined && BinMode != 0)
+    {
+        shaderSource += BinMode == 1 ? "#define BinFirstPass32\n" : "#define BinNoShared\n";
+        if (BinMode == 3)
+            shaderSource += "#define BinPlainPack\n";
+    }
+    if (&source == &ComputeRendererShaders::InterpSpans && SetupSSBO)
+        shaderSource += "#define SetupIndicesSSBO\n";
+    // GPU::ComputeCalc 1: CalcOffsets with the old atomic offsets
+    if (&source == &ComputeRendererShaders::CalcOffsets && CalcMode != 0)
+        shaderSource += "#define CalcAtomic\n";
+    // GPU::ComputeFlat 0: VariantWorkCount as uvec4s again, in every program with the binning buffer
+    if (FlatMode == 0 && source.find("BinResultBuffer") != std::string::npos)
+        shaderSource += "#define VariantCountVec4\n";
     // GPU::ComputeOpt: a define for each bit. with none of them the source is what it was
     static const char* const optDefines[] = {"OptLinearNoDivide", "OptFieldLoads", "OptSecondLayer", "OptSmall"};
     for (int bit = 0; bit < 4; bit++)
@@ -405,6 +421,19 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     GLint maxGroupThreads = 0;
     glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &maxGroupThreads);
     result->MaxGroupThreads = maxGroupThreads;
+    // which driver this is, once, and the texture buffer limit the setup indices are read under
+    // (docs/shelved/compute-on-mali.md)
+    GLint maxTexBuffer = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &maxTexBuffer);
+    result->MaxTexBufferSize = maxTexBuffer;
+    {
+        const char* vendor = (const char*)glGetString(GL_VENDOR);
+        const char* renderer = (const char*)glGetString(GL_RENDERER);
+        const char* version = (const char*)glGetString(GL_VERSION);
+        const char* glsl = (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION);
+        Platform::Log(Platform::LogLevel::Info, "COMPGL vendor=\"%s\" renderer=\"%s\" version=\"%s\" glsl=\"%s\" maxtexbuffer=%d\n",
+            vendor ? vendor : "?", renderer ? renderer : "?", version ? version : "?", glsl ? glsl : "?", maxTexBuffer);
+    }
 
     //glDebugMessageCallback(blah, NULL);
     //glEnable(GL_DEBUG_OUTPUT);
@@ -517,6 +546,11 @@ ComputeRenderer::~ComputeRenderer()
     glDeleteBuffers(1, &FinalTileMemory);
     glDeleteBuffers(1, &YSpanIndicesTextureMemory);
     glDeleteTextures(1, &YSpanIndicesTexture);
+    // GPU::ComputeCheck's, if a check ran
+    if (CheckScratch)
+        glDeleteBuffers(1, &CheckScratch);
+    if (ShaderCheckSetup)
+        glDeleteProgram(ShaderCheckSetup);
     glDeleteTextures(1, &Framebuffer);
     glDeleteTextures(1, &KeptFramebuffer);
     glDeleteTextures(1, &SpareFramebuffer);
@@ -1811,6 +1845,322 @@ void ComputeRenderer::ResetPace() noexcept
     CapturedSinceRender = false;
 }
 
+// GPU::ComputeCheck (docs/shelved/compute-on-mali.md): one count of the COMPCHECK line, with the
+// first few cases it counted for the lines after it
+namespace
+{
+struct CheckCount
+{
+    const char* Name;
+    u32 Count = 0;
+    std::vector<std::string> Examples;
+
+    explicit CheckCount(const char* name) : Name(name) {}
+
+    __attribute__((format(printf, 2, 3))) void Fail(const char* fmt, ...)
+    {
+        Count++;
+        if (Examples.size() >= 3)
+            return;
+        char text[256];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(text, sizeof(text), fmt, args);
+        va_end(args);
+        Examples.emplace_back(text);
+    }
+};
+
+// copies [offset, offset + size) of a buffer out through glMapBufferRange, as GLES has no
+// glGetBufferSubData
+bool CheckRead(GLuint buffer, size_t offset, size_t size, void* out)
+{
+    if (size == 0)
+        return true;
+    glBindBuffer(GL_COPY_READ_BUFFER, buffer);
+    const void* mapped = glMapBufferRange(GL_COPY_READ_BUFFER, (GLintptr)offset, (GLsizeiptr)size, GL_MAP_READ_BIT);
+    if (mapped)
+    {
+        memcpy(out, mapped, size);
+        glUnmapBuffer(GL_COPY_READ_BUFFER);
+    }
+    glBindBuffer(GL_COPY_READ_BUFFER, 0);
+    return mapped != nullptr;
+}
+}
+
+// GPU::ComputeCheck: after a render's dispatches, waits for the GPU, reads back what binning and
+// InterpXSpans wrote and logs a COMPCHECK line with what doesn't add up, then a line for each of
+// the first 3 cases of each count that isn't 0. the buffers' layouts are the shaders' std430 ones:
+// BinResultBuffer is BinResultHeader and then the coarse masks (CoarseBinStride words a tile), the
+// fine masks and the work offsets (BinStride words a tile, one per polygon group of 32), a tile
+// being x + y * TilesPerLine; WorkDescs are uvec2s, the unsorted ones from 0 and the sorted ones
+// from MaxWorkTiles, x = tile x | tile y << 16 in pixels, y = polygon | in-variant offset << 11
+// (sorted: | unsorted index << 11); the X spans are SpanSetupX, one per setup index
+void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupIndices, u32 totalTileBound)
+{
+    static_assert(sizeof(BinResultHeader) == 6160, "BinResultHeader must match the std430 BinResultBuffer header");
+    static_assert(sizeof(SpanSetupX) == 96, "SpanSetupX must match the std430 XSpanSetup");
+    static_assert(sizeof(SetupIndices) == 8, "SetupIndices must be 4 u16s, like the RGBA16UI texels");
+
+    s64 start = SteadyNowNs();
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    glFinish();
+
+    const int tiles = TilesPerLine * TileLines;
+    const int groups = (numPolygons + 31) / 32;
+
+    std::vector<u32> bin(sizeof(BinResultHeader) / 4 + (size_t)tiles * (CoarseBinStride + 2 * BinStride));
+    bool binOk = CheckRead(BinResultMemory, 0, bin.size() * 4, bin.data());
+    BinResultHeader header;
+    memcpy(&header, bin.data(), sizeof(header));
+    const u32* coarseMask = bin.data() + sizeof(BinResultHeader) / 4;
+    const u32* fineMask = coarseMask + (size_t)tiles * CoarseBinStride;
+    const u32* workOffset = fineMask + (size_t)tiles * BinStride;
+
+    u32 total = binOk ? header.VariantWorkCount[0*4+3] : 0;
+    u32 written = std::min(total, (u32)MaxWorkTiles);
+    std::vector<u32> unsorted((size_t)written * 2), sorted((size_t)written * 2);
+    bool workOk = binOk && CheckRead(WorkDescMemory, 0, unsorted.size() * 4, unsorted.data())
+        && CheckRead(WorkDescMemory, (size_t)MaxWorkTiles * 8, sorted.size() * 4, sorted.data());
+    std::vector<SpanSetupX> xspans(numSetupIndices);
+    bool xspanOk = CheckRead(XSpanSetupMemory, 0, xspans.size() * sizeof(SpanSetupX), xspans.data());
+
+    // a. the header: the total binning counted against the CPU's bound and the fine masks' bits,
+    // the variants' real counts and the sorted offsets CalcOffsets handed out from them
+    u32 maskBits = 0, realSum = 0;
+    u32 offsetSum = binOk ? header.VariantWorkCount[1*4+3] : 0;
+    CheckCount coarseC("coarsemask"), offsetsC("offsetgaps"), countC("countmismatch");
+    if (binOk)
+    {
+        for (int t = 0; t < tiles; t++)
+        {
+            for (int g = 0; g < BinStride; g++)
+            {
+                u32 mask = g < groups ? fineMask[(size_t)t * BinStride + g] : 0;
+                maskBits += (u32)__builtin_popcount(mask);
+                bool coarse = (coarseMask[(size_t)t * CoarseBinStride + (g >> 5)] >> (g & 31)) & 1;
+                if (coarse != (mask != 0))
+                    coarseC.Fail("tile=%d,%d group=%d coarsebit=%d finemask=%08x",
+                        t % TilesPerLine, t / TilesPerLine, g, coarse ? 1 : 0, mask);
+            }
+        }
+
+        std::vector<std::pair<u32, u32>> spans;
+        for (u32 v = 0; v < numVariants; v++)
+        {
+            u32 real = header.VariantWorkRealCount[v];
+            realSum += real;
+            if (real != 0)
+                spans.emplace_back(header.SortedWorkOffset[v], v);
+        }
+        std::sort(spans.begin(), spans.end());
+        u32 next = 0;
+        for (const auto& [offset, v] : spans)
+        {
+            if (offset != next)
+                offsetsC.Fail("variant=%u offset=%u count=%u expected offset=%u", v, offset, header.VariantWorkRealCount[v], next);
+            next = offset + header.VariantWorkRealCount[v];
+        }
+
+        // the totals that should all be the same: one count for each of the three that isn't
+        if (maskBits != written)
+            countC.Fail("maskbits=%u written=%u", maskBits, written);
+        if (realSum != written)
+            countC.Fail("realsum=%u written=%u", realSum, written);
+        if (offsetSum != realSum)
+            countC.Fail("offsetsum=%u realsum=%u", offsetSum, realSum);
+    }
+
+    // b. every unsorted WorkDesc that was written
+    CheckCount badPolyC("badpoly"), offscreenC("offscreen"), outsideBoxC("outsidebox"), varOffsetC("badvaroffset"), dupesC("dupes");
+    std::vector<u64> keys;
+    keys.reserve(written);
+    for (u32 i = 0; workOk && i < written; i++)
+    {
+        u32 pos = unsorted[i*2], desc = unsorted[i*2+1];
+        int px = (int)(pos & 0xFFFF), py = (int)(pos >> 16);
+        int poly = (int)(desc & 0x7FF);
+        u32 inVariant = desc >> 11;
+        bool onScreen = px < ScreenWidth && py < ScreenHeight && px % TileSize == 0 && py % TileSize == 0;
+        if (!onScreen)
+            offscreenC.Fail("work=%u x=%d y=%d poly=%d screen=%dx%d", i, px, py, poly, ScreenWidth, ScreenHeight);
+        if (poly >= numPolygons)
+        {
+            badPolyC.Fail("work=%u x=%d y=%d poly=%d polys=%d", i, px, py, poly, numPolygons);
+            continue;
+        }
+        // the CPU bound's box: a pixel wider on each side, bottom exclusive
+        const RenderPolygon& rp = RenderPolygons[poly];
+        if (px > rp.XMax + 1 || px + TileSize - 1 < rp.XMin - 1 || py > rp.YBot - 1 || py + TileSize - 1 < rp.YTop)
+            outsideBoxC.Fail("work=%u tile=%d,%d poly=%d box x=%d..%d y=%d..%d", i, px, py, poly, rp.XMin, rp.XMax, rp.YTop, rp.YBot - 1);
+        if (rp.Variant >= numVariants || inVariant >= header.VariantWorkRealCount[rp.Variant])
+            varOffsetC.Fail("work=%u poly=%d variant=%u offset=%u count=%u", i, poly, rp.Variant, inVariant,
+                rp.Variant < numVariants ? header.VariantWorkRealCount[rp.Variant] : 0);
+        if (onScreen)
+            keys.push_back(((u64)((py / TileSize) * TilesPerLine + px / TileSize) << 11) | (u64)poly);
+    }
+    std::sort(keys.begin(), keys.end());
+    for (size_t i = 1; i < keys.size(); i++)
+    {
+        if (keys[i] == keys[i-1])
+            dupesC.Fail("tile=%d,%d poly=%d", (int)((keys[i] >> 11) % TilesPerLine), (int)((keys[i] >> 11) / TilesPerLine), (int)(keys[i] & 0x7FF));
+    }
+
+    // c. each tile and group's fine mask against the WorkDescs at its work offset
+    CheckCount maskC("maskmismatch");
+    for (int t = 0; binOk && workOk && t < tiles; t++)
+    {
+        u32 expectPos = (u32)((t % TilesPerLine) * TileSize) | ((u32)((t / TilesPerLine) * TileSize) << 16);
+        for (int g = 0; g < groups; g++)
+        {
+            u32 mask = fineMask[(size_t)t * BinStride + g];
+            u32 offset = workOffset[(size_t)t * BinStride + g];
+            for (u32 k = 0; mask != 0; k++)
+            {
+                int bit = __builtin_ctz(mask);
+                mask &= mask - 1;
+                u32 idx = offset + k;
+                if (idx >= written)
+                {
+                    maskC.Fail("tile=%d,%d group=%d bit=%d work=%u past written=%u", t % TilesPerLine, t / TilesPerLine, g, bit, idx, written);
+                    continue;
+                }
+                u32 pos = unsorted[idx*2], poly = unsorted[idx*2+1] & 0x7FF;
+                if (pos != expectPos || poly != (u32)(g * 32 + bit))
+                    maskC.Fail("tile=%d,%d group=%d bit=%d work=%u has tile=%u,%u poly=%u", t % TilesPerLine, t / TilesPerLine, g, bit,
+                        idx, pos & 0xFFFF, pos >> 16, poly);
+            }
+        }
+    }
+
+    // the sorted list: each unsorted index once, with its own WorkDesc, inside its variant's range
+    CheckCount sortC("sortbad"), sortDupesC("sortdupes");
+    std::vector<u8> seen(written);
+    for (u32 j = 0; workOk && j < written; j++)
+    {
+        u32 pos = sorted[j*2], desc = sorted[j*2+1];
+        u32 poly = desc & 0x7FF, idx = desc >> 11;
+        if (idx >= written)
+        {
+            sortC.Fail("sorted=%u unsorted=%u past written=%u", j, idx, written);
+            continue;
+        }
+        if (seen[idx]++)
+            sortDupesC.Fail("sorted=%u unsorted=%u", j, idx);
+        u32 variant = poly < (u32)numPolygons ? RenderPolygons[poly].Variant : MaxVariants;
+        bool inRange = variant < numVariants && j >= header.SortedWorkOffset[variant]
+            && j - header.SortedWorkOffset[variant] < header.VariantWorkRealCount[variant];
+        if (unsorted[idx*2] != pos || (unsorted[idx*2+1] & 0x7FF) != poly || !inRange)
+            sortC.Fail("sorted=%u unsorted=%u tile=%u,%u poly=%u, unsorted has tile=%u,%u poly=%u, in variant range=%d", j, idx,
+                pos & 0xFFFF, pos >> 16, poly, unsorted[idx*2] & 0xFFFF, unsorted[idx*2] >> 16, unsorted[idx*2+1] & 0x7FF, inRange ? 1 : 0);
+    }
+
+    // d. each polygon's X spans, one a row, inside its box (X1 is exclusive)
+    CheckCount xspanC("xspanbad");
+    for (int p = 0; xspanOk && p < numPolygons; p++)
+    {
+        const RenderPolygon& rp = RenderPolygons[p];
+        for (int r = 0; r < rp.YBot - rp.YTop; r++)
+        {
+            u32 idx = rp.FirstXSpan + (u32)r;
+            if (idx >= (u32)numSetupIndices)
+            {
+                xspanC.Fail("poly=%d row=%d span=%u past setups=%d", p, r, idx, numSetupIndices);
+                break;
+            }
+            const SpanSetupX& xs = xspans[idx];
+            if (xs.X0 < rp.XMin || xs.X1 > rp.XMax + 1 || xs.X0 >= xs.X1)
+                xspanC.Fail("poly=%d y=%d span=%u X0=%d X1=%d box x=%d..%d", p, rp.YTop + r, idx, xs.X0, xs.X1, rp.XMin, rp.XMax);
+        }
+    }
+
+    // e. the setup indices read back through the texture buffer, both ways, against the CPU's
+    CheckCount imgC("imgmismatch"), texC("texmismatch");
+    u32 wraps = 0;
+    bool texChecked = false;
+    if (!ShaderCheckSetup && !CheckSetupFailed)
+    {
+        if (!OpenGL::CompileComputeProgram(ShaderCheckSetup, ComputeRendererShaders::CheckSetupIndices, "CheckSetupIndices", nullptr))
+        {
+            CheckSetupFailed = true;
+            ShaderCheckSetup = 0;
+            Platform::Log(Platform::LogLevel::Warn, "COMPCHECK: the setup index readback program didn't compile, check e is off\n");
+        }
+    }
+    if (ShaderCheckSetup && numSetupIndices > 0)
+    {
+        GLsizeiptr need = (GLsizeiptr)numSetupIndices * 2 * 16;
+        if (!CheckScratch)
+            glGenBuffers(1, &CheckScratch);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, CheckScratch);
+        if (need > CheckScratchSize)
+        {
+            glBufferData(GL_SHADER_STORAGE_BUFFER, need, nullptr, GL_DYNAMIC_READ);
+            CheckScratchSize = need;
+        }
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, CheckScratch);
+        glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_BUFFER, YSpanIndicesTexture);
+        glActiveTexture(GL_TEXTURE0);
+        glUseProgram(ShaderCheckSetup);
+        glUniform1ui(0, (GLuint)numSetupIndices);
+        glDispatchCompute((numSetupIndices + 31) / 32, 1, 1);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        glFinish();
+
+        std::vector<u32> fetched((size_t)numSetupIndices * 8);
+        texChecked = CheckRead(CheckScratch, 0, fetched.size() * 4, fetched.data());
+        for (int i = 0; texChecked && i < numSetupIndices; i++)
+        {
+            const SetupIndices& cpu = YSpanIndices[i];
+            u32 want[4] = { cpu.PolyIdx, cpu.SpanIdxL, cpu.SpanIdxR, cpu.Y };
+            for (int way = 0; way < 2; way++)
+            {
+                const u32* got = &fetched[(size_t)i * 8 + way * 4];
+                if (memcmp(got, want, sizeof(want)) == 0)
+                    continue;
+                // the wrap at 65536 texels older Mali drivers are said to have
+                if (way == 0 && i >= 65536)
+                {
+                    const SetupIndices& w = YSpanIndices[i % 65536];
+                    if (got[0] == w.PolyIdx && got[1] == w.SpanIdxL && got[2] == w.SpanIdxR && got[3] == w.Y)
+                        wraps++;
+                }
+                (way == 0 ? imgC : texC).Fail("index=%d cpu=%u,%u,%u,%u gpu=%u,%u,%u,%u", i, want[0], want[1], want[2], want[3],
+                    got[0], got[1], got[2], got[3]);
+            }
+        }
+
+        // what the rest of the frame had bound there
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_BUFFER, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, RenderPolygonMemory);
+        glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    }
+
+    std::string imgCount = texChecked ? std::to_string(imgC.Count) : "na";
+    std::string texCount = texChecked ? std::to_string(texC.Count) : "na";
+    Platform::Log(Platform::LogLevel::Info, "COMPCHECK render=%u polys=%d groups=%d variants=%u setups=%d screen=%dx%d tile=%d maxwork=%d "
+        "xroom=%d texbufmax=%d read=%s total=%u bound=%u pastbound=%d written=%u maskbits=%u realsum=%u offsetsum=%u "
+        "countmismatch=%u coarsemask=%u offsetgaps=%u badpoly=%u offscreen=%u outsidebox=%u badvaroffset=%u dupes=%u maskmismatch=%u "
+        "sortbad=%u sortdupes=%u xspanbad=%u imgmismatch=%s texmismatch=%s wrap65536=%u binmode=%d ssbo=%d calc=%d flat=%d ms=%.1f\n",
+        CheckRenders - 1, numPolygons, groups, numVariants, numSetupIndices, ScreenWidth, ScreenHeight, TileSize, MaxWorkTiles,
+        XSpanRoom, MaxTexBufferSize, binOk && workOk && xspanOk ? "ok" : "mapfailed", total, totalTileBound, total > totalTileBound ? 1 : 0,
+        written, maskBits, realSum, offsetSum, countC.Count, coarseC.Count, offsetsC.Count, badPolyC.Count, offscreenC.Count, outsideBoxC.Count,
+        varOffsetC.Count, dupesC.Count, maskC.Count, sortC.Count, sortDupesC.Count, xspanC.Count,
+        imgCount.c_str(), texCount.c_str(), wraps, BinMode, SetupSSBO ? 1 : 0, CalcMode, FlatMode, (SteadyNowNs() - start) / 1e6);
+    const CheckCount* checks[] = { &countC, &coarseC, &offsetsC, &badPolyC, &offscreenC, &outsideBoxC, &varOffsetC, &dupesC, &maskC,
+        &sortC, &sortDupesC, &xspanC, &imgC, &texC };
+    for (const CheckCount* check : checks)
+    {
+        for (const std::string& example : check->Examples)
+            Platform::Log(Platform::LogLevel::Info, "COMPCHECK %s %s\n", check->Name, example.c_str());
+    }
+}
+
 void ComputeRenderer::RenderFrame(GPU& gpu)
 {
 #ifdef MELONADE_DEBUG_TOOLS
@@ -1853,6 +2203,19 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         optMask &= ~ComputeOpt_OneTileBuffer;
     bool optChanged = ((optMask ^ OptMask) & ComputeOpt_Shaders) != 0 || TileLayersFor(optMask) != TileLayers;
     OptMask = optMask;
+    // GPU::ComputeBin, ComputeSSBO, ComputeCalc and ComputeFlat (Mali diagnostics and fixes) are
+    // shader defines too, and recompile the same way
+    int binMode = std::clamp(gpu.ComputeBin, 0, 3);
+    int calcMode = std::clamp(gpu.ComputeCalc, 0, 1);
+    int flatMode = std::clamp(gpu.ComputeFlat, 0, 1);
+    if (binMode != BinMode || gpu.ComputeSSBO != SetupSSBO || calcMode != CalcMode || flatMode != FlatMode)
+    {
+        BinMode = binMode;
+        SetupSSBO = gpu.ComputeSSBO;
+        CalcMode = calcMode;
+        FlatMode = flatMode;
+        optChanged = true;
+    }
     // ComputeOpt_SwapSkip: has GPU3D compare each swap's scene with the one before, from the next
     // VBlank on. a swap that changed nothing a render reads then counts like a frame without one
     gpu.GPU3D.SceneRepeatCheck = (OptMask & ComputeOpt_SwapSkip) != 0;
@@ -2489,6 +2852,10 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         // calculate x-spans
         BeginGPUTimer(ComputePass::Interp);
         glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
+        // GPU::ComputeSSBO: the same buffer as a storage buffer. binding 3 is the tile memory's
+        // second layer later, which is bound again before Rasterise
+        if (SetupSSBO)
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, YSpanIndicesTextureMemory);
         UseProgram(ShaderInterpXSpans[wbuffer]);
         glDispatchCompute((numSetupIndices + 31) / 32, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
@@ -2690,6 +3057,14 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     SLOW_LAP(End);
     LogSlow(numPolygons, numVariants, totalTileBound, numSetupIndices);
 #endif
+
+    // GPU::ComputeCheck: every Nth render with polygons, after all of its dispatches (and
+    // after COMPSLOW's lap, which it would slow down)
+    if (gpu.ComputeCheck > 0 && numYSpans > 0)
+    {
+        if (CheckRenders++ % (u32)gpu.ComputeCheck == 0)
+            RunCheck(numPolygons, numVariants, numSetupIndices, totalTileBound);
+    }
 
     /*u64 starttime = armGetSystemTick();
     EmuQueue.waitIdle();

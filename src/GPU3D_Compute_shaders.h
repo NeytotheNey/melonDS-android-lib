@@ -271,7 +271,14 @@ const std::string BinningBuffer{R"(
 
 layout (std430, binding = 6) buffer BinResultBuffer
 {
+#ifdef VariantCountVec4
     uvec4 VariantWorkCount[MaxVariants];
+#else
+    // a uint per component, the same bytes as a uvec4 each (std430 stride 16). Mali's driver
+    // (r54p3, Pixel 8) applies an atomic on a component of a uvec4 array element to element 0
+    // whatever the index, so the counters are plain uints (debug.melonade.computeflat 0: uvec4s)
+    uint VariantWorkCountFlat[MaxVariants*4];
+#endif
     uint SortedWorkOffset[MaxVariants];
     // see BinResultHeader, VariantWorkCount's .y and .z are the split rasterise dispatch
     uint VariantWorkRealCount[MaxVariants];
@@ -283,6 +290,19 @@ layout (std430, binding = 6) buffer BinResultBuffer
     //uint BinnedMask[TilesPerLine*TileLines*BinStride];
     //uint WorkOffsets[TilesPerLine*TileLines*BinStride];
 };
+
+// VariantWorkCount[i]'s .x to .w, in either layout
+#ifdef VariantCountVec4
+#define VariantCountX(i) VariantWorkCount[i].x
+#define VariantCountY(i) VariantWorkCount[i].y
+#define VariantCountZ(i) VariantWorkCount[i].z
+#define VariantCountW(i) VariantWorkCount[i].w
+#else
+#define VariantCountX(i) VariantWorkCountFlat[uint(i)*4u]
+#define VariantCountY(i) VariantWorkCountFlat[uint(i)*4u + 1u]
+#define VariantCountZ(i) VariantWorkCountFlat[uint(i)*4u + 2u]
+#define VariantCountW(i) VariantWorkCountFlat[uint(i)*4u + 3u]
+#endif
 
 const int BinningCoarseMaskStart = 0;
 const int BinningMaskStart = BinningCoarseMaskStart+TilesPerLine*TileLines*CoarseBinStride;
@@ -689,11 +709,26 @@ const std::string InterpSpans =
     YSpanSetupBuffer + R"(
 layout (local_size_x = 32) in;
 
+#ifdef SetupIndicesSSBO
+// debug.melonade.computessbo: the same buffer as a storage buffer, two words a setup index
+// (PolyIdx | SpanIdxL << 16, SpanIdxR | Y << 16)
+layout (std430, binding = 3) readonly buffer SetupIndicesBuffer
+{
+    uint SetupIndicesPacked[];
+};
+#else
 layout (binding = 0, rgba16ui) uniform readonly highp uimageBuffer SetupIndices;
+#endif
 
 void main()
 {
+#ifdef SetupIndicesSSBO
+    uint setupLo = SetupIndicesPacked[gl_GlobalInvocationID.x * 2U];
+    uint setupHi = SetupIndicesPacked[gl_GlobalInvocationID.x * 2U + 1U];
+    uvec4 setup = uvec4(setupLo & 0xFFFFU, setupLo >> 16, setupHi & 0xFFFFU, setupHi >> 16);
+#else
     uvec4 setup = imageLoad(SetupIndices, int(gl_GlobalInvocationID.x));
+#endif
 
     YSpanSetup spanL = YSpanSetups[setup.y];
     YSpanSetup spanR = YSpanSetups[setup.z];
@@ -888,7 +923,14 @@ layout (local_size_x = 32) in;
 
 void main()
 {
+#ifdef VariantCountVec4
     VariantWorkCount[gl_GlobalInvocationID.x] = uvec4(1, 1, 0, 0);
+#else
+    VariantCountX(gl_GlobalInvocationID.x) = 1u;
+    VariantCountY(gl_GlobalInvocationID.x) = 1u;
+    VariantCountZ(gl_GlobalInvocationID.x) = 0u;
+    VariantCountW(gl_GlobalInvocationID.x) = 0u;
+#endif
 }
 
 )";
@@ -969,13 +1011,23 @@ bool BinPolygon(Polygon polygon, ivec2 topLeft, ivec2 botRight)
     return true;
 }
 
+#ifndef BinNoShared
 shared uint mergedMaskShared;
+#endif
 
 void main()
 {
     int groupIdx = int(gl_WorkGroupID.x);
     ivec2 coarseTile = ivec2(gl_WorkGroupID.yz);
 
+#if defined(BinNoShared)
+    // debug.melonade.computebin 2 and 3: no shared coarse mask and no barrier, the fine pass
+    // below tests every polygon of the group
+    int localIdx = int(gl_LocalInvocationIndex);
+    int groupPolygons = clamp(int(NumPolygons) - groupIdx * 32, 0, 32);
+    uint mergedMask = groupPolygons == 32 ? 0xFFFFFFFFU : ((1U << uint(groupPolygons)) - 1U);
+    ivec2 coarseTopLeft = coarseTile * ivec2(CoarseTileW, CoarseTileH);
+#else
 #if 0
     int localIdx = int(gl_SubGroupInvocationARB);
 #else
@@ -992,7 +1044,13 @@ void main()
     ivec2 coarseBotRight = coarseTopLeft + ivec2(CoarseTileW-1, CoarseTileH-1);
 
     bool binned = false;
+#ifdef BinFirstPass32
+    // debug.melonade.computebin 1: only the first 32 invocations test a polygon, so the shift
+    // below stays under 32
+    if (localIdx < 32 && uint(polygonIdx) < NumPolygons)
+#else
     if (uint(polygonIdx) < NumPolygons)
+#endif
     {
         Polygon polygon = Polygons[polygonIdx];
         binned = BinPolygon(polygon, coarseTopLeft, coarseBotRight);
@@ -1005,6 +1063,7 @@ void main()
         atomicOr(mergedMaskShared, 1U << localIdx);
     barrier();
     uint mergedMask = mergedMaskShared;
+#endif
 #endif
 
     ivec2 fineTile = ivec2(localIdx & 0x7, localIdx >> 3);
@@ -1033,7 +1092,7 @@ void main()
     uint workOffset = 0U;
     if (binnedMask != 0U)
     {
-        workOffset = atomicAdd(VariantWorkCount[0].w, uint(bitCount(binnedMask)));
+        workOffset = atomicAdd(VariantCountW(0), uint(bitCount(binnedMask)));
         if (workOffset >= uint(MaxWorkTiles))
         {
             binnedMask = 0U;
@@ -1055,7 +1114,12 @@ void main()
     {
         BinningMaskAndOffset[BinningWorkOffsetsStart + linearTile * BinStride + groupIdx] = workOffset;
 
+#ifdef BinPlainPack
+        // debug.melonade.computebin 3: the same bits with plain uint shifts and masks
+        uint tilePositionCombined = (uint(fineTileTopLeft.x) & 0xFFFFU) | (uint(fineTileTopLeft.y) << 16);
+#else
         uint tilePositionCombined = uint(bitfieldInsert(fineTileTopLeft.x, fineTileTopLeft.y, 16, 16));
+#endif
 
         int idx = 0;
         while (binnedMask != 0U)
@@ -1066,8 +1130,12 @@ void main()
             int polygonIdx = groupIdx * 32 + bit;
             int variantIdx = Polygons[polygonIdx].Variant;
 
-            int inVariantOffset = int(atomicAdd(VariantWorkCount[variantIdx].z, 1u));
+            int inVariantOffset = int(atomicAdd(VariantCountZ(variantIdx), 1u));
+#ifdef BinPlainPack
+            WorkDescs[WorkDescsUnsortedStart + workOffset + uint(idx)] = uvec2(tilePositionCombined, (uint(polygonIdx) & 0x7FFU) | (uint(inVariantOffset) << 11));
+#else
             WorkDescs[WorkDescsUnsortedStart + workOffset + uint(idx)] = uvec2(tilePositionCombined, uint(bitfieldInsert(polygonIdx, inVariantOffset, 11, 21)));
+#endif
 
             idx++;
         }
@@ -1083,25 +1151,56 @@ layout (local_size_x = 32) in;
 
 void main()
 {
+#ifdef CalcAtomic
+    // debug.melonade.computecalc 1: the offsets from an atomic on VariantWorkCount[1].w, as it
+    // was. Mali's driver (r54p3, Pixel 8) adds those to [0].w instead, which doubles the total
+
     if (gl_GlobalInvocationID.x < NumVariants)
     {
         if (gl_GlobalInvocationID.x == 0u)
         {
             // a bit of a cheat putting this here, but this shader won't run that often
             // (binning only wrote the first MaxWorkTiles entries)
-            SortWorkWorkCount = uvec4((min(VariantWorkCount[0].w, uint(MaxWorkTiles)) + 31u) / 32u, 1u, 1u, 0u);
+            SortWorkWorkCount = uvec4((min(VariantCountW(0), uint(MaxWorkTiles)) + 31u) / 32u, 1u, 1u, 0u);
         }
-        uint realCount = VariantWorkCount[gl_GlobalInvocationID.x].z;
-        SortedWorkOffset[gl_GlobalInvocationID.x] = atomicAdd(VariantWorkCount[1].w, realCount);
+        uint realCount = VariantCountZ(gl_GlobalInvocationID.x);
+        SortedWorkOffset[gl_GlobalInvocationID.x] = atomicAdd(VariantCountW(1), realCount);
 
         // the rasterise dispatch is (1, y, z) with y*z >= the count and neither past the 65535 GL
         // guarantees, split evenly so at most y-1 groups are empty. only .y and .z change, [0].w and
         // [1].w are still counters
         uint chunks = (realCount + 65534u) / 65535u;
         VariantWorkRealCount[gl_GlobalInvocationID.x] = realCount;
-        VariantWorkCount[gl_GlobalInvocationID.x].y = chunks;
-        VariantWorkCount[gl_GlobalInvocationID.x].z = chunks == 0u ? 0u : (realCount + chunks - 1u) / chunks;
+        VariantCountY(gl_GlobalInvocationID.x) = chunks;
+        VariantCountZ(gl_GlobalInvocationID.x) = chunks == 0u ? 0u : (realCount + chunks - 1u) / chunks;
     }
+#else
+    // one invocation hands out the sorted offsets as a running sum, in variant order, with plain
+    // stores, and does every variant's other writes too, so no other invocation (or work group)
+    // overwrites a variant's .z before it's read. [1].w gets the sum, which the atomics left there
+    if (gl_GlobalInvocationID.x == 0u)
+    {
+        // a bit of a cheat putting this here, but this shader won't run that often
+        // (binning only wrote the first MaxWorkTiles entries)
+        SortWorkWorkCount = uvec4((min(VariantCountW(0), uint(MaxWorkTiles)) + 31u) / 32u, 1u, 1u, 0u);
+
+        uint sum = 0u;
+        for (uint i = 0u; i < NumVariants; i++)
+        {
+            uint realCount = VariantCountZ(i);
+            SortedWorkOffset[i] = sum;
+            sum += realCount;
+
+            // the rasterise dispatch is (1, y, z) with y*z >= the count and neither past the 65535 GL
+            // guarantees, split evenly so at most y-1 groups are empty
+            uint chunks = (realCount + 65534u) / 65535u;
+            VariantWorkRealCount[i] = realCount;
+            VariantCountY(i) = chunks;
+            VariantCountZ(i) = chunks == 0u ? 0u : (realCount + chunks - 1u) / chunks;
+        }
+        VariantCountW(1) = sum;
+    }
+#endif
 }
 
 
@@ -1118,7 +1217,7 @@ void main()
 {
     // binning dropped the work past MaxWorkTiles. the indirect dispatch has a thread per work tile,
     // the direct one is sized on the CPU from an estimate, so it strides over whatever is left
-    uint count = min(VariantWorkCount[0].w, uint(MaxWorkTiles));
+    uint count = min(VariantCountW(0), uint(MaxWorkTiles));
     uint stride = gl_NumWorkGroups.x * 32u;
     for (uint workIdx = gl_GlobalInvocationID.x; workIdx < count; workIdx += stride)
     {
@@ -1926,6 +2025,36 @@ void main()
     }
 }
 
+)";
+
+// debug.melonade.computecheck: reads every setup index back through the texture buffer, the
+// way InterpSpans does (imageLoad on image unit 0) and with texelFetch (texture unit 7), into
+// two uvec4s each, which the CPU compares with what it uploaded (ComputeRenderer::RunCheck).
+// a whole program of its own, compiled only while the switch is on
+const char* const CheckSetupIndices = R"(#version 320 es
+precision highp int;
+
+layout (local_size_x = 32) in;
+
+layout (binding = 0, rgba16ui) uniform readonly highp uimageBuffer SetupIndices;
+layout (binding = 7) uniform highp usamplerBuffer SetupIndicesTex;
+
+layout (std430, binding = 0) writeonly buffer CheckOut
+{
+    uvec4 Fetched[];
+};
+
+layout (location = 0) uniform uint Count;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < Count)
+    {
+        Fetched[i * 2U] = imageLoad(SetupIndices, int(i));
+        Fetched[i * 2U + 1U] = texelFetch(SetupIndicesTex, int(i));
+    }
+}
 )";
 
 }

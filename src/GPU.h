@@ -934,6 +934,22 @@ public:
     // (ComputeRenderer::LogWhy). it also has GPU3D hash every scene, to tell a swap that brought
     // the same polygons again
     bool ComputeWhy = false;
+    // diagnostics, compute renderer on Mali (docs/shelved/compute-on-mali.md), all off by default.
+    // ComputeCheck N: every Nth render with polygons waits for the GPU, reads binning's and the
+    // x-spans' buffers back and logs a COMPCHECK line on what's inconsistent
+    // (ComputeRenderer::RunCheck). ComputeBin 1-3: BinCombined experiments (BinFirstPass32,
+    // BinNoShared, BinPlainPack in the shader). ComputeSSBO: InterpXSpans reads the setup indices
+    // from a storage buffer instead of the texture buffer. ComputeCalc 1: CalcOffsets hands out the
+    // sorted offsets with the old atomic on VariantWorkCount[1].w, which Mali's driver adds to [0].w
+    // (CalcAtomic in the shader). ComputeFlat: VariantWorkCount is a flat uint array in the
+    // shaders, as Mali's driver applies an atomic on a uvec4 element's component to element 0;
+    // only the switch sets it to 0, the uvec4s as before (VariantCountVec4). the last four
+    // recompile the programs
+    int ComputeCheck = 0;
+    int ComputeBin = 0;
+    bool ComputeSSBO = false;
+    int ComputeCalc = 0;
+    int ComputeFlat = 1;
     // debug only, GPU discovery (docs/plan-gpu-discovery.md, all set before the game runs):
     // OpenGL renderer: 1 logs a GLTIME line once a second with each pass's GPU time from GL timer
     // queries, 2 the same passes timed on the CPU between glFinish calls (much slower, shares only)
