@@ -851,7 +851,11 @@ public:
     // one into a target of its own, read back and compared with it (the COMP1X line); the frontend
     // never sees it. 0 draws as before. 1, the default in every build since 11-11 (exact on the Fold, -6 to
     // -8% GPU cycles at the White 2 title and overworld); a debug switch changes it, set before the
-    // game runs
+    // game runs. with filtered 2D (experiment K3) such a screen is drawn with the filter's program at
+    // the filter map's scale instead of at 1x (OutputLayout::HalfScale), in either view (that program
+    // doesn't read its varying there, except in Filter2D 3's 256 view, which is drawn in full), when
+    // the output's scale is a multiple of the map's above it (4x at 8x, 12x and 16x; 2x at 4x and 6x
+    // with Filter2D 2)
     int Comp1x = 1;
     // set by the frontend before each frame, for Comp1x 1 and 2: whether everything that shows the
     // output can show a half drawn at 1x. off, every half is drawn in full
@@ -1008,6 +1012,13 @@ public:
     int Filter2D = 0;
     // debug only: logs a FILTER2D line once a second
     bool Filter2DLogging = false;
+    // filtered 2D, experiment K3 (docs/plan-gpu-discovery.md): in a frame whose keys changed on
+    // only some lines, the map passes redraw only the rows those lines can reach, each pass
+    // scissored to them (GLCompositor::RunFilter2D), instead of the whole map. 0 redraws all of it
+    // whenever a key changed, as before. 2 is a check: the partial redraw, and every 30th one the
+    // whole map drawn again over it, both read back and compared (the FILTER2D line's rowchecks).
+    // 1, the default in every build since 11-11; a debug switch changes it, set before the game runs
+    int Filter2DRows = 1;
     // banks A-D written (by the CPU, DMA or a VRAMCNT change) since the last Blit, and of those the
     // ones written while this frame's capture was armed. both only live one frame: the compositor
     // folds them into its bank state at every Blit, then they're cleared (HiresCaptureBlitDone)

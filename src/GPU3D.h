@@ -503,10 +503,17 @@ public:
 // (0 the top screen, 1 the bottom one) is a half drawn at 1x: its image is the first ViewWidth x 192
 // texels from the half's first row (h * 194 * Scale, the rows the full draw starts it at), and the
 // rest of the half's rows hold whatever they held before. Scale is the output's
+//
+// HalfScale (experiment K3) is the scale those halves were drawn at: 1, or with filtered 2D the
+// filter map's, which Scale is then a multiple of. Their image is then the first
+// ViewWidth * HalfScale x 192 * HalfScale texels from the same first row, shown nearest-upscaled by
+// Scale / HalfScale. Every half in HalvesAt1x has the same one, since the filter is on or off for
+// the whole frame
 struct OutputLayout
 {
     int HalvesAt1x = 0;
     int Scale = 1;
+    int HalfScale = 1;
 };
 
 class Renderer3D

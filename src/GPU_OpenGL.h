@@ -85,6 +85,9 @@ public:
     // 2 the check one (planes at 1x), and the OBJ pass
     static std::string Shadow2DFS(int variant);
     static std::string Shadow2DObjFS();
+
+    // GPU::Filter2DRows: rows First to Last of a filtered 2D target (see RunFilter2D)
+    struct Filter2DRowRun { int First, Last; };
 private:
     GLCompositor(GLuint CompShader) noexcept;
 
@@ -105,7 +108,8 @@ private:
         Comp1xOffScale,     // the output is at 1x anyway
         Comp1xOffView,      // a 256 view in mode 1
         Comp1xOffLines,     // the frame has no lines, so the screen texture is an older frame's
-        Comp1xOffFilter,    // filtered 2D
+        Comp1xOffFilter,    // filtered 2D the map's scale can't do (K3): the output's scale isn't a multiple
+                            // of the map's above it, or Filter2D 3's 256 view
         Comp1xOffShadow,    // the GPU 2D shadow draws over the output
         Comp1xOff_Count
     };
@@ -114,12 +118,13 @@ private:
         // what the last draw into each buffer left, and whether TakeOutputLayout has had it yet
         std::array<int, 2> Halves {};
         std::array<int, 2> Scale {};
+        std::array<int, 2> HalfScale {};
         std::array<bool, 2> Drawn {};
 
         // the check mode's target, made the first time a check runs and freed with the switch off:
-        // GL_RGBA8 CheckW x 384, half h at 1x from row h * 192
+        // GL_RGBA8 CheckW x 384 at CheckScale, half h at it from row h * 192 * CheckScale
         GLuint CheckTex = 0, CheckFB = 0;
-        int CheckW = 0;
+        int CheckW = 0, CheckScale = 0;
         u32 CheckFrames = 0;
         bool CheckFailed = false;
 
@@ -128,13 +133,24 @@ private:
         u32 LogFrames = 0;
         std::array<u32, 3> LogHalves {};    // frames with only the top half at 1x, only the bottom one, both
         std::array<u32, Comp1xOff_Count> LogOff {};
+        u32 LogFiltered = 0;                // of those, frames whose halves were filtered, at the map's scale
         u32 Checks = 0, CheckPixels = 0, Mismatches = 0, MismatchNative = 0;
     };
     Comp1xState OneX {};
 
+    // how a frame's halves at 1x are drawn: with the main draw's program, at DrawScale (1, or the
+    // filter map's with filtered 2D), whose u3DScale is at ScaleLoc and, for the filter's program,
+    // uFilterRowOffset at RowOffsetLoc (-1 for the others)
+    struct SmallHalfDraw
+    {
+        int DrawScale = 1;
+        GLuint ScaleLoc = 0;
+        GLint RowOffsetLoc = -1;
+    };
     int PlainHalves(const GPU& gpu, int backbuf, bool wingHold, bool hiresDisplay, bool ctrlCopied) const noexcept;
-    void DrawHalfAt1x(int half, int y, GLuint scaleLoc) noexcept;
-    void CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcept;
+    void DrawHalfAt1x(int half, int y, const SmallHalfDraw& draw) noexcept;
+    void EndHalvesAt1x(const SmallHalfDraw& draw) noexcept;
+    void CheckComp1x(int backbuf, int halves, const SmallHalfDraw& draw) noexcept;
     void LogComp1x(const GPU& gpu) noexcept;
     void FreeComp1xCheck() noexcept;
 
@@ -285,6 +301,7 @@ private:
     {
         GLuint Program = 0;
         GLuint ScaleLoc = 0, RatioLoc = 0, OffsetLoc = 0, HiresCapLoc = 0, MapScaleLoc = 0, IdentityLoc = 0;
+        GLint RowOffsetLoc = -1;
     };
     struct Filter2DState
     {
@@ -298,6 +315,11 @@ private:
         int MapPasses = 0;
         bool MapIdentity = false;
         std::vector<u32> Keys;
+        // GPU::Filter2DRows: the lines (half * 192 + line) whose keys UpdateFilter2DKeys last found
+        // changed, and the row runs each pass redraws (see RunFilter2D), kept for their capacity
+        std::array<bool, 384> LineChanged {};
+        std::array<std::vector<Filter2DRowRun>, 3> Runs {};
+        u32 RowCheckRuns = 0;
 
         bool Failed = false;                // a program didn't build or a target isn't complete
         GLuint KeyShader = 0;
@@ -311,6 +333,12 @@ private:
         u32 LogFrames = 0;
         u32 LogRan = 0, LogSkipped = 0, LogChangedLines = 0;
         s64 LogCheckNs = 0, LogCheckMaxNs = 0;
+        // of the frames that ran, how many redrew only some rows, and the rows each pass drew (key,
+        // first MMPX pass, second) over all of them; with GPU::Filter2DRows 2, the checks and the
+        // texels that differed
+        u32 LogPartial = 0;
+        std::array<u64, 3> LogRows {};
+        u32 LogRowChecks = 0, LogRowMismatches = 0;
     };
     Filter2DState Filter2D {};
 
@@ -319,6 +347,8 @@ private:
     bool MakeFilter2DTarget(GLuint& texture, GLuint& fb, GLenum format, int width, int height) noexcept;
     int UpdateFilter2DKeys(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied) noexcept;
     void RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied, int passes) noexcept;
+    void DrawFilter2DPasses(bool hiresDisplay, bool identity, int passes, bool full) noexcept;
+    void CheckFilter2DRows(bool hiresDisplay, bool identity, int passes) noexcept;
     void FreeFilter2DTextures() noexcept;
     void FreeFilter2D() noexcept;
     void LogFilter2D(const GPU& gpu, int passes) noexcept;

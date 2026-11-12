@@ -164,9 +164,12 @@ uniform highp usampler2D HiresStreamTex;
 #ifdef FILTER2D
 // filtered 2D (see GLCompositor::RunFilter2D): for each sub-pixel, the native pixel of its screen
 // to read planes 0-2 from. uFilterMapScale is how many map texels a native pixel has.
-// uFilterIdentity is debug.melonade.filter2d 3, see FilterRowCoord
+// uFilterIdentity is debug.melonade.filter2d 3, see FilterRowCoord. uFilterRowOffset is 0 but for
+// a half GPU::Comp1x draws at the map's scale (GLCompositor::DrawHalfAt1x): the rows from its first
+// output row to where it would start in an output at u3DScale
 uniform int uFilterMapScale;
 uniform int uFilterIdentity;
+uniform int uFilterRowOffset;
 uniform highp usampler2D FilterMapTex;
 #endif
 
@@ -275,6 +278,7 @@ ivec4 WingPixel()
 highp ivec2 FilterSubPixel()
 {
     highp ivec2 coord = ivec2(gl_FragCoord.xy);
+    coord.y -= uFilterRowOffset;
     highp int scale = int(u3DScale);
     if (coord.y >= 194 * scale)
         coord.y -= 2 * scale;

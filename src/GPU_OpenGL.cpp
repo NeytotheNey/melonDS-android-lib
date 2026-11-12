@@ -739,26 +739,40 @@ int GLCompositor::PlainHalves(const GPU& gpu, int backbuf, bool wingHold, bool h
     return halves;
 }
 
-// GPU::Comp1x: half [half] at 1x, ViewWidth x 192 from row y of what's bound to draw into, with the
-// main draw's program, uniforms and textures. the caller puts the scale and the viewport back
-void GLCompositor::DrawHalfAt1x(int half, int y, GLuint scaleLoc) noexcept
+// GPU::Comp1x: half [half] at 1x (or, filtered, at the map's scale: draw.DrawScale), ViewWidth x 192
+// at that scale from row y of what's bound to draw into, with the main draw's program, uniforms and
+// textures. the filter's program works out its sub-pixel from gl_FragCoord, so it's told how far
+// the half's rows are from where they'd start in an output at the draw's scale. EndHalvesAt1x puts
+// the uniforms and the viewport back
+void GLCompositor::DrawHalfAt1x(int half, int y, const SmallHalfDraw& draw) noexcept
 {
-    glUniform1ui(scaleLoc, 1);
-    glViewport(0, y, ViewWidth, 192);
+    glUniform1ui(draw.ScaleLoc, draw.DrawScale);
+    if (draw.RowOffsetLoc >= 0)
+        glUniform1i(draw.RowOffsetLoc, y - half * 194 * draw.DrawScale);
+    glViewport(0, y, ViewWidth * draw.DrawScale, 192 * draw.DrawScale);
     glDrawArrays(GL_TRIANGLES, 12 + half * 6, 6);
 }
 
-// GPU::Comp1x 3: right after the full draw, draws [halves] at 1x into the check target and reads
-// both back: every pixel of each half's full draw should equal its native pixel at 1x. counted for
-// the COMP1X line, with the first few that don't logged
-void GLCompositor::CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcept
+void GLCompositor::EndHalvesAt1x(const SmallHalfDraw& draw) noexcept
+{
+    glUniform1ui(draw.ScaleLoc, Scale);
+    if (draw.RowOffsetLoc >= 0)
+        glUniform1i(draw.RowOffsetLoc, 0);
+    glViewport(0, 0, ScreenW, ScreenH);
+}
+
+// GPU::Comp1x 3: right after the full draw, draws [halves] at 1x (filtered: at the map's scale) into
+// the check target and reads both back: every pixel of each half's full draw should equal the pixel
+// it upscales from there. counted for the COMP1X line, with the first few that don't logged
+void GLCompositor::CheckComp1x(int backbuf, int halves, const SmallHalfDraw& draw) noexcept
 {
     if (OneX.CheckFailed)
         return;
-    if (OneX.CheckW != ViewWidth)
+    const int ds = draw.DrawScale;
+    if (OneX.CheckW != ViewWidth || OneX.CheckScale != ds)
     {
         FreeComp1xCheck();
-        OneX.CheckTex = MakeHiresTexture(GL_RGBA8, ViewWidth, 384);
+        OneX.CheckTex = MakeHiresTexture(GL_RGBA8, ViewWidth * ds, 384 * ds);
         // the draw's 3D frame is on unit 1, which was the active one
         glActiveTexture(GL_TEXTURE1);
         GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
@@ -775,18 +789,21 @@ void GLCompositor::CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcep
             return;
         }
         OneX.CheckW = ViewWidth;
+        OneX.CheckScale = ds;
     }
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OneX.CheckFB);
     for (int half = 0; half < 2; half++)
     {
         if (halves & (1 << half))
-            DrawHalfAt1x(half, half * 192, scaleLoc);
+            DrawHalfAt1x(half, half * 192 * ds, draw);
     }
-    glUniform1ui(scaleLoc, Scale);
+    EndHalvesAt1x(draw);
 
-    std::vector<u32> small((size_t)ViewWidth * 192), full((size_t)ScreenW * 192 * Scale);
-    std::vector<u8> nativeBad(small.size());
+    // each sub-pixel of the full draw upscales the small one's pixel [up] times
+    const int smallW = ViewWidth * ds, up = Scale / ds;
+    std::vector<u32> small((size_t)smallW * 192 * ds), full((size_t)ScreenW * 192 * Scale);
+    std::vector<u8> nativeBad((size_t)ViewWidth * 192);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     for (int half = 0; half < 2; half++)
     {
@@ -794,7 +811,7 @@ void GLCompositor::CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcep
             continue;
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, OneX.CheckFB);
-        glReadPixels(0, half * 192, ViewWidth, 192, GL_RGBA, GL_UNSIGNED_BYTE, small.data());
+        glReadPixels(0, half * 192 * ds, smallW, 192 * ds, GL_RGBA, GL_UNSIGNED_BYTE, small.data());
         glBindFramebuffer(GL_READ_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
         glReadPixels(0, half * 194 * Scale, ScreenW, 192 * Scale, GL_RGBA, GL_UNSIGNED_BYTE, full.data());
 
@@ -803,10 +820,10 @@ void GLCompositor::CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcep
         for (int y = 0; y < 192 * Scale; y++)
         {
             const u32* row = &full[(size_t)y * ScreenW];
-            const u32* nativeRow = &small[(size_t)(y / Scale) * ViewWidth];
+            const u32* smallRow = &small[(size_t)(y / up) * smallW];
             for (int x = 0; x < ScreenW; x++)
             {
-                u32 expected = nativeRow[x / Scale];
+                u32 expected = smallRow[x / up];
                 if (row[x] == expected)
                     continue;
                 mismatches++;
@@ -814,8 +831,8 @@ void GLCompositor::CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcep
                 if (logged < 8 && OneX.Mismatches + mismatches <= 64)
                 {
                     logged++;
-                    Log(LogLevel::Info, "COMP1X mismatch half=%d x=%d y=%d native=%d,%d full=%08X 1x=%08X\n",
-                        half, x, y, x / Scale, y / Scale, row[x], expected);
+                    Log(LogLevel::Info, "COMP1X mismatch half=%d x=%d y=%d native=%d,%d full=%08X small=%08X halfscale=%d\n",
+                        half, x, y, x / Scale, y / Scale, row[x], expected, ds);
                 }
             }
         }
@@ -848,16 +865,18 @@ void GLCompositor::LogComp1x(const GPU& gpu) noexcept
 
     const std::array<u32, Comp1xOff_Count>& off = OneX.LogOff;
     Log(LogLevel::Info, "COMP1X mode=%d scale=%d width=%d frames=%u top=%u bottom=%u both=%u off front=%u scale=%u "
-        "view=%u nolines=%u filter=%u shadow=%u checks=%u checkpx=%u mismatches=%u mismatchnative=%u failed=%d\n",
+        "view=%u nolines=%u filter=%u shadow=%u checks=%u checkpx=%u mismatches=%u mismatchnative=%u failed=%d "
+        "filtered=%u\n",
         gpu.Comp1x, Scale, ViewWidth, OneX.LogFrames, OneX.LogHalves[0], OneX.LogHalves[1], OneX.LogHalves[2],
         off[Comp1xOffFront], off[Comp1xOffScale], off[Comp1xOffView], off[Comp1xOffLines], off[Comp1xOffFilter],
         off[Comp1xOffShadow], OneX.Checks, OneX.CheckPixels, OneX.Mismatches, OneX.MismatchNative,
-        OneX.CheckFailed ? 1 : 0);
+        OneX.CheckFailed ? 1 : 0, OneX.LogFiltered);
 
     OneX.LogStartNs = now;
     OneX.LogFrames = 0;
     OneX.LogHalves = {};
     OneX.LogOff = {};
+    OneX.LogFiltered = 0;
     OneX.Checks = OneX.CheckPixels = OneX.Mismatches = OneX.MismatchNative = 0;
 }
 
@@ -868,7 +887,7 @@ void GLCompositor::FreeComp1xCheck() noexcept
     glDeleteFramebuffers(1, &OneX.CheckFB);
     glDeleteTextures(1, &OneX.CheckTex);
     OneX.CheckFB = OneX.CheckTex = 0;
-    OneX.CheckW = 0;
+    OneX.CheckW = OneX.CheckScale = 0;
 }
 
 bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
@@ -878,6 +897,7 @@ bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
     OneX.Drawn[buf] = false;
     layout.HalvesAt1x = OneX.Halves[buf];
     layout.Scale = OneX.Scale[buf];
+    layout.HalfScale = OneX.HalfScale[buf];
     return true;
 }
 
@@ -931,8 +951,19 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // and above 1x. 1 only in a wide view: its program is highp, so the 1x pixel is exactly what each
     // full-draw sub-pixel gets, where the 256 view's mediump coordinates can round a sub-pixel into the
     // next native pixel on an fp16 GPU. the check mode (3) finds the plain halves the same way (both
-    // views, whatever the frontend can do), draws them in full and compares (CheckComp1x)
+    // views, whatever the frontend can do), draws them in full and compares (CheckComp1x).
+    // with filtered 2D (experiment K3), a plain half is drawn with the filter's program at the map's
+    // scale M instead: there a sub-pixel s at scale S reads map texel (2s+1)M/(2S), which is s/(S/M)
+    // when S is a multiple of M, and native pixel s/S, which is that over M, and nothing else it reads
+    // depends on s, so its full draw is a nearest upscale by S/M of what the draw at M makes. that
+    // program reads gl_FragCoord rather than its varying (except Filter2D 3, whose varying is
+    // mediump in the 256 view), so this holds in the 256 view too
     int halvesAt1x = 0, checkHalves = 0;
+    SmallHalfDraw smallDraw;
+    if (filterPasses > 0)
+        smallDraw = {Filter2D.MapScale, filterComp.ScaleLoc, filterComp.RowOffsetLoc};
+    else
+        smallDraw = {1, ViewWidth == 256 ? CompScaleLoc : CompWideScaleLoc, -1};
     if (gpu.Comp1x != 0)
     {
         bool check = gpu.Comp1x == 3;
@@ -941,11 +972,12 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
             off = Comp1xOffFront;
         else if (Scale < 2)
             off = Comp1xOffScale;
-        else if (gpu.Comp1x == 1 && ViewWidth == 256)
+        else if (gpu.Comp1x == 1 && ViewWidth == 256 && filterPasses == 0)
             off = Comp1xOffView;
         else if (!hasFramebuffers)
             off = Comp1xOffLines;
-        else if (filterPasses > 0)
+        else if (filterPasses > 0 && (Scale % smallDraw.DrawScale != 0 || Scale <= smallDraw.DrawScale
+                                      || (gpu.Filter2D == 3 && ViewWidth == 256)))
             off = Comp1xOffFilter;
         else if (shadowLines > 0)
             off = Comp1xOffShadow;
@@ -959,7 +991,11 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
             else
                 halvesAt1x = plain;
             if (plain)
+            {
                 OneX.LogHalves[plain - 1]++;
+                if (filterPasses > 0)
+                    OneX.LogFiltered++;
+            }
         }
     }
     if (gpu.Comp1x != 3)
@@ -983,6 +1019,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1i(filterComp.HiresCapLoc, hiresDisplay);
         glUniform1i(filterComp.MapScaleLoc, Filter2D.MapScale);
         glUniform1i(filterComp.IdentityLoc, gpu.Filter2D == 3);
+        glUniform1i(filterComp.RowOffsetLoc, 0);
         if (ViewWidth != 256)
         {
             glUniform1f(filterComp.RatioLoc, ViewWidth / 256.0f);
@@ -1070,15 +1107,13 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // in the draw's timer, so an A/B of Comp includes what the clear costs
     if (gpu.CompClear != 0)
         ClearOutput(gpu.CompClear);
-    // the program's scale uniform, for the 1x draws, which only run without the filter's program
-    GLuint scaleLoc = ViewWidth == 256 ? CompScaleLoc : CompWideScaleLoc;
     if (halvesAt1x == 0)
     {
         glDrawArrays(GL_TRIANGLES, 0, 4*3);
     }
     else
     {
-        // the full halves (vertices 0-5 are half 1's), then the others at 1x
+        // the full halves (vertices 0-5 are half 1's), then the others at 1x (or the map's scale)
         if (!(halvesAt1x & 2))
             glDrawArrays(GL_TRIANGLES, 0, 6);
         if (!(halvesAt1x & 1))
@@ -1086,21 +1121,21 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         for (int half = 0; half < 2; half++)
         {
             if (halvesAt1x & (1 << half))
-                DrawHalfAt1x(half, half * 194 * Scale, scaleLoc);
+                DrawHalfAt1x(half, half * 194 * Scale, smallDraw);
         }
-        glUniform1ui(scaleLoc, Scale);
-        glViewport(0, 0, ScreenW, ScreenH);
+        EndHalvesAt1x(smallDraw);
     }
     BeginGPUTimer(ComputePass::CompExtra);
 
     // what's in the output now, for the frontend (TakeOutputLayout)
     OneX.Halves[backbuf] = halvesAt1x;
     OneX.Scale[backbuf] = Scale;
+    OneX.HalfScale[backbuf] = halvesAt1x != 0 ? smallDraw.DrawScale : 1;
     OneX.Drawn[backbuf] = true;
 
     // before anything else draws or reads, with the main draw's state still set
     if (checkHalves != 0 && (OneX.CheckFrames++ % 30) == 0)
-        CheckComp1x(backbuf, checkHalves, scaleLoc);
+        CheckComp1x(backbuf, checkHalves, smallDraw);
 
     // over the draw, before the held wings are copied, so they hold the shadow's 2D too
     if (shadowLines > 0)
@@ -1233,6 +1268,7 @@ bool GLCompositor::PrepareFilter2DShaders(bool wide) noexcept
         comp.HiresCapLoc = glGetUniformLocation(shader, "uHiresCap");
         comp.MapScaleLoc = glGetUniformLocation(shader, "uFilterMapScale");
         comp.IdentityLoc = glGetUniformLocation(shader, "uFilterIdentity");
+        comp.RowOffsetLoc = glGetUniformLocation(shader, "uFilterRowOffset");
 
         glUseProgram(shader);
         glUniform1i(glGetUniformLocation(shader, "ScreenTex"), 0);
@@ -1260,7 +1296,8 @@ bool GLCompositor::MakeFilter2DTarget(GLuint& texture, GLuint& fb, GLenum format
 }
 
 // filtered 2D: the key the pre-pass (kFilter2DKeyFS) gives each native pixel, from the same planes
-// and control words it reads, into Filter2D.Keys. returns how many lines have a key that changed.
+// and control words it reads, into Filter2D.Keys. returns how many lines have a key that changed,
+// and marks them in Filter2D.LineChanged.
 // these keys aren't the shader's, but two of them are equal exactly when the shader's are: the
 // pixel's 6-bit color, with bit 31 for a 3D slot, and on a line that stays as it is one value no
 // color has (the shader's key there is the pixel's position, the same every frame). the passes
@@ -1317,6 +1354,7 @@ int GLCompositor::UpdateFilter2DKeys(const GPU& gpu, int backbuf, bool hiresDisp
                 }
             }
 
+            Filter2D.LineChanged[outLine] = diff != 0;
             if (diff)
                 changedLines++;
         }
@@ -1325,13 +1363,37 @@ int GLCompositor::UpdateFilter2DKeys(const GPU& gpu, int backbuf, bool hiresDisp
     return changedLines;
 }
 
+// GPU::Filter2DRows: the rows of a pass's target that can change when the rows [src] of the target it
+// reads did (runs in order, none overlapping). an MMPX texel at row y reads source rows y/2 - 3 to
+// y/2 + 3 (src()'s offsets in kFilter2DMmpxFS), clamped to its screen's rows, so with source rows
+// a-b changed, the rows that can change are those whose y/2 is in a-3 to b+3, kept in the screens
+// a and b are in. [screenH] is a screen's rows in the source. runs that touch are merged, also over
+// the gap between the screens: redrawing a row that doesn't change only costs the time
+static void WidenFilter2DRuns(const std::vector<GLCompositor::Filter2DRowRun>& src, int screenH,
+                              std::vector<GLCompositor::Filter2DRowRun>& dst) noexcept
+{
+    dst.clear();
+    for (const GLCompositor::Filter2DRowRun& run : src)
+    {
+        int screenFirst = run.First / screenH * screenH;
+        int screenLast = run.Last / screenH * screenH + screenH - 1;
+        int first = 2 * std::max(run.First - 3, screenFirst);
+        int last = 2 * std::min(run.Last + 3, screenLast) + 1;
+        if (!dst.empty() && first <= dst.back().Last + 1)
+            dst.back().Last = std::max(dst.back().Last, last);
+        else
+            dst.push_back({first, last});
+    }
+}
+
 // filtered 2D: fills the map the compositor reads planes 0-2 through, from the planes and control
 // words just uploaded. a key per native pixel, then MMPX to 2x, then at scale 4 and up to 4x. all
-// of it is the frame's own data, so what a target held before doesn't matter, and tiled GPUs are
-// told so. each pass leaves its texture for the next one on the map's unit, and the last leaves
-// the map. RenderFrame's state is back afterwards except for the program, which it sets.
+// of it is the frame's own data, so a full redraw doesn't need what a target held before, and
+// tiled GPUs are told so. each pass leaves its texture for the next one on the map's unit, and the
+// last leaves the map. RenderFrame's state is back afterwards except for the program, which it sets.
 // most frames of a 2D scene have the keys of the one before, and then the map from the last run
-// is bound as it is
+// is bound as it is. with GPU::Filter2DRows, a frame whose keys changed on some lines redraws only
+// the rows those can reach and keeps the rest, which the same passes made from the same keys
 void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, bool ctrlCopied, int passes) noexcept
 {
     auto nowNs = []
@@ -1343,7 +1405,44 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, b
     s64 checkStart = gpu.Filter2DLogging ? nowNs() : 0;
     int changedLines = UpdateFilter2DKeys(gpu, backbuf, hiresDisplay, ctrlCopied);
     bool identity = gpu.Filter2D == 3;
-    bool reuse = changedLines == 0 && Filter2D.MapPasses == passes && Filter2D.MapIdentity == identity;
+    // the targets hold what these passes made from the last keys
+    bool mapValid = Filter2D.MapPasses == passes && Filter2D.MapIdentity == identity;
+    bool reuse = changedLines == 0 && mapValid;
+    // GPU::Filter2DRows (experiment K3): otherwise only the rows the changed lines reach are redrawn,
+    // over targets that hold the rest. everything is redrawn when they don't hold this mode's map
+    bool full = !mapValid || gpu.Filter2DRows == 0;
+
+    // the rows each pass draws: a key per native pixel, so the changed lines; then each MMPX pass
+    // widens them (WidenFilter2DRuns)
+    std::array<std::vector<Filter2DRowRun>, 3>& runs = Filter2D.Runs;
+    if (!reuse)
+    {
+        for (std::vector<Filter2DRowRun>& passRuns : runs)
+            passRuns.clear();
+        if (full)
+        {
+            runs[0].push_back({0, 383});
+            runs[1].push_back({0, 767});
+            if (passes == 2)
+                runs[2].push_back({0, 1535});
+        }
+        else
+        {
+            for (int line = 0; line < 384; line++)
+            {
+                if (!Filter2D.LineChanged[line])
+                    continue;
+                if (!runs[0].empty() && runs[0].back().Last == line - 1)
+                    runs[0].back().Last = line;
+                else
+                    runs[0].push_back({line, line});
+            }
+            WidenFilter2DRuns(runs[0], 192, runs[1]);
+            if (passes == 2)
+                WidenFilter2DRuns(runs[1], 384, runs[2]);
+        }
+    }
+
     if (gpu.Filter2DLogging)
     {
         s64 checkNs = nowNs() - checkStart;
@@ -1351,9 +1450,20 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, b
         Filter2D.LogCheckMaxNs = std::max(Filter2D.LogCheckMaxNs, checkNs);
         Filter2D.LogChangedLines += changedLines;
         if (reuse)
+        {
             Filter2D.LogSkipped++;
+        }
         else
+        {
             Filter2D.LogRan++;
+            if (!full)
+                Filter2D.LogPartial++;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                for (const Filter2DRowRun& run : runs[pass])
+                    Filter2D.LogRows[pass] += run.Last - run.First + 1;
+            }
+        }
     }
 
     if (reuse)
@@ -1366,40 +1476,13 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, b
     }
 
     BeginGPUTimer(ComputePass::CompFilter);
-    const GLenum attachment = GL_COLOR_ATTACHMENT0;
 
     // kHiresCaptureVS needs no attributes, but the VAO may be the 3D renderer's
     glBindVertexArray(CompVertexArrayID);
 
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Filter2D.KeyFB);
-    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
-    glViewport(0, 0, 256, 384);
-    glUseProgram(Filter2D.KeyShader);
-    glUniform1i(Filter2D.KeyHiresCapLoc, hiresDisplay);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    glUseProgram(Filter2D.MmpxShader);
-    glUniform1i(Filter2D.MmpxIdentityLoc, identity);
-    glActiveTexture(GL_TEXTURE0 + Filter2DMapUnit);
-
-    glBindTexture(GL_TEXTURE_2D, Filter2D.KeyTex);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, passes == 2 ? Filter2D.Map2xFB : Filter2D.MapFB);
-    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
-    glViewport(0, 0, 512, 768);
-    glUniform1i(Filter2D.MmpxSrcWLoc, 256);
-    glUniform1i(Filter2D.MmpxScreenHLoc, 192);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    if (passes == 2)
-    {
-        glBindTexture(GL_TEXTURE_2D, Filter2D.Map2xTex);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Filter2D.MapFB);
-        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
-        glViewport(0, 0, 1024, 1536);
-        glUniform1i(Filter2D.MmpxSrcWLoc, 512);
-        glUniform1i(Filter2D.MmpxScreenHLoc, 384);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-    }
+    DrawFilter2DPasses(hiresDisplay, identity, passes, full);
+    if (!full && gpu.Filter2DRows == 2 && (Filter2D.RowCheckRuns++ % 30) == 0)
+        CheckFilter2DRows(hiresDisplay, identity, passes);
 
     glBindTexture(GL_TEXTURE_2D, Filter2D.MapTex);
     glActiveTexture(GL_TEXTURE0);
@@ -1409,6 +1492,126 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, b
 
     Filter2D.MapPasses = passes;
     Filter2D.MapIdentity = identity;
+}
+
+// RunFilter2D's passes, over the rows in Filter2D.Runs. a full redraw covers every texel of each
+// target, so tiled GPUs are told their old contents don't matter; a partial one keeps them, as it
+// only draws the rows that can change, scissored to them. leaves the map's unit active, with the
+// last pass's source on it
+void GLCompositor::DrawFilter2DPasses(bool hiresDisplay, bool identity, int passes, bool full) noexcept
+{
+    const GLenum attachment = GL_COLOR_ATTACHMENT0;
+    GLboolean scissor = GL_FALSE;
+    GLint box[4] {};
+    if (!full)
+    {
+        scissor = glIsEnabled(GL_SCISSOR_TEST);
+        glGetIntegerv(GL_SCISSOR_BOX, box);
+        if (!scissor)
+            glEnable(GL_SCISSOR_TEST);
+    }
+    auto draw = [&](int pass, int width)
+    {
+        if (full)
+        {
+            glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            return;
+        }
+        for (const Filter2DRowRun& run : Filter2D.Runs[pass])
+        {
+            glScissor(0, run.First, width, run.Last - run.First + 1);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+    };
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Filter2D.KeyFB);
+    glViewport(0, 0, 256, 384);
+    glUseProgram(Filter2D.KeyShader);
+    glUniform1i(Filter2D.KeyHiresCapLoc, hiresDisplay);
+    draw(0, 256);
+
+    glUseProgram(Filter2D.MmpxShader);
+    glUniform1i(Filter2D.MmpxIdentityLoc, identity);
+    glActiveTexture(GL_TEXTURE0 + Filter2DMapUnit);
+
+    glBindTexture(GL_TEXTURE_2D, Filter2D.KeyTex);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, passes == 2 ? Filter2D.Map2xFB : Filter2D.MapFB);
+    glViewport(0, 0, 512, 768);
+    glUniform1i(Filter2D.MmpxSrcWLoc, 256);
+    glUniform1i(Filter2D.MmpxScreenHLoc, 192);
+    draw(1, 512);
+
+    if (passes == 2)
+    {
+        glBindTexture(GL_TEXTURE_2D, Filter2D.Map2xTex);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Filter2D.MapFB);
+        glViewport(0, 0, 1024, 1536);
+        glUniform1i(Filter2D.MmpxSrcWLoc, 512);
+        glUniform1i(Filter2D.MmpxScreenHLoc, 384);
+        draw(2, 1024);
+    }
+
+    if (!full)
+    {
+        glScissor(box[0], box[1], box[2], box[3]);
+        if (!scissor)
+            glDisable(GL_SCISSOR_TEST);
+    }
+}
+
+// GPU::Filter2DRows 2: right after a partial redraw, reads back every target, draws them all again in
+// full, reads them back again and counts the texels that differ (the FILTER2D line's rowmismatches),
+// logging the first few. the full draw is the map as it should be, so the frame shows that one
+void GLCompositor::CheckFilter2DRows(bool hiresDisplay, bool identity, int passes) noexcept
+{
+    struct Target { GLuint FB; int W, H; };
+    std::array<Target, 3> targets {{
+        {Filter2D.KeyFB, 256, 384},
+        {passes == 2 ? Filter2D.Map2xFB : Filter2D.MapFB, 512, 768},
+        {Filter2D.MapFB, 1024, 1536},
+    }};
+    auto read = [&](std::array<std::vector<u32>, 3>& out)
+    {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        for (int pass = 0; pass < (passes == 2 ? 3 : 2); pass++)
+        {
+            const Target& t = targets[pass];
+            out[pass].resize((size_t)t.W * t.H * 4);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, t.FB);
+            glReadPixels(0, 0, t.W, t.H, GL_RGBA_INTEGER, GL_UNSIGNED_INT, out[pass].data());
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    };
+
+    std::array<std::vector<u32>, 3> partial, full;
+    read(partial);
+    DrawFilter2DPasses(hiresDisplay, identity, passes, true);
+    read(full);
+
+    u32 mismatches = 0, logged = 0;
+    for (int pass = 0; pass < (passes == 2 ? 3 : 2); pass++)
+    {
+        const Target& t = targets[pass];
+        for (int y = 0; y < t.H; y++)
+        {
+            for (int x = 0; x < t.W; x++)
+            {
+                size_t i = ((size_t)y * t.W + x) * 4;
+                if (partial[pass][i] == full[pass][i] && partial[pass][i + 1] == full[pass][i + 1])
+                    continue;
+                mismatches++;
+                if (logged < 8 && Filter2D.LogRowMismatches + mismatches <= 64)
+                {
+                    logged++;
+                    Log(LogLevel::Info, "FILTER2D rowcheck mismatch pass=%d x=%d y=%d partial=%08X,%08X full=%08X,%08X\n",
+                        pass, x, y, partial[pass][i], partial[pass][i + 1], full[pass][i], full[pass][i + 1]);
+                }
+            }
+        }
+    }
+    Filter2D.LogRowChecks++;
+    Filter2D.LogRowMismatches += mismatches;
 }
 
 void GLCompositor::FreeFilter2DTextures() noexcept
@@ -1444,7 +1647,11 @@ void GLCompositor::FreeFilter2D() noexcept
 
 // debug only (GPU::Filter2DLogging): the mode, the scale and how many passes frames run, once a second.
 // of the frames, ran made the map and skipped reused it. changedlines is how many lines' keys changed
-// and checkus how long UpdateFilter2DKeys took, on average over those two, and checkmaxus its longest
+// and checkus how long UpdateFilter2DKeys took, on average over those two, and checkmaxus its longest.
+// rows is GPU::Filter2DRows, partial how many of the frames that ran redrew only some rows, passrows
+// the rows each pass drew (key, first MMPX pass, second; of 384, 768 and 1536) on average over the
+// frames that ran, and rowchecks and rowmismatches the Filter2DRows 2 checks and the texels they found
+// differ
 void GLCompositor::LogFilter2D(const GPU& gpu, int passes) noexcept
 {
     s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1457,16 +1664,23 @@ void GLCompositor::LogFilter2D(const GPU& gpu, int passes) noexcept
 
     u32 checked = Filter2D.LogRan + Filter2D.LogSkipped;
     double perChecked = checked ? 1.0 / checked : 0.0;
+    double perRan = Filter2D.LogRan ? 1.0 / Filter2D.LogRan : 0.0;
     Log(LogLevel::Info, "FILTER2D mode=%d scale=%d passes=%d mapscale=%d frames=%u ran=%u skipped=%u "
-        "changedlines=%.1f checkus=%.1f checkmaxus=%.1f failed=%d\n",
+        "changedlines=%.1f checkus=%.1f checkmaxus=%.1f failed=%d rows=%d partial=%u passrows=%.1f/%.1f/%.1f "
+        "rowchecks=%u rowmismatches=%u\n",
         gpu.Filter2D, Scale, passes, Filter2D.MapScale, Filter2D.LogFrames, Filter2D.LogRan, Filter2D.LogSkipped,
         Filter2D.LogChangedLines * perChecked, Filter2D.LogCheckNs * perChecked / 1000.0,
-        Filter2D.LogCheckMaxNs / 1000.0, Filter2D.Failed ? 1 : 0);
+        Filter2D.LogCheckMaxNs / 1000.0, Filter2D.Failed ? 1 : 0, gpu.Filter2DRows, Filter2D.LogPartial,
+        Filter2D.LogRows[0] * perRan, Filter2D.LogRows[1] * perRan, Filter2D.LogRows[2] * perRan,
+        Filter2D.LogRowChecks, Filter2D.LogRowMismatches);
 
     Filter2D.LogStartNs = now;
     Filter2D.LogFrames = 0;
     Filter2D.LogRan = Filter2D.LogSkipped = Filter2D.LogChangedLines = 0;
     Filter2D.LogCheckNs = Filter2D.LogCheckMaxNs = 0;
+    Filter2D.LogPartial = 0;
+    Filter2D.LogRows = {};
+    Filter2D.LogRowChecks = Filter2D.LogRowMismatches = 0;
 }
 
 // hi-res display capture: decides which VRAM display lines show a hi-res bank copy. the 2D
