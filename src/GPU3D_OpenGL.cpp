@@ -2362,13 +2362,16 @@ void GLRenderer::SetupAccelFrame()
     glBindTexture(GL_TEXTURE_2D, KeptColorTex ? KeptColorTex : ColorBufferTex);
 }
 
-// debug only (GPU::GLTimers): the compositor's draw (ComputePass::Comp) and everything else it runs
-// (ComputePass::CompExtra), in the Blit's set
+// debug only (GPU::GLTimers): the compositor's parts (ComputePass::Comp and the ones after it), in
+// the Blit's set
 void GLRenderer::BeginGPUTimer(int pass)
 {
 #ifdef MELONADE_DEBUG_TOOLS
+    static_assert(GLPass::Count - GLPass::Comp == ComputePass::Count - ComputePass::FirstBlit,
+                  "GLPass has ComputePass's compositor parts, in the same order");
     if (Timers)
-        Timers->Begin(pass == ComputePass::Comp ? GLPass::Comp : GLPass::CompExtra);
+        Timers->Begin(pass >= ComputePass::FirstBlit && pass < ComputePass::Count
+                      ? GLPass::Comp + (pass - ComputePass::FirstBlit) : GLPass::CompExtra);
 #endif
 }
 

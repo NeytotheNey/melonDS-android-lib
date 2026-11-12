@@ -622,6 +622,12 @@ void GLCompositor::CopyHeldWings(int backbuf) noexcept
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
 }
 
+void GLCompositor::BeginGPUTimer(int pass) noexcept
+{
+    if (GPUTimers)
+        GPUTimers->BeginGPUTimer(pass);
+}
+
 void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 {
     int backbuf = gpu.FrontBuffer ^ 1;
@@ -658,11 +664,11 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     // the GPU 2D shadow renderer: which lines it draws, what they read and the OBJ pass, before the
     // output is bound too (it has targets of its own). its composite pass comes after the draw below.
-    // debug only: with the compute or OpenGL renderer's timers on, everything from here on but the
-    // compositor's own draw is timed as one pass
+    // debug only: with the compute or OpenGL renderer's timers on, everything from here on is timed,
+    // each part as its own pass (ComputePass, from Comp on) and the rest as CompExtra
     const bool timers = gpu.ComputeTimers || gpu.ComputeSync || gpu.GLTimers;
-    if (timers)
-        renderer.BeginGPUTimer(ComputePass::CompExtra);
+    GPUTimers = timers ? &renderer : nullptr;
+    BeginGPUTimer(ComputePass::CompExtra);
     int shadowLines = PrepareShadow2D(gpu, backbuf, hasFramebuffers, hiresDisplay, ctrlCopied);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -703,6 +709,10 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
         glUniform1i(CompWideHiresCapLoc, hiresDisplay);
     }
+
+    // the frame's wing planes, screen planes and control words
+    if (hasFramebuffers)
+        BeginGPUTimer(ComputePass::CompUpload);
 
     if (ViewWidth != 256)
     {
@@ -761,24 +771,27 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
     glBindVertexArray(CompVertexArrayID);
-    if (timers)
-        renderer.BeginGPUTimer(ComputePass::Comp);
+    // the draw that reads hi-res copies apart, as K1 (docs/plan-gpu-discovery.md) looks at that one
+    BeginGPUTimer(hiresDisplay ? ComputePass::CompHires : ComputePass::Comp);
     glDrawArrays(GL_TRIANGLES, 0, 4*3);
-    if (timers)
-        renderer.BeginGPUTimer(ComputePass::CompExtra);
+    BeginGPUTimer(ComputePass::CompExtra);
 
     // over the draw, before the held wings are copied, so they hold the shadow's 2D too
     if (shadowLines > 0)
         RunShadow2D(backbuf);
 
     if (wingHold && (WingCopy[0] || WingCopy[1]))
+    {
+        BeginGPUTimer(ComputePass::CompWings);
         CopyHeldWings(backbuf);
+    }
 
     // after the draw, which shows the copies as they were before this frame's capture
     if (gpu.HiresCapture)
         RunHiresCapture(gpu, backbuf);
     if (timers)
         renderer.EndGPUTimer();
+    GPUTimers = nullptr;
     if (gpu.HiresCaptureDebug)
         LogHiresCapture();
     if (gpu.Filter2DLogging)
@@ -1024,6 +1037,7 @@ void GLCompositor::RunFilter2D(const GPU& gpu, int backbuf, bool hiresDisplay, b
         return;
     }
 
+    BeginGPUTimer(ComputePass::CompFilter);
     const GLenum attachment = GL_COLOR_ATTACHMENT0;
 
     // kHiresCaptureVS needs no attributes, but the VAO may be the 3D renderer's
@@ -1382,6 +1396,7 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
         return;
     }
 
+    BeginGPUTimer(ComputePass::CompHiCap);
     if (!HiresCap.PlanesTex)
         HiresCap.PlanesTex = MakeHiresTexture(GL_RGBA8UI, 256*3 + 2, 192);
     if (!HiresCap.SrcBTex)
@@ -1663,6 +1678,7 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
         return 0;
     }
 
+    BeginGPUTimer(ComputePass::CompShadowObj);
     UploadShadow2D(gpu, *rec);
     RunShadow2DObj(*rec);
     Shadow.DrawnLines = drawn;
@@ -1941,6 +1957,7 @@ void GLCompositor::RunShadow2D(int backbuf) noexcept
     if (Shadow.Quads.empty())
         return;
 
+    BeginGPUTimer(ComputePass::CompShadow);
     glUseProgram(comp.Program);
     glUniform1ui(comp.ScaleLoc, Scale);
     glUniform1i(comp.WideOffsetLoc, (ViewWidth - 256) / 2);

@@ -22,11 +22,18 @@
 namespace melonDS::ComputePass
 {
 // what the compute renderer's GPU timers tell apart (GPU::ComputeTimers): the passes of
-// ComputeRenderer::RenderFrame, then the GL compositor's draw and everything else it runs
+// ComputeRenderer::RenderFrame, then the GL compositor's parts (GLCompositor::RenderFrame), which
+// the OpenGL renderer's GLTIME splits the same way (GLPass in GPU3D_GLStats.h). Comp is its draw
+// and CompHires the same draw on a frame that shows hi-res captures (the hi-res display); CompExtra
+// is the state setup and CPU work between the parts that follow it: the GPU 2D shadow's uploads and
+// OBJ pass, the screen texture uploads, filtered 2D's map passes, the shadow's composite, the held
+// wings' copy and the hi-res capture pass. the logs print comp as Comp + CompHires and compx as
+// everything from CompExtra on, as they were before the split
 enum
 {
     Clear, Interp, Bin, Offs, Sort, Rast, Depth, Final,
     Comp, CompExtra,
+    CompHires, CompShadowObj, CompUpload, CompFilter, CompShadow, CompWings, CompHiCap,
     Count,
     FirstBlit = Comp,
 };
@@ -71,6 +78,11 @@ namespace melonDS
 //                   GPU 2D shadow's OBJ pass on (uploads, filtered 2D, the shadow's composite, the
 //                   held wings, hi-res capture)
 //   total           the sum of those
+//   comp_hd cx_misc cx_sobj cx_up cx_filter cx_shadow cx_wings cx_hicap
+//                   the compositor's parts, at the end of the line, as GLTIME has them (see there):
+//                   ms per timed Blit, 0 for a Blit a part didn't run in, so comp_hd is part of comp
+//                   and the cx_ ones add up to compx. each but cx_misc has an _n, the timed Blits it
+//                   ran in, so ms per run is the value x blits / _n
 //   polys variants  per rendered frame
 //   timed blits     the render and Blit sets read this second, which the averages are over
 //   untimed         sets left out because the ring was full
@@ -101,7 +113,9 @@ namespace melonDS
 struct ComputeStats
 {
     static constexpr int SetCount = 16;
-    static constexpr int SetQueries = 8;
+    // a render uses 8 (Clear..Final), a Blit up to 9 (CompExtra twice and each other part once)
+    static constexpr int SetQueries = 12;
+    static_assert(ComputePass::Count <= 32, "the passes a set ran are a u32 mask");
 
     struct QuerySet
     {
@@ -119,6 +133,8 @@ struct ComputeStats
         u64 Polys = 0, Variants = 0, RastDispatches = 0;
         u32 TimedRenders = 0, TimedBlits = 0, Untimed = 0, Disjoint = 0;
         u64 PassNs[ComputePass::Count] {};
+        // the timed sets each pass ran in
+        u32 PassSets[ComputePass::Count] {};
 
         u32 PeakWanted = 0, PeakBound = 0, PeakXSpans = 0, PeakYSpans = 0, PeakVariants = 0, PeakPolys = 0;
         u32 Overflowed = 0, Cut = 0, PastRoom = 0, PastBound = 0;
@@ -209,6 +225,7 @@ struct ComputeStats
             SyncOpen = true;
             SyncBlit = blit;
             SyncPass = -1;
+            SyncSeen = 0;
             return;
         }
         if (!Timers)
@@ -301,6 +318,8 @@ private:
     bool SyncOpen = false, SyncBlit = false;
     int SyncPass = -1;
     s64 SyncStartNs = 0;
+    // the passes the open set has run, for Counters::PassSets
+    u32 SyncSeen = 0;
 
     // waits for the GPU to finish everything so far, which ends the pass before and starts this
     // one (-1 for none). the first of a set has no pass before it, so older work isn't charged
@@ -314,6 +333,11 @@ private:
             std::chrono::steady_clock::now().time_since_epoch()).count();
         if (SyncPass >= 0)
             Sec.PassNs[SyncPass] += (u64)(now - SyncStartNs);
+        if (pass >= 0 && !(SyncSeen & (1u << pass)))
+        {
+            SyncSeen |= 1u << pass;
+            Sec.PassSets[pass]++;
+        }
         SyncPass = pass;
         SyncStartNs = now;
     }
@@ -390,12 +414,16 @@ private:
                 }
             }
 
+            u32 seen = 0;
             for (int i = 0; i < set.Count; i++)
             {
                 GLuint64 ns = 0;
                 GetQueryObjectui64v(set.Query[i], GL_QUERY_RESULT_EXT, &ns);
                 Sec.PassNs[set.Pass[i]] += ns;
+                seen |= 1u << set.Pass[i];
             }
+            for (int pass = 0; pass < ComputePass::Count; pass++)
+                Sec.PassSets[pass] += (seen >> pass) & 1;
             if (set.Blit)
                 Sec.TimedBlits++;
             else
@@ -427,12 +455,22 @@ private:
                 Sec.Untimed, Sec.Disjoint);
 
         using namespace ComputePass;
+        // comp and compx as they were before the compositor's parts were split out
+        double comp = ms[Comp] + ms[CompHires];
+        double compx = 0.0;
+        for (int i = CompExtra; i < Count; i++)
+            compx += i == CompHires ? 0.0 : ms[i];
+        const u32* n = Sec.PassSets;
         Platform::Log(Platform::LogLevel::Info, "%s frames=%u skipped=%u clear=%.3f interp=%.3f bin=%.3f offs=%.3f "
             "sort=%.3f rast=%.3f depth=%.3f final=%.3f comp=%.3f compx=%.3f total=%.3f polys=%.0f variants=%.1f "
-            "scale=%d tile=%d %s\n",
+            "scale=%d tile=%d %s comp_hd=%.3f comp_hd_n=%u cx_misc=%.3f cx_sobj=%.3f cx_sobj_n=%u cx_up=%.3f cx_up_n=%u "
+            "cx_filter=%.3f cx_filter_n=%u cx_shadow=%.3f cx_shadow_n=%u cx_wings=%.3f cx_wings_n=%u cx_hicap=%.3f "
+            "cx_hicap_n=%u\n",
             Sync ? "COMPSYNC" : "COMPTIME", Sec.Frames, Sec.Skipped, ms[Clear], ms[Interp], ms[Bin], ms[Offs], ms[Sort],
-            ms[Rast], ms[Depth], ms[Final], ms[Comp], ms[CompExtra], total, Sec.Polys * perFrame, Sec.Variants * perFrame,
-            scale, tileSize, tail);
+            ms[Rast], ms[Depth], ms[Final], comp, compx, total, Sec.Polys * perFrame, Sec.Variants * perFrame,
+            scale, tileSize, tail, ms[CompHires], n[CompHires], ms[CompExtra], ms[CompShadowObj], n[CompShadowObj],
+            ms[CompUpload], n[CompUpload], ms[CompFilter], n[CompFilter], ms[CompShadow], n[CompShadow], ms[CompWings],
+            n[CompWings], ms[CompHiCap], n[CompHiCap]);
     }
 };
 

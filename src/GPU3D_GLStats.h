@@ -43,8 +43,8 @@ static inline s64 GLStatsNowNs()
 }
 
 // what the OpenGL renderer's GPU timers tell apart (GPU::GLTimers): GLRenderer::RenderFrame's passes,
-// the capture readback, then the compositor's draw and everything else it runs (as ComputePass::Comp
-// and CompExtra, which GPU_OpenGL.cpp passes to BeginGPUTimer)
+// the capture readback, then the compositor's parts, from Comp on in the order of ComputePass's
+// (GPU3D_ComputeStats.h), which GPU_OpenGL.cpp passes to BeginGPUTimer
 namespace GLPass
 {
 enum
@@ -52,6 +52,7 @@ enum
     Upload, Clear, Opaque, Clear0, Trans, Edge, Fog,
     Capture,
     Comp, CompExtra,
+    CompHires, CompShadowObj, CompUpload, CompFilter, CompShadow, CompWings, CompHiCap,
     Count,
 };
 }
@@ -82,13 +83,29 @@ enum
 //                  shadow, filtered 2D, held wings, hi-res capture)
 //   total          upload..fog + capture + comp + compx
 //   untimed        sets left out because the ring was full, disjoint the disjoint operations seen
+//   comp_hd .. cx_hicap
+//                  the compositor's parts (GLCompositor::RenderFrame), µs per timed Blit like comp
+//                  and compx, a Blit a part didn't run in counting 0. comp_hd is the part of comp
+//                  from Blits that showed hi-res captures (the draw reads the copies then), and the
+//                  cx_ ones add up to compx: cx_misc the state setup and CPU work between the parts
+//                  (and before the first one), cx_sobj the GPU 2D shadow's uploads and OBJ pass,
+//                  cx_up the screen texture uploads (planes, control words, wing planes), cx_filter
+//                  filtered 2D's key and MMPX passes (not on a frame that reuses the map), cx_shadow
+//                  the shadow's composite, cx_wings the held wings' copy, cx_hicap the hi-res
+//                  capture pass with its uploads. each but cx_misc has an _n, the timed Blits it ran
+//                  in, so µs per run is the value x blits (timed's third) / _n. a part's pass runs up
+//                  to the next one, so on a tiled GPU a draw's resolve can land in the part after it.
+//                  with glfinish, the CPU time between two parts goes to the first
 //   share          glfinish only: each pass's part of total, in %
 struct GLTimerStats
 {
     enum SetKind { Set_Render, Set_Capture, Set_Blit, Set_Kinds };
 
     static constexpr int SetCount = 24;
+    // a render uses up to 7, a capture readback 1, a Blit up to 9 (CompExtra twice and each other
+    // compositor part once)
     static constexpr int SetQueries = 12;
+    static_assert(GLPass::Count <= 32, "the passes a set ran are a u32 mask");
 
     struct QuerySet
     {
@@ -106,6 +123,8 @@ struct GLTimerStats
         u32 Timed[Set_Kinds] {};
         u32 Untimed = 0, Disjoint = 0;
         u64 PassNs[GLPass::Count] {};
+        // the timed sets each pass ran in
+        u32 PassSets[GLPass::Count] {};
     };
 
     // the switch as it was when this was made: 1 queries, 2 glFinish
@@ -162,6 +181,7 @@ struct GLTimerStats
             SyncOpen = true;
             SyncKind = kind;
             SyncPass = -1;
+            SyncSeen = 0;
             return;
         }
         if (!Timers)
@@ -255,6 +275,8 @@ private:
     int SyncKind = Set_Render;
     int SyncPass = -1;
     s64 SyncStartNs = 0;
+    // the passes the open set has run, for Counters::PassSets
+    u32 SyncSeen = 0;
 
     // waits for the GPU to finish everything so far, which ends the pass before and starts this
     // one (-1 for none). the first of a set has no pass before it, so older work isn't charged
@@ -267,6 +289,11 @@ private:
         s64 now = GLStatsNowNs();
         if (SyncPass >= 0)
             Sec.PassNs[SyncPass] += (u64)(now - SyncStartNs);
+        if (pass >= 0 && !(SyncSeen & (1u << pass)))
+        {
+            SyncSeen |= 1u << pass;
+            Sec.PassSets[pass]++;
+        }
         SyncPass = pass;
         SyncStartNs = now;
     }
@@ -345,13 +372,17 @@ private:
             }
 
             u64 setNs = 0;
+            u32 seen = 0;
             for (int i = 0; i < set.Count; i++)
             {
                 GLuint64 ns = 0;
                 GetQueryObjectui64v(set.Query[i], GL_QUERY_RESULT_EXT, &ns);
                 Sec.PassNs[set.Pass[i]] += ns;
                 setNs += ns;
+                seen |= 1u << set.Pass[i];
             }
+            for (int pass = 0; pass < GLPass::Count; pass++)
+                Sec.PassSets[pass] += (seen >> pass) & 1;
             Sec.Timed[set.Kind]++;
             TimedSetsRead++;
             ZeroSetsRead += setNs == 0;
@@ -381,19 +412,33 @@ private:
             total += us[i];
         }
 
+        // comp and compx as they were before the compositor's parts were split out. every pass is
+        // timed apart from the others, so total is still the sum of them all
+        double comp = us[Comp] + us[CompHires];
+        double compx = 0.0;
+        for (int i = CompExtra; i < Count; i++)
+            compx += i == CompHires ? 0.0 : us[i];
+
         char share[160] = "";
         if (Mode == 2)
         {
-            auto pct = [&](int pass) { return total > 0.0 ? (int)(us[pass] * 100.0 / total + 0.5) : 0; };
+            auto pct = [&](double value) { return total > 0.0 ? (int)(value * 100.0 / total + 0.5) : 0; };
             snprintf(share, sizeof(share), " share=upload:%d,clear:%d,opaque:%d,clear0:%d,trans:%d,edge:%d,fog:%d,capture:%d,comp:%d,compx:%d",
-                pct(Upload), pct(Clear), pct(Opaque), pct(Clear0), pct(Trans), pct(Edge), pct(Fog), pct(Capture), pct(Comp), pct(CompExtra));
+                pct(us[Upload]), pct(us[Clear]), pct(us[Opaque]), pct(us[Clear0]), pct(us[Trans]), pct(us[Edge]), pct(us[Fog]),
+                pct(us[Capture]), pct(comp), pct(compx));
         }
 
+        const u32* n = Sec.PassSets;
         Platform::Log(Platform::LogLevel::Info, "GLTIME mode=%s frames=%u skipped=%u timed=%u/%u/%u upload=%.0f clear=%.0f opaque=%.0f "
-            "clear0=%.0f trans=%.0f edge=%.0f fog=%.0f capture=%.0f comp=%.0f compx=%.0f total=%.0f untimed=%u disjoint=%u scale=%d%s\n",
+            "clear0=%.0f trans=%.0f edge=%.0f fog=%.0f capture=%.0f comp=%.0f compx=%.0f total=%.0f untimed=%u disjoint=%u scale=%d "
+            "comp_hd=%.0f comp_hd_n=%u cx_misc=%.0f cx_sobj=%.0f cx_sobj_n=%u cx_up=%.0f cx_up_n=%u cx_filter=%.0f cx_filter_n=%u "
+            "cx_shadow=%.0f cx_shadow_n=%u cx_wings=%.0f cx_wings_n=%u cx_hicap=%.0f cx_hicap_n=%u%s\n",
             Mode == 2 ? "glfinish(inflated,read_shares)" : "queries", Sec.Frames, Sec.Skipped, Sec.Timed[Set_Render],
             Sec.Timed[Set_Capture], Sec.Timed[Set_Blit], us[Upload], us[Clear], us[Opaque], us[Clear0], us[Trans], us[Edge],
-            us[Fog], us[Capture], us[Comp], us[CompExtra], total, Sec.Untimed, Sec.Disjoint, scale, share);
+            us[Fog], us[Capture], comp, compx, total, Sec.Untimed, Sec.Disjoint, scale,
+            us[CompHires], n[CompHires], us[CompExtra], us[CompShadowObj], n[CompShadowObj], us[CompUpload], n[CompUpload],
+            us[CompFilter], n[CompFilter], us[CompShadow], n[CompShadow], us[CompWings], n[CompWings], us[CompHiCap],
+            n[CompHiCap], share);
     }
 };
 

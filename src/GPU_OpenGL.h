@@ -84,6 +84,13 @@ public:
     static std::string Shadow2DObjFS();
 private:
     GLCompositor(GLuint CompShader) noexcept;
+
+    // debug only: the renderer whose GPU timers time the compositor's parts (ComputePass, from
+    // Comp on), only during a RenderFrame with them on, null otherwise. a part starts its pass right
+    // before its GL work, once it knows it runs, so a part that's left out has no query
+    Renderer3D* GPUTimers = nullptr;
+    void BeginGPUTimer(int pass) noexcept;
+
     int Scale = 0;
     int ViewWidth = 256;
     int ScreenH = 0, ScreenW = 0;
