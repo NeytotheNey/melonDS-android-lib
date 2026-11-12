@@ -91,6 +91,9 @@ private:
     Renderer3D* GPUTimers = nullptr;
     void BeginGPUTimer(int pass) noexcept;
 
+    // GPU::CompClear: right before the main draw, drops the output's old contents (see RenderFrame)
+    void ClearOutput(int mode) noexcept;
+
     int Scale = 0;
     int ViewWidth = 256;
     int ScreenH = 0, ScreenW = 0;

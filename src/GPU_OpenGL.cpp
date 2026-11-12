@@ -628,6 +628,48 @@ void GLCompositor::BeginGPUTimer(int pass) noexcept
         GPUTimers->BeginGPUTimer(pass);
 }
 
+// GPU::CompClear (experiment K2a, docs/plan-gpu-discovery.md): starts the output's render pass
+// without its old contents, so a tiled GPU needn't load every tile from memory first. called
+// with the output bound, right before RenderFrame's main draw: everything that draws elsewhere
+// (the filter's pre-passes, the shadow's OBJ pass) is done by then, and nothing has drawn into the
+// output yet. nothing reads the old contents either: that draw covers every pixel of both
+// screens (CompVertices, full width, and no compositor program discards), in every frame,
+// including those without the frame's lines; the shadow pass, the held wings' copy and the
+// hi-res capture come after it and only see this frame's draw. the padding rows are the only
+// pixels it leaves, and they're 0 in both kinds of output (PrepareOutput, and the frontend's
+// textures start cleared), which both modes keep. 1 clears the whole target to 0, with the
+// scissor test off (it already is here) and the color mask on (RenderFrame set it); 2 invalidates
+// it and clears only the padding rows to 0
+void GLCompositor::ClearOutput(int mode) noexcept
+{
+    // glClearBuffer instead of glClear, so the clear color stays what others set (the desktop
+    // presenter's is opaque black, which Stop's glClear then uses)
+    const GLfloat zero[4] = {0.f, 0.f, 0.f, 0.f};
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (mode == 2)
+    {
+        GLenum attachment = GL_COLOR_ATTACHMENT0;
+        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
+
+        GLint box[4];
+        glGetIntegerv(GL_SCISSOR_BOX, box);
+        if (!scissor)
+            glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 192 * Scale, ScreenW, 2 * Scale);
+        glClearBufferfv(GL_COLOR, 0, zero);
+        glScissor(box[0], box[1], box[2], box[3]);
+        if (!scissor)
+            glDisable(GL_SCISSOR_TEST);
+        return;
+    }
+
+    if (scissor)
+        glDisable(GL_SCISSOR_TEST);
+    glClearBufferfv(GL_COLOR, 0, zero);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+}
+
 void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 {
     int backbuf = gpu.FrontBuffer ^ 1;
@@ -773,6 +815,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     glBindVertexArray(CompVertexArrayID);
     // the draw that reads hi-res copies apart, as K1 (docs/plan-gpu-discovery.md) looks at that one
     BeginGPUTimer(hiresDisplay ? ComputePass::CompHires : ComputePass::Comp);
+    // in the draw's timer, so an A/B of Comp includes what the clear costs
+    if (gpu.CompClear != 0)
+        ClearOutput(gpu.CompClear);
     glDrawArrays(GL_TRIANGLES, 0, 4*3);
     BeginGPUTimer(ComputePass::CompExtra);
 

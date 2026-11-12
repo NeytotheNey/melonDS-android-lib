@@ -834,6 +834,13 @@ public:
     // destination alpha is 0 (GLRenderer::FetchClear0); off by default, it didn't pay off reliably.
     // only changed by a debug switch, set before the game runs
     int GLTransSkip = 3;
+    // OpenGL and compute renderers, experiment K2a (docs/plan-gpu-discovery.md): the compositor's
+    // main draw starts without the output's old contents, so a tiled GPU needn't load them. 1
+    // clears the whole output to 0 first, 2 invalidates it and clears only the padding rows
+    // between the screens. both keep the output the same, as that draw covers every other pixel
+    // (GLCompositor::ClearOutput). 0, the default, draws as before. only changed by a debug
+    // switch, set before the game runs
+    int CompClear = 0;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;
     // compute renderer: size the SortWork and Rasterise dispatches on the CPU instead of having the
