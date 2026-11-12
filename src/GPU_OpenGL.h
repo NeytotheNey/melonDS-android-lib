@@ -28,6 +28,7 @@
 namespace melonDS
 {
 class GPU;
+struct OutputLayout;
 struct Shadow2DRecorder;
 struct RenderSettings;
 class GLRenderer;
@@ -55,6 +56,8 @@ public:
     void RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept;
     void SetOutputTexture(int buf, GLuint texture);
     void BindOutputTexture(int buf);
+    // GPU::Comp1x: see Renderer3D::TakeOutputLayout
+    bool TakeOutputLayout(int buf, OutputLayout& layout) noexcept;
     // drops the held WideMelon wings (see WingHold), for a reset or a savestate load.
     // CPU state only, so it needs no GL context
     void ResetWingHold() noexcept;
@@ -93,6 +96,47 @@ private:
 
     // GPU::CompClear: right before the main draw, drops the output's old contents (see RenderFrame)
     void ClearOutput(int mode) noexcept;
+
+    // GPU::Comp1x (experiment K2c, see RenderFrame). why a frame has no half at 1x, for the COMP1X log
+    enum Comp1xOff
+    {
+        Comp1xOn,           // it could have: the halves that were plain are
+        Comp1xOffFront,     // the frontend can't show a half at 1x (GPU::Comp1xFrontend)
+        Comp1xOffScale,     // the output is at 1x anyway
+        Comp1xOffView,      // a 256 view in mode 1
+        Comp1xOffLines,     // the frame has no lines, so the screen texture is an older frame's
+        Comp1xOffFilter,    // filtered 2D
+        Comp1xOffShadow,    // the GPU 2D shadow draws over the output
+        Comp1xOff_Count
+    };
+    struct Comp1xState
+    {
+        // what the last draw into each buffer left, and whether TakeOutputLayout has had it yet
+        std::array<int, 2> Halves {};
+        std::array<int, 2> Scale {};
+        std::array<bool, 2> Drawn {};
+
+        // the check mode's target, made the first time a check runs and freed with the switch off:
+        // GL_RGBA8 CheckW x 384, half h at 1x from row h * 192
+        GLuint CheckTex = 0, CheckFB = 0;
+        int CheckW = 0;
+        u32 CheckFrames = 0;
+        bool CheckFailed = false;
+
+        // the COMP1X log, with GPU::SceneStats, GPU::GLTimers or in the check mode
+        s64 LogStartNs = 0;
+        u32 LogFrames = 0;
+        std::array<u32, 3> LogHalves {};    // frames with only the top half at 1x, only the bottom one, both
+        std::array<u32, Comp1xOff_Count> LogOff {};
+        u32 Checks = 0, CheckPixels = 0, Mismatches = 0, MismatchNative = 0;
+    };
+    Comp1xState OneX {};
+
+    int PlainHalves(const GPU& gpu, int backbuf, bool wingHold, bool hiresDisplay, bool ctrlCopied) const noexcept;
+    void DrawHalfAt1x(int half, int y, GLuint scaleLoc) noexcept;
+    void CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcept;
+    void LogComp1x(const GPU& gpu) noexcept;
+    void FreeComp1xCheck() noexcept;
 
     int Scale = 0;
     int ViewWidth = 256;
@@ -342,7 +386,10 @@ private:
         std::array<float, 2> Position {};
         std::array<float, 2> Texcoord {};
     };
-    std::array<CompVertex, 2*3*2> CompVertices {};
+    // 0-5 half 1's quad (output rows from 194 * Scale, the bottom screen: the top of clip space, as
+    // the frontend reads the output upside down) and 6-11 half 0's. GPU::Comp1x: 12-17 half 0 over a
+    // whole viewport, 18-23 half 1 (see DrawHalfAt1x)
+    std::array<CompVertex, 2*3*2*2> CompVertices {};
 
     GLuint CompScreenInputTex = 0;
     // the compositor's own output textures only exist while a buffer is drawn into without a

@@ -841,6 +841,21 @@ public:
     // (GLCompositor::ClearOutput). 0, the default, draws as before. only changed by a debug
     // switch, set before the game runs
     int CompClear = 0;
+    // OpenGL and compute renderers, experiment K2c (docs/plan-gpu-discovery.md): a screen the scale
+    // adds nothing to (no 3D, no wings that aren't plain, no held wings, no hi-res capture lines) is
+    // drawn at 1x into the first ViewWidth x 192 texels of its own half of the output, and the frame's
+    // OutputLayout (GPU3D.h) tells the frontend to show it nearest-upscaled from there (see
+    // GLCompositor::RenderFrame). 1 only in a wide view, whose program is highp, so the frontend shows
+    // exactly what the full draw would; 2 in the 256 view too, whose mediump program can round the full
+    // draw differently on an fp16 GPU. 3 is a check: the full draw as usual, and every 30 frames the 1x
+    // one into a target of its own, read back and compared with it (the COMP1X line); the frontend
+    // never sees it. 0 draws as before. 1, the default in every build since 11-11 (exact on the Fold, -6 to
+    // -8% GPU cycles at the White 2 title and overworld); a debug switch changes it, set before the
+    // game runs
+    int Comp1x = 1;
+    // set by the frontend before each frame, for Comp1x 1 and 2: whether everything that shows the
+    // output can show a half drawn at 1x. off, every half is drawn in full
+    bool Comp1xFrontend = false;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;
     // compute renderer: size the SortWork and Rasterise dispatches on the CPU instead of having the

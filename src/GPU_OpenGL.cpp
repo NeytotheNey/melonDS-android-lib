@@ -128,6 +128,19 @@ GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
 
 #undef SETVERTEX
 
+    // GPU::Comp1x: each half over a whole viewport, in the same order (see DrawHalfAt1x)
+    for (int half = 0; half < 2; half++)
+    {
+        const float xs[6] = {-1, 1, 1, -1, -1, 1};
+        const float ys[6] = {1, -1, 1, 1, -1, -1};
+        for (int i = 0; i < 6; i++)
+        {
+            CompVertex& vertex = CompVertices[12 + half * 6 + i];
+            vertex.Position = {xs[i], ys[i]};
+            vertex.Texcoord = {(xs[i] + 1.f) * (256.f / 2.f), half * 192.f + (ys[i] + 1.f) * (192.f / 2.f)};
+        }
+    }
+
     glGenBuffers(1, &CompVertexBufferID);
     glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
     glBufferData(GL_ARRAY_BUFFER, sizeof(CompVertices), &CompVertices[0], GL_STATIC_DRAW);
@@ -168,6 +181,7 @@ GLCompositor::~GLCompositor()
     FreeHiresCapture();
     FreeFilter2D();
     FreeShadow2D();
+    FreeComp1xCheck();
 
     glDeleteVertexArrays(1, &CompVertexArrayID);
     glDeleteBuffers(1, &CompVertexBufferID);
@@ -201,6 +215,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     HiresCap(other.HiresCap),
     Filter2D(std::move(other.Filter2D)),
     Shadow(std::move(other.Shadow)),
+    OneX(other.OneX),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -218,6 +233,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     other.HiresCap = {};
     other.Filter2D = {};
     other.Shadow = {};
+    other.OneX = {};
     other.CompScreenOutputFB = {};
     other.CompScreenInputTex = {};
     other.CompScreenOutputTex = {};
@@ -292,12 +308,16 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         FreeShadow2D();
         Shadow = std::move(other.Shadow);
 
+        FreeComp1xCheck();
+        OneX = other.OneX;
+
         other.HeldWingsTex = {};
         other.HeldWingsFB = {};
         other.WingPlanesTex = {};
         other.HiresCap = {};
         other.Filter2D = {};
         other.Shadow = {};
+        other.OneX = {};
         other.CompScreenOutputFB = {};
         other.CompScreenInputTex = {};
         other.CompScreenOutputTex = {};
@@ -637,9 +657,10 @@ void GLCompositor::BeginGPUTimer(int pass) noexcept
 // including those without the frame's lines; the shadow pass, the held wings' copy and the
 // hi-res capture come after it and only see this frame's draw. the padding rows are the only
 // pixels it leaves, and they're 0 in both kinds of output (PrepareOutput, and the frontend's
-// textures start cleared), which both modes keep. 1 clears the whole target to 0, with the
-// scissor test off (it already is here) and the color mask on (RenderFrame set it); 2 invalidates
-// it and clears only the padding rows to 0
+// textures start cleared), which both modes keep. (a half GPU::Comp1x draws at 1x leaves the rest
+// of its rows, which nothing shows, so there they end up 0 or undefined.) 1 clears the whole
+// target to 0, with the scissor test off (it already is here) and the color mask on (RenderFrame
+// set it); 2 invalidates it and clears only the padding rows to 0
 void GLCompositor::ClearOutput(int mode) noexcept
 {
     // glClearBuffer instead of glClear, so the clear color stays what others set (the desktop
@@ -668,6 +689,196 @@ void GLCompositor::ClearOutput(int mode) noexcept
     glClearBufferfv(GL_COLOR, 0, zero);
     if (scissor)
         glEnable(GL_SCISSOR_TEST);
+}
+
+// GPU::Comp1x (experiment K2c): the halves (bit 0 the top one) whose full draw is a nearest upscale
+// of what the 1x draw makes, from the control words as the shader gets them (CtrlWords when
+// ctrlCopied). at 1x every pixel's texture coordinate is the center of its native pixel, and a pixel
+// that only reads its native pixel's planes and control word composites as each of its sub-pixels
+// does in the full draw. a half is plain when nothing on its lines reads finer than that:
+// - no line shows a hi-res capture image (bit 7, once PrepareHiresDisplay rewrote the words);
+// - in a wide view: no line has unit A's 3D (bit 22, set whatever the windows do with it), so no 3D
+//   pixel in the middle and no 3D wings (bit 18 only comes with it), no line takes held wings
+//   (WingHeldBit), and the half's wings aren't copied this frame (only a half with bit 22's are). the
+//   wings left are black or white, from the control word alone. (the words are CtrlWords here: the
+//   wing hold runs in every wide frame with lines, and only those get this far);
+// - in the 256 view, which has no bit 22: no pixel of a display mode 1 line composites the 3D layer
+//   (compmode 0-4 in plane 3's top byte, the shader's test).
+// a screen that's off (GPU2D::SoftRenderer::FillScreensOff) is black whatever its 3D is; the wide
+// view counts it as plain since it clears bit 22, the 256 view doesn't, which only costs the saving
+int GLCompositor::PlainHalves(const GPU& gpu, int backbuf, bool wingHold, bool hiresDisplay, bool ctrlCopied) const noexcept
+{
+    int halves = 0;
+    for (int half = 0; half < 2; half++)
+    {
+        const u32* fb = gpu.Framebuffer[backbuf][half].get();
+        bool plain = !(wingHold && WingCopy[half]);
+        for (int line = 0; plain && line < 192; line++)
+        {
+            const u32* planes = &fb[line * (256*3 + 1)];
+            u32 ctrl = ctrlCopied ? CtrlWords[half * 192 + line] : planes[256*3];
+            if (hiresDisplay && (ctrl & HiresDisplayFlag))
+                plain = false;
+            else if (ViewWidth != 256)
+                plain = !(ctrl & ((1u << 22) | (1u << 18) | WingHeldBit));
+            else if (((ctrl >> 16) & 0x3) == 1)
+            {
+                for (int x = 0; x < 256; x++)
+                {
+                    if (((planes[512 + x] >> 24) & 0xF) <= 4)
+                    {
+                        plain = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (plain)
+            halves |= 1 << half;
+    }
+    return halves;
+}
+
+// GPU::Comp1x: half [half] at 1x, ViewWidth x 192 from row y of what's bound to draw into, with the
+// main draw's program, uniforms and textures. the caller puts the scale and the viewport back
+void GLCompositor::DrawHalfAt1x(int half, int y, GLuint scaleLoc) noexcept
+{
+    glUniform1ui(scaleLoc, 1);
+    glViewport(0, y, ViewWidth, 192);
+    glDrawArrays(GL_TRIANGLES, 12 + half * 6, 6);
+}
+
+// GPU::Comp1x 3: right after the full draw, draws [halves] at 1x into the check target and reads
+// both back: every pixel of each half's full draw should equal its native pixel at 1x. counted for
+// the COMP1X line, with the first few that don't logged
+void GLCompositor::CheckComp1x(int backbuf, int halves, GLuint scaleLoc) noexcept
+{
+    if (OneX.CheckFailed)
+        return;
+    if (OneX.CheckW != ViewWidth)
+    {
+        FreeComp1xCheck();
+        OneX.CheckTex = MakeHiresTexture(GL_RGBA8, ViewWidth, 384);
+        // the draw's 3D frame is on unit 1, which was the active one
+        glActiveTexture(GL_TEXTURE1);
+        GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
+        glGenFramebuffers(1, &OneX.CheckFB);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OneX.CheckFB);
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, OneX.CheckTex, 0);
+        glDrawBuffers(1, fbassign);
+        if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        {
+            Log(LogLevel::Error, "COMP1X: the check target is incomplete\n");
+            FreeComp1xCheck();
+            OneX.CheckFailed = true;
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+            return;
+        }
+        OneX.CheckW = ViewWidth;
+    }
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OneX.CheckFB);
+    for (int half = 0; half < 2; half++)
+    {
+        if (halves & (1 << half))
+            DrawHalfAt1x(half, half * 192, scaleLoc);
+    }
+    glUniform1ui(scaleLoc, Scale);
+
+    std::vector<u32> small((size_t)ViewWidth * 192), full((size_t)ScreenW * 192 * Scale);
+    std::vector<u8> nativeBad(small.size());
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    for (int half = 0; half < 2; half++)
+    {
+        if (!(halves & (1 << half)))
+            continue;
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, OneX.CheckFB);
+        glReadPixels(0, half * 192, ViewWidth, 192, GL_RGBA, GL_UNSIGNED_BYTE, small.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+        glReadPixels(0, half * 194 * Scale, ScreenW, 192 * Scale, GL_RGBA, GL_UNSIGNED_BYTE, full.data());
+
+        std::fill(nativeBad.begin(), nativeBad.end(), 0);
+        u32 mismatches = 0, logged = 0;
+        for (int y = 0; y < 192 * Scale; y++)
+        {
+            const u32* row = &full[(size_t)y * ScreenW];
+            const u32* nativeRow = &small[(size_t)(y / Scale) * ViewWidth];
+            for (int x = 0; x < ScreenW; x++)
+            {
+                u32 expected = nativeRow[x / Scale];
+                if (row[x] == expected)
+                    continue;
+                mismatches++;
+                nativeBad[(y / Scale) * ViewWidth + x / Scale] = 1;
+                if (logged < 8 && OneX.Mismatches + mismatches <= 64)
+                {
+                    logged++;
+                    Log(LogLevel::Info, "COMP1X mismatch half=%d x=%d y=%d native=%d,%d full=%08X 1x=%08X\n",
+                        half, x, y, x / Scale, y / Scale, row[x], expected);
+                }
+            }
+        }
+        OneX.Checks++;
+        OneX.CheckPixels += (u32)full.size();
+        OneX.Mismatches += mismatches;
+        for (u8 bad : nativeBad)
+            OneX.MismatchNative += bad;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+    glViewport(0, 0, ScreenW, ScreenH);
+}
+
+// GPU::Comp1x, with GPU::SceneStats or GPU::GLTimers on, or in the check mode: once a second, the
+// frames composited, how many had only the top half at 1x, only the bottom one or both (in the check
+// mode, how many had them plain), why the others couldn't (Comp1xOff; a frame left out of both had no
+// plain half), and the check mode's checks, the pixels they compared and how many of those differed,
+// and in how many native pixels
+void GLCompositor::LogComp1x(const GPU& gpu) noexcept
+{
+    s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (OneX.LogStartNs == 0)
+        OneX.LogStartNs = now;
+    OneX.LogFrames++;
+    if (now - OneX.LogStartNs < 1000000000)
+        return;
+
+    const std::array<u32, Comp1xOff_Count>& off = OneX.LogOff;
+    Log(LogLevel::Info, "COMP1X mode=%d scale=%d width=%d frames=%u top=%u bottom=%u both=%u off front=%u scale=%u "
+        "view=%u nolines=%u filter=%u shadow=%u checks=%u checkpx=%u mismatches=%u mismatchnative=%u failed=%d\n",
+        gpu.Comp1x, Scale, ViewWidth, OneX.LogFrames, OneX.LogHalves[0], OneX.LogHalves[1], OneX.LogHalves[2],
+        off[Comp1xOffFront], off[Comp1xOffScale], off[Comp1xOffView], off[Comp1xOffLines], off[Comp1xOffFilter],
+        off[Comp1xOffShadow], OneX.Checks, OneX.CheckPixels, OneX.Mismatches, OneX.MismatchNative,
+        OneX.CheckFailed ? 1 : 0);
+
+    OneX.LogStartNs = now;
+    OneX.LogFrames = 0;
+    OneX.LogHalves = {};
+    OneX.LogOff = {};
+    OneX.Checks = OneX.CheckPixels = OneX.Mismatches = OneX.MismatchNative = 0;
+}
+
+void GLCompositor::FreeComp1xCheck() noexcept
+{
+    if (!OneX.CheckTex && !OneX.CheckFB)
+        return;
+    glDeleteFramebuffers(1, &OneX.CheckFB);
+    glDeleteTextures(1, &OneX.CheckTex);
+    OneX.CheckFB = OneX.CheckTex = 0;
+    OneX.CheckW = 0;
+}
+
+bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
+{
+    if (!OneX.Drawn[buf])
+        return false;
+    OneX.Drawn[buf] = false;
+    layout.HalvesAt1x = OneX.Halves[buf];
+    layout.Scale = OneX.Scale[buf];
+    return true;
 }
 
 void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
@@ -712,6 +923,47 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     GPUTimers = timers ? &renderer : nullptr;
     BeginGPUTimer(ComputePass::CompExtra);
     int shadowLines = PrepareShadow2D(gpu, backbuf, hasFramebuffers, hiresDisplay, ctrlCopied);
+
+    // GPU::Comp1x (experiment K2c): the plain halves (see PlainHalves) are drawn at 1x into the first
+    // ViewWidth x 192 texels of their own rows, and the frontend shows them from there (see
+    // TakeOutputLayout), so a half costs 1/Scale^2 of its full draw. only in frames that draw nothing
+    // over the output (the shadow) or with another program (the filter), with the frame's own lines,
+    // and above 1x. 1 only in a wide view: its program is highp, so the 1x pixel is exactly what each
+    // full-draw sub-pixel gets, where the 256 view's mediump coordinates can round a sub-pixel into the
+    // next native pixel on an fp16 GPU. the check mode (3) finds the plain halves the same way (both
+    // views, whatever the frontend can do), draws them in full and compares (CheckComp1x)
+    int halvesAt1x = 0, checkHalves = 0;
+    if (gpu.Comp1x != 0)
+    {
+        bool check = gpu.Comp1x == 3;
+        int off = Comp1xOn;
+        if (!check && !gpu.Comp1xFrontend)
+            off = Comp1xOffFront;
+        else if (Scale < 2)
+            off = Comp1xOffScale;
+        else if (gpu.Comp1x == 1 && ViewWidth == 256)
+            off = Comp1xOffView;
+        else if (!hasFramebuffers)
+            off = Comp1xOffLines;
+        else if (filterPasses > 0)
+            off = Comp1xOffFilter;
+        else if (shadowLines > 0)
+            off = Comp1xOffShadow;
+        OneX.LogOff[off]++;
+
+        if (off == Comp1xOn)
+        {
+            int plain = PlainHalves(gpu, backbuf, wingHold, hiresDisplay, ctrlCopied);
+            if (check)
+                checkHalves = plain;
+            else
+                halvesAt1x = plain;
+            if (plain)
+                OneX.LogHalves[plain - 1]++;
+        }
+    }
+    if (gpu.Comp1x != 3)
+        FreeComp1xCheck();
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
@@ -818,8 +1070,37 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // in the draw's timer, so an A/B of Comp includes what the clear costs
     if (gpu.CompClear != 0)
         ClearOutput(gpu.CompClear);
-    glDrawArrays(GL_TRIANGLES, 0, 4*3);
+    // the program's scale uniform, for the 1x draws, which only run without the filter's program
+    GLuint scaleLoc = ViewWidth == 256 ? CompScaleLoc : CompWideScaleLoc;
+    if (halvesAt1x == 0)
+    {
+        glDrawArrays(GL_TRIANGLES, 0, 4*3);
+    }
+    else
+    {
+        // the full halves (vertices 0-5 are half 1's), then the others at 1x
+        if (!(halvesAt1x & 2))
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        if (!(halvesAt1x & 1))
+            glDrawArrays(GL_TRIANGLES, 6, 6);
+        for (int half = 0; half < 2; half++)
+        {
+            if (halvesAt1x & (1 << half))
+                DrawHalfAt1x(half, half * 194 * Scale, scaleLoc);
+        }
+        glUniform1ui(scaleLoc, Scale);
+        glViewport(0, 0, ScreenW, ScreenH);
+    }
     BeginGPUTimer(ComputePass::CompExtra);
+
+    // what's in the output now, for the frontend (TakeOutputLayout)
+    OneX.Halves[backbuf] = halvesAt1x;
+    OneX.Scale[backbuf] = Scale;
+    OneX.Drawn[backbuf] = true;
+
+    // before anything else draws or reads, with the main draw's state still set
+    if (checkHalves != 0 && (OneX.CheckFrames++ % 30) == 0)
+        CheckComp1x(backbuf, checkHalves, scaleLoc);
 
     // over the draw, before the held wings are copied, so they hold the shadow's 2D too
     if (shadowLines > 0)
@@ -841,6 +1122,8 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         LogHiresCapture();
     if (gpu.Filter2DLogging)
         LogFilter2D(gpu, filterPasses);
+    if (gpu.Comp1x != 0 && (gpu.SceneStats || gpu.GLTimers || gpu.Comp1x == 3))
+        LogComp1x(gpu);
 
     if (const Shadow2DRecorder* rec = gpu.Shadow2D.get())
     {
@@ -2208,6 +2491,8 @@ void GLCompositor::SetOutputTexture(int buf, GLuint texture)
 {
     // without a texture the buffer goes back to the compositor's own (see PrepareOutput)
     OutputExternal[buf] = texture != 0;
+    // GPU::Comp1x: a layout is only told for a draw into this texture
+    OneX.Drawn[buf] = false;
 
     GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
     glBindFramebuffer(GL_FRAMEBUFFER, CompScreenOutputFB[buf]);

@@ -73,6 +73,7 @@ public:
 
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
+    bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
     void SavestateLoaded() override;
 
     // debug only: the compositor's passes for GPU::GLTimers, and GPU::Hash3DLogging (no-ops in

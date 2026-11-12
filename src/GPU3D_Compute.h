@@ -84,6 +84,7 @@ public:
 
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
+    bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
 
     void Blit(const GPU& gpu) override;
     void Stop(const GPU& gpu) override;

@@ -499,6 +499,16 @@ public:
     u32 ScrolledLine[256]; // not part of the hardware state, don't serialize
 };
 
+// GPU::Comp1x (experiment K2c): what the compositor drew into an output texture. HalvesAt1x bit h
+// (0 the top screen, 1 the bottom one) is a half drawn at 1x: its image is the first ViewWidth x 192
+// texels from the half's first row (h * 194 * Scale, the rows the full draw starts it at), and the
+// rest of the half's rows hold whatever they held before. Scale is the output's
+struct OutputLayout
+{
+    int HalvesAt1x = 0;
+    int Scale = 1;
+};
+
 class Renderer3D
 {
 public:
@@ -546,6 +556,11 @@ public:
     virtual bool TakeEarlyCaptureFrame(bool use) { return false; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
+    // GPU::Comp1x (experiment K2c): how the compositor last drew into output buffer [buffer]. true,
+    // with [layout], the first time it's asked after a draw into the buffer, false when nothing drew
+    // into it since then (or since SetOutputTexture gave it a texture), so the texture still holds
+    // whatever it held, and the layout that went with that
+    virtual bool TakeOutputLayout(int buffer, OutputLayout& layout) { return false; }
     // after a savestate is loaded, for what the renderer keeps from earlier frames' output
     virtual void SavestateLoaded() {}
 
