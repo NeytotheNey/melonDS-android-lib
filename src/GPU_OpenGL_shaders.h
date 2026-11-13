@@ -179,8 +179,9 @@ uniform highp usampler2D FilterMapTex;
 // the shadow programs draw row runs and have no varyings: their main() sets this first, from
 // gl_FragCoord, to what the compositor's vertex shader gives the pixel's center
 vec2 fTexcoord;
-#elif defined(FILTER2D) && !defined(WIDE)
-// as with the filter off, for the identity mode, which has to round the same way
+#elif defined(FILTER2D) && !defined(WIDE) && !defined(DOWN3D)
+// as with the filter off, for the identity mode, which has to round the same way. a capped output's
+// filtered program (DOWN3D) never runs that mode (GLCompositor::OutputNeed)
 smooth in mediump vec2 fTexcoord;
 #else
 smooth in vec2 fTexcoord;
@@ -297,13 +298,21 @@ ivec2 FilterRowCoord(highp ivec2 native)
     return uFilterIdentity != 0 ? ivec2(fTexcoord) : native;
 }
 
-// where the sub-pixel reads planes 0-2: the map's entry, unless that's on a line with another
-// display mode, as not every mode writes planes 1 and 2
-ivec2 FilterPlaneCoord(highp ivec2 subPixel, highp ivec2 native, ivec2 rowCoord, int dispmode)
+// the map texel of the sub-pixel at [scale] (u3DScale, or a capped output's 3D scale for its
+// sub-pixels, see kCompositorFS_Down3D_Entry): by the sub-pixel's center, so at scales the map doesn't
+// divide evenly every sub-pixel still lands in its own native pixel
+highp ivec2 FilterMapCoord(highp ivec2 subPixel, highp int scale)
 {
-    // by the sub-pixel's center, so at scales the map doesn't divide evenly every sub-pixel still
-    // lands in its own native pixel. the mask is for Adreno, see the end of kHiresCaptureFS_Main
-    highp ivec2 mapCoord = (2 * subPixel + 1) * uFilterMapScale / (2 * int(u3DScale));
+    return (2 * subPixel + 1) * uFilterMapScale / (2 * scale);
+}
+
+// where the sub-pixel reads planes 0-2: the map's entry, unless that's on a line with another
+// display mode, as not every mode writes planes 1 and 2. [scale] is the scale the sub-pixel is at
+// (FilterMapCoord)
+ivec2 FilterPlaneCoord(highp ivec2 subPixel, highp ivec2 native, ivec2 rowCoord, int dispmode, highp int scale)
+{
+    // the mask is for Adreno, see the end of kHiresCaptureFS_Main
+    highp ivec2 mapCoord = FilterMapCoord(subPixel, scale);
     highp uint entry = texelFetch(FilterMapTex, mapCoord, 0).r;
     highp ivec2 source = ivec2(int(entry & 0xFFu), int((entry >> 8) & 0xFFu) + (native.y >= 192 ? 192 : 0));
 
@@ -373,7 +382,7 @@ void main()
     ivec2 rowCoord = FilterRowCoord(native);
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, rowCoord.y), 0));
     int dispmode = mbright.b & 0x3;
-    ivec2 planeCoord = FilterPlaneCoord(subPixel, native, rowCoord, dispmode);
+    ivec2 planeCoord = FilterPlaneCoord(subPixel, native, rowCoord, dispmode, int(u3DScale));
 #else
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
@@ -552,7 +561,15 @@ highp vec4 Bilinear3DBlock(highp ivec2 first, highp int ratio)
 // 3D, as every sub-pixel would. one with the same alpha all over composites once on the bilinear
 // average, which is only off by the rounding of a color average, unless the pixel's blend can
 // saturate. mixed alphas, a 3D edge over the 2D, and a blend that can saturate get mode 0's exact
-// composite. so does a wing pixel whose rows don't agree on the edge probe
+// composite. so does a wing pixel whose rows don't agree on the edge probe.
+// with FILTER2D too (GLCompositor::Down3DFS's filtered variants), filtered 2D (never its identity
+// mode, which isn't capped): each sub-pixel reads its planes where the full-scale filtered draw does,
+// from the map at the 3D's scale (FilterPlaneCoord), and its 3D as FilterFetch3D does there. the map
+// is at the scale the full-scale draw would use (GLCompositor::PrepareFilter2D). when the output's
+// scale is a multiple of the map's, every sub-pixel of an output pixel reads the same map texel, so
+// they all read the same planes and only the 3D differs, as without the filter, and every mode works
+// as above. at other scales a pixel whose sub-pixels don't all read the same planes is drawn as each
+// sub-pixel's full-scale filtered draw, averaged (FilterDown3D), in every mode
 const char* kCompositorFS_Down3D_Entry = R"(
 uniform int u3DRatio;
 
@@ -745,30 +762,75 @@ ivec3 WingDown3D()
 }
 #endif
 
-#if DOWN3D_MODE == 0 || DOWN3D_MODE == 3
-// the exact composite of a middle pixel's 3D compmodes (bgr, as oColor takes it): each sub-pixel's 3D
-// as the full-scale draw reads it at [base] + (i, j), composited, finished and averaged
-ivec3 MiddleDown3D(ivec4 pixel, ivec4 val2, ivec4 val3, ivec4 mbright, int dispmode, highp ivec2 base, highp int xscroll)
+// a middle sub-pixel's 3D pixel, [base] + (i, j) at the 3D's scale, as the full-scale draw reads it.
+// [base] is the output pixel's first sub-pixel: FirstSubPixel's, but in the filtered 256 view the one
+// in the map's rows (no gap between the screens), which FilterFetch3D's maths starts from
+ivec4 SubPixel3D(highp ivec2 base, highp int i, highp int j, highp int xscroll)
+{
+    highp int scale3D = int(u3DScale) * u3DRatio;
+#ifdef WIDE
+    return Fetch3DTexel(base + ivec2(i + xscroll * scale3D, j));
+#else
+    // the full-scale draw's fTexcoord at this sub-pixel's center (FilterFetch3D's position with the
+    // filter), then its Fetch3D
+    highp float _3dxpos = float(xscroll);
+    highp float scale3DF = float(scale3D);
+    highp vec2 pos = (vec2(base + ivec2(i, j)) + 0.5) / scale3DF;
+#ifdef FILTER2D
+    pos.y = mod(pos.y, 192.0);
+#endif
+    return ivec4(texelFetch(_3DTex, ivec2(vec2(pos.x + _3dxpos, pos.y) * scale3DF), 0).bgra
+                 * vec4(63,63,63,31));
+#endif
+}
+
+#ifdef FILTER2D
+// a filtered pixel whose sub-pixels don't all read the same planes (see main): each sub-pixel as the
+// full-scale filtered draw makes it, from its own planes (the map at the 3D's scale, from [sub0], the
+// first sub-pixel in the map's rows) and 3D, composited, finished and averaged (bgr, as oColor takes it)
+ivec3 FilterDown3D(ivec4 mbright, int dispmode, highp ivec2 sub0, highp ivec2 native, highp ivec2 base, highp int xscroll)
 {
     highp int ratio = u3DRatio;
     highp int scale3D = int(u3DScale) * ratio;
-#ifndef WIDE
-    highp float _3dxpos = float(xscroll);
-    highp float scale3DF = float(scale3D);
-#endif
     highp ivec3 sum = ivec3(0);
     for (highp int j = 0; j < ratio; j++)
     {
         for (highp int i = 0; i < ratio; i++)
         {
-#ifdef WIDE
-            ivec4 _3dpix = Fetch3DTexel(base + ivec2(i + xscroll * scale3D, j));
-#else
-            // the full-scale draw's fTexcoord at this sub-pixel's center, then its Fetch3D
-            highp vec2 pos = (vec2(base + ivec2(i, j)) + 0.5) / scale3DF;
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(pos.x + _3dxpos, pos.y) * scale3DF), 0).bgra
-                         * vec4(63,63,63,31));
+            ivec2 planeCoord = FilterPlaneCoord(sub0 + ivec2(i, j), native, native, dispmode, scale3D);
+            ivec4 pixel = ivec4(texelFetch(ScreenTex, planeCoord, 0));
+            if (dispmode == 1)
+            {
+                ivec4 val2 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(256,0), 0));
+                ivec4 val3 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(512,0), 0));
+                ivec4 _3dpix = ivec4(0);
+                if ((val3.a & 0xF) <= 4)
+                    _3dpix = SubPixel3D(base, i, j, xscroll);
+
+                bool opaque;
+                pixel = CompositePixel(pixel, val2, val3, _3dpix, opaque);
+            }
+            sum += FinishPixel(pixel, mbright, dispmode).bgr;
+        }
+    }
+
+    highp int n = ratio * ratio;
+    return (sum + n / 2) / n;
+}
 #endif
+
+#if DOWN3D_MODE == 0 || DOWN3D_MODE == 3
+// the exact composite of a middle pixel's 3D compmodes (bgr, as oColor takes it): each sub-pixel's 3D
+// as the full-scale draw reads it at [base] + (i, j) (SubPixel3D), composited, finished and averaged
+ivec3 MiddleDown3D(ivec4 pixel, ivec4 val2, ivec4 val3, ivec4 mbright, int dispmode, highp ivec2 base, highp int xscroll)
+{
+    highp int ratio = u3DRatio;
+    highp ivec3 sum = ivec3(0);
+    for (highp int j = 0; j < ratio; j++)
+    {
+        for (highp int i = 0; i < ratio; i++)
+        {
+            ivec4 _3dpix = SubPixel3D(base, i, j, xscroll);
 
             bool opaque;
             sum += FinishPixel(CompositePixel(pixel, val2, val3, _3dpix, opaque), mbright, dispmode).bgr;
@@ -803,9 +865,47 @@ void main()
     }
 #endif
 
+#ifdef FILTER2D
+    // the output pixel in the map's rows, its native pixel (the same for all its sub-pixels) and its
+    // first sub-pixel at the 3D's scale, whose map texel gives the planes. at an output scale that's a
+    // multiple of the map's, (2s + 1) M / (2 S3D) is s / (S3D / M) for every sub-pixel s, and S3D / M is
+    // the ratio times Sout / M, so they all read that texel. otherwise the block's corner sub-pixels'
+    // texels are compared: the texel's x only depends on the sub-pixel's x and its y on its y, each
+    // never decreasing as it grows (the block is sub0 + (0..r-1) on both axes, with no gap, wide offset
+    // or clamp inside it: FilterSubPixel took those off the output pixel before the ratio), so when the
+    // corners share one every sub-pixel does. when they don't, each sub-pixel's planes are compared
+    // with the first's, and a pixel where any differs is FilterDown3D's
+    highp ivec2 outSub = FilterSubPixel();
+    highp int scale3D = int(u3DScale) * u3DRatio;
+    highp ivec2 sub0 = outSub * u3DRatio;
+    highp ivec2 native = outSub / int(u3DScale);
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, native.y), 0));
+    int dispmode = mbright.b & 0x3;
+    ivec2 planeCoord = FilterPlaneCoord(sub0, native, native, dispmode, scale3D);
+    bool samePlanes = true;
+    if (int(u3DScale) % uFilterMapScale != 0
+        && FilterMapCoord(sub0, scale3D) != FilterMapCoord(sub0 + ivec2(u3DRatio - 1), scale3D))
+    {
+        for (highp int j = 0; j < u3DRatio; j++)
+        {
+            for (highp int i = 0; i < u3DRatio; i++)
+            {
+                if (FilterPlaneCoord(sub0 + ivec2(i, j), native, native, dispmode, scale3D) != planeCoord)
+                    samePlanes = false;
+            }
+        }
+    }
+#ifdef WIDE
+    highp ivec2 base3D = FirstSubPixel();
+#else
+    highp ivec2 base3D = sub0;
+#endif
+#else
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
     ivec2 planeCoord = ivec2(fTexcoord);
+    highp ivec2 base3D = FirstSubPixel();
+#endif
     ivec4 pixel = ivec4(texelFetch(ScreenTex, planeCoord, 0));
 
     if (uHiresCap != 0 && (mbright.r & 0x80) != 0)
@@ -827,6 +927,14 @@ void main()
             word = texelFetch(HiresBankTex, coord, 0).r;
         pixel = ivec4(int(word & 0x1Fu) << 1, int((word >> 5) & 0x1Fu) << 1, int((word >> 10) & 0x1Fu) << 1, 0);
     }
+#ifdef FILTER2D
+    else if (!samePlanes)
+    {
+        highp int xscroll = mbright.a - ((mbright.b & 0x80) * 2);
+        oColor = vec4(vec3(FilterDown3D(mbright, dispmode, sub0, native, base3D, xscroll)) / 255.0, 1.0);
+        return;
+    }
+#endif
     else if (dispmode == 1)
     {
         ivec4 val2 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(256,0), 0));
@@ -837,12 +945,11 @@ void main()
         if ((val3.a & 0xF) <= 4)
         {
             highp int ratio = u3DRatio;
-            highp ivec2 base = FirstSubPixel();
             // mbright.a == HOFS bit0..7, mbright.b bit7 == HOFS bit8 (sign)
             highp int xscroll = mbright.a - ((mbright.b & 0x80) * 2);
-            // the block's first 3D pixel: what the sub-pixel at base reads, the scroll being whole
-            // native pixels
-            highp ivec2 first = base + ivec2(xscroll * int(u3DScale) * ratio, 0);
+            // the block's first 3D pixel: what the sub-pixel at FirstSubPixel reads, the scroll being
+            // whole native pixels (in its half's rows, also with the filter)
+            highp ivec2 first = FirstSubPixel() + ivec2(xscroll * int(u3DScale) * ratio, 0);
 
 #if DOWN3D_MODE == 3
             // no alpha is no 3D in every sub-pixel, one alpha all over the bilinear average, unless
@@ -854,13 +961,13 @@ void main()
                 _3dpix = Average3D(first, ratio);
             else if (alphas == 2)
             {
-                oColor = vec4(vec3(MiddleDown3D(pixel, val2, val3, mbright, dispmode, base, xscroll)) / 255.0, 1.0);
+                oColor = vec4(vec3(MiddleDown3D(pixel, val2, val3, mbright, dispmode, base3D, xscroll)) / 255.0, 1.0);
                 return;
             }
 #elif DOWN3D_MODE != 0
             _3dpix = Average3D(first, ratio);
 #else
-            oColor = vec4(vec3(MiddleDown3D(pixel, val2, val3, mbright, dispmode, base, xscroll)) / 255.0, 1.0);
+            oColor = vec4(vec3(MiddleDown3D(pixel, val2, val3, mbright, dispmode, base3D, xscroll)) / 255.0, 1.0);
             return;
 #endif
         }

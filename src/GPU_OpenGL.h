@@ -64,14 +64,16 @@ public:
     [[nodiscard]] static int CappedScale(int scale, int need) noexcept;
     // GPU::OutputCap: the need the renderers cap the output by (see Renderer's SetOutputNeed), from
     // the frontend's need, or GPU::OutputCapNeed over it, or 0 for no cap: with OutputCap off, and while
-    // anything that reads the 3D at the output's scale and isn't ported to the DOWN3D programs yet is
-    // on (filtered 2D, the GPU 2D shadow)
+    // anything that reads the 3D at the output's scale and isn't ported to the DOWN3D programs is on
+    // (the GPU 2D shadow, filtered 2D's identity mode)
     [[nodiscard]] static int OutputNeed(const GPU& gpu, int frontendNeed) noexcept;
     // GPU::OutputCap3D: the mode the capped draw and the capped hi-res capture pass use from now on
-    // (0-3), and whether hi-res capture is on (GPU::HiresCapture). called with every SetOutputNeed,
-    // before it: a change while the output is capped builds the programs it needs here, once, and a
-    // cap that starts later builds them with the exact ones (SetRenderSettings)
-    void SetOutputCap3D(int mode, bool hiresCapture) noexcept;
+    // (0-3), whether hi-res capture is on (GPU::HiresCapture) and whether filtered 2D is
+    // (GPU::Filter2D, but for its identity mode, which isn't capped). called with every SetOutputNeed,
+    // before it: a change while a cap is asked for builds the programs it needs here, once (through
+    // SetRenderSettings, which drops the cap while filtered 2D's don't build and asks for it again once
+    // they're not needed), and a cap that starts later builds them with the exact ones
+    void SetOutputCap3D(const GPU& gpu) noexcept;
     // GPU::OutputCap, debug: logs the cap's outcome and why (the switch, an excluded feature, the
     // need, the scale, a wide view, a program that didn't build), one line each time any of it
     // changes. the renderers call it at the end of every SetOutputNeed with the need the frontend
@@ -114,7 +116,7 @@ public:
     static std::string CompositorFS();
     // GPU::OutputCap: the 256 view's or, [wide], a wide view's program for an output below the 3D's
     // scale, in GPU::OutputCap3D mode [mode] (DOWN3D_MODE)
-    static std::string Down3DFS(int mode, bool wide);
+    static std::string Down3DFS(int mode, bool wide, bool filter = false);
     static std::string HiresCaptureFS();
     // GPU::OutputCap: the hi-res capture pass's program for a capped output, in GPU::OutputCap3D mode [mode]
     static std::string HiresCaptureDown3DFS(int mode);
@@ -224,35 +226,52 @@ private:
         GLuint HiresCapLoc = 0;
         GLuint WideRatioLoc = 0;
         GLuint WideOffsetLoc = 0;
+        // filtered 2D's (FILTER2D, in Filter2DState::Down3D) only: uFilterMapScale and uFilterRowOffset
+        GLint MapScaleLoc = -1;
+        GLint RowOffsetLoc = -1;
     };
     std::array<std::array<Down3DProgram, 4>, 2> Down3D {};
-    // the GPU::OutputCap3D mode SetOutputCap3D was last given, and whether hi-res capture was on
+    // the GPU::OutputCap3D mode SetOutputCap3D was last given, and whether hi-res capture and
+    // filtered 2D (not its identity mode) were on
     int Down3DMode = 0;
     bool Down3DHiresCapture = false;
+    bool Down3DFilter2D = false;
+    // the output scale SetRenderSettings was last asked for, which SetOutputCap3D asks for again
+    int AskedScale = 0;
     // GPU::OutputCap3D 1 and 3: a GL_LINEAR sampler, bound to the 3D's unit (1) only for the capped main
     // draw and the capped capture pass, so the 3D texture itself stays GL_NEAREST for everything that
     // texelFetches it
     GLuint Down3DSampler {};
-    bool PrepareDown3D(bool wide, int mode) noexcept;
+    // [filter]: filtered 2D's variant (FILTER2D, Filter2DState::Down3D)
+    bool PrepareDown3D(bool wide, int mode, bool filter = false) noexcept;
     // what a capped output in GPU::OutputCap3D mode [mode] needs: the view's program and, while hi-res
     // capture is on, the capture pass's (see HiresCaptureState::Down3D). false when the view's didn't
     // build (a capture program that didn't only skips the capture passes)
     bool PrepareCapped(bool wide, int mode) noexcept;
+    // with filtered 2D on, what a capped output needs too: the view's filtered program in mode [mode],
+    // or the exact filtered one if that didn't build. false when neither did
+    bool PrepareCappedFilter(bool wide, int mode) noexcept;
     void MakeDown3DSampler() noexcept;
     // the mode the capped draw uses: Down3DMode once the view's program for it built, the exact one otherwise
     [[nodiscard]] int Down3DVariant() const noexcept { return Down3D[ViewWidth != 256][Down3DMode].Program ? Down3DMode : 0; }
+    // the same for the capped filtered draw (Filter2DState::Down3D)
+    [[nodiscard]] int Down3DFilterVariant() const noexcept
+    {
+        return Filter2D.Down3D[ViewWidth != 256][Down3DMode].Program ? Down3DMode : 0;
+    }
 
     // GPU::OutputCap: what LogOutputCap's last line said, so it only logs changes
     struct OutputCapLogLine
     {
         const char* Reason = nullptr;
         // Mode is the one the capped draw uses, AskedMode GPU::OutputCap3D
-        int Need = -1, FrontendNeed = -1, Scale = -1, Scale3D = -1, ViewWidth = -1, Mode = -1, AskedMode = -1, HiresCapture = -1;
+        int Need = -1, FrontendNeed = -1, Scale = -1, Scale3D = -1, ViewWidth = -1, Mode = -1, AskedMode = -1, HiresCapture = -1,
+            Filter2D = -1;
         bool operator==(const OutputCapLogLine& other) const noexcept
         {
             return Reason == other.Reason && Need == other.Need && FrontendNeed == other.FrontendNeed && Scale == other.Scale
                 && Scale3D == other.Scale3D && ViewWidth == other.ViewWidth && Mode == other.Mode
-                && AskedMode == other.AskedMode && HiresCapture == other.HiresCapture;
+                && AskedMode == other.AskedMode && HiresCapture == other.HiresCapture && Filter2D == other.Filter2D;
         }
     };
     OutputCapLogLine OutputCapLogged {};
@@ -399,7 +418,9 @@ private:
 #endif
 
     // filtered 2D (see GPU::Filter2D and RunFilter2D). everything here is made the first time a
-    // frame needs it, and the textures go at a scale change or when the filter goes off. the
+    // frame needs it, and the textures go at a scale change or when the filter goes off. the map is
+    // at the scale the full-scale draw would use, by the 3D's scale, also when GPU::OutputCap puts the
+    // output below it (see PrepareFilter2D). the
     // compositor programs are the usual ones with FILTER2D defined, one for each of the view's
     // widths, so a frame without the filter runs exactly what it would without this. a frame whose
     // pre-pass would get the same keys as the one that made the map reuses it (see UpdateFilter2DKeys)
@@ -429,6 +450,10 @@ private:
         u32 RowCheckRuns = 0;
 
         bool Failed = false;                // a program didn't build or a target isn't complete
+        // GPU::OutputCap: the DOWN3D programs with FILTER2D defined, for a capped output with filtered
+        // 2D, [wide][GPU::OutputCap3D mode], made as the compositor's are (see PrepareCappedFilter). one
+        // that doesn't build only drops the cap (its own Failed), not the filter
+        std::array<std::array<Down3DProgram, 4>, 2> Down3D {};
         GLuint KeyShader = 0;
         GLuint KeyHiresCapLoc = 0;
         GLuint MmpxShader = 0;

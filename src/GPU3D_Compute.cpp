@@ -840,7 +840,7 @@ void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinate
 void ComputeRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
 {
     // first, so a cap that starts here builds GPU::OutputCap3D's programs (and the capture pass's) along with the exact one
-    CurGLCompositor.SetOutputCap3D(gpu.OutputCap3D, gpu.HiresCapture);
+    CurGLCompositor.SetOutputCap3D(gpu);
 
     int need = GLCompositor::OutputNeed(gpu, frontendNeed);
     if (need != OutputNeed)

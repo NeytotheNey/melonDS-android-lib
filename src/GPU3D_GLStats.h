@@ -26,7 +26,12 @@
 #include <cstdio>
 #include <cstring>
 
+#include "PlatformOGL.h"
+// a PC build's GL header names its own lookup (desktop/gl/pc_gl.h), Android has EGL's, as in GPU3D_ComputeStats.h
+#ifndef MELONDS_GL_GET_PROC_ADDRESS
 #include <EGL/egl.h>
+#define MELONDS_GL_GET_PROC_ADDRESS eglGetProcAddress
+#endif
 #include <GLES2/gl2ext.h>
 
 #include "types.h"
@@ -301,7 +306,7 @@ private:
     template <typename T>
     static bool Load(T& function, const char* name)
     {
-        function = reinterpret_cast<T>(eglGetProcAddress(name));
+        function = reinterpret_cast<T>(MELONDS_GL_GET_PROC_ADDRESS(name));
         return function != nullptr;
     }
 

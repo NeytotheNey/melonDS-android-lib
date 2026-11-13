@@ -884,8 +884,9 @@ public:
     // scale too, with the capture pass reading the 3D at its own (GLCompositor::RunHiresCapture). 1
     // caps by the frontend's need (Renderer3D::SetOutputNeed, from how big the screens are drawn), the
     // default, and 0 keeps the output at the internal scale as before. a need of 0 (unknown, as the
-    // desktop build has) is no cap. not with filtered 2D or the GPU 2D shadow yet
-    // (GLCompositor::OutputNeed). only changed by a debug switch
+    // desktop build has) is no cap. filtered 2D is capped too (its map stays at the scale the 3D's
+    // scale gives it, see GLCompositor::PrepareFilter2D), but not its identity mode (Filter2D 3), nor
+    // the GPU 2D shadow (GLCompositor::OutputNeed). only changed by a debug switch
     int OutputCap = 1;
     // with OutputCap 1: above 0, the need to cap by instead of the frontend's, for A/Bs and the
     // desktop build, which has none. 0, the default, takes the frontend's
