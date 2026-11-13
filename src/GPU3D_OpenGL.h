@@ -20,6 +20,7 @@
 
 #ifdef OGLRENDERER_ENABLED
 #include "GPU3D.h"
+#include "NonStupidBitfield.h"
 #include "GPU_OpenGL.h"
 #include "OpenGLSupport.h"
 #include "GPU3D_GLStats.h"
@@ -185,7 +186,8 @@ private:
     bool FetchClear0 = false;
     // GPU::GLNoDiscard (R1 step 1): NoDiscardTried, a build of RenderShader[4] was tried since it was
     // last dropped. NoDiscard, set per frame: the switch, a Z-buffer frame and the program; then
-    // SetupPolygon's caller marks the polygons drawn with it (RenderKey_NoDiscard)
+    // SetupPolygon's caller marks the polygons drawn with it (RenderKey_NoDiscard), and with bit 1
+    // MarkScannedNoDiscard the ones whose texture was scanned
     bool NoDiscardTried = false;
     bool NoDiscard = false;
     // an opaque polygon's RenderKey bit for the no-discard program: it splits batches at the
@@ -297,6 +299,46 @@ private:
     u32 TexAlphaStamp[TexAlphaSlots] {};
     u8 TexAlphaValue[TexAlphaSlots] {};
     u32 TexAlphaFrame = 0;
+
+    // GPU::GLNoDiscard bit 1 (R1 step 2): what the opaque shader can return for an opaque polygon's
+    // texture that needs a scan (direct, 4x4, a palette with color 0 transparent), from
+    // ScanOpaqueTexture. TexScan_Opaque: no texel comes out under alpha 31, so it can drop the
+    // discard. the others say why not: an index-0 palette texel, a direct texel with alpha bit 0, a
+    // transparent 4x4 texel (index 3 in block modes 0 and 1), or a texture reaching past TexMem
+    // (or a 4x4 one spanning two 128 KB slots)
+    enum
+    {
+        TexScan_Opaque,
+        TexScan_Index0,
+        TexScan_Direct0,
+        TexScan_Comp0,
+        TexScan_OutOfRange,
+    };
+    // one scanned texture: its key (TexParam's address, size and format: wrap, flip and color 0
+    // don't change it, the scan only runs for palettes with color 0 on) and class, and the 512 byte
+    // VRAMDirty chunks it read, first to last (inclusive, First > Last for none): the texels, and
+    // for 4x4 the slot 1 index data its blocks' palette words come from
+    struct OpaqueTexEntry
+    {
+        u32 Key;
+        u16 First0, Last0, First1, Last1;
+        u8 Value;
+    };
+    // the scans kept across frames. OpaqueTex holds them in the order they were made, OpaqueTexIndex
+    // finds them by key (open addressing, -1 is empty, a quarter full at most). an entry stays
+    // until texture VRAM changes in a chunk it read (InvalidateOpaqueTex, from the same dirty set
+    // the TexMem upload uses), the cache fills up, or Reset; GPU::GLNoDiscard bit 2 drops them all
+    // every frame instead, as a check
+    static constexpr int OpaqueTexMax = 1024;
+    static constexpr int OpaqueTexSlots = 4096;
+    OpaqueTexEntry OpaqueTex[OpaqueTexMax] {};
+    s16 OpaqueTexIndex[OpaqueTexSlots];
+    int NumOpaqueTex = 0;
+    u8 ScanOpaqueTexture(const u8* vram, u32 texparam, OpaqueTexEntry& entry);
+    u8 OpaqueTexClass(const u8* vram, u32 texparam);
+    void ClearOpaqueTex();
+    void InvalidateOpaqueTex(const NonStupidBitField<512*1024/512>& dirty); // VRAMDirtyGranularity chunks
+    void MarkScannedNoDiscard(const GPU& gpu, bool texturing);
 
     // debug only (GPU::ShadowLogFrames): the masks and shadows of a frame, logged at the start of
     // the next one so their occlusion queries are done by then

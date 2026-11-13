@@ -855,8 +855,14 @@ public:
     // so the GPU can test depth early. Z-buffer frames only (W-buffer ones write gl_FragDepth
     // anyway). exact: the discard it leaves out can't fire for them. 1 is the default in every
     // build since 11-13 (hash3d-exact on the Fold, Pixel and OnePlus; Pixel up to −27% GPU
-    // cycles); 0 draws as before, for A/Bs. only changed by a debug switch
-    int GLNoDiscard = 1;
+    // cycles); 0 draws as before, for A/Bs. bit 1 (value 2, R1 step 2, on by default since 11-13, so
+    // the default is 3; exact on the desktop and the Fold and Pixel, Contra 4 −1 to −2%) adds the
+    // textures that need a scan: direct color, 4x4 and palettes with color 0 transparent, when no
+    // texel the shader can fetch comes out under alpha 31 (GLRenderer::ScanOpaqueTexture, cached
+    // until texture VRAM under it changes). bit 2 (value 4) is a check: the cache is dropped every
+    // frame, so each frame scans afresh. any nonzero value turns step 1 on (2 acts as 3). only
+    // changed by a debug switch
+    int GLNoDiscard = 3;
     // OpenGL and compute renderers, experiment K2a (docs/plan-gpu-discovery.md): the compositor's
     // main draw starts without the output's old contents, so a tiled GPU needn't load them. 1
     // clears the whole output to 0 first, 2 invalidates it and clears only the padding rows

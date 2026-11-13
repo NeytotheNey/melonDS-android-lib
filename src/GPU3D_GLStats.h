@@ -756,14 +756,20 @@ private:
 //   qual                    (untex + decal + texpal + texop + nf) area over (op + nf + nm) area: the share
 //                           of opaque-shader area a no-discard program could take in Z frames
 //   w_qual                  the same share in W-buffer frames, for reference only
-//   textures bytes scan_us  textures scanned for this (once a frame each), bytes read, CPU µs
-//   then GPU::GLNoDiscard's (R1 step 1) work, per Z-buffer frame:
-//   nd nd_area              opaque polygons drawn with the no-discard program (0 with the switch off)
+//   textures bytes scan_us  per frame: textures scanned (GLRenderer::ScanOpaqueTexture, which keeps
+//                           its results across frames until texture VRAM under them changes, so this
+//                           counts the scans its cache didn't have, whoever asked: this count or
+//                           GPU::GLNoDiscard bit 1), bytes read, and this count's CPU µs
+//   then GPU::GLNoDiscard's (R1 steps 1 and 2) work, per Z-buffer frame:
+//   nd nd_area              opaque polygons drawn with the no-discard program (0 with the switch off);
+//                           with bit 1 on, texop's too
 //   draws draws_base        the opaque pass's draw calls, and how many the same polygons take
 //                           without the no-discard key bit (the switch's extra draws are the
 //                           difference)
 //   prog_switches           glUseProgram calls the switch adds: between the two opaque programs in
 //                           the pass, and back to the normal one after it
+//   nd_scan_us              per frame: CPU µs of bit 1's pass over the polygons (MarkScannedNoDiscard:
+//                           cache lookups and the scans they make; bit 2 drops the cache every frame)
 struct GLOpaqueStats
 {
     enum Class
@@ -782,17 +788,9 @@ struct GLOpaqueStats
         u64 Textures = 0, Bytes = 0;
         u64 NoDiscard = 0, Draws = 0, DrawsBase = 0, ProgSwitches = 0;
         double NoDiscardArea = 0;
-        s64 ScanNs = 0;
+        s64 ScanNs = 0, NdScanNs = 0;
     };
     Counters Sec;
-
-    // the frame's scanned textures, as GLRenderer's TexAlpha* for T1, keyed by TexParam's address,
-    // size, format and color-0 bit
-    static constexpr int Slots = 4096;
-    u32 Key[Slots] {};
-    u32 Stamp[Slots] {};
-    u8 Value[Slots] {};
-    u32 Frame = 0;
 
     // at the start of every RenderFrame
     void FrameStart(s64 now)
@@ -819,7 +817,7 @@ struct GLOpaqueStats
             Platform::Log(Platform::LogLevel::Info, "GLOPAQUE frames=%u zframes=%u wframes=%u op=%.1f op_area=%.3f "
                 "untex=%.1f/%.3f decal=%.1f/%.3f texpal=%.1f/%.3f texop=%.1f/%.3f alpha0=%.1f/%.3f color0=%.1f/%.3f direct0=%.1f/%.3f "
                 "comp0=%.1f/%.3f oob=%.1f/%.3f nf=%.1f/%.3f nm=%.1f/%.3f nn=%.1f/%.3f qual=%.3f w_qual=%.3f "
-                "textures=%.1f bytes=%.0f scan_us=%.1f nd=%.1f nd_area=%.3f draws=%.1f draws_base=%.1f prog_switches=%.1f\n",
+                "textures=%.1f bytes=%.0f scan_us=%.1f nd=%.1f nd_area=%.3f draws=%.1f draws_base=%.1f prog_switches=%.1f nd_scan_us=%.2f\n",
                 Sec.Frames, Sec.ZFrames, Sec.WFrames, op * per, oparea * per,
                 p[Untex] * per, a[Untex] * per, p[Decal] * per, a[Decal] * per, p[TexPal] * per, a[TexPal] * per, p[TexOpaque] * per, a[TexOpaque] * per,
                 p[Alpha0] * per, a[Alpha0] * per, p[Color0] * per, a[Color0] * per, p[Direct0] * per, a[Direct0] * per,
@@ -827,7 +825,8 @@ struct GLOpaqueStats
                 p[NeedFull] * per, a[NeedFull] * per, p[NeedMixed] * per, a[NeedMixed] * per, p[NeedNone] * per, a[NeedNone] * per,
                 share(0), share(1),
                 Sec.Textures / (double)Sec.Frames, Sec.Bytes / (double)Sec.Frames, Sec.ScanNs / 1000.0 / Sec.Frames,
-                Sec.NoDiscard * per, Sec.NoDiscardArea * per, Sec.Draws * per, Sec.DrawsBase * per, Sec.ProgSwitches * per);
+                Sec.NoDiscard * per, Sec.NoDiscardArea * per, Sec.Draws * per, Sec.DrawsBase * per, Sec.ProgSwitches * per,
+                Sec.NdScanNs / 1000.0 / Sec.Frames);
         }
         Sec = {};
         LogStartNs = now;

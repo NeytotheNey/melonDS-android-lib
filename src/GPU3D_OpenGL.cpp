@@ -208,27 +208,40 @@ void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch, bool nodisc
     }
 }
 
-// GPU::GLNoDiscard (R1 step 1): whether an opaque-pass polygon's fragments always come out of
-// FinalColor at alpha 31, so kRenderFS's opaque discard (col.a < 30.5/31) can't fire, without looking
-// at its texture: polygon alpha 31 (the vertex alpha the shader gets), and texturing off (DISP3DCNT
+// GPU::GLNoDiscard (R1 step 1): NoDiscard_Yes when an opaque-pass polygon's fragments always come
+// out of FinalColor at alpha 31, so kRenderFS's opaque discard (col.a < 30.5/31) can't fire, without
+// looking at its texture: polygon alpha 31 (the vertex alpha the shader gets), and texturing off (DISP3DCNT
 // bit 0, uDispCnt in the shader) or no texture, or decal (the vertex alpha alone; mode 3 is a
 // shadow or mask, left out), or a palette texture (I2/I4/I8) whose color 0 isn't transparent
 // (TexParam bit 29), whose texels all come out at 1.0. no alpha test in these shaders. translucent
 // polygons, need-opaque ones included, and shadows aren't drawn with it. GLOPAQUE's untex, decal and
-// texpal classes (CountOpaqueR1)
-static bool CanSkipDiscard(const Polygon* polygon, bool texturing)
+// texpal classes (CountOpaqueR1). NoDiscard_Scan (R1 step 2, GPU::GLNoDiscard bit 1): the same
+// polygon with modulate or toon/highlight and a texture that can return alpha 0 texels, so the
+// texture decides (OpaqueTexClass): direct, 4x4, or a palette with color 0 transparent. A3I5 and
+// A5I3 polygons are always translucent, so they never get here (T1's classes cover them)
+enum
+{
+    NoDiscard_No,
+    NoDiscard_Yes,
+    NoDiscard_Scan,
+};
+static int NoDiscardClass(const Polygon* polygon, bool texturing)
 {
     if (polygon->Translucent || polygon->IsShadowMask || polygon->IsShadow)
-        return false;
+        return NoDiscard_No;
     u32 attr = polygon->Attr;
     if (((attr >> 16) & 0x1F) != 31)
-        return false;
+        return NoDiscard_No;
     u32 format = (polygon->TexParam >> 26) & 0x7;
     if (!texturing || format == 0)
-        return true;
+        return NoDiscard_Yes;
     if (((attr >> 4) & 0x3) == 1)
-        return true;
-    return format >= 2 && format <= 4 && !(polygon->TexParam & (1u << 29));
+        return NoDiscard_Yes;
+    if (format >= 2 && format <= 4)
+        return (polygon->TexParam & (1u << 29)) ? NoDiscard_Scan : NoDiscard_Yes;
+    if (format == 5 || format == 7)
+        return NoDiscard_Scan;
+    return NoDiscard_No;
 }
 
 void SetupDefaultTexParams(GLuint tex)
@@ -247,6 +260,7 @@ GLRenderer::GLRenderer(GLCompositor&& compositor) noexcept :
     // GLRenderer::New() will be used to actually initialize the renderer;
     // The various glDelete* functions silently ignore invalid IDs,
     // so we can just let the destructor clean up a half-initialized renderer.
+    ClearOpaqueTex();
 }
 
 std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
@@ -527,6 +541,8 @@ void GLRenderer::Reset(GPU& gpu)
     CurGLCompositor.ResetFilter2D();
     CurGLCompositor.ResetShadow2D();
     TexMemDirtyAll = true;
+    // TexMemDirtyAll drops them at the next frame anyway (every chunk counts as changed)
+    ClearOpaqueTex();
     TargetsChanged = true;
     EarlyCapture = false;
 }
@@ -1327,30 +1343,23 @@ void GLRenderer::ClassifyTransAlpha(const GPU& gpu)
 #endif
 }
 
-#ifdef MELONADE_DEBUG_TOOLS
-// GPU::SceneStats, GLOPAQUE (R1 count): whether the opaque shader can return any texel of this
+// GPU::GLNoDiscard bit 1 (R1 step 2): whether the opaque shader can return any texel of this
 // texture with alpha under 31 (so its `discard` can fire), going by the texture fetches in
-// kRenderFSCommon, for a modulate / toon / highlight polygon with alpha 31. every texel of the
-// width x height, as TextureAlphaClass reads them for T1 (TexcoordWrap keeps s and t inside), from
-// the same copy TexMem is uploaded from. once a frame per texture. A3I5 / A5I3 polygons are
-// translucent and go by T1's classes instead, so they aren't asked here
-u8 GLRenderer::OpaqueTextureClass(const u8* vram, u32 texparam)
+// kRenderFSCommon, for a modulate / toon / highlight polygon with alpha 31, whose fragment alpha
+// is then the texel's (FinalColor). every texel of the width x height, as TextureAlphaClass reads
+// them for T1 (TexcoordWrap keeps s and t inside), from the same copy TexMem is uploaded from.
+// fills in the key's chunks for InvalidateOpaqueTex: all of them, even when it stops at the first
+// transparent texel, so a texture that turns opaque later gets scanned again. only asked for
+// NoDiscard_Scan formats (I2/I4/I8 with color 0 transparent, 4x4, direct)
+u8 GLRenderer::ScanOpaqueTexture(const u8* vram, u32 texparam, OpaqueTexEntry& entry)
 {
-    GLOpaqueStats& st = *OpaqueStats;
-    u32 key = texparam & 0x3FF0FFFF; // address, size, format and color 0 (bit 29)
-    u32 slot = (key * 2654435761u) >> 20;
-    while (st.Stamp[slot] == st.Frame)
-    {
-        if (st.Key[slot] == key)
-            return st.Value[slot];
-        slot = (slot + 1) & (GLOpaqueStats::Slots - 1);
-    }
-
     u32 format = (texparam >> 26) & 0x7;
     u32 addr = (texparam & 0xFFFF) << 3;
     u32 texels = (8u << ((texparam >> 20) & 0x7)) * (8u << ((texparam >> 23) & 0x7));
-    bool color0 = (texparam & (1u << 29)) != 0;
     const u32 vramSize = sizeof(GPU::VRAMFlat_Texture);
+
+    entry.First0 = entry.First1 = 1;
+    entry.Last0 = entry.Last1 = 0;
 
     u32 bytes = 0;
     switch (format)
@@ -1360,80 +1369,209 @@ u8 GLRenderer::OpaqueTextureClass(const u8* vram, u32 texparam)
     case 4: bytes = texels; break;     // I8
     case 5: bytes = texels / 4; break; // 4x4 compressed: 4 bytes a block, plus the slot 1 index data
     case 7: bytes = texels * 2; break; // direct
-    default: bytes = 0; break;
+    default: return TexScan_OutOfRange;
     }
 
-    u8 value = GLOpaqueStats::TexOpaque;
-    u32 scanned = 0;
-    if ((format == 2 || format == 3 || format == 4) && !color0)
+    // past TexMem's 512 KB the shader's texelFetch reads out of range, which GL leaves undefined.
+    // a 4x4 texture spanning two 128 KB slots would take its palette words from two places (the
+    // hardware only has slots 0 and 2 anyway); neither qualifies, which depends on nothing in VRAM
+    if (addr + bytes > vramSize)
+        return TexScan_OutOfRange;
+    if (format == 5 && (addr >> 17) != ((addr + bytes - 1) >> 17))
+        return TexScan_OutOfRange;
+
+    entry.First0 = addr / VRAMDirtyGranularity;
+    entry.Last0 = (addr + bytes - 1) / VRAMDirtyGranularity;
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (OpaqueStats)
     {
-        // alpha0 is 1.0: every texel comes out opaque without looking
-        value = GLOpaqueStats::TexPal;
+        OpaqueStats->Sec.Textures++;
+        OpaqueStats->Sec.Bytes += bytes;
     }
-    else if (addr + bytes > vramSize)
-        value = GLOpaqueStats::OutOfRange;
-    else
+#endif
+
+    const u8* p = vram + addr;
+    bool found = false;
+    if (format == 2)
     {
-        const u8* p = vram + addr;
-        bool found = false;
-        if (format == 2)
+        // TextureFetch_I2: index 0 is alpha0, which TexParam bit 29 makes 0
+        for (u32 i = 0; i < bytes && !found; i++)
         {
-            for (u32 i = 0; i < bytes && !found; i++)
-            {
-                u8 b = p[i];
-                found = !(b & 0x03) || !(b & 0x0C) || !(b & 0x30) || !(b & 0xC0);
-            }
-            value = found ? GLOpaqueStats::Color0 : GLOpaqueStats::TexOpaque;
+            u8 b = p[i];
+            found = !(b & 0x03) || !(b & 0x0C) || !(b & 0x30) || !(b & 0xC0);
         }
-        else if (format == 3)
-        {
-            for (u32 i = 0; i < bytes && !found; i++)
-                found = !(p[i] & 0x0F) || !(p[i] & 0xF0);
-            value = found ? GLOpaqueStats::Color0 : GLOpaqueStats::TexOpaque;
-        }
-        else if (format == 4)
-        {
-            for (u32 i = 0; i < bytes && !found; i++)
-                found = p[i] == 0;
-            value = found ? GLOpaqueStats::Color0 : GLOpaqueStats::TexOpaque;
-        }
-        else if (format == 7)
-        {
-            // TextureFetch_Direct: alpha is bit 15, the high byte's bit 7
-            for (u32 i = 1; i < bytes && !found; i += 2)
-                found = !(p[i] & 0x80);
-            value = found ? GLOpaqueStats::Direct0 : GLOpaqueStats::TexOpaque;
-        }
-        else if (format == 5)
-        {
-            // TextureFetch_Compressed: a block's 4 bytes hold 2-bit indices, and index 3 is
-            // transparent (vec4(0)) when the block's palette word (slot 1, 0x20000 + half the
-            // block's offset in its slot, +0x10000 for slot 2) has mode 0 or 1 (bits 14-15)
-            for (u32 i = 0; i < bytes && !found; i += 4)
-            {
-                u32 a = addr + i;
-                u32 slot1 = 0x20000 + ((a & 0x1FFFC) >> 1);
-                if (a >= 0x40000) slot1 += 0x10000;
-                u32 palinfo = vram[slot1] | (vram[slot1 + 1] << 8);
-                if ((palinfo >> 14) >= 2) continue;
-                for (u32 j = 0; j < 4 && !found; j++)
-                {
-                    u8 b = p[i + j];
-                    found = (b & 0x03) == 0x03 || (b & 0x0C) == 0x0C || (b & 0x30) == 0x30 || (b & 0xC0) == 0xC0;
-                }
-            }
-            value = found ? GLOpaqueStats::Comp0 : GLOpaqueStats::TexOpaque;
-        }
-        scanned = bytes;
+        return found ? TexScan_Index0 : TexScan_Opaque;
+    }
+    else if (format == 3)
+    {
+        for (u32 i = 0; i < bytes && !found; i++)
+            found = !(p[i] & 0x0F) || !(p[i] & 0xF0);
+        return found ? TexScan_Index0 : TexScan_Opaque;
+    }
+    else if (format == 4)
+    {
+        for (u32 i = 0; i < bytes && !found; i++)
+            found = p[i] == 0;
+        return found ? TexScan_Index0 : TexScan_Opaque;
+    }
+    else if (format == 7)
+    {
+        // TextureFetch_Direct: alpha is bit 15, the high byte's bit 7 (addr is even)
+        for (u32 i = 1; i < bytes && !found; i += 2)
+            found = !(p[i] & 0x80);
+        return found ? TexScan_Direct0 : TexScan_Opaque;
     }
 
-    st.Sec.Textures += scanned > 0;
-    st.Sec.Bytes += scanned;
+    // TextureFetch_Compressed: a block's 4 bytes hold 2-bit indices, and index 3 is transparent
+    // (vec4(0)) when the block's palette word (slot 1, 0x20000 + half the block's offset in its
+    // slot, +0x10000 from 0x40000 on) has mode 0 or 1 (bits 14-15). inside one 128 KB slot that
+    // address grows with the block's, so the index data read is the first block's word to the
+    // last one's
+    auto slot1Of = [](u32 a)
+    {
+        u32 s = 0x20000 + ((a & 0x1FFFC) >> 1);
+        if (a >= 0x40000) s += 0x10000;
+        return s;
+    };
+    entry.First1 = slot1Of(addr) / VRAMDirtyGranularity;
+    entry.Last1 = (slot1Of(addr + bytes - 4) + 1) / VRAMDirtyGranularity;
 
-    st.Stamp[slot] = st.Frame;
-    st.Key[slot] = key;
-    st.Value[slot] = value;
-    return value;
+    for (u32 i = 0; i < bytes && !found; i += 4)
+    {
+        u32 slot1 = slot1Of(addr + i);
+        u32 palinfo = vram[slot1] | (vram[slot1 + 1] << 8);
+        if ((palinfo >> 14) >= 2) continue;
+        for (u32 j = 0; j < 4 && !found; j++)
+        {
+            u8 b = p[i + j];
+            found = (b & 0x03) == 0x03 || (b & 0x0C) == 0x0C || (b & 0x30) == 0x30 || (b & 0xC0) == 0xC0;
+        }
+    }
+    return found ? TexScan_Comp0 : TexScan_Opaque;
+}
+
+// GPU::GLNoDiscard bit 1: ScanOpaqueTexture's class, from the cache when this texture was scanned
+// and nothing it read has changed since. vram is gpu.VRAMFlat_Texture after this frame's
+// MakeVRAMFlat_TextureCoherent and InvalidateOpaqueTex
+u8 GLRenderer::OpaqueTexClass(const u8* vram, u32 texparam)
+{
+    u32 key = texparam & 0x1FF0FFFF;
+    u32 hash = (key * 2654435761u) >> 20; // OpaqueTexSlots = 4096
+    u32 slot = hash;
+    for (; OpaqueTexIndex[slot] >= 0; slot = (slot + 1) & (OpaqueTexSlots - 1))
+    {
+        const OpaqueTexEntry& e = OpaqueTex[OpaqueTexIndex[slot]];
+        if (e.Key == key)
+            return e.Value;
+    }
+
+    if (NumOpaqueTex == OpaqueTexMax)
+    {
+        // full: start over (textures that are still drawn get scanned again)
+        ClearOpaqueTex();
+        slot = hash;
+    }
+
+    OpaqueTexEntry& e = OpaqueTex[NumOpaqueTex];
+    e.Key = key;
+    e.Value = ScanOpaqueTexture(vram, texparam, e);
+    OpaqueTexIndex[slot] = (s16)NumOpaqueTex;
+    NumOpaqueTex++;
+    return e.Value;
+}
+
+void GLRenderer::ClearOpaqueTex()
+{
+    memset(OpaqueTexIndex, 0xFF, sizeof(OpaqueTexIndex));
+    NumOpaqueTex = 0;
+}
+
+// GPU::GLNoDiscard bit 1: drops the cached scans that read a chunk this frame's texture upload
+// changed (RenderFrame's textureDirty, the 512 byte chunks VRAMFlat_Texture and TexMem were just
+// brought up to date in; all of them after Reset or a renderer switch, TexMemDirtyAll), and
+// rebuilds the index from the ones left
+static_assert(VRAMDirtyGranularity == 512, "GPU3D_OpenGL.h declares InvalidateOpaqueTex with 512 byte chunks");
+void GLRenderer::InvalidateOpaqueTex(const NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty)
+{
+    constexpr u32 numChunks = 512*1024 / VRAMDirtyGranularity;
+    // before[c]: how many chunks below c changed, so a range's test is one subtraction
+    u16 before[numChunks + 1];
+    before[0] = 0;
+    for (u32 c = 0; c < numChunks; c++)
+        before[c + 1] = before[c] + (dirty[c] ? 1 : 0);
+    if (before[numChunks] == 0)
+        return;
+
+    auto changed = [&](u32 first, u32 last) { return first <= last && before[last + 1] != before[first]; };
+
+    int kept = 0;
+    for (int i = 0; i < NumOpaqueTex; i++)
+    {
+        const OpaqueTexEntry& e = OpaqueTex[i];
+        if (changed(e.First0, e.Last0) || changed(e.First1, e.Last1))
+            continue;
+        OpaqueTex[kept++] = e;
+    }
+    if (kept == NumOpaqueTex)
+        return;
+
+    memset(OpaqueTexIndex, 0xFF, sizeof(OpaqueTexIndex));
+    NumOpaqueTex = kept;
+    for (int i = 0; i < kept; i++)
+    {
+        u32 slot = (OpaqueTex[i].Key * 2654435761u) >> 20;
+        while (OpaqueTexIndex[slot] >= 0)
+            slot = (slot + 1) & (OpaqueTexSlots - 1);
+        OpaqueTexIndex[slot] = (s16)i;
+    }
+}
+
+// GPU::GLNoDiscard bit 1, after the frame's PolygonList is set up (and before anything reads the
+// render keys): the opaque polygons whose texture decides (NoDiscard_Scan) get the no-discard key
+// bit when the scan finds no texel under alpha 31. same frames as step 1 (NoDiscard: Z-buffer, the
+// program built)
+void GLRenderer::MarkScannedNoDiscard(const GPU& gpu, bool texturing)
+{
+#ifdef MELONADE_DEBUG_TOOLS
+    s64 start = OpaqueStats ? GLStatsNowNs() : 0;
+#endif
+    const u8* vram = gpu.VRAMFlat_Texture;
+    for (int i = 0; i < NumFinalPolys; i++)
+    {
+        RendererPolygon& rp = PolygonList[i];
+        if (NoDiscardClass(rp.PolyData, texturing) != NoDiscard_Scan)
+            continue;
+        if (OpaqueTexClass(vram, rp.PolyData->TexParam) == TexScan_Opaque)
+            rp.RenderKey |= RenderKey_NoDiscard;
+    }
+#ifdef MELONADE_DEBUG_TOOLS
+    if (OpaqueStats)
+        OpaqueStats->Sec.NdScanNs += GLStatsNowNs() - start;
+#endif
+}
+
+#ifdef MELONADE_DEBUG_TOOLS
+// GPU::SceneStats, GLOPAQUE (R1 count): the class of a modulate / toon / highlight polygon's texture
+// at alpha 31, by the same scan (and cache) GPU::GLNoDiscard bit 1 decides with, so texop is what
+// that bit can draw without discard. A3I5 / A5I3 polygons are translucent and go by T1's classes
+// instead, so they aren't asked here
+u8 GLRenderer::OpaqueTextureClass(const u8* vram, u32 texparam)
+{
+    u32 format = (texparam >> 26) & 0x7;
+    bool color0 = (texparam & (1u << 29)) != 0;
+    // alpha0 is 1.0: every texel comes out opaque without looking
+    if (format >= 2 && format <= 4 && !color0)
+        return GLOpaqueStats::TexPal;
+
+    switch (OpaqueTexClass(vram, texparam))
+    {
+    case TexScan_Opaque: return GLOpaqueStats::TexOpaque;
+    case TexScan_Index0: return GLOpaqueStats::Color0;
+    case TexScan_Direct0: return GLOpaqueStats::Direct0;
+    case TexScan_Comp0: return GLOpaqueStats::Comp0;
+    default: return GLOpaqueStats::OutOfRange;
+    }
 }
 
 // GPU::SceneStats, GLOPAQUE (R1 count, see GLOpaqueStats): after ClassifyTransAlpha, which it reads
@@ -1445,11 +1583,6 @@ void GLRenderer::CountOpaqueR1(const GPU& gpu)
 {
     GLOpaqueStats& st = *OpaqueStats;
     s64 start = GLStatsNowNs();
-    if (++st.Frame == 0)
-    {
-        memset(st.Stamp, 0, sizeof(st.Stamp));
-        st.Frame = 1;
-    }
 
     bool wbuffer = gpu.GPU3D.RenderPolygonRAM[0]->WBuffer;
     int b = wbuffer ? 1 : 0;
@@ -2267,6 +2400,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
         TexMemDirtyAll = false;
     }
 
+    // GPU::GLNoDiscard bit 1: the cached texture scans read VRAMFlat_Texture, which TexMem follows,
+    // and both just changed in exactly these chunks. this runs every frame whatever the switch, so
+    // nothing cached goes stale while it's off. palette RAM doesn't matter (alpha is the texel's)
+    if (gpu.GLNoDiscard & 4)
+        ClearOpaqueTex();
+    else if (textureChanged && NumOpaqueTex)
+        InvalidateOpaqueTex(textureDirty);
+
     // the targets match the polygons drawn here (see FrameTargetWidth). this runs after the
     // frame's Blit, so the compositor's width only changes between frames as well. with a Blit
     // after it (KeepFrameForBlit), only when the targets stay as they are
@@ -2549,7 +2690,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
             if (gpu.GPU3D.RenderPolygonRAM[i]->Degenerate) continue;
 
             SetupPolygon(&PolygonList[npolys], gpu.GPU3D.RenderPolygonRAM[i]);
-            if (NoDiscard && CanSkipDiscard(gpu.GPU3D.RenderPolygonRAM[i], texturing))
+            if (NoDiscard && NoDiscardClass(gpu.GPU3D.RenderPolygonRAM[i], texturing) == NoDiscard_Yes)
                 PolygonList[npolys].RenderKey |= RenderKey_NoDiscard;
             if (firsttrans < 0 && gpu.GPU3D.RenderPolygonRAM[i]->Translucent)
                 firsttrans = npolys;
@@ -2558,6 +2699,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
         }
         NumFinalPolys = npolys;
         NumOpaqueFinalPolys = firsttrans;
+        // GPU::GLNoDiscard bit 1 (R1 step 2): the textures that need a scan
+        if (NoDiscard && (gpu.GLNoDiscard & 2))
+            MarkScannedNoDiscard(gpu, texturing);
 
         BuildPolygons(&PolygonList[0], npolys);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
