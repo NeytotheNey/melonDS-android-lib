@@ -118,10 +118,12 @@ private:
     RendererPolygon PolygonList[2048] {};
 
     // fragCount: the debug build that counts fragments (GPU::SceneStats 2, GLFragCounter). fetch: the
-    // framebuffer fetch build (GPU::GLTransSkip bit 2), RenderShader[2 + wbuffer]
-    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false);
-    void UseRenderShader(bool wbuffer, int mode, bool fetch = false);
+    // framebuffer fetch build (GPU::GLTransSkip bit 2), RenderShader[2 + wbuffer]. nodiscard: the
+    // opaque-only build without discard (GPU::GLNoDiscard), RenderShader[4], Z-buffer only
+    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false);
+    void UseRenderShader(bool wbuffer, int mode, bool fetch = false, bool nodiscard = false);
     bool PrepareFetchShaders();
+    bool PrepareNoDiscardShader();
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
     u32 WideVertexX(s32 hiresx) const;
@@ -164,11 +166,13 @@ private:
     // cached per program: GL keeps a program's uniforms across glUseProgram, so the cache
     // only has to follow what this code set. [2] and [3]: their framebuffer fetch builds
     // (GPU::GLTransSkip bit 2), only translucent draws use them, made at the first frame that
-    // wants them (PrepareFetchShaders). bit 0 of an index is always W-buffering
-    GLuint RenderShader[4] {};
-    GLint RenderModeULoc[4] {};
-    GLint DepthBiasLoc[4] {};
-    float DepthBias[4] {};
+    // wants them (PrepareFetchShaders). bit 0 of an index is always W-buffering. [4]: the Z-buffer
+    // opaque build without discard (GPU::GLNoDiscard), made at the first frame that wants it
+    // (PrepareNoDiscardShader); it has no uRenderMode, it only draws opaque
+    GLuint RenderShader[5] {};
+    GLint RenderModeULoc[5] {};
+    GLint DepthBiasLoc[5] {};
+    float DepthBias[5] {};
     int CurShaderID = -1;
     int CurRenderMode = -1;
 
@@ -179,6 +183,14 @@ private:
     // set per frame: GPU::GLTransSkip bit 2 with a clear alpha of 0, the extension and its programs.
     // the clear0 pass is left out and pass 3 does its work (RenderSceneChunk)
     bool FetchClear0 = false;
+    // GPU::GLNoDiscard (R1 step 1): NoDiscardTried, a build of RenderShader[4] was tried since it was
+    // last dropped. NoDiscard, set per frame: the switch, a Z-buffer frame and the program; then
+    // SetupPolygon's caller marks the polygons drawn with it (RenderKey_NoDiscard)
+    bool NoDiscardTried = false;
+    bool NoDiscard = false;
+    // an opaque polygon's RenderKey bit for the no-discard program: it splits batches at the
+    // switches between programs, nothing else. no other key uses bit 15
+    static constexpr u32 RenderKey_NoDiscard = 0x8000;
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
@@ -337,12 +349,16 @@ private:
     // the covered count when the clear alpha is 0 (kCoverAlphaCS), and its uSize
     GLuint CoverAlphaShader = 0;
     GLint CoverAlphaSizeLoc = -1;
-    GLint FragPassLoc[4] {-1, -1, -1, -1};
+    GLint FragPassLoc[5] {-1, -1, -1, -1, -1};
     // HASH3D (GPU::Hash3DLogging)
     std::unique_ptr<Hash3DReadback> Hash3D;
     // GLTRANS (GPU::SceneStats, with GPU::GLTransSkip)
     std::unique_ptr<GLTransStats> TransStats;
+    // GLOPAQUE (GPU::SceneStats): the R1 count, after ClassifyTransAlpha
+    std::unique_ptr<GLOpaqueStats> OpaqueStats;
 
+    void CountOpaqueR1(const GPU& gpu);
+    u8 OpaqueTextureClass(const u8* vram, u32 texparam);
     void UpdateDebugStats(const GPU& gpu);
     void SetupFragCount();
     void SetFragPass(int pass);

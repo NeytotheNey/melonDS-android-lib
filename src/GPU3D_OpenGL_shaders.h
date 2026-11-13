@@ -778,6 +778,23 @@ const char* kRenderFS = R"(
 smooth in float fZ;
 #endif
 
+#ifdef NoDiscard
+// GPU::GLNoDiscard (R1 step 1, GLRenderer::BuildRenderShader's nodiscard build, Z-buffer only): the
+// opaque pass of polygons whose fragments always come out at alpha 31, so it's the opaque branch
+// below without its discard, and no other branch, so nothing in the program discards and the GPU
+// can test depth before the shader runs
+void main()
+{
+    vec4 col = FinalColor();
+
+    oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
+    oAttr.g = 0.0;
+    oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
+    oAttr.a = 1.0;
+
+    oColor = col;
+}
+#else
 uniform int uRenderMode; // 0=opaque 1=translucent 2=shadowmask
 
 void main()
@@ -828,6 +845,7 @@ void main()
     gl_FragDepth = fZ;
 #endif
 }
+#endif
 )";
 
 #ifdef MELONADE_DEBUG_TOOLS

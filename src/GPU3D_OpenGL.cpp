@@ -44,11 +44,11 @@ namespace melonDS
 #define TRANS_SKIPPED(field) do {} while (0)
 #endif
 
-bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch)
+bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard)
 {
-    char shadername[40];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
-        fragCount ? "Count" : "");
+    char shadername[48];
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
+        nodiscard ? "NoDiscard" : "", fragCount ? "Count" : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
@@ -64,6 +64,9 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch)
     // GPU::GLTransSkip bit 2: only built when the extension is listed (PrepareFetchShaders)
     if (fetch)
         fsbuf += "\n#extension GL_EXT_shader_framebuffer_fetch : require\n#define FramebufferFetch";
+    // GPU::GLNoDiscard: kRenderFS's opaque-only main, without discard
+    if (nodiscard)
+        fsbuf += "\n#define NoDiscard";
     fsbuf += wbufdef;
     fsbuf += kRenderFSCommon;
 #ifdef MELONADE_DEBUG_TOOLS
@@ -72,7 +75,9 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch)
         // debug only: the counter declarations, and the count first thing in main
         fsbuf += kRenderFSFragCount;
         std::string fs = kRenderFS;
-        size_t mainPos = fs.find("void main()");
+        // the last main: kRenderFS's first one is the NoDiscard build's (GPU::GLNoDiscard), which
+        // the counting builds don't compile, and the normal one comes after it under #else
+        size_t mainPos = fs.rfind("void main()");
         size_t brace = mainPos == std::string::npos ? std::string::npos : fs.find('{', mainPos);
         if (brace == std::string::npos)
             return false;
@@ -102,7 +107,7 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch)
     uni_id = glGetUniformLocation(prog, "TexPalMem");
     glUniform1i(uni_id, 1);
 
-    int id = (int)wbuffer + (fetch ? 2 : 0);
+    int id = nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0);
     DepthBiasLoc[id] = glGetUniformLocation(prog, "uDepthBias");
     glUniform1f(DepthBiasLoc[id], 0.0f);
     DepthBias[id] = 0.0f;
@@ -149,8 +154,46 @@ bool GLRenderer::PrepareFetchShaders()
     return true;
 }
 
-void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch)
+// GPU::GLNoDiscard: RenderShader[4], built the first time a frame wants it (one program, and the
+// shader cache has it from the second run on), like PrepareFetchShaders. false when it doesn't
+// build (logged once), and the frame draws as with the switch off
+bool GLRenderer::PrepareNoDiscardShader()
 {
+    if (RenderShader[4])
+        return true;
+    if (NoDiscardTried)
+        return false;
+    NoDiscardTried = true;
+
+    if (!BuildRenderShader(false, false, false, true))
+    {
+        glDeleteProgram(RenderShader[4]);
+        RenderShader[4] = 0;
+        Platform::Log(Platform::LogLevel::Warn, "GLNODISCARD: the no-discard program didn't build, glnodiscard stays off\n");
+        CurShaderID = -1;
+        return false;
+    }
+
+    // BuildRenderShader leaves its program in use
+    CurShaderID = -1;
+    CurRenderMode = -1;
+    return true;
+}
+
+// nodiscard: RenderShader[4] (GPU::GLNoDiscard), Z-buffer and opaque only, which has no uRenderMode
+void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch, bool nodiscard)
+{
+    if (nodiscard)
+    {
+        if (CurShaderID != 4)
+        {
+            glUseProgram(RenderShader[4]);
+            CurShaderID = 4;
+            CurRenderMode = -1;
+        }
+        return;
+    }
+
     int id = (int)wbuffer + (fetch ? 2 : 0);
     if (CurShaderID != id)
     {
@@ -163,6 +206,29 @@ void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch)
         glUniform1i(RenderModeULoc[id], mode);
         CurRenderMode = mode;
     }
+}
+
+// GPU::GLNoDiscard (R1 step 1): whether an opaque-pass polygon's fragments always come out of
+// FinalColor at alpha 31, so kRenderFS's opaque discard (col.a < 30.5/31) can't fire, without looking
+// at its texture: polygon alpha 31 (the vertex alpha the shader gets), and texturing off (DISP3DCNT
+// bit 0, uDispCnt in the shader) or no texture, or decal (the vertex alpha alone; mode 3 is a
+// shadow or mask, left out), or a palette texture (I2/I4/I8) whose color 0 isn't transparent
+// (TexParam bit 29), whose texels all come out at 1.0. no alpha test in these shaders. translucent
+// polygons, need-opaque ones included, and shadows aren't drawn with it. GLOPAQUE's untex, decal and
+// texpal classes (CountOpaqueR1)
+static bool CanSkipDiscard(const Polygon* polygon, bool texturing)
+{
+    if (polygon->Translucent || polygon->IsShadowMask || polygon->IsShadow)
+        return false;
+    u32 attr = polygon->Attr;
+    if (((attr >> 16) & 0x1F) != 31)
+        return false;
+    u32 format = (polygon->TexParam >> 26) & 0x7;
+    if (!texturing || format == 0)
+        return true;
+    if (((attr >> 4) & 0x3) == 1)
+        return true;
+    return format >= 2 && format <= 4 && !(polygon->TexParam & (1u << 29));
 }
 
 void SetupDefaultTexParams(GLuint tex)
@@ -430,7 +496,7 @@ GLRenderer::~GLRenderer()
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -1261,6 +1327,226 @@ void GLRenderer::ClassifyTransAlpha(const GPU& gpu)
 #endif
 }
 
+#ifdef MELONADE_DEBUG_TOOLS
+// GPU::SceneStats, GLOPAQUE (R1 count): whether the opaque shader can return any texel of this
+// texture with alpha under 31 (so its `discard` can fire), going by the texture fetches in
+// kRenderFSCommon, for a modulate / toon / highlight polygon with alpha 31. every texel of the
+// width x height, as TextureAlphaClass reads them for T1 (TexcoordWrap keeps s and t inside), from
+// the same copy TexMem is uploaded from. once a frame per texture. A3I5 / A5I3 polygons are
+// translucent and go by T1's classes instead, so they aren't asked here
+u8 GLRenderer::OpaqueTextureClass(const u8* vram, u32 texparam)
+{
+    GLOpaqueStats& st = *OpaqueStats;
+    u32 key = texparam & 0x3FF0FFFF; // address, size, format and color 0 (bit 29)
+    u32 slot = (key * 2654435761u) >> 20;
+    while (st.Stamp[slot] == st.Frame)
+    {
+        if (st.Key[slot] == key)
+            return st.Value[slot];
+        slot = (slot + 1) & (GLOpaqueStats::Slots - 1);
+    }
+
+    u32 format = (texparam >> 26) & 0x7;
+    u32 addr = (texparam & 0xFFFF) << 3;
+    u32 texels = (8u << ((texparam >> 20) & 0x7)) * (8u << ((texparam >> 23) & 0x7));
+    bool color0 = (texparam & (1u << 29)) != 0;
+    const u32 vramSize = sizeof(GPU::VRAMFlat_Texture);
+
+    u32 bytes = 0;
+    switch (format)
+    {
+    case 2: bytes = texels / 4; break; // I2
+    case 3: bytes = texels / 2; break; // I4
+    case 4: bytes = texels; break;     // I8
+    case 5: bytes = texels / 4; break; // 4x4 compressed: 4 bytes a block, plus the slot 1 index data
+    case 7: bytes = texels * 2; break; // direct
+    default: bytes = 0; break;
+    }
+
+    u8 value = GLOpaqueStats::TexOpaque;
+    u32 scanned = 0;
+    if ((format == 2 || format == 3 || format == 4) && !color0)
+    {
+        // alpha0 is 1.0: every texel comes out opaque without looking
+        value = GLOpaqueStats::TexPal;
+    }
+    else if (addr + bytes > vramSize)
+        value = GLOpaqueStats::OutOfRange;
+    else
+    {
+        const u8* p = vram + addr;
+        bool found = false;
+        if (format == 2)
+        {
+            for (u32 i = 0; i < bytes && !found; i++)
+            {
+                u8 b = p[i];
+                found = !(b & 0x03) || !(b & 0x0C) || !(b & 0x30) || !(b & 0xC0);
+            }
+            value = found ? GLOpaqueStats::Color0 : GLOpaqueStats::TexOpaque;
+        }
+        else if (format == 3)
+        {
+            for (u32 i = 0; i < bytes && !found; i++)
+                found = !(p[i] & 0x0F) || !(p[i] & 0xF0);
+            value = found ? GLOpaqueStats::Color0 : GLOpaqueStats::TexOpaque;
+        }
+        else if (format == 4)
+        {
+            for (u32 i = 0; i < bytes && !found; i++)
+                found = p[i] == 0;
+            value = found ? GLOpaqueStats::Color0 : GLOpaqueStats::TexOpaque;
+        }
+        else if (format == 7)
+        {
+            // TextureFetch_Direct: alpha is bit 15, the high byte's bit 7
+            for (u32 i = 1; i < bytes && !found; i += 2)
+                found = !(p[i] & 0x80);
+            value = found ? GLOpaqueStats::Direct0 : GLOpaqueStats::TexOpaque;
+        }
+        else if (format == 5)
+        {
+            // TextureFetch_Compressed: a block's 4 bytes hold 2-bit indices, and index 3 is
+            // transparent (vec4(0)) when the block's palette word (slot 1, 0x20000 + half the
+            // block's offset in its slot, +0x10000 for slot 2) has mode 0 or 1 (bits 14-15)
+            for (u32 i = 0; i < bytes && !found; i += 4)
+            {
+                u32 a = addr + i;
+                u32 slot1 = 0x20000 + ((a & 0x1FFFC) >> 1);
+                if (a >= 0x40000) slot1 += 0x10000;
+                u32 palinfo = vram[slot1] | (vram[slot1 + 1] << 8);
+                if ((palinfo >> 14) >= 2) continue;
+                for (u32 j = 0; j < 4 && !found; j++)
+                {
+                    u8 b = p[i + j];
+                    found = (b & 0x03) == 0x03 || (b & 0x0C) == 0x0C || (b & 0x30) == 0x30 || (b & 0xC0) == 0xC0;
+                }
+            }
+            value = found ? GLOpaqueStats::Comp0 : GLOpaqueStats::TexOpaque;
+        }
+        scanned = bytes;
+    }
+
+    st.Sec.Textures += scanned > 0;
+    st.Sec.Bytes += scanned;
+
+    st.Stamp[slot] = st.Frame;
+    st.Key[slot] = key;
+    st.Value[slot] = value;
+    return value;
+}
+
+// GPU::SceneStats, GLOPAQUE (R1 count, see GLOpaqueStats): after ClassifyTransAlpha, which it reads
+// for need-opaque polygons. goes by FinalColor and kRenderFS's opaque branch: the only discard is
+// col.a < 30.5/31, there's no alpha test in these shaders, and col.a is the vertex alpha (the
+// polygon's) times the texel's for modulate / toon / highlight, the vertex alpha alone for decal and
+// shadow (mode 1 and 3) and with texturing off or no texture. counts only, draws nothing
+void GLRenderer::CountOpaqueR1(const GPU& gpu)
+{
+    GLOpaqueStats& st = *OpaqueStats;
+    s64 start = GLStatsNowNs();
+    if (++st.Frame == 0)
+    {
+        memset(st.Stamp, 0, sizeof(st.Stamp));
+        st.Frame = 1;
+    }
+
+    bool wbuffer = gpu.GPU3D.RenderPolygonRAM[0]->WBuffer;
+    int b = wbuffer ? 1 : 0;
+    st.Sec.Frames++;
+    if (wbuffer) st.Sec.WFrames++;
+    else         st.Sec.ZFrames++;
+
+    bool texturing = (gpu.GPU3D.RenderDispCnt & (1<<0)) != 0;
+    const u8* vram = gpu.VRAMFlat_Texture;
+
+    for (int i = 0; i < NumFinalPolys; i++)
+    {
+        const Polygon* polygon = PolygonList[i].PolyData;
+        if (polygon->IsShadowMask) continue;
+
+        u32 attr = polygon->Attr;
+        u32 alpha = (attr >> 16) & 0x1F;
+        u32 format = (polygon->TexParam >> 26) & 0x7;
+        u32 blendmode = (attr >> 4) & 0x3;
+
+        int cls;
+        if (polygon->Translucent)
+        {
+            if (alpha != 31) continue; // a plain translucent polygon, never in the opaque shader
+            u8 v = TransAlphaClass[i];
+            if (v == AlphaClass_Full)       cls = GLOpaqueStats::NeedFull;
+            else if (v & AlphaClass_Full)   cls = GLOpaqueStats::NeedMixed;
+            else                            cls = GLOpaqueStats::NeedNone;
+        }
+        else if (alpha == 0)
+            cls = GLOpaqueStats::Alpha0;
+        else if (!texturing || format == 0)
+            cls = GLOpaqueStats::Untex;
+        else if (blendmode & 1)
+            cls = GLOpaqueStats::Decal;
+        else
+            cls = OpaqueTextureClass(vram, polygon->TexParam);
+
+        s64 sum = 0;
+        u32 n = polygon->NumVertices;
+        for (u32 j = 0; j < n; j++)
+        {
+            const Vertex* va = polygon->Vertices[j];
+            const Vertex* vb = polygon->Vertices[(j + 1) < n ? (j + 1) : 0];
+            sum += (s64)va->FinalPosition[0] * vb->FinalPosition[1] - (s64)vb->FinalPosition[0] * va->FinalPosition[1];
+        }
+        double area = (sum < 0 ? -sum : sum) / (2.0 * 256 * 192);
+
+        st.Sec.Polys[b][cls]++;
+        st.Sec.Area[b][cls] += area;
+        if (!wbuffer && (PolygonList[i].RenderKey & RenderKey_NoDiscard))
+        {
+            st.Sec.NoDiscard++;
+            st.Sec.NoDiscardArea += area;
+        }
+    }
+
+    // GPU::GLNoDiscard's batches: RenderSceneChunk's opaque loop over the same list, with and without
+    // the key bit, and the program switches it makes (it starts on the normal program)
+    if (!wbuffer)
+    {
+        bool cur = false;
+        for (int i = 0; i < NumFinalPolys; )
+        {
+            const RendererPolygon* rp = &PolygonList[i];
+            if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent) { i++; continue; }
+
+            bool nd = (rp->RenderKey & RenderKey_NoDiscard) != 0;
+            if (nd != cur) { st.Sec.ProgSwitches++; cur = nd; }
+            st.Sec.Draws++;
+            int end = i + 1;
+            while (end < NumFinalPolys && PolygonList[end].PrimType == rp->PrimType
+                   && PolygonList[end].RenderKey == rp->RenderKey)
+                end++;
+            i = end;
+        }
+        if (cur) st.Sec.ProgSwitches++;
+
+        for (int i = 0; i < NumFinalPolys; )
+        {
+            const RendererPolygon* rp = &PolygonList[i];
+            if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent) { i++; continue; }
+
+            u32 key = rp->RenderKey & ~RenderKey_NoDiscard;
+            st.Sec.DrawsBase++;
+            int end = i + 1;
+            while (end < NumFinalPolys && PolygonList[end].PrimType == rp->PrimType
+                   && (PolygonList[end].RenderKey & ~RenderKey_NoDiscard) == key)
+                end++;
+            i = end;
+        }
+    }
+
+    st.Sec.ScanNs += GLStatsNowNs() - start;
+}
+#endif
+
 void GLRenderer::LogFrameStats(const GPU3D& gpu3d)
 {
     // debug: what kinds of polygons the frame has, to find what a game draws its shadows with
@@ -1385,6 +1671,10 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
         if (rp->PolyData->IsShadowMask) { i++; continue; }
         if (rp->PolyData->Translucent) { i++; continue; }
+
+        // GPU::GLNoDiscard: the batch's program (RenderKey_NoDiscard is part of the batch key). the
+        // same program otherwise, so this only changes anything with the switch on
+        UseRenderShader(wbuffer, RenderMode_Opaque, false, (rp->RenderKey & RenderKey_NoDiscard) != 0);
 
         if (rp->PolyData->Attr & (1<<14))
             glDepthFunc(GL_LEQUAL);
@@ -1946,6 +2236,13 @@ void GLRenderer::RenderFrame(GPU& gpu)
         TransStats.reset();
     if (TransStats)
         TransStats->FrameStart(GLStatsNowNs(), gpu.GLTransSkip);
+    // GLOPAQUE (the R1 count) goes with it
+    if (gpu.SceneStats && !OpaqueStats)
+        OpaqueStats = std::make_unique<GLOpaqueStats>();
+    else if (!gpu.SceneStats && OpaqueStats)
+        OpaqueStats.reset();
+    if (OpaqueStats)
+        OpaqueStats->FrameStart(GLStatsNowNs());
 #endif
     bool keep = KeepRequested;
     KeepRequested = false;
@@ -2018,6 +2315,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // GPU::GLTransSkip bit 2: without the extension, or when its programs don't build, the frame
     // draws as without the bit
     FetchClear0 = (GLTransSkip & 4) && (gpu.GPU3D.RenderClearAttr1 & 0x001F0000) == 0 && PrepareFetchShaders();
+    // GPU::GLNoDiscard: Z-buffer frames only (RenderSceneChunk picks the shader by the first polygon,
+    // as here), and not while SCENEFRAGS has the counting builds in (there's no counting build of
+    // the no-discard program)
+    NoDiscard = gpu.GLNoDiscard && gpu.GPU3D.RenderNumPolygons && !gpu.GPU3D.RenderPolygonRAM[0]->WBuffer;
+#ifdef MELONADE_DEBUG_TOOLS
+    if (FragCounter) NoDiscard = false;
+#endif
+    if (NoDiscard) NoDiscard = PrepareNoDiscardShader();
 
     // debug: log the last frame's masks and shadows, its queries should be done by now
     if (NumShadowLogEntries) FlushShadowLog();
@@ -2238,11 +2543,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
         // render shit here
         int npolys = 0;
         int firsttrans = -1;
+        bool texturing = (gpu.GPU3D.RenderDispCnt & (1<<0)) != 0;
         for (u32 i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
         {
             if (gpu.GPU3D.RenderPolygonRAM[i]->Degenerate) continue;
 
             SetupPolygon(&PolygonList[npolys], gpu.GPU3D.RenderPolygonRAM[i]);
+            if (NoDiscard && CanSkipDiscard(gpu.GPU3D.RenderPolygonRAM[i], texturing))
+                PolygonList[npolys].RenderKey |= RenderKey_NoDiscard;
             if (firsttrans < 0 && gpu.GPU3D.RenderPolygonRAM[i]->Translucent)
                 firsttrans = npolys;
 
@@ -2271,6 +2579,11 @@ void GLRenderer::RenderFrame(GPU& gpu)
 #endif
         if (classify)
             ClassifyTransAlpha(gpu);
+#ifdef MELONADE_DEBUG_TOOLS
+        // after ClassifyTransAlpha, whose classes it reads (TransStats makes classify true)
+        if (OpaqueStats)
+            CountOpaqueR1(gpu);
+#endif
 
 #ifdef MELONADE_DEBUG_TOOLS
         if (FragCounter)

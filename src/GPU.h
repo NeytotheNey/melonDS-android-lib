@@ -849,6 +849,14 @@ public:
     // them before the next frame's clear. 3 is the default in every build since 11-12; 0 draws as
     // before, for A/Bs. only changed by a debug switch
     int GLClearFast = 3;
+    // OpenGL renderer, experiment R1 step 1 (docs/plan-gpu-discovery.md): 1 draws the opaque pass's
+    // polygons that can't discard a fragment (polygon alpha 31, not a shadow, and untextured, decal,
+    // or a palette texture without a transparent color 0) with a program built without `discard`,
+    // so the GPU can test depth early. Z-buffer frames only (W-buffer ones write gl_FragDepth
+    // anyway). exact: the discard it leaves out can't fire for them. 1 is the default in every
+    // build since 11-13 (hash3d-exact on the Fold, Pixel and OnePlus; Pixel up to −27% GPU
+    // cycles); 0 draws as before, for A/Bs. only changed by a debug switch
+    int GLNoDiscard = 1;
     // OpenGL and compute renderers, experiment K2a (docs/plan-gpu-discovery.md): the compositor's
     // main draw starts without the output's old contents, so a tiled GPU needn't load them. 1
     // clears the whole output to 0 first, 2 invalidates it and clears only the padding rows

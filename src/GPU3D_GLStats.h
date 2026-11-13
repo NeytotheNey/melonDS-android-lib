@@ -723,6 +723,120 @@ private:
     s64 LogStartNs = 0;
 };
 
+// debug builds only, OpenGL renderer, GPU::SceneStats: the GLOPAQUE log, a count for experiment R1
+// (docs/plan-gpu-discovery.md: opaque programs without `discard`, so the GPU can use early-Z). it
+// changes no drawing: GLRenderer::CountOpaqueR1 sorts the polygons the opaque shader (uRenderMode 0)
+// draws by whether that shader's `discard` (col.a < 30.5/31) can ever fire for them. only Z-buffer
+// frames matter for R1: the W-buffer build writes gl_FragDepth, which blocks early-Z anyway.
+//
+// GLOPAQUE, once a second:
+//   frames zframes wframes  drawn frames with polygons, and how many used the Z / W-buffer
+//                           (RenderPolygonRAM[0]->WBuffer, as RenderSceneChunk picks the shader)
+//   then per Z-buffer frame, polygons and area (screen fractions: the shoelace area of the
+//   polygon's 1x FinalPosition vertices over 256x192, summed, so overdraw counts again):
+//   op op_area              polygons the opaque pass draws (not translucent, not shadow masks)
+//   untex decal texpal texop
+//                           of those, the ones that can't discard: polygon alpha 31 and texturing
+//                           off (DISP3DCNT bit 0) or no texture; textured with decal or shadow
+//                           blending (the fragment's alpha is the vertex's); textured, modulate or
+//                           toon/highlight, with a palette texture (I2/I4/I8) whose color 0 isn't
+//                           transparent (TexParam bit 29 off, nothing to scan); the same with any
+//                           other texture that has no texel the shader returns with alpha under 31
+//                           (full-texture scan)
+//   alpha0 color0 direct0 comp0 oob
+//                           the rest: polygon alpha 0 (wireframe, every fragment discards); a
+//                           palette texture (I2/I4/I8) with color 0 transparent that has index-0
+//                           texels; direct color with alpha-bit-0 texels; 4x4 compressed with
+//                           transparent texels (index 3 in modes 0 and 1); a texture past TexMem
+//   nf nm nn                need-opaque polygons (translucent with polygon alpha 31, so A3I5 or
+//                           A5I3), whose opaque draw runs the same shader: nf can't discard (every
+//                           texel full, or decal / untextured, T1's AlphaClass_Full only), nm has
+//                           texels under 31 and needs the discard, nn has no full texel and T1
+//                           (gltrans bit 1) leaves its opaque draw out
+//   qual                    (untex + decal + texpal + texop + nf) area over (op + nf + nm) area: the share
+//                           of opaque-shader area a no-discard program could take in Z frames
+//   w_qual                  the same share in W-buffer frames, for reference only
+//   textures bytes scan_us  textures scanned for this (once a frame each), bytes read, CPU µs
+//   then GPU::GLNoDiscard's (R1 step 1) work, per Z-buffer frame:
+//   nd nd_area              opaque polygons drawn with the no-discard program (0 with the switch off)
+//   draws draws_base        the opaque pass's draw calls, and how many the same polygons take
+//                           without the no-discard key bit (the switch's extra draws are the
+//                           difference)
+//   prog_switches           glUseProgram calls the switch adds: between the two opaque programs in
+//                           the pass, and back to the normal one after it
+struct GLOpaqueStats
+{
+    enum Class
+    {
+        Untex, Decal, TexPal, TexOpaque,
+        Alpha0, Color0, Direct0, Comp0, OutOfRange,
+        NeedFull, NeedMixed, NeedNone,
+        NumClasses
+    };
+
+    struct Counters
+    {
+        u32 Frames = 0, ZFrames = 0, WFrames = 0;
+        u64 Polys[2][NumClasses] {};   // [0] Z frames, [1] W frames
+        double Area[2][NumClasses] {};
+        u64 Textures = 0, Bytes = 0;
+        u64 NoDiscard = 0, Draws = 0, DrawsBase = 0, ProgSwitches = 0;
+        double NoDiscardArea = 0;
+        s64 ScanNs = 0;
+    };
+    Counters Sec;
+
+    // the frame's scanned textures, as GLRenderer's TexAlpha* for T1, keyed by TexParam's address,
+    // size, format and color-0 bit
+    static constexpr int Slots = 4096;
+    u32 Key[Slots] {};
+    u32 Stamp[Slots] {};
+    u8 Value[Slots] {};
+    u32 Frame = 0;
+
+    // at the start of every RenderFrame
+    void FrameStart(s64 now)
+    {
+        if (LogStartNs == 0)
+            LogStartNs = now;
+        if (now - LogStartNs < 1000000000)
+            return;
+
+        if (Sec.Frames > 0)
+        {
+            auto share = [&](int b)
+            {
+                const double* a = Sec.Area[b];
+                double qual = a[Untex] + a[Decal] + a[TexPal] + a[TexOpaque] + a[NeedFull];
+                double all = qual + a[Alpha0] + a[Color0] + a[Direct0] + a[Comp0] + a[OutOfRange] + a[NeedMixed];
+                return all > 0 ? qual / all : 0.0;
+            };
+            double per = Sec.ZFrames ? 1.0 / Sec.ZFrames : 0.0;
+            const u64* p = Sec.Polys[0];
+            const double* a = Sec.Area[0];
+            u64 op = p[Untex] + p[Decal] + p[TexPal] + p[TexOpaque] + p[Alpha0] + p[Color0] + p[Direct0] + p[Comp0] + p[OutOfRange];
+            double oparea = a[Untex] + a[Decal] + a[TexPal] + a[TexOpaque] + a[Alpha0] + a[Color0] + a[Direct0] + a[Comp0] + a[OutOfRange];
+            Platform::Log(Platform::LogLevel::Info, "GLOPAQUE frames=%u zframes=%u wframes=%u op=%.1f op_area=%.3f "
+                "untex=%.1f/%.3f decal=%.1f/%.3f texpal=%.1f/%.3f texop=%.1f/%.3f alpha0=%.1f/%.3f color0=%.1f/%.3f direct0=%.1f/%.3f "
+                "comp0=%.1f/%.3f oob=%.1f/%.3f nf=%.1f/%.3f nm=%.1f/%.3f nn=%.1f/%.3f qual=%.3f w_qual=%.3f "
+                "textures=%.1f bytes=%.0f scan_us=%.1f nd=%.1f nd_area=%.3f draws=%.1f draws_base=%.1f prog_switches=%.1f\n",
+                Sec.Frames, Sec.ZFrames, Sec.WFrames, op * per, oparea * per,
+                p[Untex] * per, a[Untex] * per, p[Decal] * per, a[Decal] * per, p[TexPal] * per, a[TexPal] * per, p[TexOpaque] * per, a[TexOpaque] * per,
+                p[Alpha0] * per, a[Alpha0] * per, p[Color0] * per, a[Color0] * per, p[Direct0] * per, a[Direct0] * per,
+                p[Comp0] * per, a[Comp0] * per, p[OutOfRange] * per, a[OutOfRange] * per,
+                p[NeedFull] * per, a[NeedFull] * per, p[NeedMixed] * per, a[NeedMixed] * per, p[NeedNone] * per, a[NeedNone] * per,
+                share(0), share(1),
+                Sec.Textures / (double)Sec.Frames, Sec.Bytes / (double)Sec.Frames, Sec.ScanNs / 1000.0 / Sec.Frames,
+                Sec.NoDiscard * per, Sec.NoDiscardArea * per, Sec.Draws * per, Sec.DrawsBase * per, Sec.ProgSwitches * per);
+        }
+        Sec = {};
+        LogStartNs = now;
+    }
+
+private:
+    s64 LogStartNs = 0;
+};
+
 }
 
 #endif
