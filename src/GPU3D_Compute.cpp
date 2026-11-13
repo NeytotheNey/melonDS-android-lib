@@ -413,6 +413,7 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewportDims);
     result->MaxTargetWidth = std::min(maxTextureSize, maxViewportDims[0]);
+    result->MaxTargetHeight = std::min(maxTextureSize, maxViewportDims[1]);
     // and the work buffers grow with the width
     GLint64 maxBufferSize = 0;
     glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBufferSize);
@@ -726,10 +727,40 @@ int ComputeRenderer::TileSizeFor(int width, int scale, int forced) const noexcep
     return maxWorkTiles <= 65535 * 32 ? forced : tileSize;
 }
 
+// a native target always fits here: the scale was already fitted to it (FitScale)
 bool ComputeRenderer::TargetFits(int width, int scale) const noexcept
 {
-    if (width == WideMelon::NativeWidth)
-        return true;
+    return width == WideMelon::NativeWidth || BuffersFit(width, scale);
+}
+
+// the scale's native target fits the texture, viewport and work group limits and its work buffers
+// fit BuffersFit's. below 9x it always does on the GPUs Compute runs on, past it the tiles are 32
+// px, 1024 threads a group, and the biggest buffer, 64 bytes a pixel at the most work tiles, is
+// 453 MB at 12x and 805 MB at 16x, past the OnePlus 7 Pro's 512 MB storage block at 16x
+bool ComputeRenderer::ScaleFits(int scale) const noexcept
+{
+    if (MaxTargetHeight > 0 && (384 + 2) * scale > MaxTargetHeight)
+        return false;
+    int tileSize = TileSizeFor(WideMelon::NativeWidth, scale, ForcedTileSize);
+    if (MaxGroupThreads > 0 && tileSize * tileSize > MaxGroupThreads)
+        return false;
+    return BuffersFit(WideMelon::NativeWidth, scale);
+}
+
+// as GLRenderer::FitScale
+int ComputeRenderer::FitScale(int scale) const noexcept
+{
+    int fit = std::max(scale, 1);
+    while (fit > 1 && !ScaleFits(fit))
+        fit--;
+    if (fit < scale)
+        Platform::Log(Platform::LogLevel::Warn, "Compute renderer: %dx doesn't fit the GPU's limits (%dx%d textures, %d threads a group, %lld byte buffers), using %dx\n",
+            scale, MaxTargetWidth, MaxTargetHeight, MaxGroupThreads, (long long)MaxBufferSize, fit);
+    return fit;
+}
+
+bool ComputeRenderer::BuffersFit(int width, int scale) const noexcept
+{
     if (MaxTargetWidth > 0 && width * scale > MaxTargetWidth)
         return false;
 
@@ -781,6 +812,7 @@ void ComputeRenderer::SetViewWidth(int width) noexcept
 
 void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinates)
 {
+    scale = FitScale(scale);
     ViewWidth = ResolveViewWidth(RequestedViewWidth, scale);
 
     // a new renderer has no polygons drawn yet, so it starts at the view width and its shaders

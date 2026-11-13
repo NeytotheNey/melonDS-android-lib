@@ -204,6 +204,7 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewportDims);
     result->MaxTargetWidth = std::min(maxTextureSize, maxViewportDims[0]);
+    result->MaxTargetHeight = std::min(maxTextureSize, maxViewportDims[1]);
 
     glDepthRangef(0.0f, 1.0f);
     glClearDepthf(1.0f);
@@ -480,6 +481,27 @@ bool GLRenderer::TargetFits(int width, int scale) const noexcept
     return width == WideMelon::NativeWidth || MaxTargetWidth <= 0 || width * scale <= MaxTargetWidth;
 }
 
+// the native targets (256 x 192 at the scale) and the compositor's output, and the frontend's
+// textures made like it, (384+2) x scale tall, have to fit in a texture and a viewport. at 16x
+// that's 4096 x 6176, past a GPU whose limit is 4096. a limit that wasn't read counts as no limit
+bool GLRenderer::ScaleFits(int scale) const noexcept
+{
+    return (MaxTargetWidth <= 0 || WideMelon::NativeWidth * scale <= MaxTargetWidth) &&
+           (MaxTargetHeight <= 0 || (384 + 2) * scale <= MaxTargetHeight);
+}
+
+// the largest scale up to the one asked for that fits the GPU's limits, logged when it's smaller
+int GLRenderer::FitScale(int scale) const noexcept
+{
+    int fit = std::max(scale, 1);
+    while (fit > 1 && !ScaleFits(fit))
+        fit--;
+    if (fit < scale)
+        Platform::Log(Platform::LogLevel::Warn, "OpenGL renderer: %dx doesn't fit the GPU's %dx%d texture and viewport limit, using %dx\n",
+            scale, MaxTargetWidth, MaxTargetHeight, fit);
+    return fit;
+}
+
 int GLRenderer::ResolveViewWidth(int width, int scale) noexcept
 {
     if (width == WideMelon::NativeWidth)
@@ -510,6 +532,8 @@ void GLRenderer::SetViewWidth(int width) noexcept
 
 void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
 {
+    // GetScaleFactor is the scale that's used, which the frontend sizes its textures by
+    scale = FitScale(scale);
     ViewWidth = ResolveViewWidth(RequestedViewWidth, scale);
 
     int targetWidth = TargetWidth;
@@ -1803,11 +1827,19 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         CountCoveredByAlpha();
 #endif
 
-    if (gpu3d.RenderDispCnt & 0x00A0) // fog/edge enabled
+    // GPU::GLEdgeSkip (E2): the edge draw can't change a pixel while nothing writes the edge flag
+    // (attr G is 0 from every clear and opaque draw, the translucent ones mask it off, and the old
+    // edge line pass is gone, see above), since the edge shader blends (0, 0, 0, 0) over every
+    // pixel without it. once edge marking works (E1), this must key on whether any polygon of the
+    // frame can set the flag
+    bool edgepass = (gpu3d.RenderDispCnt & (1<<5)) && !EdgeSkip;
+    bool fogpass = (gpu3d.RenderDispCnt & (1<<7)) != 0;
+
+    if (edgepass || fogpass) // fog/edge enabled
     {
         // the depth buffer's detach goes with the first of them
-        if (gpu3d.RenderDispCnt & (1<<5)) GL_TIMER(Edge);
-        else                              GL_TIMER(Fog);
+        if (edgepass) GL_TIMER(Edge);
+        else          GL_TIMER(Fog);
 
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1832,7 +1864,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
         glBindVertexArray(ClearVertexArrayID);
 
-        if (gpu3d.RenderDispCnt & (1<<5))
+        if (edgepass)
         {
             // edge marking
             // TODO: depth/polyid values at screen edges
@@ -1844,11 +1876,11 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
             glDrawArrays(GL_TRIANGLES, 0, 2*3);
         }
 
-        if (gpu3d.RenderDispCnt & (1<<7))
+        if (fogpass)
         {
             // fog
 
-            if (gpu3d.RenderDispCnt & (1<<5)) GL_TIMER(Fog);
+            if (edgepass) GL_TIMER(Fog);
             glUseProgram(FinalPassFogShader);
 
             if (gpu3d.RenderDispCnt & (1<<6))
@@ -1962,6 +1994,8 @@ void GLRenderer::RenderFrame(GPU& gpu)
     ShadowMaskDepthTest = gpu.ShadowMaskDepthTest;
     EqualDepthMargin = gpu.EqualDepthMargin;
     GLTransSkip = gpu.GLTransSkip;
+    EdgeSkip = gpu.GLEdgeSkip != 0;
+    ClearFast = gpu.GLClearFast;
     // GPU::GLTransSkip bit 2: without the extension, or when its programs don't build, the frame
     // draws as without the bit
     FetchClear0 = (GLTransSkip & 4) && (gpu.GPU3D.RenderClearAttr1 & 0x001F0000) == 0 && PrepareFetchShaders();
@@ -2105,10 +2139,12 @@ void GLRenderer::RenderFrame(GPU& gpu)
         // translucent test (NOTEQUAL 0x40|id over 0x7F) would take 0x7F for translucent ID 63 and
         // keep those polygons off the clear plane, where pass 2 drew them. bit 6 is read by nothing
         // else in that frame (CountCoveredPixels runs with a clear alpha other than 0)
+        GLint clearstencil = FetchClear0 ? 0xBF : 0xFF;
         glDepthFunc(GL_ALWAYS);
-        glStencilFunc(GL_ALWAYS, FetchClear0 ? 0xBF : 0xFF, 0xFF);
+        glStencilFunc(GL_ALWAYS, clearstencil, 0xFF);
         glStencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE);
 
+        bool cleardraw = true;
         if (gpu.GPU3D.RenderDispCnt & (1<<14))
         {
             // clear bitmap: the shader reads it from TexMem, which the dirty tracking above
@@ -2124,6 +2160,29 @@ void GLRenderer::RenderFrame(GPU& gpu)
             glUniform1i(ClearBitmapULoc[0], ScaleFactor);
             glUniform2i(ClearBitmapULoc[1], xoff, yoff);
             glUniform1ui(ClearBitmapULoc[2], polyid);
+        }
+        else if (ClearFast & 1)
+        {
+            // GPU::GLClearFast bit 0 (D1): what kClearVS and kClearFS write with the quad below.
+            // every write mask is open (above) and the scissor test is off, so the clears cover what
+            // the quad does, all of MainFramebuffer. same float values as the shader's outputs, which
+            // the GL turns into the targets' formats the same way: color (RGBA8, the DS's BGR order
+            // swizzled into RGB) and attr (RGB8: poly ID/63, edge flag 0, fog flag) round to the
+            // same bytes (k*255/31 and k*255/63 are never near a half), depth is the window z the
+            // quad's NDC z gives, z/2^24 (both exact in float), stencil the reference above
+            u32 r = gpu.GPU3D.RenderClearAttr1 & 0x1F;
+            u32 g = (gpu.GPU3D.RenderClearAttr1 >> 5) & 0x1F;
+            u32 b = (gpu.GPU3D.RenderClearAttr1 >> 10) & 0x1F;
+            u32 fog = (gpu.GPU3D.RenderClearAttr1 >> 15) & 0x1;
+            u32 a = (gpu.GPU3D.RenderClearAttr1 >> 16) & 0x1F;
+            u32 z = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
+
+            const GLfloat color[4] = {(float)b / 31.0f, (float)g / 31.0f, (float)r / 31.0f, (float)a / 31.0f};
+            const GLfloat attr[4] = {(float)polyid / 63.0f, 0.0f, (float)fog, 1.0f};
+            glClearBufferfv(GL_COLOR, 0, color);
+            glClearBufferfv(GL_COLOR, 1, attr);
+            glClearBufferfi(GL_DEPTH_STENCIL, 0, (float)z / 16777216.0f, clearstencil);
+            cleardraw = false;
         }
         else
         {
@@ -2146,9 +2205,12 @@ void GLRenderer::RenderFrame(GPU& gpu)
             glUniform1ui(ClearUniformLoc[3], fog);
         }
 
-        glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
-        glBindVertexArray(ClearVertexArrayID);
-        glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        if (cleardraw)
+        {
+            glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
+            glBindVertexArray(ClearVertexArrayID);
+            glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        }
     }
 
     if (gpu.GPU3D.RenderNumPolygons)
@@ -2208,6 +2270,18 @@ void GLRenderer::RenderFrame(GPU& gpu)
     }
     else
         NumFinalPolys = 0;
+
+    if (ClearFast & 2)
+    {
+        // GPU::GLClearFast bit 1 (D1): attr, depth and stencil are only read during the frame (the
+        // passes, the fog and edge pass, CountCoveredPixels above), and the next frame's clear
+        // writes all of them before anything reads them again. what's read after the frame is
+        // the color target only: the capture readback, the hi-res capture, hash3d and the
+        // compositor, and a frame skipped as identical keeps using that. so a tiled GPU needn't
+        // store these two to memory
+        const GLenum attachments[2] = {GL_COLOR_ATTACHMENT1, GL_DEPTH_STENCIL_ATTACHMENT};
+        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 2, attachments);
+    }
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Timers)

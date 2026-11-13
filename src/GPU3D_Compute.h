@@ -51,6 +51,9 @@ public:
     void Reset(GPU& gpu) override;
 
     void SetRenderSettings(int scale, bool highResolutionCoordinates);
+    // the scale in use, which can be below the one asked for when that doesn't fit the GPU's
+    // limits (see FitScale). the frontend sizes its textures by this
+    [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
     // dithers the polygons' interpolated vertex colors to 6 bits instead of dropping the low bits
     // (see the Rasterise shader). not something the DS does, so it's off by default
     void SetColorDither(bool dither) noexcept;
@@ -484,6 +487,8 @@ private:
     int ViewWidth = 256;
     int TargetWidth = 256;
     int MaxTargetWidth {};
+    // as in GLRenderer: the compositor's (384+2) x scale rows have to fit (see FitScale)
+    int MaxTargetHeight {};
     s64 MaxBufferSize {};
 
     // set per frame, as in GLRenderer: the polygons were built for a wide view, or are drawn into
@@ -505,6 +510,9 @@ private:
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
+    bool BuffersFit(int width, int scale) const noexcept;
+    bool ScaleFits(int scale) const noexcept;
+    int FitScale(int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
     void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth);
     bool AllocTileMemory(int workTiles);

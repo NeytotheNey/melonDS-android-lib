@@ -129,8 +129,9 @@ void main()
 // shadow programs (SHADOW2D) share all but the entry point (see GLCompositor::Shadow2DFS)
 const char* kCompositorFS_Nearest_Head = R"(#version 320 es
 
-#if defined(WIDE) || defined(FILTER2D) || defined(SHADOW2D)
-// wide and filtered coordinates need more precision than mediump (which can be fp16) has
+#if defined(WIDE) || defined(FILTER2D) || defined(SHADOW2D) || defined(HIGHP)
+// wide and filtered coordinates need more precision than mediump (which can be fp16) has, and so
+// do plain ones above 8x (HIGHP, see GLCompositor::BuildCompShader)
 precision highp float;
 #else
 precision mediump float;

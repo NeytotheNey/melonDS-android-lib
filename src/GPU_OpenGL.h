@@ -161,6 +161,13 @@ private:
     GLuint CompShader {};
     GLuint CompScaleLoc = 0;
     GLuint CompHiresCapLoc = 0;
+    // CompShader was built for a scale above 8, with highp floats (or that build was tried and the
+    // mediump one kept): at mediump, which can be fp16, the 3D fetch's coordinates on the right of
+    // the screen only step by 1/8 of a native pixel and its texel index past 2048 by 2, so 12x and
+    // 16x 3D would show at about 6x-8x there. below 9x the program stays the mediump one it always was
+    bool CompShaderForHighScale = false;
+    void SetupCompShader() noexcept;
+    void BuildCompShader(bool highScale) noexcept;
 
     // the texture units of the images hi-res lines show (see PrepareHiresDisplay)
     static constexpr int HiresBankUnit = 3;

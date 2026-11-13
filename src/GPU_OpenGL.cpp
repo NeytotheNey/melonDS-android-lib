@@ -89,7 +89,8 @@ std::optional<GLCompositor> GLCompositor::New() noexcept
     return { GLCompositor(CompShader) };
 }
 
-GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
+// CompShader's uniform locations and texture units, which leaves it bound
+void GLCompositor::SetupCompShader() noexcept
 {
     CompScaleLoc = glGetUniformLocation(CompShader, "u3DScale");
     CompHiresCapLoc = glGetUniformLocation(CompShader, "uHiresCap");
@@ -101,6 +102,43 @@ GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
     glUniform1i(_3dTextureUniform, 1);
     glUniform1i(glGetUniformLocation(CompShader, "HiresBankTex"), HiresBankUnit);
     glUniform1i(glGetUniformLocation(CompShader, "HiresStreamTex"), HiresStreamUnit);
+}
+
+// CompShader again, with highp floats for a scale above 8 or the mediump one New makes below it
+// (see CompShaderForHighScale). when the build fails the program in use stays, and it isn't tried
+// again until the scale goes back across 8. the bound program is put back
+void GLCompositor::BuildCompShader(bool highScale) noexcept
+{
+    CompShaderForHighScale = highScale;
+
+    std::string fs = CompositorFS();
+    // after the #version line, as in PrepareWide
+    if (highScale)
+        fs.insert(fs.find('\n') + 1, "#define HIGHP\n");
+
+    GLuint shader {};
+    if (!OpenGL::CompileVertexFragmentProgram(shader,
+            kCompositorVS, fs,
+            highScale ? "CompositorShaderHighp" : "CompositorShader",
+            {{"vPosition", 0}, {"vTexcoord", 1}},
+            {{"oColor", 0}}))
+    {
+        Log(LogLevel::Warn, "compositor: the %s program didn't build, keeping the one in use\n", highScale ? "highp" : "mediump");
+        return;
+    }
+
+    GLint bound = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &bound);
+    bool wasBound = (GLuint)bound == CompShader;
+    glDeleteProgram(CompShader);
+    CompShader = shader;
+    SetupCompShader();
+    glUseProgram(wasBound ? CompShader : (GLuint)bound);
+}
+
+GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
+{
+    SetupCompShader();
 
     // all this mess is to prevent bleeding
 #define SETVERTEX(i, x, y, offset) \
@@ -198,6 +236,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     ScreenW(other.ScreenW),
     CompScaleLoc(other.CompScaleLoc),
     CompHiresCapLoc(other.CompHiresCapLoc),
+    CompShaderForHighScale(other.CompShaderForHighScale),
     CompShaderWide(other.CompShaderWide),
     CompShaderWideFailed(other.CompShaderWideFailed),
     CompWideScaleLoc(other.CompWideScaleLoc),
@@ -253,6 +292,7 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         ScreenW = other.ScreenW;
         CompScaleLoc = other.CompScaleLoc;
         CompHiresCapLoc = other.CompHiresCapLoc;
+        CompShaderForHighScale = other.CompShaderForHighScale;
         CompShaderWideFailed = other.CompShaderWideFailed;
         CompWideScaleLoc = other.CompWideScaleLoc;
         CompWideRatioLoc = other.CompWideRatioLoc;
@@ -395,6 +435,8 @@ void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
         FreeHiresBanks();
         FreeFilter2DTextures();
     }
+    if ((scale > 8) != CompShaderForHighScale)
+        BuildCompShader(scale > 8);
 
     Scale = scale;
     ViewWidth = viewWidth;

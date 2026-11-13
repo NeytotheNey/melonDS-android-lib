@@ -117,6 +117,8 @@ private:
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
     u32 WideVertexX(s32 hiresx) const;
     bool TargetFits(int width, int scale) const noexcept;
+    bool ScaleFits(int scale) const noexcept;
+    int FitScale(int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
     int FrameTargetWidth(const GPU& gpu) noexcept;
     bool ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept;
@@ -237,6 +239,9 @@ private:
     int ViewWidth = 256;
     int TargetWidth = 256;
     int MaxTargetWidth {};
+    // the tallest texture and viewport there can be, which the compositor's (384+2) x scale rows
+    // have to fit in (see FitScale)
+    int MaxTargetHeight {};
 
     // set per frame: the polygons were built for a wide view, or are drawn into one. when the
     // two widths differ (right after a change), WideXAdjust keeps them centred
@@ -249,6 +254,9 @@ private:
     bool EqualDepthMargin = true;
     // set per frame from GPU::GLTransSkip
     int GLTransSkip = 0;
+    // set per frame from GPU::GLEdgeSkip and GPU::GLClearFast
+    bool EdgeSkip = false;
+    int ClearFast = 0;
 
     // GPU::GLTransSkip bit 1: what a need-opaque polygon's fragments can come out as (AlphaClass_*),
     // per PolygonList entry, filled by ClassifyTransAlpha before the passes. both bits for every
