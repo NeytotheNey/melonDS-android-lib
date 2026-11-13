@@ -836,6 +836,25 @@ void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinate
     ResizeTargets(scale, highResolutionCoordinates, targetWidth);
 }
 
+// GPU::OutputCap: the targets stay as they are, only the compositor's output follows the need
+void ComputeRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
+{
+    // first, so a cap that starts here builds GPU::OutputCap3D's programs (and the capture pass's) along with the exact one
+    CurGLCompositor.SetOutputCap3D(gpu.OutputCap3D, gpu.HiresCapture);
+
+    int need = GLCompositor::OutputNeed(gpu, frontendNeed);
+    if (need != OutputNeed)
+    {
+        OutputNeed = need;
+        // before the targets' first setup, that one caps it
+        if (ScaleFactor > 0)
+            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need), ScaleFactor, TargetWidth);
+    }
+
+    // debug: a line when the cap's outcome or its reason changes
+    CurGLCompositor.LogOutputCap(gpu, frontendNeed);
+}
+
 void ComputeRenderer::SetColorDither(bool dither) noexcept
 {
     if (dither != ColorDither)
@@ -847,7 +866,7 @@ void ComputeRenderer::SetColorDither(bool dither) noexcept
 
 void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth)
 {
-    CurGLCompositor.SetRenderSettings(scale, targetWidth);
+    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed), scale, targetWidth);
 
     if (ScaleFactor != -1)
     {

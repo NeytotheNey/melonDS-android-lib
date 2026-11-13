@@ -129,9 +129,10 @@ void main()
 // shadow programs (SHADOW2D) share all but the entry point (see GLCompositor::Shadow2DFS)
 const char* kCompositorFS_Nearest_Head = R"(#version 320 es
 
-#if defined(WIDE) || defined(FILTER2D) || defined(SHADOW2D) || defined(HIGHP)
+#if defined(WIDE) || defined(FILTER2D) || defined(SHADOW2D) || defined(HIGHP) || defined(DOWN3D)
 // wide and filtered coordinates need more precision than mediump (which can be fp16) has, and so
-// do plain ones above 8x (HIGHP, see GLCompositor::BuildCompShader)
+// do plain ones above 8x (HIGHP, see GLCompositor::BuildCompShader) and the 3D scale's sub-pixels
+// of a capped output (DOWN3D, see kCompositorFS_Down3D_Entry)
 precision highp float;
 #else
 precision mediump float;
@@ -454,6 +455,425 @@ void main()
 }
 )";
 
+// GPU::OutputCap3D 1's (and 3's) bilinear taps, shared by the capped compositor
+// (kCompositorFS_Down3D_Entry) and the capped capture program (GLCompositor::HiresCaptureDown3DFS),
+// after their _3DTex: the plain average of the ratio x ratio block of the 3D starting at texel
+// [first], as the texture's value (the draw binds a GL_LINEAR sampler to the 3D's unit). at 2, one tap
+// at the block's center. at 4, one at the center of each 2x2 quarter. at 3, two taps a side at 5/6 and
+// 13/6 texels in, each 2/3 of one texel and 1/3 of the next, which weighs the three the same. the
+// filter's weights are only as exact as the GPU's sub-texel precision
+const char* kDown3DTapsFS = R"(
+#if DOWN3D_MODE == 3
+// GPU::OutputCap3D 3: what the alphas of the ratio x ratio block of the 3D starting at texel [first]
+// are, from textureGather: 0 none has any, 1 all have the same nonzero one, 2 they differ. a gather
+// at P reads the 2x2 texels from floor(P * size - 0.5), the ones a bilinear tap at P would weigh, so
+// at P = (first + c) / size, a corner between texels, that's first + c - 1 and the next, with P * size
+// half a texel from either neighbor's footprint: the most that rounding P or the GPU's sub-texel
+// precision can be off by without leaving it. at 2 the block is one gather around its center, at 4
+// one around each 2x2 quarter's, at 3 the four around the corners between its middle texel and its
+// neighbors, which overlap on the middle row and column and cover the 9. the alphas are compared as
+// stored, which is stricter than the 5 bits Fetch3D keeps. the block has to be inside the texture
+int Block3DAlphas(highp ivec2 first, highp int ratio)
+{
+    highp vec2 origin = vec2(first);
+    highp vec2 texel = 1.0 / vec2(textureSize(_3DTex, 0));
+    vec4 alpha0 = textureGather(_3DTex, (origin + 1.0) * texel, 3);
+    bool same = all(equal(alpha0, vec4(alpha0.x)));
+    if (ratio != 2)
+    {
+        highp float far = ratio == 4 ? 3.0 : 2.0;
+        vec4 alpha1 = textureGather(_3DTex, (origin + vec2(far, 1.0)) * texel, 3);
+        vec4 alpha2 = textureGather(_3DTex, (origin + vec2(1.0, far)) * texel, 3);
+        vec4 alpha3 = textureGather(_3DTex, (origin + vec2(far, far)) * texel, 3);
+        same = same && all(equal(alpha1, vec4(alpha0.x))) && all(equal(alpha2, vec4(alpha0.x)))
+            && all(equal(alpha3, vec4(alpha0.x)));
+    }
+    return !same ? 2 : alpha0.x != 0.0 ? 1 : 0;
+}
+
+// GPU::OutputCap3D 3: whether a pixel's composite can saturate where its 3D shows, so that compositing
+// the block's average isn't the average of the sub-pixels' composites even with one alpha all over.
+// only compmode 1 (3D on bottom, blending) can: EVA (val3.g) and EVB (val3.b) are 16 at most each, but
+// above 16 together the blend can pass 0x3F and be clamped (CompositePixel). every other compmode, and
+// master brightness, stays in 0..0x3F with factors that don't depend on the 3D's color, so only the
+// rounding differs. a pixel that can saturate takes the exact composite
+bool BlendSaturates(ivec4 val3)
+{
+    return (val3.a & 0xF) == 1 && val3.g + val3.b > 16;
+}
+#endif
+
+#if DOWN3D_MODE == 1 || DOWN3D_MODE == 3
+highp vec4 Bilinear3DBlock(highp ivec2 first, highp int ratio)
+{
+    highp ivec2 size = textureSize(_3DTex, 0);
+    highp vec2 origin = vec2(first);
+    highp vec2 texel = 1.0 / vec2(size);
+    if (ratio == 2)
+        return texture(_3DTex, (origin + 1.0) * texel);
+
+    highp float tapNear = ratio == 4 ? 1.0 : 5.0 / 6.0;
+    highp float tapFar = ratio == 4 ? 3.0 : 13.0 / 6.0;
+    // summed at highp, as a lowp sum of four could leave lowp's range
+    highp vec4 tap0 = texture(_3DTex, (origin + vec2(tapNear, tapNear)) * texel);
+    highp vec4 tap1 = texture(_3DTex, (origin + vec2(tapFar, tapNear)) * texel);
+    highp vec4 tap2 = texture(_3DTex, (origin + vec2(tapNear, tapFar)) * texel);
+    highp vec4 tap3 = texture(_3DTex, (origin + vec2(tapFar, tapFar)) * texel);
+    return (tap0 + tap1 + tap2 + tap3) * 0.25;
+}
+#endif
+)";
+
+// GPU::OutputCap (experiment K4): the entry point for an output below the 3D's scale, in place of
+// kCompositorFS_Nearest_Entry, with DOWN3D defined (GLCompositor::Down3DFS), for the 256 view and,
+// with WIDE too, a wide one. u3DScale is the output's scale, and each output pixel spans u3DRatio x
+// u3DRatio pixels of the 3D, which is at u3DScale * u3DRatio. at that scale all of them are in the
+// output pixel's native pixel, so their planes and control word are its own: only the 3D differs.
+// each sub-pixel gets what the full-scale draw gives it (its center in native pixels, then Fetch3D's
+// maths with the same truncation, the composite, master brightness and the 8-bit expansion), and the
+// output is their average rounded to nearest, (sum + n/2) / n per channel, so it's exactly a box
+// filter of the full-scale output. hi-res capture lines show their copy, which is at the output's
+// scale (GLCompositor::RunHiresCapture), as the full-scale program shows it at its own.
+// in a wide view the 3D target is as wide as the output, so the 3D column under an output sub-pixel
+// (counted from the output's left edge, at the 3D's scale) is that column plus the X scroll, in the
+// middle and in the wings alike. a wing pixel of a 3D line is WingPixel's for each sub-pixel, the edge
+// probe included (at the probe's column and the sub-pixel's row, both at the 3D's scale). held wings
+// are copies of earlier outputs, at the output's scale, so they're read as the full-scale program
+// reads its own.
+// that's DOWN3D_MODE 0 (GPU::OutputCap3D). modes 1 and 2 are cheaper and inexact: one composite per
+// output pixel, on one 3D pixel made from the block's (Average3D), so an A/B tells the 3D fetches'
+// cost from the per-sub-pixel composites'. a wing's edge probe then asks whether any of the block's
+// rows has 3D at the probe's column. everything else (the 2D, the padding rows, master brightness, the
+// compmodes that read 3D, hi-res capture lines, held wings) is as in mode 0. besides the 3D edges,
+// modes 1 and 2 are off where a 3D-on-bottom blend saturates (BlendSaturates): clamping the composite
+// of the average isn't averaging the clamped composites, so a textured block can come out brighter.
+// mode 3 is mode 1 where that can't leave a fringe: it reads the block's alphas first (Block3DAlphas,
+// one textureGather at a ratio of 2, four at 3 and 4). a block with no alpha composites once with no
+// 3D, as every sub-pixel would. one with the same alpha all over composites once on the bilinear
+// average, which is only off by the rounding of a color average, unless the pixel's blend can
+// saturate. mixed alphas, a 3D edge over the 2D, and a blend that can saturate get mode 0's exact
+// composite. so does a wing pixel whose rows don't agree on the edge probe
+const char* kCompositorFS_Down3D_Entry = R"(
+uniform int u3DRatio;
+
+#if DOWN3D_MODE != 0
+// the 3D pixel the output pixel composites, from the ratio x ratio block of the 3D starting at
+// [first], in Fetch3D's 6-bit color and 5-bit alpha. a scroll moves the 3D by whole native pixels,
+// so the block is either all inside the 3D or all past its side, which has no 3D (as texelFetch
+// gives there, on the GPUs it's been checked on, in the 256 view, and as Fetch3D gives in a wide one)
+ivec4 Average3D(highp ivec2 first, highp int ratio)
+{
+    highp ivec2 size = textureSize(_3DTex, 0);
+    if (first.x < 0 || first.x >= size.x)
+        return ivec4(0);
+
+#if DOWN3D_MODE == 1 || DOWN3D_MODE == 3
+    // the plain average of the block's color and alpha (Bilinear3DBlock), back to a stored 8-bit
+    // value, rounded to nearest, then Fetch3D's conversion of a stored value done in integers:
+    // Fetch3D's float maths gives exactly v * 63 / 255 (and v * 31 / 255 for alpha), rounded down,
+    // for every v, so a block of one color reads what Fetch3D reads
+    highp ivec4 stored = ivec4(Bilinear3DBlock(first, ratio).bgra * 255.0 + 0.5);
+    return stored * ivec4(63,63,63,31) / 255;
+#else
+    // each 3D pixel as Fetch3D reads it. the color's average is weighted by alpha, so transparent
+    // pixels don't darken an edge, and the alpha is the plain average (both rounded to nearest).
+    // no alpha anywhere is no 3D
+    highp ivec3 color = ivec3(0);
+    highp int alpha = 0;
+    for (highp int j = 0; j < ratio; j++)
+    {
+        for (highp int i = 0; i < ratio; i++)
+        {
+            ivec4 _3dpix = ivec4(texelFetch(_3DTex, first + ivec2(i, j), 0).bgra * vec4(63,63,63,31));
+            color += _3dpix.rgb * _3dpix.a;
+            alpha += _3dpix.a;
+        }
+    }
+    if (alpha == 0)
+        return ivec4(0);
+
+    highp int n = ratio * ratio;
+    return ivec4((color + alpha / 2) / alpha, (alpha + n / 2) / n);
+#endif
+}
+#endif
+
+#if DOWN3D_MODE == 3
+// Block3DAlphas for a block that can be past the 3D's sides, where there's no 3D (as in Average3D).
+// in the 256 view the full-scale draw truncates its position toward 0, so the last sub-pixel column
+// left of the 3D (at -0.5 texels) reads column 0: the block that has it is mixed, and the exact
+// composite repeats that
+int Down3DAlphas(highp ivec2 first, highp int ratio)
+{
+    if (first.x < 0 || first.x >= textureSize(_3DTex, 0).x)
+    {
+#ifdef WIDE
+        return 0;
+#else
+        return first.x == -ratio ? 2 : 0;
+#endif
+    }
+    return Block3DAlphas(first, ratio);
+}
+#endif
+
+// master brightness and the expansion to 8 bits, as the plain program's main() does them
+ivec4 FinishPixel(ivec4 pixel, ivec4 mbright, int dispmode)
+{
+    if (dispmode != 0)
+    {
+        int brightmode = mbright.g >> 6;
+        int evy = min(mbright.r & 0x1F, 16);
+        if      (brightmode == 1) pixel += ((0x3F - pixel) * evy) >> 4;
+        else if (brightmode == 2) pixel -= ((pixel * evy) + 0xF) >> 4;
+    }
+
+    pixel.rgb <<= 2;
+    pixel.rgb |= (pixel.rgb >> 6);
+    return pixel;
+}
+
+// the output pixel's first sub-pixel at the 3D's scale, in its half's rows: the output has 2 padding
+// lines between the halves, so the second half's rows start at 194 lines
+highp ivec2 FirstSubPixel()
+{
+    highp int scale = int(u3DScale);
+    highp ivec2 base = ivec2(gl_FragCoord.xy);
+    if (base.y >= 194 * scale)
+        base.y -= 194 * scale;
+    return base * u3DRatio;
+}
+
+#ifdef WIDE
+// the 3D pixel at texel [coord] of the 3D as Fetch3D reads it, with no 3D past its sides
+ivec4 Fetch3DTexel(highp ivec2 coord)
+{
+    if (coord.x < 0 || coord.x >= textureSize(_3DTex, 0).x)
+        return ivec4(0);
+    return ivec4(texelFetch(_3DTex, coord, 0).bgra * vec4(63,63,63,31));
+}
+
+// WingPixel's composite of a 3D line's wing pixel from the wing's planes and one 3D pixel: [edge] is
+// whether the edge's 3D has alpha at its probe, which only matters for a transparent 3D pixel
+ivec4 WingComposite(ivec4 val1, ivec4 val2, ivec4 val3, ivec4 _3dpix, bool edge)
+{
+    if ((val3.a & 0x10) != 0)
+        _3dpix.a = max(_3dpix.a, 1);
+    else if (_3dpix.a == 0 && edge)
+        _3dpix.a = (val3.a & 0xF) == 4 ? 31 : 1;
+
+    bool opaque;
+    return CompositePixel(val1, val2, val3, _3dpix, opaque);
+}
+
+// the wing pixel in 8 bits (bgr, as oColor takes it): WingPixel and the expansion for each sub-pixel,
+// averaged, or in modes 1 and 2 for one 3D pixel made from theirs. mode 3 takes the one 3D pixel where
+// the block's alphas are the same and, for a transparent one the probe matters to, the probe has 3D
+// in all of the block's rows or none (the edge colors the transparent 3D, so a block with no alpha
+// still reads its average), and each sub-pixel otherwise. lines without 3D wings are the same in
+// every sub-pixel
+ivec3 WingDown3D()
+{
+    int row = int(fTexcoord.y);
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
+    int dispmode = mbright.b & 0x3;
+
+    if ((mbright.b & 0x20) != 0)
+        return FinishPixel(ivec4(0x3F), mbright, dispmode).bgr;
+    if ((mbright.b & 0x4) == 0)
+        return FinishPixel(ivec4(0), mbright, dispmode).bgr;
+
+    int side = fTexcoord.x < 0.0 ? 0 : 3;
+    ivec4 val1 = ivec4(texelFetch(WingPlanesTex, ivec2(side, row), 0));
+    ivec4 val2 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 1, row), 0));
+    ivec4 val3 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 2, row), 0));
+
+    // same X scroll as the middle
+    highp int xscroll = mbright.a - ((mbright.b & 0x80) * 2);
+    highp int ratio = u3DRatio;
+    highp int scale3D = int(u3DScale) * ratio;
+    highp ivec2 first = FirstSubPixel() + ivec2(xscroll * scale3D, 0);
+    // the edge's probe column, one native pixel in, as Fetch3D finds it at the full scale
+    highp int probeX = int(floor(((side == 0 ? 1.5 : 254.5) + float(xscroll + uWideOffset)) * float(scale3D)));
+
+#if DOWN3D_MODE != 0
+    bool exact = false;
+#if DOWN3D_MODE == 3
+    // a blend that can saturate is exact too (BlendSaturates), whatever the alphas, as the edge probe
+    // can give transparent 3D an alpha. DrawWingPlanes doesn't give a wing compmode 1, so that's only
+    // in case it does one day
+    exact = Down3DAlphas(first, ratio) == 2 || BlendSaturates(val3);
+#endif
+    if (!exact)
+    {
+        ivec4 _3dpix = Average3D(first, ratio);
+        int probed = 0;
+        if ((val3.a & 0x10) == 0 && _3dpix.a == 0)
+        {
+            // how many of the block's rows have 3D at the probe: modes 1 and 2 only ask whether any does
+            for (highp int j = 0; j < ratio; j++)
+            {
+                probed += Fetch3DTexel(ivec2(probeX, first.y + j)).a != 0 ? 1 : 0;
+#if DOWN3D_MODE != 3
+                if (probed != 0)
+                    break;
+#endif
+            }
+#if DOWN3D_MODE == 3
+            exact = probed != 0 && probed != ratio;
+#endif
+        }
+        if (!exact)
+            return FinishPixel(WingComposite(val1, val2, val3, _3dpix, probed != 0), mbright, dispmode).bgr;
+    }
+#endif
+
+    highp ivec3 sum = ivec3(0);
+    for (highp int j = 0; j < ratio; j++)
+    {
+        for (highp int i = 0; i < ratio; i++)
+        {
+            highp ivec2 sub = first + ivec2(i, j);
+            ivec4 _3dpix = Fetch3DTexel(sub);
+            bool edge = (val3.a & 0x10) == 0 && _3dpix.a == 0 && Fetch3DTexel(ivec2(probeX, sub.y)).a != 0;
+            sum += FinishPixel(WingComposite(val1, val2, val3, _3dpix, edge), mbright, dispmode).bgr;
+        }
+    }
+
+    highp int n = ratio * ratio;
+    return (sum + n / 2) / n;
+}
+#endif
+
+#if DOWN3D_MODE == 0 || DOWN3D_MODE == 3
+// the exact composite of a middle pixel's 3D compmodes (bgr, as oColor takes it): each sub-pixel's 3D
+// as the full-scale draw reads it at [base] + (i, j), composited, finished and averaged
+ivec3 MiddleDown3D(ivec4 pixel, ivec4 val2, ivec4 val3, ivec4 mbright, int dispmode, highp ivec2 base, highp int xscroll)
+{
+    highp int ratio = u3DRatio;
+    highp int scale3D = int(u3DScale) * ratio;
+#ifndef WIDE
+    highp float _3dxpos = float(xscroll);
+    highp float scale3DF = float(scale3D);
+#endif
+    highp ivec3 sum = ivec3(0);
+    for (highp int j = 0; j < ratio; j++)
+    {
+        for (highp int i = 0; i < ratio; i++)
+        {
+#ifdef WIDE
+            ivec4 _3dpix = Fetch3DTexel(base + ivec2(i + xscroll * scale3D, j));
+#else
+            // the full-scale draw's fTexcoord at this sub-pixel's center, then its Fetch3D
+            highp vec2 pos = (vec2(base + ivec2(i, j)) + 0.5) / scale3DF;
+            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(pos.x + _3dxpos, pos.y) * scale3DF), 0).bgra
+                         * vec4(63,63,63,31));
+#endif
+
+            bool opaque;
+            sum += FinishPixel(CompositePixel(pixel, val2, val3, _3dpix, opaque), mbright, dispmode).bgr;
+        }
+    }
+
+    highp int n = ratio * ratio;
+    return (sum + n / 2) / n;
+}
+#endif
+
+void main()
+{
+#ifdef WIDE
+    if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
+    {
+        // a held line takes the wings from an earlier frame's output as they are, as in
+        // kCompositorFS_Nearest_Entry: that output was at this scale too
+        ivec4 ctrl = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+        if ((ctrl.g & 0x20) != 0)
+        {
+            highp ivec2 coord = ivec2(gl_FragCoord.xy);
+            highp int wingW = uWideOffset * int(u3DScale);
+            if (coord.x >= wingW)
+                coord.x -= 256 * int(u3DScale);
+            oColor = vec4(texelFetch(HeldWingsTex, coord, 0).rgb, 1.0);
+            return;
+        }
+
+        oColor = vec4(vec3(WingDown3D()) / 255.0, 1.0);
+        return;
+    }
+#endif
+
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+    int dispmode = mbright.b & 0x3;
+    ivec2 planeCoord = ivec2(fTexcoord);
+    ivec4 pixel = ivec4(texelFetch(ScreenTex, planeCoord, 0));
+
+    if (uHiresCap != 0 && (mbright.r & 0x80) != 0)
+    {
+        // from a hi-res image at the output's scale, as in kCompositorFS_Nearest_Entry
+        highp ivec2 coord = ivec2(gl_FragCoord.xy);
+        highp int scale = int(u3DScale);
+        if (coord.y >= 194 * scale)
+            coord.y -= 194 * scale;
+#ifdef WIDE
+        coord.x -= uWideOffset * scale;
+#endif
+        coord = clamp(coord, ivec2(0), ivec2(256 * scale - 1, 192 * scale - 1));
+
+        highp uint word;
+        if ((mbright.r & 0x20) != 0)
+            word = texelFetch(HiresStreamTex, coord, 0).r;
+        else
+            word = texelFetch(HiresBankTex, coord, 0).r;
+        pixel = ivec4(int(word & 0x1Fu) << 1, int((word >> 5) & 0x1Fu) << 1, int((word >> 10) & 0x1Fu) << 1, 0);
+    }
+    else if (dispmode == 1)
+    {
+        ivec4 val2 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(256,0), 0));
+        ivec4 val3 = ivec4(texelFetch(ScreenTex, planeCoord + ivec2(512,0), 0));
+
+        // the compmodes that show 3D (0-4)
+        ivec4 _3dpix = ivec4(0);
+        if ((val3.a & 0xF) <= 4)
+        {
+            highp int ratio = u3DRatio;
+            highp ivec2 base = FirstSubPixel();
+            // mbright.a == HOFS bit0..7, mbright.b bit7 == HOFS bit8 (sign)
+            highp int xscroll = mbright.a - ((mbright.b & 0x80) * 2);
+            // the block's first 3D pixel: what the sub-pixel at base reads, the scroll being whole
+            // native pixels
+            highp ivec2 first = base + ivec2(xscroll * int(u3DScale) * ratio, 0);
+
+#if DOWN3D_MODE == 3
+            // no alpha is no 3D in every sub-pixel, one alpha all over the bilinear average, unless
+            // the blend can saturate (BlendSaturates): then it's the exact composite, as for mixed alphas
+            int alphas = Down3DAlphas(first, ratio);
+            if (alphas == 1 && BlendSaturates(val3))
+                alphas = 2;
+            if (alphas == 1)
+                _3dpix = Average3D(first, ratio);
+            else if (alphas == 2)
+            {
+                oColor = vec4(vec3(MiddleDown3D(pixel, val2, val3, mbright, dispmode, base, xscroll)) / 255.0, 1.0);
+                return;
+            }
+#elif DOWN3D_MODE != 0
+            _3dpix = Average3D(first, ratio);
+#else
+            oColor = vec4(vec3(MiddleDown3D(pixel, val2, val3, mbright, dispmode, base, xscroll)) / 255.0, 1.0);
+            return;
+#endif
+        }
+
+        bool opaque;
+        pixel = CompositePixel(pixel, val2, val3, _3dpix, opaque);
+    }
+
+    pixel = FinishPixel(pixel, mbright, dispmode);
+    oColor = vec4(vec3(pixel.bgr) / 255.0, 1.0);
+}
+)";
+
 // hi-res display capture: the capture pass (GLCompositor::RunHiresCapture) redoes a frame's display
 // capture at the 3D scale into a bank copy, a GL_R16UI texture of 256 x 256 bank rows at the
 // scale. it draws one triangle over the viewport, which covers the captured rows
@@ -468,7 +888,9 @@ void main()
 
 // the capture program's fragment shader is kHiresCaptureFS_Head + kCompositePixelFS +
 // kHiresCaptureFS_Main. it makes the bank word DoCapture (GPU2D_Soft.cpp) would make for this
-// hi-res texel, with the same integer maths, so at 1x it should match the native capture exactly
+// hi-res texel, with the same integer maths, so at 1x it should match the native capture exactly.
+// GPU::OutputCap's program for a capped output has DOWN3D defined and kDown3DTapsFS before the main
+// part (GLCompositor::HiresCaptureDown3DFS)
 const char* kHiresCaptureFS_Head = R"(#version 320 es
 
 precision highp float;
@@ -505,6 +927,140 @@ ivec4 Fetch3DCapture(int x, int y)
     return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
 }
 
+#ifdef DOWN3D
+// GPU::OutputCap (experiment K4): with the output capped, the copies are at the output's scale
+// (uScale), while the 3D is u3DRatio times that. a texel's source A is then made from the ratio x
+// ratio 3D pixels under it, as the capped compositor makes its pixels (GPU::OutputCap3D): in mode 0
+// each is composited as the full-scale capture would, then the 6-bit color is averaged (rounded to
+// nearest) and the alpha bit is set where at least half of them have it. modes 1 and 2 composite
+// once, on one 3D pixel made from the block's (Average3DCapture), and mode 3 does that where the
+// block's alphas are the same (Block3DAlphas) and mode 0's maths where they differ or the blend can
+// saturate (BlendSaturates, which modes 1 and 2 are off by, as in the compositor). the word maths
+// after that are the full-scale capture's. the words have 5 bits a channel, so this can't be a box filter of the
+// full-scale copy exactly, only close to it
+uniform int u3DRatio;
+
+// Fetch3DCapture at the 3D's scale: column x of the middle 256 and line y, both at [scale3D]
+ivec4 Fetch3DCaptureAt(int x, int y, int scale3D)
+{
+    if (x < 0 || x >= 256 * scale3D)
+        return ivec4(0);
+
+    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * scale3D, y), 0);
+    return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
+}
+
+#if DOWN3D_MODE != 0
+// the 3D pixel source A composites in modes 1, 2 and 3, from the ratio x ratio block at x, y (as for
+// Fetch3DCaptureAt), decoded as Fetch3DCapture decodes. the block is all inside the middle 256 or
+// all past it, as the scroll is whole native pixels. 1: the plain average from bilinear taps
+// (Bilinear3DBlock, the pass binds the GL_LINEAR sampler), rounded back to a stored byte, and 3
+// the same where the block's alphas are. 2: the color weighted by alpha and the plain average
+// alpha, or the plain color where no pixel has alpha, as a capture of the 3D alone keeps the color
+// of its transparent pixels
+ivec4 Average3DCapture(int x, int y, int ratio, int scale3D)
+{
+    if (x < 0 || x >= 256 * scale3D)
+        return ivec4(0);
+
+#if DOWN3D_MODE == 1 || DOWN3D_MODE == 3
+    vec4 average = Bilinear3DBlock(ivec2(x + uWideOffset * scale3D, y), ratio);
+    return ivec4(average.bgra * 255.0 + 0.5) >> ivec4(2, 2, 2, 3);
+#else
+    ivec3 color = ivec3(0), plain = ivec3(0);
+    int alpha = 0;
+    for (int j = 0; j < ratio; j++)
+    {
+        for (int i = 0; i < ratio; i++)
+        {
+            ivec4 _3dpix = Fetch3DCaptureAt(x + i, y + j, scale3D);
+            color += _3dpix.rgb * _3dpix.a;
+            plain += _3dpix.rgb;
+            alpha += _3dpix.a;
+        }
+    }
+
+    int n = ratio * ratio;
+    if (alpha == 0)
+        return ivec4((plain + n / 2) / n, 0);
+    return ivec4((color + alpha / 2) / alpha, (alpha + n / 2) / n);
+#endif
+}
+#endif
+
+// source A of the texel at [frag], capture line [line] and native column [x], [row] being its row
+// in the captured rectangle, all at the output's scale
+void SourceADown3D(ivec2 frag, int row, int x, int line, uint capcnt, int xscroll, out ivec4 colA, out bool alphaA)
+{
+    int ratio = u3DRatio;
+    int scale3D = uScale * ratio;
+    int x3d = frag.x * ratio + xscroll * scale3D;
+    int y3d = row * ratio;
+    bool only3D = (capcnt & (1u << 24)) != 0u;
+
+    ivec4 val1 = ivec4(0), val2 = ivec4(0), val3 = ivec4(0);
+    if (!only3D)
+    {
+        val1 = ivec4(texelFetch(PlanesTex, ivec2(x, line), 0));
+        val2 = ivec4(texelFetch(PlanesTex, ivec2(x + 256, line), 0));
+        val3 = ivec4(texelFetch(PlanesTex, ivec2(x + 512, line), 0));
+
+        // a compmode that doesn't show 3D is the same in every sub-pixel
+        if ((val3.a & 0xF) > 4)
+        {
+            colA = CompositePixel(val1, val2, val3, ivec4(0), alphaA);
+            return;
+        }
+    }
+
+#if DOWN3D_MODE != 0
+    bool exact = false;
+#if DOWN3D_MODE == 3
+    // past the middle 256 there's no 3D. one alpha all over is exact too where the blend can
+    // saturate (BlendSaturates, never with the 3D alone, whose planes are 0)
+    if (x3d >= 0 && x3d < 256 * scale3D)
+    {
+        int alphas = Block3DAlphas(ivec2(x3d + uWideOffset * scale3D, y3d), ratio);
+        exact = alphas == 2 || (alphas == 1 && BlendSaturates(val3));
+    }
+#endif
+    if (!exact)
+    {
+        ivec4 _3dpix = Average3DCapture(x3d, y3d, ratio, scale3D);
+        if (only3D)
+        {
+            colA = _3dpix;
+            alphaA = colA.a != 0;
+        }
+        else
+        {
+            colA = CompositePixel(val1, val2, val3, _3dpix, alphaA);
+        }
+        return;
+    }
+#endif
+
+    ivec3 sum = ivec3(0);
+    int set = 0;
+    for (int j = 0; j < ratio; j++)
+    {
+        for (int i = 0; i < ratio; i++)
+        {
+            ivec4 sub = Fetch3DCaptureAt(x3d + i, y3d + j, scale3D);
+            bool subAlpha = sub.a != 0;
+            if (!only3D)
+                sub = CompositePixel(val1, val2, val3, sub, subAlpha);
+            sum += sub.rgb;
+            set += subAlpha ? 1 : 0;
+        }
+    }
+
+    int n = ratio * ratio;
+    colA = ivec4((sum + n / 2) / n, 0);
+    alphaA = set * 2 >= n;
+}
+#endif
+
 uint TexelWord(uvec4 texel)
 {
     return texel.r | (texel.g << 8) | (texel.b << 16) | (texel.a << 24);
@@ -532,6 +1088,9 @@ void main()
         int xscroll = int(linectrl & 0x1FFu);
         if (xscroll >= 256)
             xscroll -= 512;
+#ifdef DOWN3D
+        SourceADown3D(frag, row, x, line, capcnt, xscroll, colA, alphaA);
+#else
         int x3d = frag.x + xscroll * uScale;
 
         if ((capcnt & (1u << 24)) != 0u)
@@ -551,6 +1110,7 @@ void main()
 
             colA = CompositePixel(val1, val2, val3, _3dpix, alphaA);
         }
+#endif
     }
 
     // source B: the hi-res copy of the bank, or the native words upscaled

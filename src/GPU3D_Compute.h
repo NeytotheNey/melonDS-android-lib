@@ -54,6 +54,9 @@ public:
     // the scale in use, which can be below the one asked for when that doesn't fit the GPU's
     // limits (see FitScale). the frontend sizes its textures by this
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
+    // GPU::OutputCap: same as GLRenderer's (see GPU3D_OpenGL.h)
+    void SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept;
+    [[nodiscard]] int GetOutputScale() const noexcept { return CurGLCompositor.GetScaleFactor(); }
     // dithers the polygons' interpolated vertex colors to 6 bits instead of dropping the low bits
     // (see the Rasterise shader). not something the DS does, so it's off by default
     void SetColorDither(bool dither) noexcept;
@@ -388,6 +391,8 @@ private:
     int ScreenWidth {}, ScreenHeight {};
     int TilesPerLine {}, TileLines {};
     int ScaleFactor = -1;
+    // GPU::OutputCap: the need SetOutputNeed last worked out, which ResizeTargets caps the output by
+    int OutputNeed = 0;
     int MaxWorkTiles {};
     // the room the work buffers have now, which TargetFits and the shaders don't know about: the
     // tile memory layers in work tiles (MaxWorkTiles at most), the X spans and their setup indices

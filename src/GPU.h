@@ -875,6 +875,33 @@ public:
     // set by the frontend before each frame, for Comp1x 1 and 2: whether everything that shows the
     // output can show a half drawn at 1x. off, every half is drawn in full
     bool Comp1xFrontend = false;
+    // OpenGL and compute renderers, experiment K4 (docs/plan-gpu-discovery.md): the compositor's
+    // output is capped at the scale the frontend shows it at, while the 3D keeps rendering at the full
+    // internal scale. the output goes down to scale / d, the largest d up to 4 that divides the scale
+    // and leaves the output at least the need (GLCompositor::CappedScale), and the compositor's main
+    // draw makes each output pixel from the d x d 3D pixels under it (the DOWN3D programs, in the
+    // 256 view and in a wide one, see OutputCap3D). hi-res capture's copies are at the output's
+    // scale too, with the capture pass reading the 3D at its own (GLCompositor::RunHiresCapture). 1
+    // caps by the frontend's need (Renderer3D::SetOutputNeed, from how big the screens are drawn), the
+    // default, and 0 keeps the output at the internal scale as before. a need of 0 (unknown, as the
+    // desktop build has) is no cap. not with filtered 2D or the GPU 2D shadow yet
+    // (GLCompositor::OutputNeed). only changed by a debug switch
+    int OutputCap = 1;
+    // with OutputCap 1: above 0, the need to cap by instead of the frontend's, for A/Bs and the
+    // desktop build, which has none. 0, the default, takes the frontend's
+    int OutputCapNeed = 0;
+    // with OutputCap capping the output: how the capped draw (and the capped hi-res capture pass)
+    // turns the ratio x ratio 3D pixels under an output pixel into it. 0 is the exact supersample (a
+    // composite per 3D pixel, averaged), exactly a box filter of the full-scale output. the cheaper,
+    // inexact ones composite once per output pixel: 1 on the plain average of the 3D pixels' color and
+    // alpha, read with bilinear taps (off by a few levels on 3D pixels only, more on 3D edges over 2D,
+    // where transparent pixels' color mixes in), 2 on their alpha-weighted color and averaged alpha,
+    // read with a texelFetch each. both are also off where a 3D-on-bottom blend saturates (EVA + EVB
+    // above 16), as clamping the average's composite isn't averaging the clamped composites. 3, the
+    // default, reads the alphas first with textureGather and is 1 where they're the same, and 0 where
+    // they differ or the blend can saturate, so it's only off by a color average's rounding
+    // (kCompositorFS_Down3D_Entry). only changed by a debug switch
+    int OutputCap3D = 3;
     // debug only: the OpenGL renderer logs the masks and shadows of this many frames (that have any)
     int ShadowLogFrames = 0;
     // compute renderer: size the SortWork and Rasterise dispatches on the CPU instead of having the

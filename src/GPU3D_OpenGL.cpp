@@ -543,13 +543,32 @@ void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
     ResizeTargets(betterpolygons, scale, targetWidth);
 }
 
+// GPU::OutputCap: the targets stay as they are, only the compositor's output follows the need
+void GLRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
+{
+    // first, so a cap that starts here builds GPU::OutputCap3D's programs (and the capture pass's) along with the exact one
+    CurGLCompositor.SetOutputCap3D(gpu.OutputCap3D, gpu.HiresCapture);
+
+    int need = GLCompositor::OutputNeed(gpu, frontendNeed);
+    if (need != OutputNeed)
+    {
+        OutputNeed = need;
+        // before the targets' first setup, that one caps it
+        if (ScaleFactor > 0)
+            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need), ScaleFactor, TargetWidth);
+    }
+
+    // debug: a line when the cap's outcome or its reason changes
+    CurGLCompositor.LogOutputCap(gpu, frontendNeed);
+}
+
 // true when anything changed
 bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept
 {
     if (betterpolygons == BetterPolygons && scale == ScaleFactor && targetWidth == TargetWidth)
         return false;
 
-    CurGLCompositor.SetRenderSettings(scale, targetWidth);
+    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed), scale, targetWidth);
     ScaleFactor = scale;
     TargetWidth = targetWidth;
     BetterPolygons = betterpolygons;

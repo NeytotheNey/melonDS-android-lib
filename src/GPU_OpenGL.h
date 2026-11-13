@@ -44,11 +44,39 @@ public:
     ~GLCompositor();
 
     void SetScaleFactor(int scale) noexcept;
+    // the output's scale, which with GPU::OutputCap can be below the 3D's (see SetRenderSettings)
     [[nodiscard]] int GetScaleFactor() const noexcept { return Scale; }
+    [[nodiscard]] int GetScale3D() const noexcept { return Scale3D; }
 
     // WideMelon: the output is viewWidth x scale wide, and the wide shader is only built when
-    // PrepareWide() is first called. it returns false if that failed, then only 256 works
-    void SetRenderSettings(int scale, int viewWidth) noexcept;
+    // PrepareWide() is first called. it returns false if that failed, then only 256 works.
+    // GPU::OutputCap (experiment K4): the 3D the renderer draws is at scale3D, which is scale or a
+    // whole multiple of it up to 4 (see CappedScale). above scale, the main draw uses the view's
+    // DOWN3D program, built here the first time it's needed (with the hi-res capture pass's while
+    // that's on, see SetOutputCap3D): each output pixel composites the ratio x ratio 3D pixels under
+    // it and averages them. when the program doesn't build, the output stays at scale3D. a call that
+    // changes the output's scale works like a scale change, so the hi-res copies, which are at the
+    // output's scale, start over
+    void SetRenderSettings(int scale, int scale3D, int viewWidth) noexcept;
+    // GPU::OutputCap: the output scale for 3D at [scale] when what shows the output needs [need]x:
+    // scale / d for the largest d in 1..4 that divides scale and leaves scale / d >= need. need 0
+    // (unknown) keeps scale
+    [[nodiscard]] static int CappedScale(int scale, int need) noexcept;
+    // GPU::OutputCap: the need the renderers cap the output by (see Renderer's SetOutputNeed), from
+    // the frontend's need, or GPU::OutputCapNeed over it, or 0 for no cap: with OutputCap off, and while
+    // anything that reads the 3D at the output's scale and isn't ported to the DOWN3D programs yet is
+    // on (filtered 2D, the GPU 2D shadow)
+    [[nodiscard]] static int OutputNeed(const GPU& gpu, int frontendNeed) noexcept;
+    // GPU::OutputCap3D: the mode the capped draw and the capped hi-res capture pass use from now on
+    // (0-3), and whether hi-res capture is on (GPU::HiresCapture). called with every SetOutputNeed,
+    // before it: a change while the output is capped builds the programs it needs here, once, and a
+    // cap that starts later builds them with the exact ones (SetRenderSettings)
+    void SetOutputCap3D(int mode, bool hiresCapture) noexcept;
+    // GPU::OutputCap, debug: logs the cap's outcome and why (the switch, an excluded feature, the
+    // need, the scale, a wide view, a program that didn't build), one line each time any of it
+    // changes. the renderers call it at the end of every SetOutputNeed with the need the frontend
+    // gave them, so it only costs a few compares in a frame that changes nothing
+    void LogOutputCap(const GPU& gpu, int frontendNeed) noexcept;
     [[nodiscard]] int GetViewWidth() const noexcept { return ViewWidth; }
     bool PrepareWide() noexcept;
 
@@ -71,16 +99,25 @@ public:
     // reset or a savestate load. CPU state only too
     void ResetShadow2D() noexcept;
     // whether the capture pass would run now (see RunHiresCapture): above 1x, or at 1x in the
-    // check mode (GPU::HiresCaptureDebug 2), and while the capture program hasn't failed. GPU
-    // only records capture lines and flags VRAM display lines while it does (GPU::Start2DJob)
+    // check mode (GPU::HiresCaptureDebug 2), and while the capture program hasn't failed: with the
+    // output capped (GPU::OutputCap), the capped one in the draw's mode, or the exact one the pass
+    // falls back to. GPU only records capture lines and flags VRAM display lines while it does
+    // (GPU::Start2DJob)
     [[nodiscard]] bool RunsHiresCapture(int debug) const noexcept
     {
-        return (Scale > 1 || debug >= 2) && !HiresCap.ShaderFailed;
+        bool failed = Scale3D != Scale ? HiresCap.Down3D[Down3DVariant()].Failed && HiresCap.Down3D[0].Failed
+                                       : HiresCap.ShaderFailed;
+        return (Scale > 1 || debug >= 2) && !failed;
     }
 
     // the fragment shader sources, as assembled around kCompositePixelFS
     static std::string CompositorFS();
+    // GPU::OutputCap: the 256 view's or, [wide], a wide view's program for an output below the 3D's
+    // scale, in GPU::OutputCap3D mode [mode] (DOWN3D_MODE)
+    static std::string Down3DFS(int mode, bool wide);
     static std::string HiresCaptureFS();
+    // GPU::OutputCap: the hi-res capture pass's program for a capped output, in GPU::OutputCap3D mode [mode]
+    static std::string HiresCaptureDown3DFS(int mode);
     // the GPU 2D shadow programs' fragment shaders: 0 the middle-only composite, 1 the wide one,
     // 2 the check one (planes at 1x), and the OBJ pass
     static std::string Shadow2DFS(int variant);
@@ -155,6 +192,9 @@ private:
     void FreeComp1xCheck() noexcept;
 
     int Scale = 0;
+    // GPU::OutputCap: the 3D's scale, Scale times the ratio the DOWN3D program averages over (Scale
+    // itself without a cap)
+    int Scale3D = 0;
     int ViewWidth = 256;
     int ScreenH = 0, ScreenW = 0;
 
@@ -168,6 +208,54 @@ private:
     bool CompShaderForHighScale = false;
     void SetupCompShader() noexcept;
     void BuildCompShader(bool highScale) noexcept;
+
+    // GPU::OutputCap: the programs with DOWN3D defined (always highp), for an output below the 3D's
+    // scale, the 256 view's ([0]) and a wide view's ([1], with WIDE too), one per GPU::OutputCap3D mode
+    // (DOWN3D_MODE, see kCompositorFS_Down3D_Entry). the view's exact one (0) is made the first time
+    // SetRenderSettings caps the output in it, with the mode's alongside it, and another mode's when
+    // GPU::OutputCap3D changes while capped (SetOutputCap3D): never per frame. the wide ones' uniforms
+    // past HiresCapLoc are only found in them
+    struct Down3DProgram
+    {
+        GLuint Program {};
+        bool Failed = false;
+        GLuint ScaleLoc = 0;
+        GLuint RatioLoc = 0;
+        GLuint HiresCapLoc = 0;
+        GLuint WideRatioLoc = 0;
+        GLuint WideOffsetLoc = 0;
+    };
+    std::array<std::array<Down3DProgram, 4>, 2> Down3D {};
+    // the GPU::OutputCap3D mode SetOutputCap3D was last given, and whether hi-res capture was on
+    int Down3DMode = 0;
+    bool Down3DHiresCapture = false;
+    // GPU::OutputCap3D 1 and 3: a GL_LINEAR sampler, bound to the 3D's unit (1) only for the capped main
+    // draw and the capped capture pass, so the 3D texture itself stays GL_NEAREST for everything that
+    // texelFetches it
+    GLuint Down3DSampler {};
+    bool PrepareDown3D(bool wide, int mode) noexcept;
+    // what a capped output in GPU::OutputCap3D mode [mode] needs: the view's program and, while hi-res
+    // capture is on, the capture pass's (see HiresCaptureState::Down3D). false when the view's didn't
+    // build (a capture program that didn't only skips the capture passes)
+    bool PrepareCapped(bool wide, int mode) noexcept;
+    void MakeDown3DSampler() noexcept;
+    // the mode the capped draw uses: Down3DMode once the view's program for it built, the exact one otherwise
+    [[nodiscard]] int Down3DVariant() const noexcept { return Down3D[ViewWidth != 256][Down3DMode].Program ? Down3DMode : 0; }
+
+    // GPU::OutputCap: what LogOutputCap's last line said, so it only logs changes
+    struct OutputCapLogLine
+    {
+        const char* Reason = nullptr;
+        // Mode is the one the capped draw uses, AskedMode GPU::OutputCap3D
+        int Need = -1, FrontendNeed = -1, Scale = -1, Scale3D = -1, ViewWidth = -1, Mode = -1, AskedMode = -1, HiresCapture = -1;
+        bool operator==(const OutputCapLogLine& other) const noexcept
+        {
+            return Reason == other.Reason && Need == other.Need && FrontendNeed == other.FrontendNeed && Scale == other.Scale
+                && Scale3D == other.Scale3D && ViewWidth == other.ViewWidth && Mode == other.Mode
+                && AskedMode == other.AskedMode && HiresCapture == other.HiresCapture;
+        }
+    };
+    OutputCapLogLine OutputCapLogged {};
 
     // the texture units of the images hi-res lines show (see PrepareHiresDisplay)
     static constexpr int HiresBankUnit = 3;
@@ -222,7 +310,8 @@ private:
     void CopyHeldWings(int backbuf) noexcept;
 
     // hi-res display capture (see GPU::HiresCapture). one copy per capture bank (A-D, the only
-    // capture targets), GL_R16UI, 256 x 256 bank rows at Scale, holding the bank's words. a copy
+    // capture targets), GL_R16UI, 256 x 256 bank rows at Scale (the output's, which GPU::OutputCap can
+    // put below the 3D's), holding the bank's words. a copy
     // only counts over the rows its last capture pass wrote (anything else is native, with no
     // rows kept from older passes), and only while nothing else wrote the bank. the textures are
     // made the first time a pass needs them and freed when the scale changes.
@@ -264,6 +353,16 @@ private:
         GLuint Shader = 0;
         bool ShaderFailed = false;
         GLuint ScaleLoc = 0, WideOffsetLoc = 0, DstRowLoc = 0;
+        // GPU::OutputCap: the pass's programs for a capped output, one per GPU::OutputCap3D mode
+        // (HiresCaptureDown3DFS), which read the 3D at its own scale. made alongside the compositor's
+        // (PrepareCapped) while hi-res capture is on, or by the first capped pass that needs one
+        struct Down3DShader
+        {
+            GLuint Program = 0;
+            bool Failed = false;
+            GLuint ScaleLoc = 0, WideOffsetLoc = 0, DstRowLoc = 0, RatioLoc = 0;
+        };
+        std::array<Down3DShader, 4> Down3D {};
 
         // the bank the frame's VRAM display lines show from (bound on unit 3), or -1
         int ShowBank = -1;
@@ -290,6 +389,7 @@ private:
     void PrepareHiresStream(const GPU& gpu, int backbuf) noexcept;
     void RunHiresCapture(const GPU& gpu, int backbuf) noexcept;
     bool PrepareHiresCaptureShader() noexcept;
+    bool PrepareHiresCaptureDown3D(int mode) noexcept;
     static GLuint MakeHiresTexture(GLenum format, int width, int height) noexcept;
     void FreeHiresBanks() noexcept;
     void FreeHiresCapture() noexcept;

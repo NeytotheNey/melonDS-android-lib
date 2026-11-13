@@ -40,6 +40,15 @@ public:
     void SetScaleFactor(int scale) noexcept;
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
+    // GPU::OutputCap (experiment K4): how many times the native size the frontend shows the screens
+    // at, at most (0 for unknown), which GLCompositor::OutputNeed turns into the need the
+    // compositor's output is capped by (GLCompositor::CappedScale). call it before every frame, on
+    // the GL (emulator) thread, after the frontend set what that reads (filtered 2D, hi-res capture,
+    // the GPU 2D shadow): only a change reaches the compositor, and it never touches the 3D targets.
+    // GetOutputScale is the output's scale, which the frontend sizes its textures by (with
+    // GetOutputWidth); GetScaleFactor stays the 3D's
+    void SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept;
+    [[nodiscard]] int GetOutputScale() const noexcept { return CurGLCompositor.GetScaleFactor(); }
 
     // WideMelon: width of the 3D view in native pixels (even, 256..768, anything else means 256).
     // * it's kept across SetRenderSettings calls and re-checked when the scale changes: it drops
@@ -232,6 +241,8 @@ private:
     u16 TexPalConvBuffer[1024 * 48] {};
 
     int ScaleFactor {};
+    // GPU::OutputCap: the need SetOutputNeed last worked out, which ResizeTargets caps the output by
+    int OutputNeed = 0;
     bool BetterPolygons {};
     int ScreenW {}, ScreenH {};
 

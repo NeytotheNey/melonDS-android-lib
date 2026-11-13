@@ -50,6 +50,18 @@ std::string GLCompositor::CompositorFS()
     return std::string(kCompositorFS_Nearest_Head) + kCompositePixelFS + kCompositorFS_Nearest_Main + kCompositorFS_Nearest_Entry;
 }
 
+// GPU::OutputCap: the program with the DOWN3D entry point (see kCompositorFS_Down3D_Entry), in
+// GPU::OutputCap3D mode [mode], for the 256 view or, with WIDE, a wide one
+std::string GLCompositor::Down3DFS(int mode, bool wide)
+{
+    std::string fs = std::string(kCompositorFS_Nearest_Head) + kCompositePixelFS + kCompositorFS_Nearest_Main
+                   + kDown3DTapsFS + kCompositorFS_Down3D_Entry;
+    // after the #version line, as in PrepareWide
+    fs.insert(fs.find('\n') + 1, std::string(wide ? "#define WIDE\n" : "") + "#define DOWN3D\n#define DOWN3D_MODE "
+              + std::to_string(mode) + "\n");
+    return fs;
+}
+
 std::string GLCompositor::Shadow2DFS(int variant)
 {
     std::string fs = std::string(kCompositorFS_Nearest_Head) + kCompositePixelFS + kCompositorFS_Nearest_Main
@@ -72,6 +84,16 @@ std::string GLCompositor::Shadow2DObjFS()
 std::string GLCompositor::HiresCaptureFS()
 {
     return std::string(kHiresCaptureFS_Head) + kCompositePixelFS + kHiresCaptureFS_Main;
+}
+
+// GPU::OutputCap: the capture program with DOWN3D defined (see kHiresCaptureFS_Main), in
+// GPU::OutputCap3D mode [mode]
+std::string GLCompositor::HiresCaptureDown3DFS(int mode)
+{
+    std::string fs = std::string(kHiresCaptureFS_Head) + kCompositePixelFS + kDown3DTapsFS + kHiresCaptureFS_Main;
+    // after the #version line, as in PrepareWide
+    fs.insert(fs.find('\n') + 1, "#define DOWN3D\n#define DOWN3D_MODE " + std::to_string(mode) + "\n");
+    return fs;
 }
 
 std::optional<GLCompositor> GLCompositor::New() noexcept
@@ -226,17 +248,29 @@ GLCompositor::~GLCompositor()
 
     glDeleteProgram(CompShader);
     glDeleteProgram(CompShaderWide);
+    for (std::array<Down3DProgram, 4>& view : Down3D)
+    {
+        for (Down3DProgram& program : view)
+            glDeleteProgram(program.Program);
+    }
+    glDeleteSamplers(1, &Down3DSampler);
 }
 
 
 GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     Scale(other.Scale),
+    Scale3D(other.Scale3D),
     ViewWidth(other.ViewWidth),
     ScreenH(other.ScreenH),
     ScreenW(other.ScreenW),
     CompScaleLoc(other.CompScaleLoc),
     CompHiresCapLoc(other.CompHiresCapLoc),
     CompShaderForHighScale(other.CompShaderForHighScale),
+    Down3D(other.Down3D),
+    Down3DMode(other.Down3DMode),
+    Down3DHiresCapture(other.Down3DHiresCapture),
+    Down3DSampler(other.Down3DSampler),
+    OutputCapLogged(other.OutputCapLogged),
     CompShaderWide(other.CompShaderWide),
     CompShaderWideFailed(other.CompShaderWideFailed),
     CompWideScaleLoc(other.CompWideScaleLoc),
@@ -280,6 +314,12 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     other.CompVertexBufferID = {};
     other.CompShader = {};
     other.CompShaderWide = {};
+    for (std::array<Down3DProgram, 4>& view : other.Down3D)
+    {
+        for (Down3DProgram& program : view)
+            program.Program = {};
+    }
+    other.Down3DSampler = {};
 }
 
 GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
@@ -287,12 +327,16 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
     if (this != &other)
     {
         Scale = other.Scale;
+        Scale3D = other.Scale3D;
         ViewWidth = other.ViewWidth;
         ScreenH = other.ScreenH;
         ScreenW = other.ScreenW;
         CompScaleLoc = other.CompScaleLoc;
         CompHiresCapLoc = other.CompHiresCapLoc;
         CompShaderForHighScale = other.CompShaderForHighScale;
+        Down3DMode = other.Down3DMode;
+        Down3DHiresCapture = other.Down3DHiresCapture;
+        OutputCapLogged = other.OutputCapLogged;
         CompShaderWideFailed = other.CompShaderWideFailed;
         CompWideScaleLoc = other.CompWideScaleLoc;
         CompWideRatioLoc = other.CompWideRatioLoc;
@@ -311,6 +355,16 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
 
         glDeleteProgram(CompShaderWide);
         CompShaderWide = other.CompShaderWide;
+
+        for (std::array<Down3DProgram, 4>& view : Down3D)
+        {
+            for (Down3DProgram& program : view)
+                glDeleteProgram(program.Program);
+        }
+        Down3D = other.Down3D;
+
+        glDeleteSamplers(1, &Down3DSampler);
+        Down3DSampler = other.Down3DSampler;
 
         glDeleteBuffers(1, &CompVertexBufferID);
         CompVertexBufferID = other.CompVertexBufferID;
@@ -365,6 +419,12 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         other.CompVertexBufferID = {};
         other.CompShader = {};
         other.CompShaderWide = {};
+        for (std::array<Down3DProgram, 4>& view : other.Down3D)
+        {
+            for (Down3DProgram& program : view)
+                program.Program = {};
+        }
+        other.Down3DSampler = {};
     }
 
     return *this;
@@ -419,15 +479,196 @@ bool GLCompositor::PrepareWide() noexcept
     return true;
 }
 
-void GLCompositor::SetScaleFactor(int scale) noexcept
+bool GLCompositor::PrepareDown3D(bool wide, int mode) noexcept
 {
-    SetRenderSettings(scale, ViewWidth);
+    Down3DProgram& program = Down3D[wide][mode];
+    if (program.Program || program.Failed)
+        return program.Program != 0;
+
+    // a wide view's has the wide vertex shader too, as in PrepareWide
+    std::string vs = kCompositorVS;
+    if (wide)
+        vs.insert(vs.find('\n') + 1, "#define WIDE\n");
+
+    GLuint shader {};
+    if (!OpenGL::CompileVertexFragmentProgram(shader,
+            vs, Down3DFS(mode, wide),
+            wide ? "CompositorShaderWideDown3D" : "CompositorShaderDown3D",
+            {{"vPosition", 0}, {"vTexcoord", 1}},
+            {{"oColor", 0}}))
+    {
+        if (mode == 0)
+            Log(LogLevel::Warn, "compositor: the %s DOWN3D program didn't build, the output stays at the 3D's scale there\n",
+                wide ? "wide" : "256");
+        else
+            Log(LogLevel::Warn, "compositor: the %s DOWN3D mode %d program didn't build, the capped output uses the exact one\n",
+                wide ? "wide" : "256", mode);
+        program.Failed = true;
+        return false;
+    }
+
+    program.Program = shader;
+    program.ScaleLoc = glGetUniformLocation(shader, "u3DScale");
+    program.RatioLoc = glGetUniformLocation(shader, "u3DRatio");
+    program.HiresCapLoc = glGetUniformLocation(shader, "uHiresCap");
+    if (wide)
+    {
+        program.WideRatioLoc = glGetUniformLocation(shader, "uWideRatio");
+        program.WideOffsetLoc = glGetUniformLocation(shader, "uWideOffset");
+    }
+
+    // the bound program is put back, as in BuildCompShader
+    GLint bound = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &bound);
+    glUseProgram(shader);
+    glUniform1i(glGetUniformLocation(shader, "ScreenTex"), 0);
+    glUniform1i(glGetUniformLocation(shader, "_3DTex"), 1);
+    glUniform1i(glGetUniformLocation(shader, "HiresBankTex"), HiresBankUnit);
+    glUniform1i(glGetUniformLocation(shader, "HiresStreamTex"), HiresStreamUnit);
+    if (wide)
+    {
+        // as PrepareWide's, which made the wing planes' texture before the view got wide
+        glUniform1i(glGetUniformLocation(shader, "HeldWingsTex"), 2);
+        glUniform1i(glGetUniformLocation(shader, "WingPlanesTex"), WingPlanesUnit);
+    }
+    glUseProgram((GLuint)bound);
+
+    if (mode == 1 || mode == 3)
+        MakeDown3DSampler();
+    return true;
 }
 
-void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
+// modes 1 and 3's bilinear taps. a block never reaches past the 3D's edge (see Average3D in
+// kCompositorFS_Down3D_Entry), so the wrap mode doesn't matter
+void GLCompositor::MakeDown3DSampler() noexcept
 {
-    if (scale == Scale && viewWidth == ViewWidth)
+    if (Down3DSampler)
         return;
+    glGenSamplers(1, &Down3DSampler);
+    glSamplerParameteri(Down3DSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glSamplerParameteri(Down3DSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glSamplerParameteri(Down3DSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glSamplerParameteri(Down3DSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+bool GLCompositor::PrepareCapped(bool wide, int mode) noexcept
+{
+    bool built = PrepareDown3D(wide, mode);
+    if (Down3DHiresCapture)
+        PrepareHiresCaptureDown3D(built ? mode : 0);
+    return built;
+}
+
+void GLCompositor::SetOutputCap3D(int mode, bool hiresCapture) noexcept
+{
+    mode = std::clamp(mode, 0, 3);
+    if (mode == Down3DMode && hiresCapture == Down3DHiresCapture)
+        return;
+
+    Down3DMode = mode;
+    Down3DHiresCapture = hiresCapture;
+    // a capped output draws with them from the next frame. otherwise the next cap builds them
+    if (Scale != Scale3D)
+        PrepareCapped(ViewWidth != 256, mode);
+}
+
+void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
+{
+    // nothing to say before the renderer's first SetRenderSettings
+    if (Scale3D <= 0)
+        return;
+
+    OutputCapLogLine line;
+    line.Need = OutputNeed(gpu, frontendNeed);
+    line.FrontendNeed = frontendNeed;
+    line.Scale = Scale;
+    line.Scale3D = Scale3D;
+    line.ViewWidth = ViewWidth;
+    line.Mode = Down3DVariant();
+    line.AskedMode = gpu.OutputCap3D;
+    line.HiresCapture = gpu.HiresCapture ? 1 : 0;
+    // the first reason, in the order they're checked: OutputNeed's, then CappedScale's, then
+    // SetRenderSettings'
+    if (gpu.OutputCap == 0)
+        line.Reason = "switch off";
+    else if (gpu.Filter2D != 0)
+        line.Reason = "filtered 2D";
+    else if (gpu.Shadow2D)
+        line.Reason = "GPU 2D shadow";
+    else if (line.Need <= 0)
+        line.Reason = "need 0";
+    else if (line.Need >= Scale3D)
+        line.Reason = "need >= scale";
+    else if (CappedScale(Scale3D, line.Need) == Scale3D)
+        line.Reason = "need above every capped scale";
+    else if (Down3D[ViewWidth != 256][0].Failed)
+        line.Reason = ViewWidth != 256 ? "wide DOWN3D program failed" : "DOWN3D program failed";
+    else if (Scale == Scale3D)
+        line.Reason = "not applied";
+
+    // with the switch off it's said once, whatever the frontend's need does
+    if (gpu.OutputCap == 0)
+        line.Need = line.FrontendNeed = 0;
+    if (line == OutputCapLogged)
+        return;
+    OutputCapLogged = line;
+
+    const char* source = gpu.OutputCapNeed > 0 ? "outcapneed" : "frontend";
+    if (line.Reason)
+        Log(LogLevel::Info, "OUTCAP: no cap (%s), output %dx, 3D %dx, outcap %d, outcap3d %d, need %d (%s), frontend need %d, view %d, "
+            "hirescap %d\n",
+            line.Reason, Scale, Scale3D, gpu.OutputCap, gpu.OutputCap3D, line.Need, source, frontendNeed, ViewWidth, line.HiresCapture);
+    else
+        Log(LogLevel::Info, "OUTCAP: capped, output %dx, 3D %dx, ratio %d, outcap3d %d (asked %d), need %d (%s), frontend need %d, view %d, "
+            "hirescap %d\n",
+            Scale, Scale3D, Scale3D / Scale, line.Mode, gpu.OutputCap3D, line.Need, source, frontendNeed, ViewWidth, line.HiresCapture);
+}
+
+int GLCompositor::CappedScale(int scale, int need) noexcept
+{
+    if (need <= 0)
+        return scale;
+    for (int d = 4; d > 1; d--)
+    {
+        if (scale % d == 0 && scale / d >= need)
+            return scale / d;
+    }
+    return scale;
+}
+
+// GPU::OutputCap: what the DOWN3D programs can't draw yet is decided here, so the output stays at
+// the 3D's scale while any of it is on. each reads the 3D, or draws, at the output's scale with
+// programs of its own: filtered 2D (FilterFetch3D, and the map at the output's scale) and the GPU 2D
+// shadow's composite (gpu2dwide's too). the frontend sets them between frames, before it calls the
+// renderer's SetOutputNeed, so the output is back at the 3D's scale in the first frame that runs them.
+// hi-res capture has a capped pass (HiresCaptureDown3DFS), with its copies at the output's scale
+int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) noexcept
+{
+    if (gpu.OutputCap == 0 || gpu.Filter2D != 0 || gpu.Shadow2D)
+        return 0;
+    return gpu.OutputCapNeed > 0 ? gpu.OutputCapNeed : frontendNeed;
+}
+
+void GLCompositor::SetScaleFactor(int scale) noexcept
+{
+    SetRenderSettings(scale, scale, ViewWidth);
+}
+
+void GLCompositor::SetRenderSettings(int scale, int scale3D, int viewWidth) noexcept
+{
+    // GPU::OutputCap: the view's DOWN3D programs, for whole ratios up to 4. GPU::OutputCap3D's (and
+    // the capture pass's for it) alongside the exact one, which the draw falls back to if it doesn't build
+    bool wide = viewWidth != 256;
+    if (scale != scale3D && (scale < 1 || scale3D % scale != 0 || scale3D / scale > 4 || !PrepareDown3D(wide, 0)))
+        scale = scale3D;
+    if (scale != scale3D)
+        PrepareCapped(wide, Down3DMode);
+
+    if (scale == Scale && scale3D == Scale3D && viewWidth == ViewWidth)
+        return;
+
+    if (scale != scale3D || Scale != Scale3D)
+        Log(LogLevel::Info, "compositor: output at %dx, 3D at %dx\n", scale, scale3D);
 
     // the hi-res capture copies are at the scale, a view width change keeps them
     if (scale != Scale)
@@ -435,10 +676,12 @@ void GLCompositor::SetRenderSettings(int scale, int viewWidth) noexcept
         FreeHiresBanks();
         FreeFilter2DTextures();
     }
-    if ((scale > 8) != CompShaderForHighScale)
-        BuildCompShader(scale > 8);
+    // by the 3D's scale: the plain program only draws while the output is at it
+    if ((scale3D > 8) != CompShaderForHighScale)
+        BuildCompShader(scale3D > 8);
 
     Scale = scale;
+    Scale3D = scale3D;
     ViewWidth = viewWidth;
     ScreenW = viewWidth * scale;
     ScreenH = (384+2) * scale;
@@ -1005,7 +1248,8 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     if (filterPasses > 0)
         smallDraw = {Filter2D.MapScale, filterComp.ScaleLoc, filterComp.RowOffsetLoc};
     else
-        smallDraw = {1, ViewWidth == 256 ? CompScaleLoc : CompWideScaleLoc, -1};
+        smallDraw = {1, Scale3D != Scale ? Down3D[ViewWidth != 256][Down3DVariant()].ScaleLoc
+                        : ViewWidth != 256 ? CompWideScaleLoc : CompScaleLoc, -1};
     if (gpu.Comp1x != 0)
     {
         bool check = gpu.Comp1x == 3;
@@ -1066,6 +1310,20 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         {
             glUniform1f(filterComp.RatioLoc, ViewWidth / 256.0f);
             glUniform1i(filterComp.OffsetLoc, (ViewWidth - 256) / 2);
+        }
+    }
+    else if (Scale3D != Scale)
+    {
+        // GPU::OutputCap: a capped output, with the view's program in GPU::OutputCap3D's mode
+        const Down3DProgram& program = Down3D[ViewWidth != 256][Down3DVariant()];
+        glUseProgram(program.Program);
+        glUniform1ui(program.ScaleLoc, Scale);
+        glUniform1i(program.RatioLoc, Scale3D / Scale);
+        glUniform1i(program.HiresCapLoc, hiresDisplay);
+        if (ViewWidth != 256)
+        {
+            glUniform1f(program.WideRatioLoc, ViewWidth / 256.0f);
+            glUniform1i(program.WideOffsetLoc, (ViewWidth - 256) / 2);
         }
     }
     else if (ViewWidth == 256)
@@ -1141,6 +1399,10 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     glActiveTexture(GL_TEXTURE1);
     renderer.SetupAccelFrame();
+    // GPU::OutputCap3D 1 and 3: the capped draw's bilinear taps, for this draw only (unbound right after it)
+    bool down3DLinear = filterPasses == 0 && Scale3D != Scale && (Down3DVariant() == 1 || Down3DVariant() == 3);
+    if (down3DLinear)
+        glBindSampler(1, Down3DSampler);
 
     glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
     glBindVertexArray(CompVertexArrayID);
@@ -1167,6 +1429,8 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         }
         EndHalvesAt1x(smallDraw);
     }
+    if (down3DLinear)
+        glBindSampler(1, 0);
     BeginGPUTimer(ComputePass::CompExtra);
 
     // what's in the output now, for the frontend (TakeOutputLayout)
@@ -1911,7 +2175,17 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
     // nothing at 1x otherwise (RunsHiresCapture), so this only catches lines held across a change
     if (Scale == 1 && gpu.HiresCaptureDebug < 2)
         skip |= HiresCapSkip_Native1x;
-    if (!skip && !PrepareHiresCaptureShader())
+    // GPU::OutputCap: a capped output's pass reads the 3D at its own scale, in the main draw's mode
+    // (or the exact one's if that mode's program didn't build)
+    int capMode = Down3DVariant();
+    if (!skip && Scale3D != Scale)
+    {
+        if (!PrepareHiresCaptureDown3D(capMode))
+            capMode = 0;
+        if (capMode == 0 && !PrepareHiresCaptureDown3D(0))
+            skip |= HiresCapSkip_Shader;
+    }
+    else if (!skip && !PrepareHiresCaptureShader())
         skip |= HiresCapSkip_Shader;
 
     // where each line's source B comes from, decided with the copies as they were before this
@@ -2019,11 +2293,30 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
     glDrawBuffers(1, fbassign);
     glViewport(0, dstRow * Scale, 256 * Scale, rows * Scale);
 
-    glUseProgram(HiresCap.Shader);
-    glUniform1i(HiresCap.ScaleLoc, Scale);
-    glUniform1i(HiresCap.WideOffsetLoc, (ViewWidth - 256) / 2);
-    glUniform1i(HiresCap.DstRowLoc, dstRow);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (Scale3D != Scale)
+    {
+        const HiresCaptureState::Down3DShader& shader = HiresCap.Down3D[capMode];
+        glUseProgram(shader.Program);
+        glUniform1i(shader.ScaleLoc, Scale);
+        glUniform1i(shader.WideOffsetLoc, (ViewWidth - 256) / 2);
+        glUniform1i(shader.DstRowLoc, dstRow);
+        glUniform1i(shader.RatioLoc, Scale3D / Scale);
+        // GPU::OutputCap3D 1 and 3's bilinear taps on the 3D's unit, for this pass only, as in the main draw
+        bool linear = capMode == 1 || capMode == 3;
+        if (linear)
+            glBindSampler(1, Down3DSampler);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (linear)
+            glBindSampler(1, 0);
+    }
+    else
+    {
+        glUseProgram(HiresCap.Shader);
+        glUniform1i(HiresCap.ScaleLoc, Scale);
+        glUniform1i(HiresCap.WideOffsetLoc, (ViewWidth - 256) / 2);
+        glUniform1i(HiresCap.DstRowLoc, dstRow);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
 
     // the destination's old image becomes the scratch one, and stays usable for the next frame's
     // stream with the rows it covered, until the next pass draws over it. the native capture is
@@ -2044,7 +2337,9 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
     HiresCap.Passes++;
 
 #ifdef MELONADE_DEBUG_TOOLS
-    if (gpu.HiresCaptureDebug >= 2 && Scale == 1 && (HiresCap.CheckCount++ % 30) == 0)
+    // not while capped (GPU::OutputCap): the copy is then made from the 3D at its own scale, which
+    // the native capture never matches
+    if (gpu.HiresCaptureDebug >= 2 && Scale == 1 && Scale3D == Scale && (HiresCap.CheckCount++ % 30) == 0)
         CheckHiresCapture(dstNative, dst, dstRow, rows);
 #endif
 
@@ -2085,6 +2380,47 @@ bool GLCompositor::PrepareHiresCaptureShader() noexcept
     return true;
 }
 
+// GPU::OutputCap: the capped pass's program in GPU::OutputCap3D mode [mode], tried once. the bound
+// program is put back, as it can be built outside the pass (PrepareCapped)
+bool GLCompositor::PrepareHiresCaptureDown3D(int mode) noexcept
+{
+    HiresCaptureState::Down3DShader& shader = HiresCap.Down3D[mode];
+    if (shader.Program || shader.Failed)
+        return shader.Program != 0;
+
+    GLuint program {};
+    if (!OpenGL::CompileVertexFragmentProgram(program,
+            kHiresCaptureVS, HiresCaptureDown3DFS(mode),
+            "HiresCaptureShaderDown3D",
+            {},
+            {{"oWord", 0}}))
+    {
+        Log(LogLevel::Warn, "compositor: the capped hi-res capture program (mode %d) didn't build%s\n", mode,
+            mode == 0 ? ", capped captures stay native" : "");
+        shader.Failed = true;
+        return false;
+    }
+
+    shader.Program = program;
+    shader.ScaleLoc = glGetUniformLocation(program, "uScale");
+    shader.WideOffsetLoc = glGetUniformLocation(program, "uWideOffset");
+    shader.DstRowLoc = glGetUniformLocation(program, "uDstRow");
+    shader.RatioLoc = glGetUniformLocation(program, "u3DRatio");
+
+    GLint bound = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &bound);
+    glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "PlanesTex"), 4);
+    glUniform1i(glGetUniformLocation(program, "_3DTex"), 1);
+    glUniform1i(glGetUniformLocation(program, "SrcBTex"), 5);
+    glUniform1i(glGetUniformLocation(program, "BankBTex"), 6);
+    glUseProgram((GLuint)bound);
+
+    if (mode == 1 || mode == 3)
+        MakeDown3DSampler();
+    return true;
+}
+
 // an integer texture for the capture pass, made on unit 7 so no binding the frame uses changes
 GLuint GLCompositor::MakeHiresTexture(GLenum format, int width, int height) noexcept
 {
@@ -2120,10 +2456,13 @@ void GLCompositor::FreeHiresCapture() noexcept
     glDeleteTextures(1, &HiresCap.SrcBTex);
     glDeleteFramebuffers(1, &HiresCap.PassFB);
     glDeleteProgram(HiresCap.Shader);
+    for (HiresCaptureState::Down3DShader& shader : HiresCap.Down3D)
+        glDeleteProgram(shader.Program);
     HiresCap.PlanesTex = 0;
     HiresCap.SrcBTex = 0;
     HiresCap.PassFB = 0;
     HiresCap.Shader = 0;
+    HiresCap.Down3D = {};
 }
 
 // debug only (GPU::HiresCaptureDebug): once a second, how many captures there were and passes
