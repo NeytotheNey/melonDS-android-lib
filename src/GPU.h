@@ -839,15 +839,16 @@ public:
     // off too. exact while nothing writes the edge flag (attr G): the edge shader only marks pixels
     // whose flag is set, and blends (0, 0, 0, 0) over the rest, which keeps them as they are. once
     // edge marking works (E1), this must key on whether any polygon of the frame can set the flag.
-    // 0, the default for now, draws as before. only changed by a debug switch
-    int GLEdgeSkip = 0;
+    // 1 is the default in every build since 11-12; 0 draws as before, for A/Bs. only changed by a
+    // debug switch
+    int GLEdgeSkip = 1;
     // OpenGL renderer, experiment D1 (docs/plan-gpu-discovery.md), a bit each. bit 0: the plain
     // clear (not the clear bitmap, DISP3DCNT bit 14) is a glClearBuffer per attachment instead of a
     // full-screen quad, with the same values the quad's shader writes. bit 1: after the frame, the
     // attr and depth/stencil targets are invalidated (glInvalidateFramebuffer), since nothing reads
-    // them before the next frame's clear. 0, the default for now, draws as before. only changed by
-    // a debug switch
-    int GLClearFast = 0;
+    // them before the next frame's clear. 3 is the default in every build since 11-12; 0 draws as
+    // before, for A/Bs. only changed by a debug switch
+    int GLClearFast = 3;
     // OpenGL and compute renderers, experiment K2a (docs/plan-gpu-discovery.md): the compositor's
     // main draw starts without the output's old contents, so a tiled GPU needn't load them. 1
     // clears the whole output to 0 first, 2 invalidates it and clears only the padding rows
