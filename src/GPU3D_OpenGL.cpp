@@ -46,13 +46,16 @@ namespace melonDS
 
 bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard, bool full)
 {
-    char shadername[64];
+    char shadername[80];
     char probename[16] = "";
     if (TexProbe)
         snprintf(probename, sizeof(probename), "TexProbe%d", TexProbe);
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
+    // GPU::GLTexCache 256: the color-only build is only the cache-only programs', never the twins'
+    bool colorOnly = TexCache && TexColorPlane && TexColorOnly && TexCacheOnly && !full;
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
         nodiscard ? "NoDiscard" : "", fragCount ? "Count" : "", probename,
-        TexCache ? (TexCacheOnly && !full ? "TexCacheOnly" : "TexCache") : "", TexCache && TexWrapVS ? "WrapVS" : "");
+        TexCache ? (TexCacheOnly && !full ? "TexCacheOnly" : "TexCache") : "", TexCache && TexWrapVS ? "WrapVS" : "",
+        TexCache && TexColorPlane ? (colorOnly ? "ColorOnly" : "Color") : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
@@ -95,6 +98,13 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     // (full) the heap's fallback polygons draw with
     if (TexCache && TexCacheOnly && !full)
         fsbuf += "\n#define TexCacheOnly";
+    // GPU::GLTexCache 128 (T2 step 4a, measurement only): the heap lookup reads the color plane for
+    // the polygons AssignTexCache marked, in every build with the lookup. 256 (debug): the
+    // cache-only programs without the record path
+    if (TexCache && TexColorPlane)
+        fsbuf += "\n#define TexColorPlane";
+    if (colorOnly)
+        fsbuf += "\n#define TexColorOnly";
     fsbuf += wrapdef;
 #ifdef MELONADE_DEBUG_TOOLS
     // debug only, GPU::GLTexCache 32: a twin that can't build, to test TexCacheOff
@@ -144,6 +154,8 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     {
         glUniform1i(glGetUniformLocation(prog, "TexHeap"), 2);
         glUniform1i(glGetUniformLocation(prog, "TexPalLinear"), 3);
+        if (TexColorPlane)
+            glUniform1i(glGetUniformLocation(prog, "TexColor"), 4);
     }
 
     int id = (nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0)) + (full ? FullShader : 0);
@@ -224,11 +236,14 @@ bool GLRenderer::PrepareNoDiscardShader()
 // counts), and the fetch and no-discard builds are dropped, to be made again with it the first frame
 // that wants them. when [0] or [1] doesn't build, they're built again as they were (logged), and the
 // variant stays off until a switch changes
-void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs)
+void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs, bool color, bool colorOnly)
 {
     only = cache && only;
     wrapvs = cache && wrapvs;
-    if (probe == TexProbe && cache == TexCache && only == TexCacheOnly && wrapvs == TexWrapVS)
+    color = cache && color;
+    colorOnly = color && only && colorOnly;
+    if (probe == TexProbe && cache == TexCache && only == TexCacheOnly && wrapvs == TexWrapVS
+        && color == TexColorPlane && colorOnly == TexColorOnly)
         return;
 
     bool fragCount = false;
@@ -237,11 +252,16 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs)
 #endif
     int oldProbe = TexProbe;
     bool oldCache = TexCache, oldOnly = TexCacheOnly, oldWrapVS = TexWrapVS;
+    bool oldColor = TexColorPlane, oldColorOnly = TexColorOnly;
     GLuint prev[2] = { RenderShader[0], RenderShader[1] };
     TexProbe = probe;
     TexCache = cache;
     TexCacheOnly = only;
     TexWrapVS = wrapvs;
+    TexColorPlane = color;
+    TexColorOnly = colorOnly;
+    bool cacheVariantChanged = cache != oldCache || only != oldOnly || wrapvs != oldWrapVS
+        || color != oldColor || colorOnly != oldColorOnly;
     bool built0 = BuildRenderShader(false, fragCount);
     bool built1 = built0 && BuildRenderShader(true, fragCount);
     if (!built1)
@@ -250,13 +270,16 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs)
             glDeleteProgram(RenderShader[0]);
         if (probe != oldProbe)
             Platform::Log(Platform::LogLevel::Warn, "GLTEXPROBE: the probe %d render programs didn't build, gltexprobe stays at %d\n", probe, oldProbe);
-        if (cache != oldCache || only != oldOnly || wrapvs != oldWrapVS)
-            Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs %s the texel heap lookup%s%s didn't build, gltexcache stays %s\n",
-                cache ? "with" : "without", only ? " only" : "", wrapvs ? " and the vertex shader wrap" : "", oldCache ? "on" : "off");
+        if (cacheVariantChanged)
+            Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs %s the texel heap lookup%s%s%s didn't build, gltexcache stays %s\n",
+                cache ? "with" : "without", only ? " only" : "", wrapvs ? " and the vertex shader wrap" : "",
+                color ? (colorOnly ? " and the color plane only" : " and the color plane") : "", oldCache ? "on" : "off");
         TexProbe = oldProbe;
         TexCache = oldCache;
         TexCacheOnly = oldOnly;
         TexWrapVS = oldWrapVS;
+        TexColorPlane = oldColor;
+        TexColorOnly = oldColorOnly;
         BuildRenderShader(false, fragCount);
         BuildRenderShader(true, fragCount);
     }
@@ -278,10 +301,12 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs)
     CurRenderMode = -1;
     if (built1 && probe != oldProbe)
         Platform::Log(Platform::LogLevel::Info, "GLTEXPROBE: render programs built with texture probe %d (renders wrong on purpose)\n", TexProbe);
-    if (built1 && (cache != oldCache || only != oldOnly || wrapvs != oldWrapVS))
-        Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: render programs built %s the texel heap lookup%s%s\n", TexCache ? "with" : "without",
+    if (built1 && cacheVariantChanged)
+        Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: render programs built %s the texel heap lookup%s%s%s\n", TexCache ? "with" : "without",
             TexCacheOnly ? " only (step 2, the old decode path is in twins made when a polygon needs it)" : "",
-            TexWrapVS ? ", its wrap constants made in the vertex shader (step 3)" : "");
+            TexWrapVS ? ", its wrap constants made in the vertex shader (step 3)" : "",
+            TexColorPlane ? (TexColorOnly ? ", the color plane only, no record path (step 4a, 256, measurement only)"
+                                          : ", the color plane (step 4a, measurement only, palette changes go unseen)") : "");
 }
 
 // RenderFrame, when GPU::GLTexProbe or GPU::GLTexCache differs from what was asked last: the probe
@@ -306,6 +331,10 @@ void GLRenderer::UpdateRenderVariant(const GPU& gpu)
     bool only = !(TexCacheAsked & 16);
     // step 3, bit 6 (64): the heap lookup's wrap constants from the vertex shader
     bool wrapvs = (TexCacheAsked & 64) != 0;
+    // step 4a, bit 7 (128): the color plane (measurement only); bit 8 (256, debug): its cache-only
+    // programs without the record path (needs 128 and step 2, ignored otherwise)
+    bool color = (TexCacheAsked & 128) != 0;
+    bool colorOnly = color && only && (TexCacheAsked & 256) != 0;
 #ifdef MELONADE_DEBUG_TOOLS
     // debug only, GPU::GLTexCache 32: the twins' source gets an #error, to test TexCacheOff
     FailTwins = (TexCacheAsked & 32) != 0;
@@ -315,12 +344,12 @@ void GLRenderer::UpdateRenderVariant(const GPU& gpu)
         DeleteTexCache();
     if (cache && !TexHeap && !CreateTexCache(TexCacheAsked))
         cache = false;
-    SetRenderVariant(probe, cache, only, wrapvs);
+    SetRenderVariant(probe, cache, only, wrapvs, color, colorOnly);
     // a build that failed left the programs as they were, which can be the heap lookup ones with the
     // heap already gone: make it again, or drop to the programs without the lookup. if even that
     // fails, RenderFrame only runs AssignTexCache with a heap, so every polygon takes the old path
     if (TexCache && !TexHeap && !CreateTexCache(TexCacheAsked))
-        SetRenderVariant(TexProbe, false, false, false);
+        SetRenderVariant(TexProbe, false, false, false, false, false);
     if (TexHeap && !TexCache)
         DeleteTexCache();
 }
@@ -355,20 +384,36 @@ bool GLRenderer::CreateTexCache(int mode)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 256, 192, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, NULL);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, TexPalConvBuffer);
+
+    // GPU::GLTexCache 128 (T2 step 4a, measurement only): the color plane, the heap's size, the
+    // internal format, format and type of TexPalLinear (the same 16-bit words). only the blocks of
+    // entries with one are ever written or read
+    if (mode & 128)
+    {
+        glActiveTexture(GL_TEXTURE4);
+        glGenTextures(1, &TexColorID);
+        glBindTexture(GL_TEXTURE_2D, TexColorID);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 1024, rows, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, NULL);
+    }
     GLenum error = glGetError();
     glActiveTexture(GL_TEXTURE0);
     if (error != GL_NO_ERROR)
     {
-        Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the heap textures (1024 x %u RGBA8UI, 256 x 192 RGB5_A1) failed "
-            "with GL error 0x%X, gltexcache stays off\n", rows, error);
+        Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the heap textures (1024 x %u RGBA8UI, 256 x 192 RGB5_A1%s) failed "
+            "with GL error 0x%X, gltexcache stays off\n", rows, (mode & 128) ? ", the RGB5_A1 color plane" : "", error);
         DeleteTexCache();
         return false;
     }
 
     TexHeapRows = rows;
     TexHeap = std::make_unique<GLTexHeap>();
-    TexHeap->Configure(mode, rows);
-    Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: on, mode %d, heap 1024 x %u texels\n", mode, rows);
+    TexHeap->Configure(mode, rows, TexPalConvBuffer);
+    Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: on, mode %d, heap 1024 x %u texels%s\n", mode, rows,
+        (mode & 128) ? ", with a color plane (step 4a)" : "");
     return true;
 }
 
@@ -376,7 +421,8 @@ void GLRenderer::DeleteTexCache()
 {
     glDeleteTextures(1, &TexHeapID);
     glDeleteTextures(1, &TexPalLinearID);
-    TexHeapID = TexPalLinearID = 0;
+    glDeleteTextures(1, &TexColorID);
+    TexHeapID = TexPalLinearID = TexColorID = 0;
     TexHeapRows = 0;
     TexHeap.reset();
 #ifdef MELONADE_DEBUG_TOOLS
@@ -438,7 +484,7 @@ void GLRenderer::TexCacheOff()
         "gltexcache %d stays off until it changes\n", TexCacheAsked);
     CacheFailed = true;
     // the programs without the heap lookup, which the frames with the switch at 0 use
-    SetRenderVariant(TexProbe, false, false, false);
+    SetRenderVariant(TexProbe, false, false, false, false, false);
     if (TexCache)
         Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs without the heap lookup didn't build either\n");
     for (int i = 0; i < NumFinalPolys; i++)
@@ -1840,21 +1886,38 @@ struct TexHeapUploader : GLTexHeap::UploadSink
 {
     bool Active = false;
     GLint PrevUnit = GL_TEXTURE0;
-    void Upload(u32 x, u32 y, u32 w, u32 h, const u8* data) override
+    GLenum Unit = 0;
+    void Select(GLenum unit)
     {
         if (!Active)
         {
             glGetIntegerv(GL_ACTIVE_TEXTURE, &PrevUnit);
-            glActiveTexture(GL_TEXTURE2);
             Active = true;
         }
+        if (Unit != unit)
+        {
+            glActiveTexture(unit);
+            Unit = unit;
+        }
+    }
+    void Upload(u32 x, u32 y, u32 w, u32 h, const u8* data) override
+    {
+        Select(GL_TEXTURE2);
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, data);
+    }
+    // GPU::GLTexCache 128: the color plane, which RenderFrame bound on unit 4, uploaded as
+    // TexPalLinear is
+    void UploadColor(u32 x, u32 y, u32 w, u32 h, const u16* data) override
+    {
+        Select(GL_TEXTURE4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, data);
     }
     void Restore()
     {
         if (Active)
             glActiveTexture((GLenum)PrevUnit);
         Active = false;
+        Unit = 0;
     }
 };
 }
@@ -1874,6 +1937,8 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
     TexHeap->Timing = st != nullptr;
 #endif
     TexHeap->BeginFrame();
+    // GPU::GLTexCache 128: only with programs built for it and the plane there
+    bool colorPlane = TexColorPlane && TexColorID != 0 && TexHeap->ColorPlane();
 
     if (texturing)
     {
@@ -1906,8 +1971,26 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
                 lastOffset = offset;
                 lastResult = result;
             }
+            bool color = false, colorFull = false;
             if (result < GLTexHeap::NumServed)
+            {
                 rp.TexWord = 0x40000000 | offset;
+                // step 4a (128): the color plane's bits (TextureLookup_Cached): 22 has one, 23 takes
+                // the alpha from the record (A3I5, A5I3)
+                if (colorPlane && GLTexHeap::ColorFormat(format))
+                {
+                    color = true;
+                    rp.TexWord |= TexWord_Color | ((format == 1 || format == 6) ? TexWord_RecAlpha : 0);
+                }
+                else if (TexColorOnly)
+                {
+                    // 256: the cache-only programs have no record path, so a served texture without a
+                    // color plane (4x4, direct) draws with the twins, whose heap lookup has it
+                    colorFull = true;
+                    rp.RenderKey |= RenderKey_TexFull;
+                    anyFull = true;
+                }
+            }
             else if (TexCacheOnly)
             {
                 // step 2: the old path is only in the twins. a key bit, so batches split here
@@ -1933,6 +2016,16 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
                 st->Sec.FormatArea[format] += area;
                 if (result < GLTexHeap::NumServed)
                     st->Sec.FormatServed[format] += area;
+                if (color)
+                {
+                    st->Sec.ColorPolys++;
+                    st->Sec.ColorArea += area;
+                }
+                if (colorFull)
+                {
+                    st->Sec.ColorFullPolys++;
+                    st->Sec.ColorFullArea += area;
+                }
             }
 #endif
         }
@@ -2996,6 +3089,12 @@ void GLRenderer::RenderFrame(GPU& gpu)
         glBindTexture(GL_TEXTURE_2D, TexHeapID);
         glActiveTexture(GL_TEXTURE3);
         glBindTexture(GL_TEXTURE_2D, TexPalLinearID);
+        // GPU::GLTexCache 128: the color plane on unit 4, which the compositor rebinds too
+        if (TexColorID)
+        {
+            glActiveTexture(GL_TEXTURE4);
+            glBindTexture(GL_TEXTURE_2D, TexColorID);
+        }
         glActiveTexture(GL_TEXTURE1);
     }
 
@@ -3361,6 +3460,12 @@ void GLRenderer::SavestateLoaded()
     CurGLCompositor.ResetShadow2D();
     // line 0 reads back MainFramebuffer again, as it did before the early readback
     EarlyCapture = false;
+    // GPU::GLTexCache 128 (step 4a): the color plane was resolved with the old palette, which the
+    // loaded state replaced, and a texture whose bytes hash the same would keep it, so the heap
+    // starts over. without the color plane nothing to do: every chunk counts as changed at the next
+    // frame and rehashing is enough
+    if (TexHeap && TexHeap->ColorPlane())
+        TexHeap->Clear();
 }
 
 u32* GLRenderer::GetLine(int line)

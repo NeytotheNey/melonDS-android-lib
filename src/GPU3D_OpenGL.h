@@ -115,7 +115,8 @@ private:
 
         u32 RenderKey;
         // what the vertices' second polygon word (fPolygonAttr.y) is: TexParam's VRAM offset, or
-        // with GPU::GLTexCache 0x40000000 | the texture's heap offset (AssignTexCache)
+        // with GPU::GLTexCache 0x40000000 | the texture's heap offset (below 2^22, AssignTexCache),
+        // plus step 4a's TexWord_Color and TexWord_RecAlpha (bits 22 and 23; 24 to 29 are free)
         u32 TexWord;
     };
 
@@ -133,7 +134,7 @@ private:
     static bool PolyFull(const RendererPolygon* rp) { return (rp->RenderKey & RenderKey_TexFull) != 0; }
     bool PrepareFetchShaders();
     bool PrepareNoDiscardShader();
-    void SetRenderVariant(int probe, bool cache, bool only, bool wrapvs);
+    void SetRenderVariant(int probe, bool cache, bool only, bool wrapvs, bool color, bool colorOnly);
     void UpdateRenderVariant(const GPU& gpu);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const;
@@ -224,6 +225,13 @@ private:
     // GPU::GLTexCache step 3 (bit 6, value 64): the programs with the heap lookup (step 2's, step 1's
     // and the twins) were built with its per-polygon wrap constants made in the vertex shader
     bool TexWrapVS = false;
+    // GPU::GLTexCache step 4a (bit 7, value 128, measurement only): the programs with the heap lookup
+    // read the color plane for polygons with TexWord_Color. TexColorOnly (bit 8, 256, debug): the
+    // cache-only programs were built without the record path (with step 2 and 128 only)
+    bool TexColorPlane = false;
+    bool TexColorOnly = false;
+    static constexpr u32 TexWord_Color = 0x400000;
+    static constexpr u32 TexWord_RecAlpha = 0x800000;
     bool CacheFailed = false;
     bool FailTwins = false;
     static constexpr u32 RenderKey_TexFull = 0x40000;
@@ -285,6 +293,9 @@ private:
     // 256 x 192, unit 3), uploaded with it; TexHeap, what's in the heap
     GLuint TexHeapID {};
     GLuint TexPalLinearID {};
+    // GPU::GLTexCache 128 (T2 step 4a): the color plane, RGB5_A1 1024 x TexHeapRows, unit 4, made
+    // with the heap when the value has 128
+    GLuint TexColorID {};
     u32 TexHeapRows = 0;
     std::unique_ptr<GLTexHeap> TexHeap;
     bool CreateTexCache(int mode);

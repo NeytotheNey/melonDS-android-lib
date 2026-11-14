@@ -60,6 +60,9 @@ public:
     struct UploadSink
     {
         virtual void Upload(u32 x, u32 y, u32 w, u32 h, const u8* data) = 0;
+        // GPU::GLTexCache 128 (T2 step 4a): the same rectangle of the color plane, w x h palette words
+        // (RGB5_A1, as TexPalConvBuffer has them, A set to the texel's 0/1 alpha)
+        virtual void UploadColor(u32 x, u32 y, u32 w, u32 h, const u16* data) = 0;
     };
 
     // what Use did with a polygon's texture: served from the heap (the first four), or why not
@@ -78,9 +81,11 @@ public:
         NumResults
     };
 
-    // mode: GPU::GLTexCache's value (2 check, 4 tiny, 8 no budget or volatile rule); rows: how many
-    // 1024 texel rows the heap texture has (a power of two). drops everything
-    void Configure(int mode, u32 rows);
+    // mode: GPU::GLTexCache's value (2 check, 4 tiny, 8 no budget or volatile rule, 128 the color
+    // plane); rows: how many 1024 texel rows the heap texture has (a power of two); palette: palette
+    // RAM as TexPalLinear holds it (GLRenderer::TexPalConvBuffer, entry p at p), which the color plane
+    // is resolved from at decode (128 only). drops everything
+    void Configure(int mode, u32 rows, const u16* palette);
     void Clear();
     // at the start of every frame AssignTexCache runs
     void BeginFrame();
@@ -90,6 +95,12 @@ public:
     // texture VRAM changed in these chunks this frame: what was decoded from them is checked again
     // at its next use
     void Invalidate(const TexDirtyPrefix& dirty);
+
+    // GPU::GLTexCache 128 (T2 step 4a): whether a format's entries get a color plane next to their
+    // records, the palette word of each texel (I2, I4, I8: kind 0; A3I5, A5I3: kind 1, whose alpha
+    // still comes from the record). 4x4 and direct are records only
+    bool ColorPlane() const { return (Mode & 128) != 0; }
+    static bool ColorFormat(u32 format) { return format == 1 || format == 2 || format == 3 || format == 4 || format == 6; }
 
     int NumEntries() const { return (int)Entries.size(); }
     u32 UsedTexels() const { return Used; }
@@ -160,9 +171,11 @@ private:
 
     int Mode = 0;
     u32 Rows = 0;
+    const u16* Palette = nullptr;
     u32 Frame = 0;
     u32 BudgetUsed = 0;
     std::unique_ptr<u8[]> Staging;
+    std::unique_ptr<u16[]> StagingColor; // GPU::GLTexCache 128
 
     static u32 HashSlot(u64 key) { return (u32)((key * 0x9E3779B97F4A7C15ull) >> 51); } // IndexSlots = 8192
     void RemoveEntry(int e);

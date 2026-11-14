@@ -332,6 +332,12 @@ uniform sampler2D TexPalMem;
 // come back at the same precision
 uniform usampler2D TexHeap;
 uniform sampler2D TexPalLinear;
+#ifdef TexColorPlane
+// GPU::GLTexCache 128 (T2 step 4a, measurement only): the heap's color plane, the same size and
+// offsets as TexHeap, each texel's palette word as TexPalLinear holds it (RGB5_A1, the same 16 bits)
+// with A the record's 0/1 alpha. declared like TexPalMem and TexPalLinear, the same precision
+uniform sampler2D TexColor;
+#endif
 #ifdef TexWrapVS
 // GPU::GLTexCache 64 (T2 step 3): kRenderVS's per-polygon wrap constants, (P.x, P.y, R.x, R.y).
 // all within [-1, 2047], so mediump (16 bits on the phones) holds them exactly
@@ -634,6 +640,31 @@ vec4 TextureLookup_Cached(vec2 st)
 
     int a = (fPolygonAttr.y & 0x3FFFFF) + ((c.y * tw) + c.x);
 #endif
+#ifdef TexColorPlane
+    // GPU::GLTexCache 128 (T2 step 4a): a polygon whose texture has a color plane (I2, I4, I8: bit
+    // 22 of fPolygonAttr.y; A3I5, A5I3: bits 22 and 23) reads the palette word straight from it, so
+    // there's no dependent fetch. rgb is kind 0's and 1's (the same word, format and precision as
+    // their TexPalLinear fetch), A is kind 0's 0/1 alpha; with bit 23 the alpha is kind 1's, from
+    // the record at the same address
+    ivec2 ta = ivec2(a&0x3FF, a>>10);
+#ifdef TexColorOnly
+    // GPU::GLTexCache 256 (debug, measurement): built without the record path. polygons without the
+    // color plane never draw with this build (AssignTexCache gives them RenderKey_TexFull)
+    {
+#else
+    if ((fPolygonAttr.y & 0x400000) != 0)
+    {
+#endif
+        vec4 color = texelFetch(TexColor, ta, 0);
+        if ((fPolygonAttr.y & 0x800000) != 0)
+        {
+            ivec4 rec = ivec4(texelFetch(TexHeap, ta, 0));
+            return vec4(color.rgb, float(rec.b)/31.0);
+        }
+        return color;
+    }
+#endif
+#ifndef TexColorOnly
     ivec4 rec = ivec4(texelFetch(TexHeap, ivec2(a&0x3FF, a>>10), 0));
     int kind = rec.a & 0x7;
 
@@ -669,6 +700,7 @@ vec4 TextureLookup_Cached(vec2 st)
         else if (kind == 4) return vec4((color0.rgb*5.0 + color1.rgb*3.0) / 8.0, 1.0);
         else                return vec4((color0.rgb*3.0 + color1.rgb*5.0) / 8.0, 1.0);
     }
+#endif
 }
 #endif
 

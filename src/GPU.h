@@ -888,6 +888,12 @@ public:
     // until the value changes, to test that fallback. 64 is step 3: the heap lookup's per-polygon
     // wrap constants are made in the vertex shader (one more flat varying) and the fragment shader
     // wraps without branches, the same texels as TexcoordWrap (65 = step 2 with it, 81 = step 1).
+    // 128 is step 4a, for measurement only, never a default: I2/I4/I8/A3I5/A5I3 textures also get a
+    // color plane (an RGB5_A1 texture the heap's size, each texel's palette word resolved at decode)
+    // that the shader reads without the record's dependent fetch; palette changes aren't tracked, so
+    // palette animation draws stale colors (193 = steps 2, 3 and 4a, 129 without step 3). 256 (with
+    // 128 and step 2, debug) builds the cache-only programs without the record path at all; served
+    // textures without a color plane (4x4, direct) draw with the twins.
     // GLTexProbe wins while it's nonzero. 1 is the default in every build since 11-13 (hash3d-exact
     // on the desktop, Fold, Pixel and OnePlus; Fold −19% / −10% GPU cycles in W2 title / town); 0
     // makes no GL objects and draws as before, for A/Bs. only changed by a debug switch

@@ -235,12 +235,15 @@ static bool Check4x4Palette(const u8* vram, u32 addr, u32 bytes, u32 texpal)
     return true;
 }
 
-void GLTexHeap::Configure(int mode, u32 rows)
+void GLTexHeap::Configure(int mode, u32 rows, const u16* palette)
 {
     Mode = mode;
     Rows = (mode & 4) ? std::min(rows, TinyRows) : rows;
+    Palette = palette;
     if (!Staging)
         Staging = std::make_unique<u8[]>(StagingTexels * 4);
+    if (ColorPlane() && !StagingColor)
+        StagingColor = std::make_unique<u16[]>(StagingTexels);
     Clear();
 }
 
@@ -440,23 +443,44 @@ void GLTexHeap::Decode(const u8* vram, Entry& e, UploadSink& sink)
     u32 w = 8u << ((e.TexParam >> 20) & 0x7);
     u32 h = 8u << ((e.TexParam >> 23) & 0x7);
     u32 rowsPerStrip = std::min(h, StagingTexels / w);
+    bool color = ColorPlane() && Palette && ColorFormat((e.TexParam >> 26) & 0x7);
     for (u32 y0 = 0; y0 < h; y0 += rowsPerStrip)
     {
         u32 y1 = std::min(h, y0 + rowsPerStrip);
         s64 start = Timing ? HeapNowNs() : 0;
         DecodeRows(vram, e.TexParam, e.TexPal, y0, y1, Staging.get());
-        s64 mid = Timing ? HeapNowNs() : 0;
-
         u32 first = e.Offset + y0 * w;
         u32 count = (y1 - y0) * w;
+        if (color)
+        {
+            // GPU::GLTexCache 128 (T2 step 4a): each record's palette word as TexPalLinear holds it at
+            // (R, G) (palette entry R + 256 G, the same 16 bits, so a fetch of it gives the same rgb as
+            // the record path's TexPalLinear fetch), with A (bit 0 of RGB5_A1) set to kind 0's alpha,
+            // B != 0. kind 1 (A3I5, A5I3) takes its alpha from the record's B instead. resolved now:
+            // a later palette change isn't seen here (step 4a has no palette tracking)
+            const u8* rec = Staging.get();
+            u16* out = StagingColor.get();
+            for (u32 i = 0; i < count; i++, rec += 4)
+                out[i] = (u16)((Palette[rec[0] | (rec[1] << 8)] & ~1u) | (rec[2] != 0 ? 1u : 0u));
+        }
+        s64 mid = Timing ? HeapNowNs() : 0;
+
         if (count >= 1024)
+        {
             sink.Upload(0, first >> 10, 1024, count >> 10, Staging.get());
+            if (color)
+                sink.UploadColor(0, first >> 10, 1024, count >> 10, StagingColor.get());
+        }
         else
+        {
             sink.Upload(first & 0x3FF, first >> 10, count, 1, Staging.get());
+            if (color)
+                sink.UploadColor(first & 0x3FF, first >> 10, count, 1, StagingColor.get());
+        }
 
         Sec.Texels += count;
         Sec.Uploads++;
-        Sec.UploadBytes += count * 4;
+        Sec.UploadBytes += count * (color ? 6 : 4);
         if (Timing)
         {
             s64 end = HeapNowNs();
