@@ -28,10 +28,12 @@ namespace melonDS
 
 // the 512 byte texture VRAM chunks a frame changed (RenderFrame's textureDirty), as a count of the
 // changed chunks below each one, so whether a range changed is one subtraction. built once a frame
-// and shared by GLRenderer::InvalidateOpaqueTex (GPU::GLNoDiscard bit 1) and GLTexHeap::Invalidate
-struct TexDirtyPrefix
+// and shared by GLRenderer::InvalidateOpaqueTex (GPU::GLNoDiscard bit 1) and GLTexHeap::Invalidate.
+// the palette one (texPalDirty, TexPalMem's 96 KB) is for GLTexHeap::InvalidatePalette
+template <u32 Chunks>
+struct DirtyPrefix
 {
-    static constexpr u32 NumChunks = 512*1024 / 512;
+    static constexpr u32 NumChunks = Chunks;
     u16 Before[NumChunks + 1];
 
     template <class Bits>
@@ -44,6 +46,9 @@ struct TexDirtyPrefix
     u32 Count() const { return Before[NumChunks]; }
     bool Changed(u32 first, u32 last) const { return first <= last && Before[last + 1] != Before[first]; }
 };
+using TexDirtyPrefix = DirtyPrefix<512*1024 / 512>;
+// one chunk is 256 palette entries, one TexPalLinear row
+using TexPalDirtyPrefix = DirtyPrefix<96*1024 / 512>;
 
 // GPU::GLTexCache (experiment T2, docs/plan-t2-texcache.md): the CPU side of the OpenGL renderer's
 // decoded texel heap. a texture (TexParam's address, size, format and color 0 bit, plus the palette
@@ -81,29 +86,49 @@ public:
         NumResults
     };
 
+    // GPU::GLTexCache 128: what a served polygon's color plane is (Use's plane)
+    enum Plane
+    {
+        PlaneNone,     // no plane for this format (4x4, direct) or without 128
+        PlaneOk,       // its block's color plane holds this frame's palette words
+        PlaneVolatile, // its palette changed too often lately: records only for a while (4b)
+        PlaneBudget,   // its palette changed and this frame's budget is spent: records only for now
+    };
+
     // mode: GPU::GLTexCache's value (2 check, 4 tiny, 8 no budget or volatile rule, 128 the color
     // plane); rows: how many 1024 texel rows the heap texture has (a power of two); palette: palette
     // RAM as TexPalLinear holds it (GLRenderer::TexPalConvBuffer, entry p at p), which the color plane
-    // is resolved from at decode (128 only). drops everything
+    // is resolved from (128 only). drops everything
     void Configure(int mode, u32 rows, const u16* palette);
     void Clear();
     // at the start of every frame AssignTexCache runs
     void BeginFrame();
     // the texture of a polygon. offset is its block, for fPolygonAttr.y, when the result is one of
-    // the served ones. vram is gpu.VRAMFlat_Texture after this frame's MakeVRAMFlat_TextureCoherent
-    Result Use(const u8* vram, u32 texparam, u32 texpal, UploadSink& sink, u32& offset);
+    // the served ones, and plane what its color plane is then (PlaneNone otherwise). vram is
+    // gpu.VRAMFlat_Texture after this frame's MakeVRAMFlat_TextureCoherent; the palette is this
+    // frame's (RenderFrame converted the changed rows before this runs)
+    Result Use(const u8* vram, u32 texparam, u32 texpal, UploadSink& sink, u32& offset, Plane& plane);
     // texture VRAM changed in these chunks this frame: what was decoded from them is checked again
     // at its next use
     void Invalidate(const TexDirtyPrefix& dirty);
+    // GPU::GLTexCache 128 (T2 step 4b): palette RAM changed in these chunks this frame (texPalDirty,
+    // the rows TexPalConvBuffer was just converted again in): the color planes resolved from them
+    // get their palette words hashed again at their next use
+    void InvalidatePalette(const TexPalDirtyPrefix& dirty);
 
     // GPU::GLTexCache 128 (T2 step 4a): whether a format's entries get a color plane next to their
     // records, the palette word of each texel (I2, I4, I8: kind 0; A3I5, A5I3: kind 1, whose alpha
-    // still comes from the record). 4x4 and direct are records only
+    // still comes from the record). 4x4 and direct are records only. step 4b keeps each plane in
+    // step with palette RAM: the words it was resolved from are hashed again after a palette write
+    // under them, and the plane alone is resolved again when they changed; a polygon whose plane
+    // isn't current (palette-volatile, budget) reads its records, which TexPalLinear keeps exact
     bool ColorPlane() const { return (Mode & 128) != 0; }
     static bool ColorFormat(u32 format) { return format == 1 || format == 2 || format == 3 || format == 4 || format == 6; }
 
     int NumEntries() const { return (int)Entries.size(); }
     u32 UsedTexels() const { return Used; }
+    // the entries in a palette-volatile spell now (debug stats)
+    int NumPalVolatile() const;
 
     // counted whatever the stats switch, read and cleared by the debug stats (GLTexCacheStats).
     // Timing: the ns ones are measured (debug builds, while the stats run)
@@ -112,6 +137,10 @@ public:
         u64 Texels = 0, Uploads = 0, UploadBytes = 0, HashBytes = 0;
         u64 Evictions = 0, Volatiles = 0, Removed = 0;
         s64 DecodeNs = 0, UploadNs = 0, HashNs = 0;
+        // GPU::GLTexCache 128 (4b): palette rehashes after a palette change (and how many found the
+        // words unchanged), color plane re-resolves (records kept) and their texels, entries that
+        // went palette-volatile
+        u64 PalRehashes = 0, PalKept = 0, Resolves = 0, ResolveTexels = 0, PalVolatiles = 0;
     };
     Counters Sec;
     bool Timing = false;
@@ -150,6 +179,17 @@ private:
         u8 State;
         u8 History;  // the last 8 frames it was used in, bit set where its bytes had changed
         bool HasBlock;
+        // GPU::GLTexCache 128 (T2 step 4b), color formats only. PlaneValid: its block's color plane
+        // was resolved from the palette words PalHash hashes, entries PalLo to PalHi (the lowest and
+        // highest its records point at), in palette chunks PalFirst to PalLast. PalStale: palette RAM
+        // changed in those chunks since, hash again at the next use. PalHistory: as History, for
+        // palette changes that did change its words. PalVolatile: records only until PalVolatileUntil
+        bool PlaneValid, PalStale, PalVolatile;
+        u8 PalHistory;
+        u16 PalLo, PalHi;
+        u8 PalFirst, PalLast;
+        u32 PalVolatileUntil;
+        u64 PalHash;
     };
 
     // the entries, in no order, and an open-addressed index by key (-1 empty, half full at most)
@@ -185,7 +225,9 @@ private:
     bool Evict(u32 order, u32& offset);
     void DropBlock(Entry& e);
     u64 HashSource(const u8* vram, const Entry& e);
-    void Decode(const u8* vram, Entry& e, UploadSink& sink);
+    u64 HashPalette(const Entry& e);
+    void Decode(const u8* vram, Entry& e, UploadSink& sink, bool records, bool color);
+    Plane UsePlane(const u8* vram, Entry& e, UploadSink& sink, bool limits);
 };
 
 }

@@ -304,6 +304,8 @@ private:
     void TexCacheOff();
     // the frame's changed texture chunks, for InvalidateOpaqueTex and the heap
     TexDirtyPrefix TextureDirtyPrefix;
+    // and the changed palette chunks, for the heap's color planes (GPU::GLTexCache 128, step 4b)
+    TexPalDirtyPrefix TexPalettePrefix;
 
     // texture VRAM upload tracking. the dirty texture / palette chunks come from the shared
     // VRAMDirty_Texture / VRAMDirty_TexPal sets (consumed once per RenderFrame, like the other

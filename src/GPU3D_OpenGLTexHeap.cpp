@@ -336,6 +336,8 @@ void GLTexHeap::DropBlock(Entry& e)
         return;
     FreeBlock(e.Offset, e.Order);
     e.HasBlock = false;
+    e.PlaneValid = false;
+    e.PalStale = false;
 }
 
 // frees the blocks of entries not used this frame, least recently used first, until a block of
@@ -435,15 +437,32 @@ u64 GLTexHeap::HashSource(const u8* vram, const Entry& e)
     return hash;
 }
 
+// GPU::GLTexCache 128 (T2 step 4b): the palette words an entry's color plane was resolved from,
+// TexPalConvBuffer's entries PalLo to PalHi (the same buffer TexPalLinear is uploaded from)
+u64 GLTexHeap::HashPalette(const Entry& e)
+{
+    s64 start = Timing ? HeapNowNs() : 0;
+    u32 bytes = (e.PalHi - e.PalLo + 1) * 2;
+    u64 hash = XXH3_64bits(Palette + e.PalLo, bytes);
+    Sec.HashBytes += bytes;
+    if (Timing)
+        Sec.HashNs += HeapNowNs() - start;
+    return hash;
+}
+
 // into its block, in strips of up to StagingTexels: a block of 1024 texels or more is whole heap
 // rows (strips too, as both are powers of two and the strip is a multiple of the row), a smaller one
-// part of a row
-void GLTexHeap::Decode(const u8* vram, Entry& e, UploadSink& sink)
+// part of a row. records: decode and upload the records; color: resolve and upload the color plane
+// (GPU::GLTexCache 128, color formats). color alone (step 4b's re-resolve after a palette change)
+// decodes the records into the staging buffer again only to read their palette coordinates: the
+// caller has made sure VRAM under the entry still holds what its records were decoded from, so
+// they come out the same, and only the plane is uploaded
+void GLTexHeap::Decode(const u8* vram, Entry& e, UploadSink& sink, bool records, bool color)
 {
     u32 w = 8u << ((e.TexParam >> 20) & 0x7);
     u32 h = 8u << ((e.TexParam >> 23) & 0x7);
     u32 rowsPerStrip = std::min(h, StagingTexels / w);
-    bool color = ColorPlane() && Palette && ColorFormat((e.TexParam >> 26) & 0x7);
+    u32 lo = 0xFFFF, hi = 0;
     for (u32 y0 = 0; y0 < h; y0 += rowsPerStrip)
     {
         u32 y1 = std::min(h, y0 + rowsPerStrip);
@@ -456,31 +475,41 @@ void GLTexHeap::Decode(const u8* vram, Entry& e, UploadSink& sink)
             // GPU::GLTexCache 128 (T2 step 4a): each record's palette word as TexPalLinear holds it at
             // (R, G) (palette entry R + 256 G, the same 16 bits, so a fetch of it gives the same rgb as
             // the record path's TexPalLinear fetch), with A (bit 0 of RGB5_A1) set to kind 0's alpha,
-            // B != 0. kind 1 (A3I5, A5I3) takes its alpha from the record's B instead. resolved now:
-            // a later palette change isn't seen here (step 4a has no palette tracking)
+            // B != 0. kind 1 (A3I5, A5I3) takes its alpha from the record's B instead. resolved from
+            // this frame's palette; step 4b keeps the range of entries it read to see later changes
             const u8* rec = Staging.get();
             u16* out = StagingColor.get();
             for (u32 i = 0; i < count; i++, rec += 4)
-                out[i] = (u16)((Palette[rec[0] | (rec[1] << 8)] & ~1u) | (rec[2] != 0 ? 1u : 0u));
+            {
+                u32 p = rec[0] | (rec[1] << 8);
+                lo = std::min(lo, p);
+                hi = std::max(hi, p);
+                out[i] = (u16)((Palette[p] & ~1u) | (rec[2] != 0 ? 1u : 0u));
+            }
         }
         s64 mid = Timing ? HeapNowNs() : 0;
 
         if (count >= 1024)
         {
-            sink.Upload(0, first >> 10, 1024, count >> 10, Staging.get());
+            if (records)
+                sink.Upload(0, first >> 10, 1024, count >> 10, Staging.get());
             if (color)
                 sink.UploadColor(0, first >> 10, 1024, count >> 10, StagingColor.get());
         }
         else
         {
-            sink.Upload(first & 0x3FF, first >> 10, count, 1, Staging.get());
+            if (records)
+                sink.Upload(first & 0x3FF, first >> 10, count, 1, Staging.get());
             if (color)
                 sink.UploadColor(first & 0x3FF, first >> 10, count, 1, StagingColor.get());
         }
 
-        Sec.Texels += count;
+        if (records)
+            Sec.Texels += count;
+        else
+            Sec.ResolveTexels += count;
         Sec.Uploads++;
-        Sec.UploadBytes += count * (color ? 6 : 4);
+        Sec.UploadBytes += count * ((records ? 4 : 0) + (color ? 2 : 0));
         if (Timing)
         {
             s64 end = HeapNowNs();
@@ -488,12 +517,79 @@ void GLTexHeap::Decode(const u8* vram, Entry& e, UploadSink& sink)
             Sec.UploadNs += end - mid;
         }
     }
+
+    e.PlaneValid = color;
+    e.PalStale = false;
+    if (color)
+    {
+        // step 4b: the palette entries the plane was resolved from (every texel reads one, so
+        // lo <= hi), their chunks (256 entries, 512 bytes each), and their words now
+        e.PalLo = (u16)lo;
+        e.PalHi = (u16)hi;
+        e.PalFirst = (u8)(lo >> 8);
+        e.PalLast = (u8)(hi >> 8);
+        e.PalHash = HashPalette(e);
+    }
 }
 
-GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, UploadSink& sink, u32& offset)
+// GPU::GLTexCache 128 (T2 step 4b), for a served entry of a color format after its records are
+// current: makes its color plane match this frame's palette, or says why the polygon reads the
+// records instead (which is always exact: TexPalLinear holds this frame's palette)
+GLTexHeap::Plane GLTexHeap::UsePlane(const u8* vram, Entry& e, UploadSink& sink, bool limits)
+{
+    if (e.PalVolatile)
+        return PlaneVolatile;
+
+    if (e.PlaneValid && e.PalStale)
+    {
+        // palette RAM changed under its entries: the same words keep the plane
+        e.PalStale = false;
+        Sec.PalRehashes++;
+        if (HashPalette(e) == e.PalHash)
+        {
+            Sec.PalKept++;
+            return PlaneOk;
+        }
+        e.PlaneValid = false;
+        e.PalHistory |= 1;
+        // its words changed in 3 of the last 8 frames it was used in: records only for a while,
+        // no re-resolves (GPU::GLTexCache 8 and 2 turn the rule off)
+        if (limits && __builtin_popcount(e.PalHistory) >= 3)
+        {
+            e.PalVolatile = true;
+            e.PalVolatileUntil = Frame + 120;
+            Sec.PalVolatiles++;
+            return PlaneVolatile;
+        }
+    }
+    if (e.PlaneValid)
+        return PlaneOk;
+
+    // re-resolve the plane only, within the budget like a decode (it's a decode on the CPU, and
+    // a third of its upload)
+    u32 n = 1u << e.Order;
+    u32 budget = (Mode & 4) ? TinyBudget : DefaultBudget;
+    if (limits && BudgetUsed && BudgetUsed + n > budget)
+        return PlaneBudget;
+    Decode(vram, e, sink, false, true);
+    BudgetUsed += n;
+    Sec.Resolves++;
+    return PlaneOk;
+}
+
+int GLTexHeap::NumPalVolatile() const
+{
+    int n = 0;
+    for (const Entry& e : Entries)
+        n += (e.PalVolatile && (s32)(Frame - e.PalVolatileUntil) < 0) ? 1 : 0;
+    return n;
+}
+
+GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, UploadSink& sink, u32& offset, Plane& plane)
 {
     constexpr u32 mask = IndexSlots - 1;
     u32 format = (texparam >> 26) & 0x7;
+    plane = PlaneNone;
     // what decides the records: wrap, flip (16-19) and texgen (30-31) don't, color 0 (29) only for
     // I2/I4/I8, the palette not for direct color
     u32 tp = texparam & 0x3FF0FFFF;
@@ -585,11 +681,22 @@ GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, Uploa
 
     Entry& e = Entries[ei];
     bool check = (Mode & 2) != 0;
-    bool limits = !check && !(Mode & 8); // the budget and the volatile rule
+    bool limits = !check && !(Mode & 8); // the budget and the volatile rules
     bool firstUse = e.LastUsed != Frame;
     e.LastUsed = Frame;
     if (firstUse)
+    {
         e.History <<= 1;
+        e.PalHistory <<= 1;
+    }
+    // GPU::GLTexCache 128 (T2 step 4b): the color formats' plane, checked against this frame's
+    // palette after the records (a decode below resolves it too, unless it's palette-volatile)
+    bool color = ColorPlane() && Palette && ColorFormat(format);
+    if (color && e.PalVolatile && (s32)(Frame - e.PalVolatileUntil) >= 0)
+    {
+        e.PalVolatile = false;
+        e.PalHistory = 0;
+    }
 
     switch (e.State)
     {
@@ -604,7 +711,8 @@ GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, Uploa
         e.History = 0;
         break;
     case Valid:
-        // GPU::GLTexCache 2 (check): decoded again the first time it's used in every frame
+        // GPU::GLTexCache 2 (check): decoded again the first time it's used in every frame, the
+        // color plane with it
         if (check && firstUse)
             e.State = Changed;
         break;
@@ -618,6 +726,8 @@ GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, Uploa
         {
             e.State = Valid;
             offset = e.Offset;
+            if (color)
+                plane = UsePlane(vram, e, sink, limits);
             return Kept;
         }
         e.State = Changed;
@@ -639,6 +749,8 @@ GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, Uploa
     if (e.State == Valid)
     {
         offset = e.Offset;
+        if (color)
+            plane = UsePlane(vram, e, sink, limits);
         return Hit;
     }
 
@@ -670,11 +782,16 @@ GLTexHeap::Result GLTexHeap::Use(const u8* vram, u32 texparam, u32 texpal, Uploa
         e.HasBlock = true;
     }
 
-    Decode(vram, e, sink);
+    // the color plane with the records, from this frame's palette, unless the entry is in a
+    // palette-volatile spell (then the plane stays invalid until it ends)
+    bool resolve = color && !e.PalVolatile;
+    Decode(vram, e, sink, true, resolve);
     BudgetUsed += n;
     e.SrcHash = HashSource(vram, e);
     e.State = Valid;
     offset = e.Offset;
+    if (color)
+        plane = resolve ? PlaneOk : PlaneVolatile;
     return fresh ? Decoded : Redecoded;
 }
 
@@ -689,6 +806,17 @@ void GLTexHeap::Invalidate(const TexDirtyPrefix& dirty)
         if (!dirty.Changed(e.First0, e.Last0) && !dirty.Changed(e.First1, e.Last1))
             continue;
         e.State = (e.State == Valid) ? Stale : Pending;
+    }
+}
+
+void GLTexHeap::InvalidatePalette(const TexPalDirtyPrefix& dirty)
+{
+    if (dirty.Count() == 0)
+        return;
+    for (Entry& e : Entries)
+    {
+        if (e.PlaneValid && dirty.Changed(e.PalFirst, e.PalLast))
+            e.PalStale = true;
     }
 }
 

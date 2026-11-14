@@ -884,6 +884,11 @@ struct GLTexCacheStats
         // the served ones without one that went to the twins
         u64 ColorPolys = 0, ColorFullPolys = 0;
         double ColorArea = 0, ColorFullArea = 0;
+        // step 4b: served color-format polygons that read their records because the entry is
+        // palette-volatile, or its plane needed a re-resolve the budget didn't allow; and the
+        // palette-volatile entries, summed over frames
+        u64 ColorVolPolys = 0, ColorBudgetPolys = 0, PalVolEntries = 0;
+        double ColorVolArea = 0, ColorBudgetArea = 0;
     };
     Counters Sec;
 
@@ -920,7 +925,9 @@ struct GLTexCacheStats
                 "a3i5=%.3f/%.3f i2=%.3f/%.3f i4=%.3f/%.3f i8=%.3f/%.3f 4x4=%.3f/%.3f a5i3=%.3f/%.3f direct=%.3f/%.3f "
                 "entries=%.0f heap_used=%.0f texels=%.0f uploads=%.2f upload_kb=%.1f decode_us=%.1f upload_us=%.1f "
                 "hash_us=%.2f hash_kb=%.1f assign_us=%.1f assign_peak_us=%.0f evictions=%llu volatiles=%llu removed=%llu "
-                "s2_full=%.1f s2_draws=%.1f s2_draws_base=%.1f s2_switches=%.1f color=%.1f/%.3f color_full=%.1f/%.3f\n",
+                "s2_full=%.1f s2_draws=%.1f s2_draws_base=%.1f s2_switches=%.1f color=%.1f/%.3f color_full=%.1f/%.3f "
+                "color_vol=%.1f/%.3f color_budget=%.1f/%.3f pal_rehash=%.2f pal_kept=%.2f resolves=%.2f resolve_texels=%.0f "
+                "pal_volatiles=%llu pal_vol_entries=%.1f\n",
                 Sec.Frames, mode, polys * per, area * per, served * per, servedArea * per,
                 polys ? (double)served / polys : 0.0, area > 0 ? servedArea / area : 0.0,
                 p[GLTexHeap::Hit] * per, p[GLTexHeap::Kept] * per, p[GLTexHeap::Decoded] * per, p[GLTexHeap::Redecoded] * per,
@@ -935,7 +942,10 @@ struct GLTexCacheStats
                 Sec.AssignNs / 1000.0 * per, Sec.AssignPeakNs / 1000.0,
                 (unsigned long long)h.Evictions, (unsigned long long)h.Volatiles, (unsigned long long)h.Removed,
                 Sec.FullPolys * per, Sec.Draws * per, Sec.DrawsBase * per, Sec.Switches * per,
-                Sec.ColorPolys * per, Sec.ColorArea * per, Sec.ColorFullPolys * per, Sec.ColorFullArea * per);
+                Sec.ColorPolys * per, Sec.ColorArea * per, Sec.ColorFullPolys * per, Sec.ColorFullArea * per,
+                Sec.ColorVolPolys * per, Sec.ColorVolArea * per, Sec.ColorBudgetPolys * per, Sec.ColorBudgetArea * per,
+                h.PalRehashes * per, h.PalKept * per, h.Resolves * per, h.ResolveTexels * per,
+                (unsigned long long)h.PalVolatiles, Sec.PalVolEntries * per);
         }
         Sec = {};
         heap.Sec = {};

@@ -888,16 +888,20 @@ public:
     // until the value changes, to test that fallback. 64 is step 3: the heap lookup's per-polygon
     // wrap constants are made in the vertex shader (one more flat varying) and the fragment shader
     // wraps without branches, the same texels as TexcoordWrap (65 = step 2 with it, 81 = step 1).
-    // 128 is step 4a, for measurement only, never a default: I2/I4/I8/A3I5/A5I3 textures also get a
-    // color plane (an RGB5_A1 texture the heap's size, each texel's palette word resolved at decode)
-    // that the shader reads without the record's dependent fetch; palette changes aren't tracked, so
-    // palette animation draws stale colors (193 = steps 2, 3 and 4a, 129 without step 3). 256 (with
-    // 128 and step 2, debug) builds the cache-only programs without the record path at all; served
-    // textures without a color plane (4x4, direct) draw with the twins.
-    // GLTexProbe wins while it's nonzero. 1 is the default in every build since 11-13 (hash3d-exact
-    // on the desktop, Fold, Pixel and OnePlus; Fold −19% / −10% GPU cycles in W2 title / town); 0
-    // makes no GL objects and draws as before, for A/Bs. only changed by a debug switch
-    int GLTexCache = 1;
+    // 128 is steps 4a and 4b: I2/I4/I8/A3I5/A5I3 textures also get a color plane (an
+    // RGB5_A1 texture the heap's size, each texel's palette word resolved on the CPU) that the shader
+    // reads without the record's dependent fetch. 4b tracks the palette words each plane was resolved
+    // from (rehash after a palette write under them, re-resolve the plane alone when they changed),
+    // and textures whose palette keeps changing read their records for a while (193 = steps 2, 3 and
+    // 4, 129 without step 3). 256 (with 128 and step 2) builds the cache-only programs without
+    // the record path at all; served textures without a current color plane (4x4, direct,
+    // palette-volatile) draw with the twins.
+    // GLTexProbe wins while it's nonzero. 449 (steps 2, 3, 4 and 256) is the default in every build
+    // since 11-14 (hash3d-exact on the desktop, Fold, Pixel and OnePlus; vs 1, Fold −8% / −5% GL time
+    // and Pixel −8% / −5% core-active cycles in W2 title / town); 1 was the default from 11-13 (Fold
+    // −19% / −10% GPU cycles vs 0); 0 makes no GL objects and draws as before, for A/Bs. only changed
+    // by a debug switch
+    int GLTexCache = 449;
     // OpenGL and compute renderers, experiment K2a (docs/plan-gpu-discovery.md): the compositor's
     // main draw starts without the output's old contents, so a tiled GPU needn't load them. 1
     // clears the whole output to 0 first, 2 invalidates it and clears only the padding rows

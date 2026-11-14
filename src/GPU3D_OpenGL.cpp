@@ -305,8 +305,8 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs,
         Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: render programs built %s the texel heap lookup%s%s%s\n", TexCache ? "with" : "without",
             TexCacheOnly ? " only (step 2, the old decode path is in twins made when a polygon needs it)" : "",
             TexWrapVS ? ", its wrap constants made in the vertex shader (step 3)" : "",
-            TexColorPlane ? (TexColorOnly ? ", the color plane only, no record path (step 4a, 256, measurement only)"
-                                          : ", the color plane (step 4a, measurement only, palette changes go unseen)") : "");
+            TexColorPlane ? (TexColorOnly ? ", the color plane only, no record path (step 4, 256)"
+                                          : ", the color plane (step 4, palette-tracked)") : "");
 }
 
 // RenderFrame, when GPU::GLTexProbe or GPU::GLTexCache differs from what was asked last: the probe
@@ -331,7 +331,7 @@ void GLRenderer::UpdateRenderVariant(const GPU& gpu)
     bool only = !(TexCacheAsked & 16);
     // step 3, bit 6 (64): the heap lookup's wrap constants from the vertex shader
     bool wrapvs = (TexCacheAsked & 64) != 0;
-    // step 4a, bit 7 (128): the color plane (measurement only); bit 8 (256, debug): its cache-only
+    // step 4, bit 7 (128): the color plane (4a, with 4b's palette tracking); bit 8 (256, debug): its cache-only
     // programs without the record path (needs 128 and step 2, ignored otherwise)
     bool color = (TexCacheAsked & 128) != 0;
     bool colorOnly = color && only && (TexCacheAsked & 256) != 0;
@@ -413,7 +413,7 @@ bool GLRenderer::CreateTexCache(int mode)
     TexHeap = std::make_unique<GLTexHeap>();
     TexHeap->Configure(mode, rows, TexPalConvBuffer);
     Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: on, mode %d, heap 1024 x %u texels%s\n", mode, rows,
-        (mode & 128) ? ", with a color plane (step 4a)" : "");
+        (mode & 128) ? ", with a color plane (step 4)" : "");
     return true;
 }
 
@@ -1948,6 +1948,7 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
         // and palette (the heap's state can't change in between, nothing else runs)
         u32 lastParam = 0, lastPal = 0, lastOffset = 0;
         int lastResult = -1;
+        GLTexHeap::Plane lastPlane = GLTexHeap::PlaneNone;
         for (int i = 0; i < NumFinalPolys; i++)
         {
             RendererPolygon& rp = PolygonList[i];
@@ -1958,26 +1959,30 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
 
             int result;
             u32 offset = 0;
+            GLTexHeap::Plane plane = GLTexHeap::PlaneNone;
             if (lastResult >= 0 && polygon->TexParam == lastParam && polygon->TexPalette == lastPal)
             {
                 offset = lastOffset;
                 result = lastResult < GLTexHeap::NumServed ? GLTexHeap::Hit : lastResult;
+                plane = lastPlane;
             }
             else
             {
-                result = TexHeap->Use(vram, polygon->TexParam, polygon->TexPalette, uploader, offset);
+                result = TexHeap->Use(vram, polygon->TexParam, polygon->TexPalette, uploader, offset, plane);
                 lastParam = polygon->TexParam;
                 lastPal = polygon->TexPalette;
                 lastOffset = offset;
                 lastResult = result;
+                lastPlane = plane;
             }
             bool color = false, colorFull = false;
             if (result < GLTexHeap::NumServed)
             {
                 rp.TexWord = 0x40000000 | offset;
                 // step 4a (128): the color plane's bits (TextureLookup_Cached): 22 has one, 23 takes
-                // the alpha from the record (A3I5, A5I3)
-                if (colorPlane && GLTexHeap::ColorFormat(format))
+                // the alpha from the record (A3I5, A5I3). step 4b: only while the plane matches this
+                // frame's palette (PlaneOk); otherwise the records, which read TexPalLinear
+                if (colorPlane && plane == GLTexHeap::PlaneOk)
                 {
                     color = true;
                     rp.TexWord |= TexWord_Color | ((format == 1 || format == 6) ? TexWord_RecAlpha : 0);
@@ -1985,7 +1990,8 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
                 else if (TexColorOnly)
                 {
                     // 256: the cache-only programs have no record path, so a served texture without a
-                    // color plane (4x4, direct) draws with the twins, whose heap lookup has it
+                    // current color plane (4x4, direct, palette-volatile, a re-resolve over the budget)
+                    // draws with the twins, whose heap lookup has it
                     colorFull = true;
                     rp.RenderKey |= RenderKey_TexFull;
                     anyFull = true;
@@ -2026,6 +2032,17 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
                     st->Sec.ColorFullPolys++;
                     st->Sec.ColorFullArea += area;
                 }
+                // step 4b: served color-format polygons that read their records instead
+                if (result < GLTexHeap::NumServed && plane == GLTexHeap::PlaneVolatile)
+                {
+                    st->Sec.ColorVolPolys++;
+                    st->Sec.ColorVolArea += area;
+                }
+                if (result < GLTexHeap::NumServed && plane == GLTexHeap::PlaneBudget)
+                {
+                    st->Sec.ColorBudgetPolys++;
+                    st->Sec.ColorBudgetArea += area;
+                }
             }
 #endif
         }
@@ -2039,6 +2056,8 @@ bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
         st->Sec.Frames++;
         st->Sec.Entries += TexHeap->NumEntries();
         st->Sec.UsedTexels += TexHeap->UsedTexels();
+        if (TexHeap->ColorPlane())
+            st->Sec.PalVolEntries += TexHeap->NumPalVolatile();
         st->Sec.AssignNs += ns;
         st->Sec.AssignPeakNs = std::max(st->Sec.AssignPeakNs, ns);
 
@@ -2956,6 +2975,17 @@ void GLRenderer::RenderFrame(GPU& gpu)
         InvalidateOpaqueTex(TextureDirtyPrefix);
     if (textureChanged && TexHeap)
         TexHeap->Invalidate(TextureDirtyPrefix);
+    // GPU::GLTexCache 128 (T2 step 4b): the color planes were resolved from TexPalConvBuffer, which
+    // the palette upload below converts again in exactly these chunks (all of them after Reset, a
+    // renderer switch or a state load: ResetVRAMCache makes every mapping mismatch, so DeriveState
+    // returns every chunk; bank remaps the same way). the planes over a changed chunk get their
+    // words hashed again at their next use, which runs after that upload, so it sees the palette
+    // TexPalLinear and the record path see in this frame
+    if (texPalChanged && TexHeap && TexHeap->ColorPlane())
+    {
+        TexPalettePrefix.Build(texPalDirty);
+        TexHeap->InvalidatePalette(TexPalettePrefix);
+    }
 
     // the targets match the polygons drawn here (see FrameTargetWidth). this runs after the
     // frame's Blit, so the compositor's width only changes between frames as well. with a Blit
@@ -3460,12 +3490,10 @@ void GLRenderer::SavestateLoaded()
     CurGLCompositor.ResetShadow2D();
     // line 0 reads back MainFramebuffer again, as it did before the early readback
     EarlyCapture = false;
-    // GPU::GLTexCache 128 (step 4a): the color plane was resolved with the old palette, which the
-    // loaded state replaced, and a texture whose bytes hash the same would keep it, so the heap
-    // starts over. without the color plane nothing to do: every chunk counts as changed at the next
-    // frame and rehashing is enough
-    if (TexHeap && TexHeap->ColorPlane())
-        TexHeap->Clear();
+    // GPU::GLTexCache: nothing to do. the load ends in GPU::ResetVRAMCache, so every texture and
+    // palette chunk counts as changed at the next frame's DeriveState: the records are rehashed
+    // against VRAM, and (128, step 4b) every color plane's palette words against the loaded palette
+    // (step 4a had no palette tracking and cleared the heap here)
 }
 
 u32* GLRenderer::GetLine(int line)
