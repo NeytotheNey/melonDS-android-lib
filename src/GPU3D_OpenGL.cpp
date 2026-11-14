@@ -50,16 +50,20 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     char probename[16] = "";
     if (TexProbe)
         snprintf(probename, sizeof(probename), "TexProbe%d", TexProbe);
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
         nodiscard ? "NoDiscard" : "", fragCount ? "Count" : "", probename,
-        TexCache ? (TexCacheOnly && !full ? "TexCacheOnly" : "TexCache") : "");
+        TexCache ? (TexCacheOnly && !full ? "TexCacheOnly" : "TexCache") : "", TexCache && TexWrapVS ? "WrapVS" : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
+    // GPU::GLTexCache 64 (T2 step 3): the heap lookup's per-polygon wrap constants come from the
+    // vertex shader, in a flat varying both stages declare under this
+    const char* wrapdef = TexCache && TexWrapVS ? "\n#define TexWrapVS" : "";
 
     std::string vsbuf;
     vsbuf += kShaderHeader;
     vsbuf += wbufdef;
+    vsbuf += wrapdef;
     vsbuf += kRenderVSCommon;
     vsbuf += kRenderVS;
 
@@ -91,6 +95,7 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     // (full) the heap's fallback polygons draw with
     if (TexCache && TexCacheOnly && !full)
         fsbuf += "\n#define TexCacheOnly";
+    fsbuf += wrapdef;
 #ifdef MELONADE_DEBUG_TOOLS
     // debug only, GPU::GLTexCache 32: a twin that can't build, to test TexCacheOff
     if (full && FailTwins)
@@ -219,10 +224,11 @@ bool GLRenderer::PrepareNoDiscardShader()
 // counts), and the fetch and no-discard builds are dropped, to be made again with it the first frame
 // that wants them. when [0] or [1] doesn't build, they're built again as they were (logged), and the
 // variant stays off until a switch changes
-void GLRenderer::SetRenderVariant(int probe, bool cache, bool only)
+void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs)
 {
     only = cache && only;
-    if (probe == TexProbe && cache == TexCache && only == TexCacheOnly)
+    wrapvs = cache && wrapvs;
+    if (probe == TexProbe && cache == TexCache && only == TexCacheOnly && wrapvs == TexWrapVS)
         return;
 
     bool fragCount = false;
@@ -230,11 +236,12 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only)
     fragCount = FragCounter != nullptr;
 #endif
     int oldProbe = TexProbe;
-    bool oldCache = TexCache, oldOnly = TexCacheOnly;
+    bool oldCache = TexCache, oldOnly = TexCacheOnly, oldWrapVS = TexWrapVS;
     GLuint prev[2] = { RenderShader[0], RenderShader[1] };
     TexProbe = probe;
     TexCache = cache;
     TexCacheOnly = only;
+    TexWrapVS = wrapvs;
     bool built0 = BuildRenderShader(false, fragCount);
     bool built1 = built0 && BuildRenderShader(true, fragCount);
     if (!built1)
@@ -243,12 +250,13 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only)
             glDeleteProgram(RenderShader[0]);
         if (probe != oldProbe)
             Platform::Log(Platform::LogLevel::Warn, "GLTEXPROBE: the probe %d render programs didn't build, gltexprobe stays at %d\n", probe, oldProbe);
-        if (cache != oldCache || only != oldOnly)
-            Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs %s the texel heap lookup%s didn't build, gltexcache stays %s\n",
-                cache ? "with" : "without", only ? " only" : "", oldCache ? "on" : "off");
+        if (cache != oldCache || only != oldOnly || wrapvs != oldWrapVS)
+            Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs %s the texel heap lookup%s%s didn't build, gltexcache stays %s\n",
+                cache ? "with" : "without", only ? " only" : "", wrapvs ? " and the vertex shader wrap" : "", oldCache ? "on" : "off");
         TexProbe = oldProbe;
         TexCache = oldCache;
         TexCacheOnly = oldOnly;
+        TexWrapVS = oldWrapVS;
         BuildRenderShader(false, fragCount);
         BuildRenderShader(true, fragCount);
     }
@@ -270,9 +278,10 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only)
     CurRenderMode = -1;
     if (built1 && probe != oldProbe)
         Platform::Log(Platform::LogLevel::Info, "GLTEXPROBE: render programs built with texture probe %d (renders wrong on purpose)\n", TexProbe);
-    if (built1 && (cache != oldCache || only != oldOnly))
-        Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: render programs built %s the texel heap lookup%s\n", TexCache ? "with" : "without",
-            TexCacheOnly ? " only (step 2, the old decode path is in twins made when a polygon needs it)" : "");
+    if (built1 && (cache != oldCache || only != oldOnly || wrapvs != oldWrapVS))
+        Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: render programs built %s the texel heap lookup%s%s\n", TexCache ? "with" : "without",
+            TexCacheOnly ? " only (step 2, the old decode path is in twins made when a polygon needs it)" : "",
+            TexWrapVS ? ", its wrap constants made in the vertex shader (step 3)" : "");
 }
 
 // RenderFrame, when GPU::GLTexProbe or GPU::GLTexCache differs from what was asked last: the probe
@@ -295,6 +304,8 @@ void GLRenderer::UpdateRenderVariant(const GPU& gpu)
     cache = cache && !CacheFailed;
     // step 2 unless bit 4 (16) asks for step 1
     bool only = !(TexCacheAsked & 16);
+    // step 3, bit 6 (64): the heap lookup's wrap constants from the vertex shader
+    bool wrapvs = (TexCacheAsked & 64) != 0;
 #ifdef MELONADE_DEBUG_TOOLS
     // debug only, GPU::GLTexCache 32: the twins' source gets an #error, to test TexCacheOff
     FailTwins = (TexCacheAsked & 32) != 0;
@@ -304,12 +315,12 @@ void GLRenderer::UpdateRenderVariant(const GPU& gpu)
         DeleteTexCache();
     if (cache && !TexHeap && !CreateTexCache(TexCacheAsked))
         cache = false;
-    SetRenderVariant(probe, cache, only);
+    SetRenderVariant(probe, cache, only, wrapvs);
     // a build that failed left the programs as they were, which can be the heap lookup ones with the
     // heap already gone: make it again, or drop to the programs without the lookup. if even that
     // fails, RenderFrame only runs AssignTexCache with a heap, so every polygon takes the old path
     if (TexCache && !TexHeap && !CreateTexCache(TexCacheAsked))
-        SetRenderVariant(TexProbe, false, false);
+        SetRenderVariant(TexProbe, false, false, false);
     if (TexHeap && !TexCache)
         DeleteTexCache();
 }
@@ -427,7 +438,7 @@ void GLRenderer::TexCacheOff()
         "gltexcache %d stays off until it changes\n", TexCacheAsked);
     CacheFailed = true;
     // the programs without the heap lookup, which the frames with the switch at 0 use
-    SetRenderVariant(TexProbe, false, false);
+    SetRenderVariant(TexProbe, false, false, false);
     if (TexCache)
         Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs without the heap lookup didn't build either\n");
     for (int i = 0; i < NumFinalPolys; i++)

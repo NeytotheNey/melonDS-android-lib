@@ -885,7 +885,9 @@ public:
     // path, and the polygons the heap doesn't serve carry a render key bit and draw with twins that
     // have it (made the first frame one needs them); 16 asks for step 1 instead, one program with both
     // paths, for A/Bs. 32 (debug builds) makes the twins fail to build, which turns the cache off
-    // until the value changes, to test that fallback.
+    // until the value changes, to test that fallback. 64 is step 3: the heap lookup's per-polygon
+    // wrap constants are made in the vertex shader (one more flat varying) and the fragment shader
+    // wraps without branches, the same texels as TexcoordWrap (65 = step 2 with it, 81 = step 1).
     // GLTexProbe wins while it's nonzero. 1 is the default in every build since 11-13 (hash3d-exact
     // on the desktop, Fold, Pixel and OnePlus; Fold −19% / −10% GPU cycles in W2 title / town); 0
     // makes no GL objects and draws as before, for A/Bs. only changed by a debug switch

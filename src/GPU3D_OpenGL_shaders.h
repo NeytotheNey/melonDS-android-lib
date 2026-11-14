@@ -332,6 +332,11 @@ uniform sampler2D TexPalMem;
 // come back at the same precision
 uniform usampler2D TexHeap;
 uniform sampler2D TexPalLinear;
+#ifdef TexWrapVS
+// GPU::GLTexCache 64 (T2 step 3): kRenderVS's per-polygon wrap constants, (P.x, P.y, R.x, R.y).
+// all within [-1, 2047], so mediump (16 bits on the phones) holds them exactly
+flat in mediump ivec4 fTexWrap;
+#endif
 #endif
 
 layout(std140) uniform uConfig
@@ -604,6 +609,21 @@ vec4 TextureProbe(vec2 st)
 // 3 4x4 half and half, 4 4x4 5:3, 5 4x4 3:5 (color 1 is the entry after color 0), 6 transparent
 vec4 TextureLookup_Cached(vec2 st)
 {
+#ifdef TexWrapVS
+    // GPU::GLTexCache 64 (T2 step 3): TexcoordWrap without branches, from kRenderVS's constants.
+    // per axis, P is the mask (m = size-1 for repeat, 2m+1 for repeat and flip, -1 for clamp), R the
+    // mirror (2m+1 for flip, else size) and H = R + P the clamp's top (4m+2, 2m+1, m). repeat:
+    // c & m. flip: u = c & (2m+1) is mirrored by min(u, u ^ (2m+1)) = min(u, 2m+1-u). clamp:
+    // clamp(c, 0, m), and u ^ size = u + size leaves the min alone. the same texel as TexcoordWrap
+    // for every int c (checked for all c in [-2^24, 2^24] and 2^24 random ints, every size and
+    // mode). R.x's top bit is log2(tw) in every mode, so the row is a shift
+    ivec4 w = fTexWrap;
+    ivec2 c = ivec2(st);
+    ivec2 u = clamp(c & w.xy, ivec2(0), w.zw + w.xy);
+    c = min(u, u ^ w.zw);
+
+    int a = (fPolygonAttr.y & 0x3FFFFF) + ((c.y << findMSB(w.z)) + c.x);
+#else
     int attr = int(fPolygonAttr.z << 16);
     int tw = 8 << ((attr >> 20) & 0x7);
     int th = 8 << ((attr >> 23) & 0x7);
@@ -613,6 +633,7 @@ vec4 TextureLookup_Cached(vec2 st)
     c.y = TexcoordWrap(c.y, th, wrapmode>>1);
 
     int a = (fPolygonAttr.y & 0x3FFFFF) + ((c.y * tw) + c.x);
+#endif
     ivec4 rec = ivec4(texelFetch(TexHeap, ivec2(a&0x3FF, a>>10), 0));
     int kind = rec.a & 0x7;
 
@@ -876,6 +897,22 @@ const char* kRenderVS = R"(
 smooth out float fZ;
 #endif
 
+#ifdef TexWrapVS
+// GPU::GLTexCache 64 (T2 step 3): the per-polygon part of TexcoordWrap for the heap's lookup
+// (kRenderFSCommon's TextureLookup_Cached), once a vertex instead of once a fragment. (P, R) for
+// one axis of size 1 << k, mode as TexcoordWrap's (bit 0 repeat, bit 2 flip). the same for every
+// vertex of a polygon, so flat. polygons the heap doesn't serve get them too, unused
+flat out mediump ivec4 fTexWrap;
+
+ivec2 TexWrapAxis(int k, int mode)
+{
+    int m = (1 << k) - 1;
+    if ((mode & (1<<0)) == 0) return ivec2(-1, m + 1);
+    if ((mode & (1<<2)) == 0) return ivec2(m, m + 1);
+    return ivec2(2*m + 1, 2*m + 1);
+}
+#endif
+
 void main()
 {
     int attr = vPolygonAttr.x;
@@ -895,6 +932,14 @@ void main()
     fColor = vec4(vColor) / vec4(255.0,255.0,255.0,31.0);
     fTexcoord = vec2(vTexcoord) / 16.0;
     fPolygonAttr = vPolygonAttr;
+#ifdef TexWrapVS
+    // the same fields TextureLookup_Cached's old code reads from fPolygonAttr.z
+    int tattr = vPolygonAttr.z << 16;
+    int wrapmode = (tattr >> 16);
+    ivec2 sx = TexWrapAxis(3 + ((tattr >> 20) & 0x7), wrapmode>>0);
+    ivec2 sy = TexWrapAxis(3 + ((tattr >> 23) & 0x7), wrapmode>>1);
+    fTexWrap = ivec4(sx.x, sy.x, sx.y, sy.y);
+#endif
 
     gl_Position = fpos;
 }

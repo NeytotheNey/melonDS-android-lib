@@ -133,7 +133,7 @@ private:
     static bool PolyFull(const RendererPolygon* rp) { return (rp->RenderKey & RenderKey_TexFull) != 0; }
     bool PrepareFetchShaders();
     bool PrepareNoDiscardShader();
-    void SetRenderVariant(int probe, bool cache, bool only);
+    void SetRenderVariant(int probe, bool cache, bool only, bool wrapvs);
     void UpdateRenderVariant(const GPU& gpu);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const;
@@ -221,6 +221,9 @@ private:
     // cache is off until GPU::GLTexCache changes (TexCacheOff). FailTwins: debug only, GPU::GLTexCache
     // 32 makes the twins fail to build, to test that
     bool TexCacheOnly = false;
+    // GPU::GLTexCache step 3 (bit 6, value 64): the programs with the heap lookup (step 2's, step 1's
+    // and the twins) were built with its per-polygon wrap constants made in the vertex shader
+    bool TexWrapVS = false;
     bool CacheFailed = false;
     bool FailTwins = false;
     static constexpr u32 RenderKey_TexFull = 0x40000;
