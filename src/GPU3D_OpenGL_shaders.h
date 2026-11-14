@@ -326,6 +326,13 @@ precision mediump usampler2D;
 
 uniform usampler2D TexMem;
 uniform sampler2D TexPalMem;
+#ifdef TexCache
+// GPU::GLTexCache (T2, GLRenderer::BuildRenderShader): the decoded texel heap (RGBA8UI, 1024 wide,
+// mediump like TexMem) and the palette 256 entries a row, declared like TexPalMem so its fetches
+// come back at the same precision
+uniform usampler2D TexHeap;
+uniform sampler2D TexPalLinear;
+#endif
 
 layout(std140) uniform uConfig
 {
@@ -543,8 +550,120 @@ vec4 TextureFetch_Direct(ivec2 addr, ivec4 st, int wrapmode)
     return color;
 }
 
+#if defined(TexProbeFetch)
+// GPU::GLTexProbe 1 (T2 measurement probe, GLRenderer::BuildRenderShader, renders wrong on purpose):
+// what a lookup into decoded RGBA textures would cost at most, one texelFetch from a float sampler
+// that's bound anyway (TexPalMem, 1024 x 48), at the texcoord's texel masked into its first 32 rows so
+// neighboring fragments read neighboring texels as with a real texture. no wrap, no format decode,
+// no palette fetch. alpha 1: the per-texel alpha (color 0, A3I5/A5I3, direct's bit, 4x4 mode 3) needs
+// the decoded texel, and the polygon's own alpha still decides the pass through modulate and decal
+vec4 TextureProbe(vec2 st)
+{
+    return vec4(texelFetch(TexPalMem, ivec2(st) & ivec2(0x3FF, 0x1F), 0).rgb, 1.0);
+}
+#elif defined(TexProbeConst)
+// GPU::GLTexProbe 2: as 1 without the fetch, so 1 against 2 is the fetch and 0 against 1 the decode
+vec4 TextureProbe(vec2 st)
+{
+    return vec4(1.0);
+}
+#elif defined(TexProbeWrap) || defined(TexProbeChain)
+// GPU::GLTexProbe 3 and 4 (T2 measurement probes, render wrong on purpose): both wrap the texcoord
+// with the old path's code first. 3 then makes probe 1's one fetch at the wrapped texel (masked into
+// TexPalMem's first 32 rows), so 1 against 3 is the wrap. 4 instead makes two dependent fetches like
+// T2's: a TexMem byte at I8's address from the wrapped texel and the VRAM offset, then the palette
+// entry it indexes as I8 does, alpha 1, with no kind branches or alpha decode
+vec4 TextureProbe(vec2 st)
+{
+    int attr = int(fPolygonAttr.z << 16);
+    int tw = 8 << ((attr >> 20) & 0x7);
+    int th = 8 << ((attr >> 23) & 0x7);
+    int wrapmode = (attr >> 16);
+    ivec2 c = ivec2(st);
+    c.x = TexcoordWrap(c.x, tw, wrapmode>>0);
+    c.y = TexcoordWrap(c.y, th, wrapmode>>1);
+#ifdef TexProbeWrap
+    return vec4(texelFetch(TexPalMem, c & ivec2(0x3FF, 0x1F), 0).rgb, 1.0);
+#else
+    int addr = (int(fPolygonAttr.y) << 3) + ((c.y * tw) + c.x);
+    ivec4 pixel = ivec4(texelFetch(TexMem, ivec2(addr&0x3FF, addr>>10), 0));
+    int pal = (int(fPolygonAttr.z >> 16) << 3) + pixel.r;
+    vec4 color = texelFetch(TexPalMem, ivec2(pal&0x3FF, pal>>10), 0);
+    return vec4(color.rgb, 1.0);
+#endif
+}
+#endif
+
+#ifdef TexCache
+// GPU::GLTexCache (T2 step 1): a polygon whose texture is in the heap (fPolygonAttr.y is
+// 0x40000000 | its block's offset) reads the texel's record, decoded on the CPU from the integer
+// code of the TextureFetch_* above (GPU3D_OpenGLTexHeap.cpp), and runs that fetch's float tail on
+// it, written as it is there: the same wrap, the same palette words fetched at the same precision
+// and the same expressions, so the color comes out the same. a record's A & 7 is its kind:
+// 0 palette with alpha 0/1 in B, 1 palette with alpha 0..31 in B (A3I5, A5I3), 2 direct color,
+// 3 4x4 half and half, 4 4x4 5:3, 5 4x4 3:5 (color 1 is the entry after color 0), 6 transparent
+vec4 TextureLookup_Cached(vec2 st)
+{
+    int attr = int(fPolygonAttr.z << 16);
+    int tw = 8 << ((attr >> 20) & 0x7);
+    int th = 8 << ((attr >> 23) & 0x7);
+    int wrapmode = (attr >> 16);
+    ivec2 c = ivec2(st);
+    c.x = TexcoordWrap(c.x, tw, wrapmode>>0);
+    c.y = TexcoordWrap(c.y, th, wrapmode>>1);
+
+    int a = (fPolygonAttr.y & 0x3FFFFF) + ((c.y * tw) + c.x);
+    ivec4 rec = ivec4(texelFetch(TexHeap, ivec2(a&0x3FF, a>>10), 0));
+    int kind = rec.a & 0x7;
+
+    if (kind == 2)
+    {
+        vec4 color;
+        color.r = float(rec.r) / 31.0;
+        color.g = float(rec.g) / 31.0;
+        color.b = float(rec.b) / 31.0;
+        color.a = float(rec.a >> 7);
+
+        return color;
+    }
+    else if (kind == 6)
+    {
+        return vec4(0.0);
+    }
+    else if (kind == 0)
+    {
+        vec4 color = texelFetch(TexPalLinear, rec.rg, 0);
+        return vec4(color.rgb, (rec.b>0) ? 1.0 : 0.0);
+    }
+    else if (kind == 1)
+    {
+        vec4 color = texelFetch(TexPalLinear, rec.rg, 0);
+        return vec4(color.rgb, float(rec.b)/31.0);
+    }
+    else
+    {
+        vec4 color0 = texelFetch(TexPalLinear, rec.rg, 0);
+        vec4 color1 = texelFetch(TexPalLinear, rec.rg + ivec2(1, 0), 0);
+        if (kind == 3)      return vec4((color0.rgb + color1.rgb) / 2.0, 1.0);
+        else if (kind == 4) return vec4((color0.rgb*5.0 + color1.rgb*3.0) / 8.0, 1.0);
+        else                return vec4((color0.rgb*3.0 + color1.rgb*5.0) / 8.0, 1.0);
+    }
+}
+#endif
+
 vec4 TextureLookup_Nearest(vec2 st)
 {
+#if defined(TexProbeFetch) || defined(TexProbeConst) || defined(TexProbeWrap) || defined(TexProbeChain)
+    return TextureProbe(st);
+#elif defined(TexCacheOnly)
+    // GPU::GLTexCache step 2 (GLRenderer::BuildRenderShader): no old path here. only polygons the heap
+    // serves (and untextured ones) draw with this build; the others carry RenderKey_TexFull and draw
+    // with the twin built without TexCacheOnly
+    return TextureLookup_Cached(st);
+#else
+#ifdef TexCache
+    if (fPolygonAttr.y >= 0x40000000) return TextureLookup_Cached(st);
+#endif
     int vramOffset = int(fPolygonAttr.y);
     int attr = int(fPolygonAttr.z << 16); // Shift just to reuse same code as in original source. Same below
     int paladdr = int(fPolygonAttr.z >> 16);
@@ -568,10 +687,18 @@ vec4 TextureLookup_Nearest(vec2 st)
     else if (type == 1) return TextureFetch_A3I5      (vramaddr, st_full, wrapmode);
     else if (type == 6) return TextureFetch_A5I3      (vramaddr, st_full, wrapmode);
     else                return TextureFetch_Direct    (vramaddr, st_full, wrapmode);
+#endif
 }
 
+// not called (FinalColor's call is commented out). with GPU::GLTexCache, fPolygonAttr.y can be a heap
+// word (0x40000000 | offset) instead of a VRAM offset, which this reads as an offset: before using it
+// again, give it TextureLookup_Nearest's TexCache branch or keep the cache off
 vec4 TextureLookup_Linear(vec2 texcoord)
 {
+#if defined(TexProbeFetch) || defined(TexProbeConst) || defined(TexProbeWrap) || defined(TexProbeChain)
+    // one fetch (or none), not four
+    return TextureProbe(texcoord);
+#else
     ivec2 intpart = ivec2(texcoord);
     vec2 fracpart = fract(texcoord);
 
@@ -679,6 +806,7 @@ vec4 TextureLookup_Linear(vec2 texcoord)
     }
 
     return ret;
+#endif
 }
 
 vec4 FinalColor()

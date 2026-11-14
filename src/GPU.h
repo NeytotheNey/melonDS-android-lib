@@ -863,6 +863,33 @@ public:
     // frame, so each frame scans afresh. any nonzero value turns step 1 on (2 acts as 3). only
     // changed by a debug switch
     int GLNoDiscard = 3;
+    // OpenGL renderer, a measurement probe for experiment T2 (docs/plan-gpu-discovery.md), and it
+    // renders WRONG on purpose: it bounds what a decoded texture cache could save. 1 makes the render
+    // programs' texture lookup one texelFetch from TexPalMem at a coordinate taken from the texcoord,
+    // with alpha 1, instead of decoding texture VRAM (no wrap, no format decode, no palette fetch);
+    // 2 makes it the constant 1.0, no fetch at all, so 1 vs 2 is the fetch and 0 vs 1 the decode.
+    // 3 is 1 after the old path's TexcoordWrap on both axes (1 vs 3 is the wrap), 4 the wrap and two
+    // dependent fetches like T2's (a TexMem byte at I8's address, then the palette entry it indexes).
+    // everything else (passes, draws, program keys) stays as it is. the programs are rebuilt the
+    // first frame it differs from what they were built with (GLRenderer::SetRenderVariant). 0, the
+    // default, draws as before. only changed by a debug switch
+    int GLTexProbe = 0;
+    // OpenGL renderer, experiment T2 step 1 (docs/plan-t2-texcache.md): textures are decoded once on
+    // the CPU into texel records kept in a heap texture until texture VRAM under them changes, and
+    // the render programs look those up instead of decoding VRAM per fragment, with the same float
+    // math, so the image stays the same. a polygon whose texture isn't in the heap (out of range,
+    // budget, heap full, changing too often) takes the old path. a sum of bits: 1 on (any nonzero
+    // value is), 2 a check that decodes every used texture again every frame, 4 a tiny budget (4K
+    // texels a frame) and heap (128K texels) so both paths mix, 8 no budget and no volatile rule.
+    // step 2 is the default: the programs most polygons draw with are built without the old decode
+    // path, and the polygons the heap doesn't serve carry a render key bit and draw with twins that
+    // have it (made the first frame one needs them); 16 asks for step 1 instead, one program with both
+    // paths, for A/Bs. 32 (debug builds) makes the twins fail to build, which turns the cache off
+    // until the value changes, to test that fallback.
+    // GLTexProbe wins while it's nonzero. 1 is the default in every build since 11-13 (hash3d-exact
+    // on the desktop, Fold, Pixel and OnePlus; Fold −19% / −10% GPU cycles in W2 title / town); 0
+    // makes no GL objects and draws as before, for A/Bs. only changed by a debug switch
+    int GLTexCache = 1;
     // OpenGL and compute renderers, experiment K2a (docs/plan-gpu-discovery.md): the compositor's
     // main draw starts without the output's old contents, so a tiled GPU needn't load them. 1
     // clears the whole output to 0 first, 2 invalidates it and clears only the padding rows

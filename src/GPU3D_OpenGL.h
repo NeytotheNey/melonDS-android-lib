@@ -25,6 +25,7 @@
 #include "OpenGLSupport.h"
 #include "GPU3D_GLStats.h"
 #include "GPU3D_Hash3D.h"
+#include "GPU3D_OpenGLTexHeap.h"
 
 namespace melonDS
 {
@@ -113,6 +114,9 @@ private:
         u32 EdgeIndicesOffset;
 
         u32 RenderKey;
+        // what the vertices' second polygon word (fPolygonAttr.y) is: TexParam's VRAM offset, or
+        // with GPU::GLTexCache 0x40000000 | the texture's heap offset (AssignTexCache)
+        u32 TexWord;
     };
 
     GLCompositor CurGLCompositor;
@@ -121,12 +125,18 @@ private:
     // fragCount: the debug build that counts fragments (GPU::SceneStats 2, GLFragCounter). fetch: the
     // framebuffer fetch build (GPU::GLTransSkip bit 2), RenderShader[2 + wbuffer]. nodiscard: the
     // opaque-only build without discard (GPU::GLNoDiscard), RenderShader[4], Z-buffer only
-    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false);
-    void UseRenderShader(bool wbuffer, int mode, bool fetch = false, bool nodiscard = false);
+    // full: the twin with the old decode path (GPU::GLTexCache step 2), RenderShader[FullShader + id]
+    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false, bool full = false);
+    void UseRenderShader(bool wbuffer, int mode, bool fetch = false, bool nodiscard = false, bool full = false);
+    bool PrepareFullShaders();
+    void DropFullShaders();
+    static bool PolyFull(const RendererPolygon* rp) { return (rp->RenderKey & RenderKey_TexFull) != 0; }
     bool PrepareFetchShaders();
     bool PrepareNoDiscardShader();
+    void SetRenderVariant(int probe, bool cache, bool only);
+    void UpdateRenderVariant(const GPU& gpu);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
-    u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
+    u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const;
     u32 WideVertexX(s32 hiresx) const;
     bool TargetFits(int width, int scale) const noexcept;
     bool ScaleFits(int scale) const noexcept;
@@ -169,11 +179,15 @@ private:
     // (GPU::GLTransSkip bit 2), only translucent draws use them, made at the first frame that
     // wants them (PrepareFetchShaders). bit 0 of an index is always W-buffering. [4]: the Z-buffer
     // opaque build without discard (GPU::GLNoDiscard), made at the first frame that wants it
-    // (PrepareNoDiscardShader); it has no uRenderMode, it only draws opaque
-    GLuint RenderShader[5] {};
-    GLint RenderModeULoc[5] {};
-    GLint DepthBiasLoc[5] {};
-    float DepthBias[5] {};
+    // (PrepareNoDiscardShader); it has no uRenderMode, it only draws opaque. [5] to [9]: GPU::GLTexCache
+    // step 2's twins of [0] to [4] with the old decode path, for the polygons the heap doesn't serve
+    // (RenderKey_TexFull), made the first frame that has such a polygon (PrepareFullShaders); while
+    // step 2 runs, [0] to [4] are built without that path (TexCacheOnly)
+    static constexpr int FullShader = 5;
+    GLuint RenderShader[10] {};
+    GLint RenderModeULoc[10] {};
+    GLint DepthBiasLoc[10] {};
+    float DepthBias[10] {};
     int CurShaderID = -1;
     int CurRenderMode = -1;
 
@@ -193,6 +207,23 @@ private:
     // an opaque polygon's RenderKey bit for the no-discard program: it splits batches at the
     // switches between programs, nothing else. no other key uses bit 15
     static constexpr u32 RenderKey_NoDiscard = 0x8000;
+    // GPU::GLTexProbe (T2 measurement probe, renders wrong) and GPU::GLTexCache (T2 step 1): TexProbe
+    // and TexCache, what the render programs were built with (TexCache: with the heap's lookup, and
+    // the heap textures exist); the Asked ones, the switches' values at the last UpdateRenderVariant,
+    // which RenderFrame calls when a switch differs from them (so a build that fails is tried once)
+    int TexProbe = 0;
+    int TexProbeAsked = 0;
+    bool TexCache = false;
+    int TexCacheAsked = 0;
+    // GPU::GLTexCache step 2 (on unless bit 4, value 16, asks for step 1): RenderShader[0] to [4] were
+    // built without the old decode path, and the polygons the heap doesn't serve carry
+    // RenderKey_TexFull and draw with the twins. CacheFailed: a build of the twins failed, and the
+    // cache is off until GPU::GLTexCache changes (TexCacheOff). FailTwins: debug only, GPU::GLTexCache
+    // 32 makes the twins fail to build, to test that
+    bool TexCacheOnly = false;
+    bool CacheFailed = false;
+    bool FailTwins = false;
+    static constexpr u32 RenderKey_TexFull = 0x40000;
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
@@ -244,6 +275,21 @@ private:
 
     GLuint TexMemID {};
     GLuint TexPalMemID {};
+
+    // GPU::GLTexCache (T2 step 1, docs/plan-t2-texcache.md), all made when the switch turns on and
+    // dropped when it turns off: TexHeapID, the decoded texel records (RGBA8UI, 1024 x TexHeapRows,
+    // unit 2); TexPalLinearID, the palette as TexPalMem has it but 256 entries a row (RGB5_A1,
+    // 256 x 192, unit 3), uploaded with it; TexHeap, what's in the heap
+    GLuint TexHeapID {};
+    GLuint TexPalLinearID {};
+    u32 TexHeapRows = 0;
+    std::unique_ptr<GLTexHeap> TexHeap;
+    bool CreateTexCache(int mode);
+    void DeleteTexCache();
+    bool AssignTexCache(const GPU& gpu, bool texturing);
+    void TexCacheOff();
+    // the frame's changed texture chunks, for InvalidateOpaqueTex and the heap
+    TexDirtyPrefix TextureDirtyPrefix;
 
     // texture VRAM upload tracking. the dirty texture / palette chunks come from the shared
     // VRAMDirty_Texture / VRAMDirty_TexPal sets (consumed once per RenderFrame, like the other
@@ -337,7 +383,7 @@ private:
     u8 ScanOpaqueTexture(const u8* vram, u32 texparam, OpaqueTexEntry& entry);
     u8 OpaqueTexClass(const u8* vram, u32 texparam);
     void ClearOpaqueTex();
-    void InvalidateOpaqueTex(const NonStupidBitField<512*1024/512>& dirty); // VRAMDirtyGranularity chunks
+    void InvalidateOpaqueTex(const TexDirtyPrefix& dirty);
     void MarkScannedNoDiscard(const GPU& gpu, bool texturing);
 
     // debug only (GPU::ShadowLogFrames): the masks and shadows of a frame, logged at the start of
@@ -391,13 +437,15 @@ private:
     // the covered count when the clear alpha is 0 (kCoverAlphaCS), and its uSize
     GLuint CoverAlphaShader = 0;
     GLint CoverAlphaSizeLoc = -1;
-    GLint FragPassLoc[5] {-1, -1, -1, -1, -1};
+    GLint FragPassLoc[10] {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     // HASH3D (GPU::Hash3DLogging)
     std::unique_ptr<Hash3DReadback> Hash3D;
     // GLTRANS (GPU::SceneStats, with GPU::GLTransSkip)
     std::unique_ptr<GLTransStats> TransStats;
     // GLOPAQUE (GPU::SceneStats): the R1 count, after ClassifyTransAlpha
     std::unique_ptr<GLOpaqueStats> OpaqueStats;
+    // GLTEXCACHE (GPU::SceneStats, with GPU::GLTexCache on)
+    std::unique_ptr<GLTexCacheStats> TexCacheStats;
 
     void CountOpaqueR1(const GPU& gpu);
     u8 OpaqueTextureClass(const u8* vram, u32 texparam);

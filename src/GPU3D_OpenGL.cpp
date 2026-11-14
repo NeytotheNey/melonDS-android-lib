@@ -44,11 +44,15 @@ namespace melonDS
 #define TRANS_SKIPPED(field) do {} while (0)
 #endif
 
-bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard)
+bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard, bool full)
 {
-    char shadername[48];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
-        nodiscard ? "NoDiscard" : "", fragCount ? "Count" : "");
+    char shadername[64];
+    char probename[16] = "";
+    if (TexProbe)
+        snprintf(probename, sizeof(probename), "TexProbe%d", TexProbe);
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
+        nodiscard ? "NoDiscard" : "", fragCount ? "Count" : "", probename,
+        TexCache ? (TexCacheOnly && !full ? "TexCacheOnly" : "TexCache") : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
@@ -67,6 +71,31 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     // GPU::GLNoDiscard: kRenderFS's opaque-only main, without discard
     if (nodiscard)
         fsbuf += "\n#define NoDiscard";
+    // GPU::GLTexProbe (T2 measurement probes, render wrong): kRenderFSCommon's texture lookups
+    // become one fetch (1), none (2), the wrap and one fetch (3), or the wrap and two dependent
+    // fetches (4), in every build of the render programs
+    if (TexProbe == 1)
+        fsbuf += "\n#define TexProbeFetch";
+    else if (TexProbe == 2)
+        fsbuf += "\n#define TexProbeConst";
+    else if (TexProbe == 3)
+        fsbuf += "\n#define TexProbeWrap";
+    else if (TexProbe == 4)
+        fsbuf += "\n#define TexProbeChain";
+    // GPU::GLTexCache (T2 step 1): kRenderFSCommon's nearest lookup reads the decoded texel heap for
+    // the polygons AssignTexCache put in it, in every build of the render programs. never together
+    // with the probe (UpdateRenderVariant)
+    if (TexCache)
+        fsbuf += "\n#define TexCache";
+    // GPU::GLTexCache step 2: the nearest lookup without the old decode path, except in the twins
+    // (full) the heap's fallback polygons draw with
+    if (TexCache && TexCacheOnly && !full)
+        fsbuf += "\n#define TexCacheOnly";
+#ifdef MELONADE_DEBUG_TOOLS
+    // debug only, GPU::GLTexCache 32: a twin that can't build, to test TexCacheOff
+    if (full && FailTwins)
+        fsbuf += "\n#error gltexcache 32 makes the twins fail on purpose";
+#endif
     fsbuf += wbufdef;
     fsbuf += kRenderFSCommon;
 #ifdef MELONADE_DEBUG_TOOLS
@@ -106,8 +135,13 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     glUniform1i(uni_id, 0);
     uni_id = glGetUniformLocation(prog, "TexPalMem");
     glUniform1i(uni_id, 1);
+    if (TexCache)
+    {
+        glUniform1i(glGetUniformLocation(prog, "TexHeap"), 2);
+        glUniform1i(glGetUniformLocation(prog, "TexPalLinear"), 3);
+    }
 
-    int id = nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0);
+    int id = (nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0)) + (full ? FullShader : 0);
     DepthBiasLoc[id] = glGetUniformLocation(prog, "uDepthBias");
     glUniform1f(DepthBiasLoc[id], 0.0f);
     DepthBias[id] = 0.0f;
@@ -180,21 +214,257 @@ bool GLRenderer::PrepareNoDiscardShader()
     return true;
 }
 
-// nodiscard: RenderShader[4] (GPU::GLNoDiscard), Z-buffer and opaque only, which has no uRenderMode
-void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch, bool nodiscard)
+// GPU::GLTexProbe (T2 measurement probe, renders wrong) and GPU::GLTexCache (T2 step 1): RenderShader[0]
+// and [1] are built again with the probe or the heap lookup (as counting builds while SCENEFRAGS
+// counts), and the fetch and no-discard builds are dropped, to be made again with it the first frame
+// that wants them. when [0] or [1] doesn't build, they're built again as they were (logged), and the
+// variant stays off until a switch changes
+void GLRenderer::SetRenderVariant(int probe, bool cache, bool only)
 {
+    only = cache && only;
+    if (probe == TexProbe && cache == TexCache && only == TexCacheOnly)
+        return;
+
+    bool fragCount = false;
+#ifdef MELONADE_DEBUG_TOOLS
+    fragCount = FragCounter != nullptr;
+#endif
+    int oldProbe = TexProbe;
+    bool oldCache = TexCache, oldOnly = TexCacheOnly;
+    GLuint prev[2] = { RenderShader[0], RenderShader[1] };
+    TexProbe = probe;
+    TexCache = cache;
+    TexCacheOnly = only;
+    bool built0 = BuildRenderShader(false, fragCount);
+    bool built1 = built0 && BuildRenderShader(true, fragCount);
+    if (!built1)
+    {
+        if (built0)
+            glDeleteProgram(RenderShader[0]);
+        if (probe != oldProbe)
+            Platform::Log(Platform::LogLevel::Warn, "GLTEXPROBE: the probe %d render programs didn't build, gltexprobe stays at %d\n", probe, oldProbe);
+        if (cache != oldCache || only != oldOnly)
+            Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs %s the texel heap lookup%s didn't build, gltexcache stays %s\n",
+                cache ? "with" : "without", only ? " only" : "", oldCache ? "on" : "off");
+        TexProbe = oldProbe;
+        TexCache = oldCache;
+        TexCacheOnly = oldOnly;
+        BuildRenderShader(false, fragCount);
+        BuildRenderShader(true, fragCount);
+    }
+    for (int i = 0; i < 2; i++)
+        if (RenderShader[i] != prev[i])
+            glDeleteProgram(prev[i]);
+
+    glDeleteProgram(RenderShader[2]);
+    glDeleteProgram(RenderShader[3]);
+    glDeleteProgram(RenderShader[4]);
+    RenderShader[2] = RenderShader[3] = RenderShader[4] = 0;
+#ifdef MELONADE_DEBUG_TOOLS
+    FragPassLoc[2] = FragPassLoc[3] = FragPassLoc[4] = -1;
+#endif
+    DropFullShaders();
+    FetchShadersTried = false;
+    NoDiscardTried = false;
+    CurShaderID = -1;
+    CurRenderMode = -1;
+    if (built1 && probe != oldProbe)
+        Platform::Log(Platform::LogLevel::Info, "GLTEXPROBE: render programs built with texture probe %d (renders wrong on purpose)\n", TexProbe);
+    if (built1 && (cache != oldCache || only != oldOnly))
+        Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: render programs built %s the texel heap lookup%s\n", TexCache ? "with" : "without",
+            TexCacheOnly ? " only (step 2, the old decode path is in twins made when a polygon needs it)" : "");
+}
+
+// RenderFrame, when GPU::GLTexProbe or GPU::GLTexCache differs from what was asked last: the probe
+// wins (the heap lookup is left out while it's nonzero). any change of GPU::GLTexCache starts the
+// heap over, and the heap only exists while the programs have the lookup
+void GLRenderer::UpdateRenderVariant(const GPU& gpu)
+{
+    bool cacheChanged = gpu.GLTexCache != TexCacheAsked;
+    TexProbeAsked = gpu.GLTexProbe;
+    TexCacheAsked = gpu.GLTexCache;
+    int probe = (TexProbeAsked >= 1 && TexProbeAsked <= 4) ? TexProbeAsked : 0;
+    bool cache = TexCacheAsked != 0 && probe == 0;
+    if (cacheChanged)
+    {
+        CacheFailed = false;
+        // made again for the new value when a polygon needs them
+        DropFullShaders();
+    }
+    // off after a twin didn't build (TexCacheOff), until the switch changes
+    cache = cache && !CacheFailed;
+    // step 2 unless bit 4 (16) asks for step 1
+    bool only = !(TexCacheAsked & 16);
+#ifdef MELONADE_DEBUG_TOOLS
+    // debug only, GPU::GLTexCache 32: the twins' source gets an #error, to test TexCacheOff
+    FailTwins = (TexCacheAsked & 32) != 0;
+#endif
+
+    if (TexHeap && (cacheChanged || !cache))
+        DeleteTexCache();
+    if (cache && !TexHeap && !CreateTexCache(TexCacheAsked))
+        cache = false;
+    SetRenderVariant(probe, cache, only);
+    // a build that failed left the programs as they were, which can be the heap lookup ones with the
+    // heap already gone: make it again, or drop to the programs without the lookup. if even that
+    // fails, RenderFrame only runs AssignTexCache with a heap, so every polygon takes the old path
+    if (TexCache && !TexHeap && !CreateTexCache(TexCacheAsked))
+        SetRenderVariant(TexProbe, false, false);
+    if (TexHeap && !TexCache)
+        DeleteTexCache();
+}
+
+// GPU::GLTexCache: the heap texture (smaller in the tiny mode, 4) and TexPalLinear, filled from
+// TexPalConvBuffer, which holds all of palette RAM once a frame has run (TexMemDirtyAll converts
+// every row; on the first frame that upload fills both). false when GL can't make them
+bool GLRenderer::CreateTexCache(int mode)
+{
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    u32 rows = maxTextureSize >= 4096 ? 4096 : 2048;
+    if (mode & 4)
+        rows = GLTexHeap::TinyRows;
+
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; i++) {}
+    glActiveTexture(GL_TEXTURE2);
+    glGenTextures(1, &TexHeapID);
+    glBindTexture(GL_TEXTURE_2D, TexHeapID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 1024, rows);
+
+    glActiveTexture(GL_TEXTURE3);
+    glGenTextures(1, &TexPalLinearID);
+    glBindTexture(GL_TEXTURE_2D, TexPalLinearID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 256, 192, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, NULL);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, TexPalConvBuffer);
+    GLenum error = glGetError();
+    glActiveTexture(GL_TEXTURE0);
+    if (error != GL_NO_ERROR)
+    {
+        Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the heap textures (1024 x %u RGBA8UI, 256 x 192 RGB5_A1) failed "
+            "with GL error 0x%X, gltexcache stays off\n", rows, error);
+        DeleteTexCache();
+        return false;
+    }
+
+    TexHeapRows = rows;
+    TexHeap = std::make_unique<GLTexHeap>();
+    TexHeap->Configure(mode, rows);
+    Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE: on, mode %d, heap 1024 x %u texels\n", mode, rows);
+    return true;
+}
+
+void GLRenderer::DeleteTexCache()
+{
+    glDeleteTextures(1, &TexHeapID);
+    glDeleteTextures(1, &TexPalLinearID);
+    TexHeapID = TexPalLinearID = 0;
+    TexHeapRows = 0;
+    TexHeap.reset();
+#ifdef MELONADE_DEBUG_TOOLS
+    TexCacheStats.reset();
+#endif
+}
+
+// GPU::GLTexCache step 2: the twins with the old decode path of the programs this frame uses
+// (Z and W always, fetch with FetchClear0, no-discard with NoDiscard), as counting builds while
+// SCENEFRAGS counts, made the first frame a polygon needs them (AssignTexCache marked one). false
+// when one doesn't build: RenderFrame then turns the cache off (TexCacheOff)
+bool GLRenderer::PrepareFullShaders()
+{
+    bool fragCount = false;
+#ifdef MELONADE_DEBUG_TOOLS
+    fragCount = FragCounter != nullptr;
+#endif
+    auto build = [&](bool wbuffer, bool fetch, bool nodiscard)
+    {
+        int id = (nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0)) + FullShader;
+        if (RenderShader[id])
+            return true;
+        if (BuildRenderShader(wbuffer, fragCount && !nodiscard, fetch, nodiscard, true))
+            return true;
+        glDeleteProgram(RenderShader[id]);
+        RenderShader[id] = 0;
+        return false;
+    };
+    bool ok = build(false, false, false) && build(true, false, false);
+    if (ok && FetchClear0)
+        ok = build(false, true, false) && build(true, true, false);
+    if (ok && NoDiscard)
+        ok = build(false, false, true);
+    // BuildRenderShader leaves its program in use
+    CurShaderID = -1;
+    CurRenderMode = -1;
+    return ok;
+}
+
+void GLRenderer::DropFullShaders()
+{
+    for (int i = FullShader; i < FullShader + 5; i++)
+    {
+        glDeleteProgram(RenderShader[i]);
+        RenderShader[i] = 0;
+#ifdef MELONADE_DEBUG_TOOLS
+        FragPassLoc[i] = -1;
+#endif
+    }
+}
+
+// GPU::GLTexCache step 2, when a twin didn't build: logged once, the programs are built again with
+// both paths (step 1) for this frame on, and the polygons lose RenderKey_TexFull. this frame's
+// fetch and no-discard programs are made again for it (they were dropped); a no-discard one that
+// doesn't build takes its key bit off the polygons too, so the frame stays exact
+void GLRenderer::TexCacheOff()
+{
+    Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs with the old decode path (step 2's twins) didn't build, "
+        "gltexcache %d stays off until it changes\n", TexCacheAsked);
+    CacheFailed = true;
+    // the programs without the heap lookup, which the frames with the switch at 0 use
+    SetRenderVariant(TexProbe, false, false);
+    if (TexCache)
+        Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the render programs without the heap lookup didn't build either\n");
+    for (int i = 0; i < NumFinalPolys; i++)
+    {
+        PolygonList[i].TexWord = PolygonList[i].PolyData->TexParam & 0xFFFF;
+        PolygonList[i].RenderKey &= ~RenderKey_TexFull;
+    }
+    DeleteTexCache();
+    // SetRenderVariant dropped this frame's fetch and no-discard programs. the fetch ones are those
+    // of a frame with the switch at 0 now; a no-discard one that doesn't build takes its key bit off
+    if (FetchClear0 && !PrepareFetchShaders())
+        Platform::Log(Platform::LogLevel::Warn, "GLTEXCACHE: the framebuffer fetch programs didn't build again, this frame's translucent draws are lost\n");
+    if (NoDiscard && !PrepareNoDiscardShader())
+    {
+        NoDiscard = false;
+        for (int i = 0; i < NumFinalPolys; i++)
+            PolygonList[i].RenderKey &= ~RenderKey_NoDiscard;
+    }
+}
+
+// nodiscard: RenderShader[4] (GPU::GLNoDiscard), Z-buffer and opaque only, which has no uRenderMode.
+// full: the twin with the old decode path (GPU::GLTexCache step 2, RenderKey_TexFull)
+void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch, bool nodiscard, bool full)
+{
+    int twin = full ? FullShader : 0;
     if (nodiscard)
     {
-        if (CurShaderID != 4)
+        if (CurShaderID != 4 + twin)
         {
-            glUseProgram(RenderShader[4]);
-            CurShaderID = 4;
+            glUseProgram(RenderShader[4 + twin]);
+            CurShaderID = 4 + twin;
             CurRenderMode = -1;
         }
         return;
     }
 
-    int id = (int)wbuffer + (fetch ? 2 : 0);
+    int id = (int)wbuffer + (fetch ? 2 : 0) + twin;
     if (CurShaderID != id)
     {
         glUseProgram(RenderShader[id]);
@@ -490,6 +760,7 @@ GLRenderer::~GLRenderer()
 
     glDeleteTextures(1, &TexMemID);
     glDeleteTextures(1, &TexPalMemID);
+    DeleteTexCache();
 
     glDeleteFramebuffers(1, &MainFramebuffer);
     glDeleteFramebuffers(1, &DownscaleFramebuffer);
@@ -510,7 +781,7 @@ GLRenderer::~GLRenderer()
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 10; i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -543,6 +814,9 @@ void GLRenderer::Reset(GPU& gpu)
     TexMemDirtyAll = true;
     // TexMemDirtyAll drops them at the next frame anyway (every chunk counts as changed)
     ClearOpaqueTex();
+    // GPU::GLTexCache: the same, the heap would only rehash everything at its next use
+    if (TexHeap)
+        TexHeap->Clear();
     TargetsChanged = true;
     EarlyCapture = false;
 }
@@ -746,6 +1020,7 @@ void GLRenderer::KeepColorBuffer() noexcept
 void GLRenderer::SetupPolygon(GLRenderer::RendererPolygon* rp, Polygon* polygon) const
 {
     rp->PolyData = polygon;
+    rp->TexWord = polygon->TexParam & 0xFFFF;
 
     // render key: depending on what we're drawing
     // opaque polygons:
@@ -789,7 +1064,7 @@ void GLRenderer::SetupPolygon(GLRenderer::RendererPolygon* rp, Polygon* polygon)
     }
 }
 
-u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const
+u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const
 {
     u32 z = poly->FinalZ[vid];
     u32 w = poly->FinalW[vid];
@@ -847,8 +1122,9 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
     *vptr++ = (u16)vtx->TexCoords[0] | ((u16)vtx->TexCoords[1] << 16);
 
     // Split TexParam into 2 because some GPUs don't have 32 bit ints. TexPalette only uses 13 bits
+    // (texword: TexParam & 0xFFFF, or the heap offset with GPU::GLTexCache, RendererPolygon::TexWord)
     *vptr++ = vtxattr | (zshift << 16);
-    *vptr++ = poly->TexParam & 0xFFFF;
+    *vptr++ = texword;
     *vptr++ = (poly->TexParam >> 16 ) | (poly->TexPalette << 16);
 
     return vptr;
@@ -906,7 +1182,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                 lastx = vtx->FinalPosition[0];
                 lasty = vtx->FinalPosition[1];
 
-                vptr = SetupVertex(poly, j, vtx, vtxattr, vptr);
+                vptr = SetupVertex(poly, j, vtx, vtxattr, rp->TexWord, vptr);
 
                 IndexBuffer[iidx++] = vidx;
                 rp->NumIndices++;
@@ -924,7 +1200,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
             {
                 Vertex* vtx = poly->Vertices[j];
 
-                vptr = SetupVertex(poly, j, vtx, vtxattr, vptr);
+                vptr = SetupVertex(poly, j, vtx, vtxattr, rp->TexWord, vptr);
                 vidx++;
             }
 
@@ -946,7 +1222,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                 {
                     Vertex* vtx = poly->Vertices[j];
 
-                    vptr = SetupVertex(poly, j, vtx, vtxattr, vptr);
+                    vptr = SetupVertex(poly, j, vtx, vtxattr, rp->TexWord, vptr);
 
                     if (j >= 2)
                     {
@@ -1034,7 +1310,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
 
                 // Split TexParam into 2 because some GPUs don't have 32 bit ints. TexPalette only uses 13 bits
                 *vptr++ = vtxattr | (zshift << 16);
-                *vptr++ = poly->TexParam & 0xFFFF;
+                *vptr++ = rp->TexWord;
                 *vptr++ = (poly->TexParam >> 16 ) | (poly->TexPalette << 16);
 
                 vidx++;
@@ -1044,7 +1320,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                 {
                     Vertex* vtx = poly->Vertices[j];
 
-                    vptr = SetupVertex(poly, j, vtx, vtxattr, vptr);
+                    vptr = SetupVertex(poly, j, vtx, vtxattr, rp->TexWord, vptr);
 
                     if (j >= 1)
                     {
@@ -1194,7 +1470,7 @@ void GLRenderer::SetPolygonDepthBias(u32 polyattr)
     // than the DS would. set right before every draw, for the shader in use
     float bias = 0.0f;
     if (EqualDepthMargin && (polyattr & (1<<14)))
-        bias = (CurShaderID & 1) ? -255.0f : -512.0f;
+        bias = ((CurShaderID % FullShader) & 1) ? -255.0f : -512.0f; // bit 0 of the index is W-buffering, twins too
 
     SetDepthBias(bias);
 }
@@ -1490,26 +1766,19 @@ void GLRenderer::ClearOpaqueTex()
 // GPU::GLNoDiscard bit 1: drops the cached scans that read a chunk this frame's texture upload
 // changed (RenderFrame's textureDirty, the 512 byte chunks VRAMFlat_Texture and TexMem were just
 // brought up to date in; all of them after Reset or a renderer switch, TexMemDirtyAll), and
-// rebuilds the index from the ones left
-static_assert(VRAMDirtyGranularity == 512, "GPU3D_OpenGL.h declares InvalidateOpaqueTex with 512 byte chunks");
-void GLRenderer::InvalidateOpaqueTex(const NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty)
+// rebuilds the index from the ones left. dirty is textureDirty as a count of the changed chunks
+// below each one (TexDirtyPrefix), built once a frame for this and the texel heap (GPU::GLTexCache)
+static_assert(VRAMDirtyGranularity == 512, "TexDirtyPrefix counts 512 byte chunks");
+void GLRenderer::InvalidateOpaqueTex(const TexDirtyPrefix& dirty)
 {
-    constexpr u32 numChunks = 512*1024 / VRAMDirtyGranularity;
-    // before[c]: how many chunks below c changed, so a range's test is one subtraction
-    u16 before[numChunks + 1];
-    before[0] = 0;
-    for (u32 c = 0; c < numChunks; c++)
-        before[c + 1] = before[c] + (dirty[c] ? 1 : 0);
-    if (before[numChunks] == 0)
+    if (dirty.Count() == 0)
         return;
-
-    auto changed = [&](u32 first, u32 last) { return first <= last && before[last + 1] != before[first]; };
 
     int kept = 0;
     for (int i = 0; i < NumOpaqueTex; i++)
     {
         const OpaqueTexEntry& e = OpaqueTex[i];
-        if (changed(e.First0, e.Last0) || changed(e.First1, e.Last1))
+        if (dirty.Changed(e.First0, e.Last0) || dirty.Changed(e.First1, e.Last1))
             continue;
         OpaqueTex[kept++] = e;
     }
@@ -1549,6 +1818,165 @@ void GLRenderer::MarkScannedNoDiscard(const GPU& gpu, bool texturing)
     if (OpaqueStats)
         OpaqueStats->Sec.NdScanNs += GLStatsNowNs() - start;
 #endif
+}
+
+namespace
+{
+// GPU::GLTexCache: the heap's decodes go into TexHeap, which RenderFrame bound on unit 2. the unit
+// that was active before the first upload is made active again at the end (Restore), so later binds
+// that don't pick a unit don't land on unit 2
+struct TexHeapUploader : GLTexHeap::UploadSink
+{
+    bool Active = false;
+    GLint PrevUnit = GL_TEXTURE0;
+    void Upload(u32 x, u32 y, u32 w, u32 h, const u8* data) override
+    {
+        if (!Active)
+        {
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &PrevUnit);
+            glActiveTexture(GL_TEXTURE2);
+            Active = true;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, data);
+    }
+    void Restore()
+    {
+        if (Active)
+            glActiveTexture((GLenum)PrevUnit);
+        Active = false;
+    }
+};
+}
+
+// GPU::GLTexCache (T2 step 1, docs/plan-t2-texcache.md), after the frame's PolygonList is set up and
+// before BuildPolygons writes the vertices: every textured polygon (texturing on, a format, not a
+// shadow mask, which never samples) whose texture the heap holds, or can decode within the frame's
+// budget, reads it from there (TexWord = 0x40000000 | its offset). the rest keep TexParam's VRAM
+// offset and the old path, which is always exact. render keys and batches don't change. vram is
+// VRAMFlat_Texture, which TexMem was just brought up to date from
+bool GLRenderer::AssignTexCache(const GPU& gpu, bool texturing)
+{
+    bool anyFull = false;
+#ifdef MELONADE_DEBUG_TOOLS
+    GLTexCacheStats* st = TexCacheStats.get();
+    s64 start = st ? GLStatsNowNs() : 0;
+    TexHeap->Timing = st != nullptr;
+#endif
+    TexHeap->BeginFrame();
+
+    if (texturing)
+    {
+        const u8* vram = gpu.VRAMFlat_Texture;
+        TexHeapUploader uploader;
+        // polygons in a row often share a texture: the last answer is reused for the same TexParam
+        // and palette (the heap's state can't change in between, nothing else runs)
+        u32 lastParam = 0, lastPal = 0, lastOffset = 0;
+        int lastResult = -1;
+        for (int i = 0; i < NumFinalPolys; i++)
+        {
+            RendererPolygon& rp = PolygonList[i];
+            const Polygon* polygon = rp.PolyData;
+            u32 format = (polygon->TexParam >> 26) & 0x7;
+            if (polygon->IsShadowMask || format == 0)
+                continue;
+
+            int result;
+            u32 offset = 0;
+            if (lastResult >= 0 && polygon->TexParam == lastParam && polygon->TexPalette == lastPal)
+            {
+                offset = lastOffset;
+                result = lastResult < GLTexHeap::NumServed ? GLTexHeap::Hit : lastResult;
+            }
+            else
+            {
+                result = TexHeap->Use(vram, polygon->TexParam, polygon->TexPalette, uploader, offset);
+                lastParam = polygon->TexParam;
+                lastPal = polygon->TexPalette;
+                lastOffset = offset;
+                lastResult = result;
+            }
+            if (result < GLTexHeap::NumServed)
+                rp.TexWord = 0x40000000 | offset;
+            else if (TexCacheOnly)
+            {
+                // step 2: the old path is only in the twins. a key bit, so batches split here
+                rp.RenderKey |= RenderKey_TexFull;
+                anyFull = true;
+            }
+
+#ifdef MELONADE_DEBUG_TOOLS
+            if (st)
+            {
+                // as CountOpaqueR1's: the shoelace area of the 1x vertices, in screens
+                s64 sum = 0;
+                u32 n = polygon->NumVertices;
+                for (u32 j = 0; j < n; j++)
+                {
+                    const Vertex* va = polygon->Vertices[j];
+                    const Vertex* vb = polygon->Vertices[(j + 1) < n ? (j + 1) : 0];
+                    sum += (s64)va->FinalPosition[0] * vb->FinalPosition[1] - (s64)vb->FinalPosition[0] * va->FinalPosition[1];
+                }
+                double area = (sum < 0 ? -sum : sum) / (2.0 * 256 * 192);
+                st->Sec.Polys[result]++;
+                st->Sec.Area[result] += area;
+                st->Sec.FormatArea[format] += area;
+                if (result < GLTexHeap::NumServed)
+                    st->Sec.FormatServed[format] += area;
+            }
+#endif
+        }
+        uploader.Restore();
+    }
+
+#ifdef MELONADE_DEBUG_TOOLS
+    if (st)
+    {
+        s64 ns = GLStatsNowNs() - start;
+        st->Sec.Frames++;
+        st->Sec.Entries += TexHeap->NumEntries();
+        st->Sec.UsedTexels += TexHeap->UsedTexels();
+        st->Sec.AssignNs += ns;
+        st->Sec.AssignPeakNs = std::max(st->Sec.AssignPeakNs, ns);
+
+        // step 2's batches: the opaque pass's polygons and the translucent ones, each in list order as
+        // the passes walk them, with and without RenderKey_TexFull, and the program switches between
+        // the two forms it adds (each pass starts on the cache-only one)
+        for (int translucent = 0; translucent < 2; translucent++)
+        {
+            bool cur = false;
+            for (int i = 0; i < NumFinalPolys; )
+            {
+                const RendererPolygon* rp = &PolygonList[i];
+                if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent != (translucent != 0)) { i++; continue; }
+                bool full = PolyFull(rp);
+                if (full != cur) { st->Sec.Switches++; cur = full; }
+                st->Sec.Draws++;
+                int end = i;
+                while (end < NumFinalPolys && PolygonList[end].PrimType == rp->PrimType && PolygonList[end].RenderKey == rp->RenderKey)
+                {
+                    if (PolyFull(&PolygonList[end])) st->Sec.FullPolys++;
+                    end++;
+                }
+                i = end;
+            }
+            if (cur) st->Sec.Switches++;
+
+            for (int i = 0; i < NumFinalPolys; )
+            {
+                const RendererPolygon* rp = &PolygonList[i];
+                if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent != (translucent != 0)) { i++; continue; }
+                u32 key = rp->RenderKey & ~RenderKey_TexFull;
+                st->Sec.DrawsBase++;
+                int end = i + 1;
+                while (end < NumFinalPolys && PolygonList[end].PrimType == rp->PrimType
+                       && (PolygonList[end].RenderKey & ~RenderKey_TexFull) == key)
+                    end++;
+                i = end;
+            }
+        }
+    }
+#endif
+    return anyFull;
 }
 
 #ifdef MELONADE_DEBUG_TOOLS
@@ -1654,8 +2082,9 @@ void GLRenderer::CountOpaqueR1(const GPU& gpu)
             if (nd != cur) { st.Sec.ProgSwitches++; cur = nd; }
             st.Sec.Draws++;
             int end = i + 1;
+            // without GPU::GLTexCache step 2's bit, whose batches GLTEXCACHE counts
             while (end < NumFinalPolys && PolygonList[end].PrimType == rp->PrimType
-                   && PolygonList[end].RenderKey == rp->RenderKey)
+                   && (PolygonList[end].RenderKey & ~RenderKey_TexFull) == (rp->RenderKey & ~RenderKey_TexFull))
                 end++;
             i = end;
         }
@@ -1666,11 +2095,11 @@ void GLRenderer::CountOpaqueR1(const GPU& gpu)
             const RendererPolygon* rp = &PolygonList[i];
             if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent) { i++; continue; }
 
-            u32 key = rp->RenderKey & ~RenderKey_NoDiscard;
+            u32 key = rp->RenderKey & ~(RenderKey_NoDiscard | RenderKey_TexFull);
             st.Sec.DrawsBase++;
             int end = i + 1;
             while (end < NumFinalPolys && PolygonList[end].PrimType == rp->PrimType
-                   && (PolygonList[end].RenderKey & ~RenderKey_NoDiscard) == key)
+                   && (PolygonList[end].RenderKey & ~(RenderKey_NoDiscard | RenderKey_TexFull)) == key)
                 end++;
             i = end;
         }
@@ -1807,7 +2236,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
         // GPU::GLNoDiscard: the batch's program (RenderKey_NoDiscard is part of the batch key). the
         // same program otherwise, so this only changes anything with the switch on
-        UseRenderShader(wbuffer, RenderMode_Opaque, false, (rp->RenderKey & RenderKey_NoDiscard) != 0);
+        UseRenderShader(wbuffer, RenderMode_Opaque, false, (rp->RenderKey & RenderKey_NoDiscard) != 0, PolyFull(rp));
 
         if (rp->PolyData->Attr & (1<<14))
             glDepthFunc(GL_LEQUAL);
@@ -1965,7 +2394,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     if (drawopaque)
                     {
-                        UseRenderShader(wbuffer, RenderMode_Opaque);
+                        UseRenderShader(wbuffer, RenderMode_Opaque, false, false, PolyFull(rp));
 
                         glDisable(GL_BLEND);
                         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1991,7 +2420,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     // only a need-opaque polygon, which is drawn on its own
                     if (!drawtrans) { i++; continue; }
 
-                    UseRenderShader(wbuffer, RenderMode_Translucent);
+                    UseRenderShader(wbuffer, RenderMode_Translucent, false, false, PolyFull(rp));
 
                     GLboolean transfog;
                     if (!(polyattr & (1<<15))) transfog = fogenable;
@@ -2165,7 +2594,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 if (drawopaque)
                 {
-                    UseRenderShader(wbuffer, RenderMode_Opaque);
+                    UseRenderShader(wbuffer, RenderMode_Opaque, false, false, PolyFull(rp));
 
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -2186,7 +2615,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 // bit 2: the framebuffer fetch program, for all but shadows
                 bool fetch = FetchClear0 && !rp->PolyData->IsShadow;
-                UseRenderShader(wbuffer, RenderMode_Translucent, fetch);
+                UseRenderShader(wbuffer, RenderMode_Translucent, fetch, false, PolyFull(rp));
 
                 GLboolean transfog;
                 if (!(polyattr & (1<<15))) transfog = fogenable;
@@ -2376,6 +2805,16 @@ void GLRenderer::RenderFrame(GPU& gpu)
         OpaqueStats.reset();
     if (OpaqueStats)
         OpaqueStats->FrameStart(GLStatsNowNs());
+    // GLTEXCACHE too, while the heap exists (GPU::GLTexCache)
+    if (gpu.SceneStats && TexHeap && !TexCacheStats)
+    {
+        TexCacheStats = std::make_unique<GLTexCacheStats>();
+        TexHeap->Sec = {};
+    }
+    else if ((!gpu.SceneStats || !TexHeap) && TexCacheStats)
+        TexCacheStats.reset();
+    if (TexCacheStats)
+        TexCacheStats->FrameStart(GLStatsNowNs(), *TexHeap, TexCacheAsked);
 #endif
     bool keep = KeepRequested;
     KeepRequested = false;
@@ -2403,10 +2842,16 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // GPU::GLNoDiscard bit 1: the cached texture scans read VRAMFlat_Texture, which TexMem follows,
     // and both just changed in exactly these chunks. this runs every frame whatever the switch, so
     // nothing cached goes stale while it's off. palette RAM doesn't matter (alpha is the texel's)
+    // GPU::GLTexCache: the heap's textures were decoded from VRAMFlat_Texture too, and those under a
+    // changed chunk get hashed again at their next use. the chunks are counted once for both
+    if (textureChanged && (NumOpaqueTex || TexHeap))
+        TextureDirtyPrefix.Build(textureDirty);
     if (gpu.GLNoDiscard & 4)
         ClearOpaqueTex();
     else if (textureChanged && NumOpaqueTex)
-        InvalidateOpaqueTex(textureDirty);
+        InvalidateOpaqueTex(TextureDirtyPrefix);
+    if (textureChanged && TexHeap)
+        TexHeap->Invalidate(TextureDirtyPrefix);
 
     // the targets match the polygons drawn here (see FrameTargetWidth). this runs after the
     // frame's Blit, so the compositor's width only changes between frames as well. with a Blit
@@ -2434,6 +2879,11 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
     if (keep)
         KeepColorBuffer();
+
+    // GPU::GLTexProbe (T2 measurement probe) and GPU::GLTexCache (T2 step 1): rebuilds the render
+    // programs only when a switch changed, so with both at 0 this is two compares
+    if (gpu.GLTexProbe != TexProbeAsked || gpu.GLTexCache != TexCacheAsked)
+        UpdateRenderVariant(gpu);
 
     CurShaderID = -1;
     CurRenderMode = -1;
@@ -2528,6 +2978,15 @@ void GLRenderer::RenderFrame(GPU& gpu)
     glBindTexture(GL_TEXTURE_2D, TexMemID);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, TexPalMemID);
+    // GPU::GLTexCache: units 2 and 3, which the compositor rebinds too
+    if (TexHeap)
+    {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, TexHeapID);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, TexPalLinearID);
+        glActiveTexture(GL_TEXTURE1);
+    }
 
     if (textureChanged)
     {
@@ -2578,6 +3037,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
             }
 
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, start, 1024, row - start, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, dst);
+            // GPU::GLTexCache: the same words into TexPalLinear, where a 1024 entry row is four
+            // 256 entry rows
+            if (TexHeap)
+            {
+                glActiveTexture(GL_TEXTURE3);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 4 * start, 256, 4 * (row - start), GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, dst);
+                glActiveTexture(GL_TEXTURE1);
+            }
         }
     }
 
@@ -2702,6 +3169,13 @@ void GLRenderer::RenderFrame(GPU& gpu)
         // GPU::GLNoDiscard bit 1 (R1 step 2): the textures that need a scan
         if (NoDiscard && (gpu.GLNoDiscard & 2))
             MarkScannedNoDiscard(gpu, texturing);
+        // GPU::GLTexCache: the polygons whose texture the heap holds (or can decode now) read it
+        if (TexCache && TexHeap)
+        {
+            // step 2: the twins with the old decode path, the first frame a polygon needs one
+            if (AssignTexCache(gpu, texturing) && !PrepareFullShaders())
+                TexCacheOff();
+        }
 
         BuildPolygons(&PolygonList[0], npolys);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
@@ -3049,6 +3523,8 @@ void GLRenderer::SetupFragCount()
     glDeleteProgram(RenderShader[3]);
     RenderShader[2] = RenderShader[3] = 0;
     FragPassLoc[2] = FragPassLoc[3] = -1;
+    // and GPU::GLTexCache step 2's twins, the next frame a polygon needs them
+    DropFullShaders();
     FetchShadersTried = false;
     CurShaderID = -1;
     CurRenderMode = -1;
@@ -3065,7 +3541,7 @@ void GLRenderer::SetupFragCount()
 // the counter the render programs add to from here on, set in both
 void GLRenderer::SetFragPass(int pass)
 {
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 10; i++)
     {
         if (RenderShader[i] && FragPassLoc[i] >= 0)
             glProgramUniform1i(RenderShader[i], FragPassLoc[i], pass);

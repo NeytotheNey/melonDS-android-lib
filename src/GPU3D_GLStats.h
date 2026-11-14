@@ -37,6 +37,7 @@
 #include "types.h"
 #include "Platform.h"
 #include "OpenGLSupport.h"
+#include "GPU3D_OpenGLTexHeap.h"
 
 namespace melonDS
 {
@@ -829,6 +830,110 @@ struct GLOpaqueStats
                 Sec.NdScanNs / 1000.0 / Sec.Frames);
         }
         Sec = {};
+        LogStartNs = now;
+    }
+
+private:
+    s64 LogStartNs = 0;
+};
+
+// debug builds only, OpenGL renderer: the GLTEXCACHE log, GPU::GLTexCache's texel heap (experiment T2
+// step 1, docs/plan-t2-texcache.md), with GPU::SceneStats on and the heap there. once a second, per
+// frame AssignTexCache ran in (frames, the 3D frames drawn):
+//   mode                    the switch's value
+//   polys area              textured polygons (texturing on, a format, not shadow masks) and their area
+//                           in screens (the shoelace area of the 1x vertices, overdraw counted)
+//   served cover cover_area those the heap served, and their share of the polygons and of the area
+//   hit kept decoded redecoded
+//                           served polygons by how: already current, rehashed the same after a VRAM
+//                           write, decoded now, decoded again after their bytes changed
+//   range palette volatile budget full
+//                           polygons/area on the old path by why: the texture reads past TexMem or the
+//                           palette rows (by TexParam), a 4x4 block's palette does (by its data), it
+//                           changed in 3 of the last 8 frames it was used in, the frame's decode budget
+//                           is spent, no room in the heap or the entry table
+//   a3i5 .. direct          per format, served area over textured area
+//   entries heap_used       heap entries (textures seen, served or not) and texels in blocks, averaged
+//   texels uploads upload_kb
+//                           decoded texels, glTexSubImage2D calls and their KB per frame
+//   decode_us upload_us hash_us hash_kb
+//                           CPU µs per frame decoding, in the upload calls and hashing, and KB hashed
+//   assign_us assign_peak_us
+//                           CPU µs per frame of AssignTexCache, all of the above in it, and the most in
+//                           one frame
+//   evictions volatiles removed
+//                           this second: blocks freed for room, textures that went volatile, entries
+//                           dropped from a full table
+//   s2_full s2_draws s2_draws_base s2_switches
+//                           step 2: polygons drawn with the twins that have the old decode path (the
+//                           fallback ones, 0 in step 1), the opaque and translucent polygons' batches
+//                           in list order with and without that key bit (the extra draws are the
+//                           difference), and the program switches between the two forms it adds
+struct GLTexCacheStats
+{
+    struct Counters
+    {
+        u32 Frames = 0;
+        u64 Polys[GLTexHeap::NumResults] {};
+        double Area[GLTexHeap::NumResults] {};
+        double FormatArea[8] {}, FormatServed[8] {};
+        u64 Entries = 0, UsedTexels = 0;
+        s64 AssignNs = 0, AssignPeakNs = 0;
+        u64 FullPolys = 0, Draws = 0, DrawsBase = 0, Switches = 0;
+    };
+    Counters Sec;
+
+    // at the start of every RenderFrame; reads and clears the heap's counters
+    void FrameStart(s64 now, GLTexHeap& heap, int mode)
+    {
+        if (LogStartNs == 0)
+            LogStartNs = now;
+        if (now - LogStartNs < 1000000000)
+            return;
+
+        if (Sec.Frames > 0)
+        {
+            double per = 1.0 / Sec.Frames;
+            const GLTexHeap::Counters& h = heap.Sec;
+            u64 polys = 0, served = 0;
+            double area = 0, servedArea = 0;
+            for (int r = 0; r < GLTexHeap::NumResults; r++)
+            {
+                polys += Sec.Polys[r];
+                area += Sec.Area[r];
+                if (r < GLTexHeap::NumServed)
+                {
+                    served += Sec.Polys[r];
+                    servedArea += Sec.Area[r];
+                }
+            }
+            auto fmt = [&](int f) { return Sec.FormatArea[f] > 0 ? Sec.FormatServed[f] / Sec.FormatArea[f] : 0.0; };
+            const u64* p = Sec.Polys;
+            const double* a = Sec.Area;
+            Platform::Log(Platform::LogLevel::Info, "GLTEXCACHE frames=%u mode=%d polys=%.1f area=%.3f served=%.1f/%.3f "
+                "cover=%.3f cover_area=%.3f hit=%.1f kept=%.1f decoded=%.2f redecoded=%.2f "
+                "range=%.1f/%.3f palette=%.1f/%.3f volatile=%.1f/%.3f budget=%.1f/%.3f full=%.1f/%.3f "
+                "a3i5=%.3f/%.3f i2=%.3f/%.3f i4=%.3f/%.3f i8=%.3f/%.3f 4x4=%.3f/%.3f a5i3=%.3f/%.3f direct=%.3f/%.3f "
+                "entries=%.0f heap_used=%.0f texels=%.0f uploads=%.2f upload_kb=%.1f decode_us=%.1f upload_us=%.1f "
+                "hash_us=%.2f hash_kb=%.1f assign_us=%.1f assign_peak_us=%.0f evictions=%llu volatiles=%llu removed=%llu "
+                "s2_full=%.1f s2_draws=%.1f s2_draws_base=%.1f s2_switches=%.1f\n",
+                Sec.Frames, mode, polys * per, area * per, served * per, servedArea * per,
+                polys ? (double)served / polys : 0.0, area > 0 ? servedArea / area : 0.0,
+                p[GLTexHeap::Hit] * per, p[GLTexHeap::Kept] * per, p[GLTexHeap::Decoded] * per, p[GLTexHeap::Redecoded] * per,
+                p[GLTexHeap::FallRange] * per, a[GLTexHeap::FallRange] * per, p[GLTexHeap::FallPalette] * per, a[GLTexHeap::FallPalette] * per,
+                p[GLTexHeap::FallVolatile] * per, a[GLTexHeap::FallVolatile] * per, p[GLTexHeap::FallBudget] * per, a[GLTexHeap::FallBudget] * per,
+                p[GLTexHeap::FallFull] * per, a[GLTexHeap::FallFull] * per,
+                fmt(1), Sec.FormatArea[1] * per, fmt(2), Sec.FormatArea[2] * per, fmt(3), Sec.FormatArea[3] * per,
+                fmt(4), Sec.FormatArea[4] * per, fmt(5), Sec.FormatArea[5] * per, fmt(6), Sec.FormatArea[6] * per,
+                fmt(7), Sec.FormatArea[7] * per,
+                Sec.Entries * per, Sec.UsedTexels * per, h.Texels * per, h.Uploads * per, h.UploadBytes / 1024.0 * per,
+                h.DecodeNs / 1000.0 * per, h.UploadNs / 1000.0 * per, h.HashNs / 1000.0 * per, h.HashBytes / 1024.0 * per,
+                Sec.AssignNs / 1000.0 * per, Sec.AssignPeakNs / 1000.0,
+                (unsigned long long)h.Evictions, (unsigned long long)h.Volatiles, (unsigned long long)h.Removed,
+                Sec.FullPolys * per, Sec.Draws * per, Sec.DrawsBase * per, Sec.Switches * per);
+        }
+        Sec = {};
+        heap.Sec = {};
         LogStartNs = now;
     }
 
