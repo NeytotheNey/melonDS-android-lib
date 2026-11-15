@@ -963,12 +963,14 @@ void GLRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
     CurGLCompositor.SetOutputCap3D(gpu);
 
     int need = GLCompositor::OutputNeed(gpu, frontendNeed);
-    if (need != OutputNeed)
+    bool anyRatio = GLCompositor::OutputAnyRatio(gpu);
+    if (need != OutputNeed || anyRatio != OutputAnyRatio)
     {
         OutputNeed = need;
+        OutputAnyRatio = anyRatio;
         // before the targets' first setup, that one caps it
         if (ScaleFactor > 0)
-            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need), ScaleFactor, TargetWidth);
+            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need, anyRatio), ScaleFactor, TargetWidth);
     }
 
     // debug: a line when the cap's outcome or its reason changes
@@ -981,7 +983,7 @@ bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) 
     if (betterpolygons == BetterPolygons && scale == ScaleFactor && targetWidth == TargetWidth)
         return false;
 
-    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed), scale, targetWidth);
+    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth);
     ScaleFactor = scale;
     TargetWidth = targetWidth;
     BetterPolygons = betterpolygons;

@@ -939,8 +939,19 @@ public:
     // default, and 0 keeps the output at the internal scale as before. a need of 0 (unknown, as the
     // desktop build has) is no cap. filtered 2D is capped too (its map stays at the scale the 3D's
     // scale gives it, see GLCompositor::PrepareFilter2D), but not its identity mode (Filter2D 3), nor
-    // the GPU 2D shadow (GLCompositor::OutputNeed). only changed by a debug switch
+    // the GPU 2D shadow (GLCompositor::OutputNeed). docs/plan-deband-outcap.md part B: the output can
+    // also go to a scale that doesn't divide the 3D's, above half of it (8x gives 5x-7x, so 6x for a 6x
+    // screen instead of staying at 8x; 12x 7x-11x, 16x 9x-15x), the smallest one that's at least the
+    // need, whole ratio or not. the output's scale stays whole, so its pixels keep native pixel edges,
+    // and the DOWN3D programs weigh each 3D pixel by how much of it the output pixel covers (an area
+    // resample, exact in OutputCap3D 0). it only pays while the frontend debands the frame, whose cost
+    // goes with the frame's size, so by default (1) it follows OutputCapDeband. bit 2 (3) takes it
+    // always, bit 4 (5) never, which keeps every output as before; bit 2 wins over bit 4
+    // (GLCompositor::OutputAnyRatio). only changed by a debug switch
     int OutputCap = 1;
+    // set by the frontend before each frame: whether anything that shows the output debands it (the
+    // screen filter's deband), which lets OutputCap take a ratio that isn't whole (see above)
+    bool OutputCapDeband = false;
     // with OutputCap 1: above 0, the need to cap by instead of the frontend's, for A/Bs and the
     // desktop build, which has none. 0, the default, takes the frontend's
     int OutputCapNeed = 0;

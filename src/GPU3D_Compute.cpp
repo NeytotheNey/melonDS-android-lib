@@ -847,12 +847,14 @@ void ComputeRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
     CurGLCompositor.SetOutputCap3D(gpu);
 
     int need = GLCompositor::OutputNeed(gpu, frontendNeed);
-    if (need != OutputNeed)
+    bool anyRatio = GLCompositor::OutputAnyRatio(gpu);
+    if (need != OutputNeed || anyRatio != OutputAnyRatio)
     {
         OutputNeed = need;
+        OutputAnyRatio = anyRatio;
         // before the targets' first setup, that one caps it
         if (ScaleFactor > 0)
-            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need), ScaleFactor, TargetWidth);
+            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need, anyRatio), ScaleFactor, TargetWidth);
     }
 
     // debug: a line when the cap's outcome or its reason changes
@@ -870,7 +872,7 @@ void ComputeRenderer::SetColorDither(bool dither) noexcept
 
 void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth)
 {
-    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed), scale, targetWidth);
+    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth);
 
     if (ScaleFactor != -1)
     {

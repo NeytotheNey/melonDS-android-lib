@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -618,9 +619,10 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
     line.AskedMode = gpu.OutputCap3D;
     line.HiresCapture = gpu.HiresCapture ? 1 : 0;
     line.Filter2D = gpu.Filter2D;
+    bool anyRatio = OutputAnyRatio(gpu, &line.Ratios);
     // the first reason, in the order they're checked: OutputNeed's, then CappedScale's, then
     // SetRenderSettings'
-    if (gpu.OutputCap == 0)
+    if ((gpu.OutputCap & 1) == 0)
         line.Reason = "switch off";
     else if (gpu.Filter2D == 3)
         line.Reason = "filtered 2D identity mode";
@@ -630,7 +632,7 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
         line.Reason = "need 0";
     else if (line.Need >= Scale3D)
         line.Reason = "need >= scale";
-    else if (CappedScale(Scale3D, line.Need) == Scale3D)
+    else if (CappedScale(Scale3D, line.Need, anyRatio) == Scale3D)
         line.Reason = "need above every capped scale";
     else if (Down3D[ViewWidth != 256][0].Failed)
         line.Reason = ViewWidth != 256 ? "wide DOWN3D program failed" : "DOWN3D program failed";
@@ -641,8 +643,11 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
         line.Reason = "not applied";
 
     // with the switch off it's said once, whatever the frontend's need does
-    if (gpu.OutputCap == 0)
+    if ((gpu.OutputCap & 1) == 0)
+    {
         line.Need = line.FrontendNeed = 0;
+        line.Ratios = "n/a (switch off)";
+    }
     if (line == OutputCapLogged)
         return;
     OutputCapLogged = line;
@@ -650,26 +655,58 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
     const char* source = gpu.OutputCapNeed > 0 ? "outcapneed" : "frontend";
     if (line.Reason)
         Log(LogLevel::Info, "OUTCAP: no cap (%s), output %dx, 3D %dx, outcap %d, outcap3d %d, need %d (%s), frontend need %d, view %d, "
-            "hirescap %d, filter2d %d\n",
+            "hirescap %d, filter2d %d, ratios %s\n",
             line.Reason, Scale, Scale3D, gpu.OutputCap, gpu.OutputCap3D, line.Need, source, frontendNeed, ViewWidth, line.HiresCapture,
-            line.Filter2D);
+            line.Filter2D, line.Ratios);
     else
-        Log(LogLevel::Info, "OUTCAP: capped, output %dx, 3D %dx, ratio %d, outcap3d %d (asked %d), need %d (%s), frontend need %d, view %d, "
-            "hirescap %d, filter2d %d\n",
-            Scale, Scale3D, Scale3D / Scale, line.Mode, gpu.OutputCap3D, line.Need, source, frontendNeed, ViewWidth, line.HiresCapture,
-            line.Filter2D);
+    {
+        // a whole ratio as before ("ratio 2"), another one as a fraction in lowest terms ("ratio 4/3")
+        int p, q;
+        Down3DRatio(p, q);
+        char ratio[24];
+        if (q == 1)
+            snprintf(ratio, sizeof(ratio), "%d", p);
+        else
+            snprintf(ratio, sizeof(ratio), "%d/%d", p, q);
+        Log(LogLevel::Info, "OUTCAP: capped, output %dx, 3D %dx, ratio %s, outcap3d %d (asked %d), need %d (%s), frontend need %d, view %d, "
+            "hirescap %d, filter2d %d, ratios %s\n",
+            Scale, Scale3D, ratio, line.Mode, gpu.OutputCap3D, line.Need, source, frontendNeed, ViewWidth, line.HiresCapture,
+            line.Filter2D, line.Ratios);
+    }
 }
 
-int GLCompositor::CappedScale(int scale, int need) noexcept
+void GLCompositor::Down3DRatio(int& p, int& q) const noexcept
+{
+    int g = std::gcd(Scale3D, Scale);
+    p = g > 0 ? Scale3D / g : 1;
+    q = g > 0 ? Scale / g : 1;
+}
+
+int GLCompositor::CappedScale(int scale, int need, bool anyRatio) noexcept
 {
     if (need <= 0)
         return scale;
-    for (int d = 4; d > 1; d--)
+    // the smallest output scale that's at least the need, at a whole ratio up to 4 (the largest d up to 4
+    // that divides scale and leaves scale / d >= need, as before) or, with [anyRatio], at one below 2,
+    // where an output pixel covers 2 or 3 3D pixels a side
+    for (int s = need; s < scale; s++)
     {
-        if (scale % d == 0 && scale / d >= need)
-            return scale / d;
+        if ((scale % s == 0 && scale / s <= 4) || (anyRatio && 2 * s > scale))
+            return s;
     }
     return scale;
+}
+
+bool GLCompositor::OutputAnyRatio(const GPU& gpu, const char** why) noexcept
+{
+    // the OUTCAP line's words: "any" or "whole", and why
+    bool any = (gpu.OutputCap & 2) != 0 || ((gpu.OutputCap & 4) == 0 && gpu.OutputCapDeband);
+    const char* reason = (gpu.OutputCap & 2) != 0 ? "any (forced, outcap bit 2)"
+                       : (gpu.OutputCap & 4) != 0 ? "whole (forced, outcap bit 4)"
+                       : gpu.OutputCapDeband ? "any (deband on)" : "whole (deband off)";
+    if (why)
+        *why = reason;
+    return any;
 }
 
 // GPU::OutputCap: what the DOWN3D programs can't draw is decided here, so the output stays at the
@@ -681,7 +718,7 @@ int GLCompositor::CappedScale(int scale, int need) noexcept
 // scale, and filtered 2D capped programs (FILTER2D with DOWN3D), with the map at the 3D's scale
 int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) noexcept
 {
-    if (gpu.OutputCap == 0 || gpu.Filter2D == 3 || gpu.Shadow2D)
+    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || gpu.Shadow2D)
         return 0;
     return gpu.OutputCapNeed > 0 ? gpu.OutputCapNeed : frontendNeed;
 }
@@ -696,11 +733,14 @@ void GLCompositor::SetRenderSettings(int scale, int scale3D, int viewWidth) noex
     // what's asked, which SetOutputCap3D asks for again when what a cap needs changes
     AskedScale = scale;
 
-    // GPU::OutputCap: the view's DOWN3D programs, for whole ratios up to 4. GPU::OutputCap3D's (and
-    // the capture pass's for it) alongside the exact one, which the draw falls back to if it doesn't build.
-    // with filtered 2D on, its own too (PrepareCappedFilter): without one the output stays at the 3D's scale
+    // GPU::OutputCap: the view's DOWN3D programs, for whole ratios up to 4 and ratios between 1 and 2
+    // (CappedScale). GPU::OutputCap3D's (and the capture pass's for it) alongside the exact one, which
+    // the draw falls back to if it doesn't build. with filtered 2D on, its own too (PrepareCappedFilter):
+    // without one the output stays at the 3D's scale
     bool wide = viewWidth != 256;
-    if (scale != scale3D && (scale < 1 || scale3D % scale != 0 || scale3D / scale > 4 || !PrepareDown3D(wide, 0)))
+    bool ratioFits = scale >= 1 && scale < scale3D
+                     && ((scale3D % scale == 0 && scale3D / scale <= 4) || 2 * scale > scale3D);
+    if (scale != scale3D && (!ratioFits || !PrepareDown3D(wide, 0)))
         scale = scale3D;
     if (scale != scale3D)
     {
@@ -1302,7 +1342,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // scale D it reads the map at sub-pixel s of scale D * ratio, (2s + 1) M / (2 D ratio), which is
     // s / ratio at D = M: the pixel's own texel, as the uncapped program at M reads it. a plain half
     // reads no 3D, so the 3D's scale doesn't matter there. the filtered halves need an output above the
-    // map's scale, so at 4x with the 4x map (16x 3D on the Fold's cover screen) they're drawn in full
+    // map's scale, so at 4x with the 4x map (16x 3D on the Fold's cover screen) they're drawn in full.
+    // that needs a whole ratio too: at another one (GPU::OutputCap bit 2, 8x 3D at 6x) the draw at M
+    // would read the map at M * Scale3D / Scale, which isn't a scale, so they're drawn in full there
     int halvesAt1x = 0, checkHalves = 0;
     SmallHalfDraw smallDraw;
     if (filterPasses > 0)
@@ -1323,7 +1365,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         else if (!hasFramebuffers)
             off = Comp1xOffLines;
         else if (filterPasses > 0 && (Scale % smallDraw.DrawScale != 0 || Scale <= smallDraw.DrawScale
-                                      || (gpu.Filter2D == 3 && ViewWidth == 256)))
+                                      || (gpu.Filter2D == 3 && ViewWidth == 256) || (capped && Scale3D % Scale != 0)))
             off = Comp1xOffFilter;
         else if (shadowLines > 0)
             off = Comp1xOffShadow;
@@ -1363,7 +1405,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         // GPU::OutputCap: a capped output, with capProgram
         glUseProgram(capProgram.Program);
         glUniform1ui(capProgram.ScaleLoc, Scale);
-        glUniform1i(capProgram.RatioLoc, Scale3D / Scale);
+        int ratioP, ratioQ;
+        Down3DRatio(ratioP, ratioQ);
+        glUniform2i(capProgram.RatioLoc, ratioP, ratioQ);
         glUniform1i(capProgram.HiresCapLoc, hiresDisplay);
         if (ViewWidth != 256)
         {
@@ -2374,7 +2418,9 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
         glUniform1i(shader.ScaleLoc, Scale);
         glUniform1i(shader.WideOffsetLoc, (ViewWidth - 256) / 2);
         glUniform1i(shader.DstRowLoc, dstRow);
-        glUniform1i(shader.RatioLoc, Scale3D / Scale);
+        int ratioP, ratioQ;
+        Down3DRatio(ratioP, ratioQ);
+        glUniform2i(shader.RatioLoc, ratioP, ratioQ);
         // GPU::OutputCap3D 1 and 3's bilinear taps on the 3D's unit, for this pass only, as in the main draw
         bool linear = capMode == 1 || capMode == 3;
         if (linear)

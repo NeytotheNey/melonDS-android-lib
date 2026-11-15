@@ -414,6 +414,8 @@ private:
     int ScaleFactor = -1;
     // GPU::OutputCap: the need SetOutputNeed last worked out, which ResizeTargets caps the output by
     int OutputNeed = 0;
+    // and whether it may cap at a ratio that isn't whole (GPU::OutputCap bit 2, GLCompositor::OutputAnyRatio)
+    bool OutputAnyRatio = false;
     int MaxWorkTiles {};
     // the room the work buffers have now, which TargetFits and the shaders don't know about: the
     // tile memory layers in work tiles (MaxWorkTiles at most), the X spans and their setup indices

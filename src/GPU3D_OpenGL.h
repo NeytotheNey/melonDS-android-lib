@@ -322,6 +322,8 @@ private:
     int ScaleFactor {};
     // GPU::OutputCap: the need SetOutputNeed last worked out, which ResizeTargets caps the output by
     int OutputNeed = 0;
+    // and whether it may cap at a ratio that isn't whole (GPU::OutputCap bit 2, GLCompositor::OutputAnyRatio)
+    bool OutputAnyRatio = false;
     bool BetterPolygons {};
     int ScreenW {}, ScreenH {};
 

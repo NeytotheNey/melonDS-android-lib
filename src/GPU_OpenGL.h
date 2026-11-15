@@ -51,17 +51,23 @@ public:
     // WideMelon: the output is viewWidth x scale wide, and the wide shader is only built when
     // PrepareWide() is first called. it returns false if that failed, then only 256 works.
     // GPU::OutputCap (experiment K4): the 3D the renderer draws is at scale3D, which is scale or a
-    // whole multiple of it up to 4 (see CappedScale). above scale, the main draw uses the view's
-    // DOWN3D program, built here the first time it's needed (with the hi-res capture pass's while
-    // that's on, see SetOutputCap3D): each output pixel composites the ratio x ratio 3D pixels under
-    // it and averages them. when the program doesn't build, the output stays at scale3D. a call that
-    // changes the output's scale works like a scale change, so the hi-res copies, which are at the
-    // output's scale, start over
+    // whole multiple of it up to 4, or (GPU::OutputCap bit 2) between scale and twice it (see
+    // CappedScale). above scale, the main draw uses the view's DOWN3D program, built here the first
+    // time it's needed (with the hi-res capture pass's while that's on, see SetOutputCap3D): each
+    // output pixel composites the 3D pixels under it and averages them, each weighted by how much of
+    // it the output pixel covers. when the program doesn't build, the output stays at scale3D. a call
+    // that changes the output's scale works like a scale change, so the hi-res copies, which are at
+    // the output's scale, start over
     void SetRenderSettings(int scale, int scale3D, int viewWidth) noexcept;
     // GPU::OutputCap: the output scale for 3D at [scale] when what shows the output needs [need]x:
-    // scale / d for the largest d in 1..4 that divides scale and leaves scale / d >= need. need 0
-    // (unknown) keeps scale
-    [[nodiscard]] static int CappedScale(int scale, int need) noexcept;
+    // the smallest s >= need that divides scale with scale / s up to 4 or, with [anyRatio] (GPU::OutputCap
+    // bit 2), is also above scale / 2 (8x gives 5x-7x, 12x 7x-11x, 16x 9x-15x), so an output pixel
+    // covers 3 3D pixels a side at most. need 0 (unknown), or none of those, keeps scale
+    [[nodiscard]] static int CappedScale(int scale, int need, bool anyRatio) noexcept;
+    // GPU::OutputCap: whether CappedScale may take an output scale that doesn't divide the 3D's: always
+    // with bit 2, never with bit 4 (and not bit 2), otherwise while the frontend debands
+    // (GPU::OutputCapDeband). [why] says which, for the OUTCAP line
+    [[nodiscard]] static bool OutputAnyRatio(const GPU& gpu, const char** why = nullptr) noexcept;
     // GPU::OutputCap: the need the renderers cap the output by (see Renderer's SetOutputNeed), from
     // the frontend's need, or GPU::OutputCapNeed over it, or 0 for no cap: with OutputCap off, and while
     // anything that reads the 3D at the output's scale and isn't ported to the DOWN3D programs is on
@@ -197,6 +203,9 @@ private:
     // GPU::OutputCap: the 3D's scale, Scale times the ratio the DOWN3D program averages over (Scale
     // itself without a cap)
     int Scale3D = 0;
+    // GPU::OutputCap: Scale3D / Scale in lowest terms, p / q, for the DOWN3D programs' u3DRatio: an
+    // output pixel spans p / q 3D pixels a side (q is 1 at a whole ratio)
+    void Down3DRatio(int& p, int& q) const noexcept;
     int ViewWidth = 256;
     int ScreenH = 0, ScreenW = 0;
 
@@ -267,11 +276,14 @@ private:
         // Mode is the one the capped draw uses, AskedMode GPU::OutputCap3D
         int Need = -1, FrontendNeed = -1, Scale = -1, Scale3D = -1, ViewWidth = -1, Mode = -1, AskedMode = -1, HiresCapture = -1,
             Filter2D = -1;
+        // whether a ratio that isn't whole may be taken, and why (OutputAnyRatio)
+        const char* Ratios = nullptr;
         bool operator==(const OutputCapLogLine& other) const noexcept
         {
             return Reason == other.Reason && Need == other.Need && FrontendNeed == other.FrontendNeed && Scale == other.Scale
                 && Scale3D == other.Scale3D && ViewWidth == other.ViewWidth && Mode == other.Mode
-                && AskedMode == other.AskedMode && HiresCapture == other.HiresCapture && Filter2D == other.Filter2D;
+                && AskedMode == other.AskedMode && HiresCapture == other.HiresCapture && Filter2D == other.Filter2D
+                && Ratios == other.Ratios;
         }
     };
     OutputCapLogLine OutputCapLogged {};
