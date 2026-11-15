@@ -157,6 +157,12 @@ public:
     bool WideCheckEqualTiming = true;
     u32 WideCheckBoxTests = 0, WideCheckBoxHits = 0, WideCheckCountReads = 0;
     u32 WideCheckBoxRetryHits = 0; // box tests that missed natively and hit on the wide retry
+    u32 WideCheckCountHash = 0; // of the values the polygon RAM count reads returned, in order
+    void NoteWideCheckCount(u32 addr, u32 value) noexcept
+    {
+        WideCheckCountReads++;
+        WideCheckCountHash = (WideCheckCountHash ^ value ^ (addr << 24)) * 16777619u;
+    }
 
     [[nodiscard]] Renderer3D& GetCurrentRenderer() noexcept { return *CurrentRenderer; }
     [[nodiscard]] const Renderer3D& GetCurrentRenderer() const noexcept { return *CurrentRenderer; }
@@ -177,8 +183,8 @@ public:
 
     // polygons dropped because the polygon or vertex RAM was full, since the last reset, and of those,
     // with WideMelon on, the ones the native view would still have had room for, so the wide view cost
-    // them (an estimate, see SubmitPolygon). not serialized
-    u32 DroppedPolygons = 0, DroppedNativeFit = 0;
+    // them (an estimate, see SubmitPolygon), and the ones only the wide view kept (wing). not serialized
+    u32 DroppedPolygons = 0, DroppedNativeFit = 0, DroppedWing = 0;
     // the polygon and vertex RAM counts the native view would have so far, with WideMelon on (for the wide check)
     [[nodiscard]] u32 GetNativeNumPolygons() const noexcept { return NativeNumPolygons; }
     [[nodiscard]] u32 GetNativeNumVertices() const noexcept { return NativeNumVertices; }
@@ -285,6 +291,13 @@ private:
     u16 RenderXPos = 0;
     int ViewWidth = 256;
     int RendererViewWidth() const noexcept;
+    // WideMelon's wide list (GPU::WidePolys): with the view wider than 256, a bank holds up to
+    // PolygonRAMSize polygons and VertexRAMSize vertices, the native view's counts take the DS's limits
+    // and only they set DISP3DCNT bit 13 and feed the count registers, and the polygons only the wide view
+    // keeps get a budget of their own (WingNumPolygons). latched with ViewWidth (LatchViewWidth), but kept
+    // through a renderer switch mid-scene, and a state's GP3W brings its scene's. off, everything is as before
+    bool WideListOn = false;
+    void LatchViewWidth() noexcept;
 
     // WideMelon: the polygon and vertex RAM counts the native view would have (NumPolygons and NumVertices
     // without the wide view), see NativeClipVertices. derived again on a state load, not serialized
@@ -299,6 +312,16 @@ private:
     bool NativeClipSame = false;
     ClipPosition NativeClipped[10];
     int NativeClippedCount = 0;
+    // the wide list: the polygons in it the native view doesn't keep (clipped away, or zero-dot there), and
+    // their vertices, of NativePolygonRAMSize and NativeVertexRAMSize. in the GP3W section of a savestate
+    u32 WingNumPolygons = 0, WingNumVertices = 0;
+    // a polygon was dropped because the wide list or the wing budget was full, which bit 13 doesn't
+    // show (HalfCamera::Replay). not serialized
+    bool WideListOverflow = false;
+    // the GP3W section: what GP3D's upstream layout can't hold (see DoSavestate)
+    void DoWideSavestate(Savestate* file, const RenderList* renderList, u32 renderNumPolygons) noexcept;
+    void WideSavestateHighWater(const RenderList* renderList, u32 renderNumPolygons, u32 polygons[2], u32 vertices[2]) const noexcept;
+    [[nodiscard]] bool WideSavestateExtra(const RenderList* renderList, u32 renderNumPolygons) const noexcept;
 
     // the WIDEDROPS line, per scene (polygon RAM swap) and once a second
     struct WideDropStats
@@ -306,7 +329,8 @@ private:
         bool Enabled = false;
         std::chrono::steady_clock::time_point LastLog {};
         u32 Scenes = 0, DropScenes = 0, MaxSceneDrops = 0, PeakPolygons = 0, PeakVertices = 0;
-        u32 SceneStartDrops = 0, SecondStartDrops = 0, SecondStartNativeFit = 0;
+        u32 PeakNativePolygons = 0, PeakNativeVertices = 0, PeakWingPolygons = 0;
+        u32 SceneStartDrops = 0, SecondStartDrops = 0, SecondStartNativeFit = 0, SecondStartWing = 0;
     } WideDrops;
     void WideDropsOnSwap() noexcept;
     void WideDropsOnVBlank() noexcept;
@@ -439,6 +463,9 @@ public:
     // vertices by value. with save the copy becomes this scene, without it nothing changes
     bool MatchRenderScene(bool save) noexcept;
     int RenderViewWidth = 256; // the view width RenderPolygonRAM was built for, not serialized either
+    // and whether it was built into WideMelon's wide list (WideListOn at the swap), for the renderers'
+    // list sizes. derived on a state load
+    bool RenderWideList = false;
 
     bool AbortFrame = false;
 
@@ -482,8 +509,9 @@ public:
     Polygon* LastStripPolygon = nullptr;
     u32 NumOpaquePolygons = 0;
 
-    Vertex VertexRAM[6144 * 2] {};
-    Polygon PolygonRAM[2048 * 2] {};
+    // two banks of VertexRAMSize and PolygonRAMSize, the DS's sizes but for WideMelon's wide list
+    Vertex VertexRAM[VertexRAMSize * 2] {};
+    Polygon PolygonRAM[PolygonRAMSize * 2] {};
 
     Vertex* CurVertexRAM = nullptr;
     Polygon* CurPolygonRAM = nullptr;
@@ -491,7 +519,7 @@ public:
     u32 NumPolygons = 0;
     u32 CurRAMBank = 0;
 
-    std::array<Polygon*,2048> RenderPolygonRAM {};
+    RenderList RenderPolygonRAM {};
     u32 RenderNumPolygons = 0;
 
     u32 FlushRequest = 0;

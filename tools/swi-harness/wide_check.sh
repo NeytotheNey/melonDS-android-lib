@@ -8,13 +8,16 @@
 #   sh tools/swi-harness/wide_check.sh
 #
 # Needs MSYS2 MinGW (gcc/g++ in /c/msys64/mingw64/bin), CMake and Ninja. Override with GAMES (the
-# ROM folder, only read), OUT (results, default the app repo's git-ignored logs/wide-check), BUILD
-# and WIDTH (default 342, 16:9). Savestates are copied into $OUT/states first and only read there.
+# ROM folder, only read), OUT (results, default the app repo's git-ignored logs/wide-check), BUILD,
+# WIDTH (default 342, 16:9) and WIDEPOLYS (GPU::WidePolys, 0 or 1, default 0: with 1 the overflow
+# flag, the native counts and the count reads have to match too). Savestates are copied into
+# $OUT/states first and only read there.
 
 GAMES=${GAMES:-/c/Users/neyto/OneDrive/Documents/Games}
 OUT=${OUT:-/c/Dev/melonDS-android/logs/wide-check}
 BUILD=${BUILD:-/c/Dev/swi-harness-data/build-widecheck}
 WIDTH=${WIDTH:-342}
+WIDEPOLYS=${WIDEPOLYS:-0}
 HERE=$(cd "$(dirname "$0")" && pwd)
 export PATH=/c/msys64/mingw64/bin:$PATH
 
@@ -37,7 +40,7 @@ run() # name rom.nds frames [options]
     name=$1; rom=$2; frames=$3; shift 3
     mkdir -p "$OUT/$name"
     # stderr goes to a file (the core can be chatty there) and is shown if the run couldn't start
-    "$BUILD/swi-harness.exe" "$rom" --wide-check "$WIDTH" --frames "$frames" --out "$OUT/$name" "$@" 2> "$OUT/$name/stderr.txt"
+    "$BUILD/swi-harness.exe" "$rom" --wide-check "$WIDTH" --wide-polys "$WIDEPOLYS" --frames "$frames" --out "$OUT/$name" "$@" 2> "$OUT/$name/stderr.txt"
     case $? in
         0) ;;
         1) failed=1 ;;

@@ -1184,6 +1184,7 @@ void HalfCamera::ResetShadow()
     CopyGeometry(shadow, *Start);
     // what the scene was built for: it's only updated after this, at the swap
     shadow.ViewWidth = Main.ViewWidth;
+    shadow.WideListOn = Main.WideListOn;
     shadow.ZeroDotWLimit = Main.ZeroDotWLimit;
     shadow.ClipMatrixDirty = true;
     shadow.LastStripPolygon = nullptr;
@@ -1197,14 +1198,17 @@ void HalfCamera::ResetShadow()
     shadow.VertexSlotCounter = 0;
     shadow.VertexSlotsFree = 1;
 
-    shadow.CurVertexRAM = &shadow.VertexRAM[shadow.CurRAMBank ? 6144 : 0];
-    shadow.CurPolygonRAM = &shadow.PolygonRAM[shadow.CurRAMBank ? 2048 : 0];
+    shadow.CurVertexRAM = &shadow.VertexRAM[shadow.CurRAMBank ? VertexRAMSize : 0];
+    shadow.CurPolygonRAM = &shadow.PolygonRAM[shadow.CurRAMBank ? PolygonRAMSize : 0];
     shadow.NumVertices = 0;
     shadow.NumPolygons = 0;
     shadow.NumOpaquePolygons = 0;
     shadow.NativeNumVertices = 0;
     shadow.NativeNumPolygons = 0;
     shadow.NativeStripVerts = 0;
+    shadow.WingNumPolygons = 0;
+    shadow.WingNumVertices = 0;
+    shadow.WideListOverflow = false;
 }
 
 bool HalfCamera::Replay(const SceneInfo& current, const SceneInfo& previous)
@@ -1293,8 +1297,9 @@ bool HalfCamera::Replay(const SceneInfo& current, const SceneInfo& previous)
     Total.ReplayVertices += submitted;
     Total.ReplayPolygons += shadow.NumPolygons;
 
-    // a hole in the in-between scene would be worse than not having it. bit 13 is the RAM overflow flag
-    return shadow.NumPolygons > 0 && !(shadow.DispCnt & (1 << 13));
+    // a hole in the in-between scene would be worse than not having it. bit 13 is the RAM overflow flag,
+    // and with WideMelon's wide list on, which bit 13 doesn't cover, WideListOverflow the wide list's
+    return shadow.NumPolygons > 0 && !(shadow.DispCnt & (1 << 13)) && !shadow.WideListOverflow;
 }
 
 // false when the in-between scene came out as the real one, polygon for polygon, which then stays
@@ -1457,7 +1462,7 @@ void HalfCamera::SetPaused(bool isPaused)
     IsPaused = isPaused;
 }
 
-void HalfCamera::GetRealRenderList(const std::array<Polygon*, 2048>*& list, u32& numPolygons) const noexcept
+void HalfCamera::GetRealRenderList(const RenderList*& list, u32& numPolygons) const noexcept
 {
     if (!IsMidActive)
         return;

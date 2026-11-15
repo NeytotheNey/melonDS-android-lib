@@ -313,8 +313,9 @@ const int BinningWorkOffsetsStart = BinningMaskStart+TilesPerLine*TileLines*BinS
 /*
     structure of each WorkDesc item:
         x:
-            bits 0-10: polygon idx
+            bits 0-10: polygon idx (0-11 with MaxPolygons 4096, PolyIdxBits)
             bits 11-31: tile idx (before sorting within variant after sorting within all tiles)
+                        (12-31 with MaxPolygons 4096)
         y:
             bits 0-15: X position on screen
             bits 15-31: Y position on screen
@@ -414,8 +415,11 @@ const int FramebufferStride = ScreenWidth*ScreenHeight;
 const int TilesPerLine = ScreenWidth/TileSize;
 const int TileLines = ScreenHeight/TileSize;
 
-const int BinStride = 2048/32;
+// MaxPolygons is 4096 for WideMelon's wide list (GPU::WidePolys), else 2048. a WorkDesc keeps the
+// polygon index in PolyIdxBits (12 or 11), the work tile index above it
+const int BinStride = MaxPolygons/32;
 const int CoarseBinStride = BinStride/32;
+const uint PolyIdxMask = uint(MaxPolygons - 1);
 
 const int MaxVariants = 256;
 
@@ -941,8 +945,8 @@ layout (local_size_x = ClearCoarseBinMaskLocalSize) in;
 
 void main()
 {
-    BinningMaskAndOffset[BinningCoarseMaskStart + int(gl_GlobalInvocationID.x)*CoarseBinStride+0] = 0u;
-    BinningMaskAndOffset[BinningCoarseMaskStart + int(gl_GlobalInvocationID.x)*CoarseBinStride+1] = 0u;
+    for (int i = 0; i < CoarseBinStride; i++)
+        BinningMaskAndOffset[BinningCoarseMaskStart + int(gl_GlobalInvocationID.x)*CoarseBinStride+i] = 0u;
 }
 
 )";
@@ -1132,9 +1136,9 @@ void main()
 
             int inVariantOffset = int(atomicAdd(VariantCountZ(variantIdx), 1u));
 #ifdef BinPlainPack
-            WorkDescs[WorkDescsUnsortedStart + workOffset + uint(idx)] = uvec2(tilePositionCombined, (uint(polygonIdx) & 0x7FFU) | (uint(inVariantOffset) << 11));
+            WorkDescs[WorkDescsUnsortedStart + workOffset + uint(idx)] = uvec2(tilePositionCombined, (uint(polygonIdx) & PolyIdxMask) | (uint(inVariantOffset) << PolyIdxBits));
 #else
-            WorkDescs[WorkDescsUnsortedStart + workOffset + uint(idx)] = uvec2(tilePositionCombined, uint(bitfieldInsert(polygonIdx, inVariantOffset, 11, 21)));
+            WorkDescs[WorkDescsUnsortedStart + workOffset + uint(idx)] = uvec2(tilePositionCombined, uint(bitfieldInsert(polygonIdx, inVariantOffset, PolyIdxBits, 32 - PolyIdxBits)));
 #endif
 
             idx++;
@@ -1222,12 +1226,12 @@ void main()
     for (uint workIdx = gl_GlobalInvocationID.x; workIdx < count; workIdx += stride)
     {
         uvec2 workDesc = WorkDescs[WorkDescsUnsortedStart + workIdx];
-        int inVariantOffset = int(bitfieldExtract(workDesc.y, 11, 21));
-        int polygonIdx = int(bitfieldExtract(workDesc.y, 0, 11));
+        int inVariantOffset = int(bitfieldExtract(workDesc.y, PolyIdxBits, 32 - PolyIdxBits));
+        int polygonIdx = int(bitfieldExtract(workDesc.y, 0, PolyIdxBits));
         int variantIdx = Polygons[polygonIdx].Variant;
 
         int sortedIndex = int(SortedWorkOffset[variantIdx]) + inVariantOffset;
-        WorkDescs[WorkDescsSortedStart + uint(sortedIndex)] = uvec2(workDesc.x, bitfieldInsert(workDesc.y, workIdx, 11, 21));
+        WorkDescs[WorkDescsSortedStart + uint(sortedIndex)] = uvec2(workDesc.x, bitfieldInsert(workDesc.y, workIdx, PolyIdxBits, 32 - PolyIdxBits));
     }
 }
 
@@ -1271,14 +1275,14 @@ void RasteriseTile(uint workIdx)
 #ifdef OptFieldLoads
     // only the words the coverage test needs are read up front, the rest once the pixel is
     // covered. the values are the same ones
-    uint polygonIdx = bitfieldExtract(workDesc.y, 0, 11);
+    uint polygonIdx = bitfieldExtract(workDesc.y, 0, PolyIdxBits);
     int polyYTop = Polygons[polygonIdx].YTop;
     int polyYBot = Polygons[polygonIdx].YBot;
 #else
-    Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, 11)];
+    Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, PolyIdxBits)];
 #endif
     ivec2 position = ivec2(int(bitfieldExtract(workDesc.x, 0, 16)), int(bitfieldExtract(workDesc.x, 16, 16))) + ivec2(gl_LocalInvocationID.xy);
-    int tileOffset = int(bitfieldExtract(workDesc.y, 11, 21)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
+    int tileOffset = int(bitfieldExtract(workDesc.y, PolyIdxBits, 32 - PolyIdxBits)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
 
     uint color = 0U;
 #ifdef OptFieldLoads
@@ -1773,9 +1777,6 @@ void main()
 {
     int linearTile = int(gl_WorkGroupID.x + (gl_WorkGroupID.y * uint(TilesPerLine)));
 
-    uint coarseMaskLo = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + 0];
-    uint coarseMaskHi = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + 1];
-
     uvec2 color, depth;
     uvec2 attr = uvec2(ClearAttr, 0U);
     if ((DispCnt & (1U<<14)) != 0U)
@@ -1799,8 +1800,12 @@ void main()
     uint stencil = 0U;
     bool prevIsShadowMask = false;
 
-    ProcessCoarseMask(linearTile, coarseMaskLo, 0u, color, depth, attr, stencil, prevIsShadowMask);
-    ProcessCoarseMask(linearTile, coarseMaskHi, uint(BinStride/2), color, depth, attr, stencil, prevIsShadowMask);
+    // a coarse mask word for each 32 groups of 32 polygons, in order
+    for (int i = 0; i < CoarseBinStride; i++)
+    {
+        uint coarseMask = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + i];
+        ProcessCoarseMask(linearTile, coarseMask, uint(i) * 32u, color, depth, attr, stencil, prevIsShadowMask);
+    }
 
     int resultOffset = int(gl_GlobalInvocationID.x) + int(gl_GlobalInvocationID.y) * ScreenWidth;
 #ifdef OptSecondLayer

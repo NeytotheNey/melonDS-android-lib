@@ -121,7 +121,8 @@ private:
     };
 
     GLCompositor CurGLCompositor;
-    RendererPolygon PolygonList[2048] {};
+    // PolygonRAMSize: WideMelon's wide list can hold that many
+    RendererPolygon PolygonList[PolygonRAMSize] {};
 
     // fragCount: the debug build that counts fragments (GPU::SceneStats 2, GLFragCounter). fetch: the
     // framebuffer fetch build (GPU::GLTransSkip bit 2), RenderShader[2 + wbuffer]. nodiscard: the
@@ -274,15 +275,17 @@ private:
     // * bit9: W-buffering (?)
 
     GLuint VertexBufferID {};
-    u32 VertexBuffer[10240 * 7] {};
+    // a bank's vertices and three more a polygon (upstream's 10240 could already overflow), for WideMelon's
+    // wide list. the indices stay below 65536
+    u32 VertexBuffer[(VertexRAMSize + 3 * PolygonRAMSize) * 7] {};
     u32 NumVertices {};
 
     GLuint VertexArrayID {};
     GLuint IndexBufferID {};
-    u16 IndexBuffer[2048 * 40] {};
+    u16 IndexBuffer[PolygonRAMSize * 40] {};
     u32 NumIndices {}, NumEdgeIndices {};
 
-    const u32 EdgeIndicesOffset = 2048 * 30;
+    const u32 EdgeIndicesOffset = PolygonRAMSize * 30;
 
     GLuint TexMemID {};
     GLuint TexPalMemID {};
@@ -353,7 +356,7 @@ private:
         AlphaClass_Full = 1,    // some fragment can have alpha 31: the opaque draw can pass it
         AlphaClass_Partial = 2, // some can have alpha 1-30: the translucent draw can pass it
     };
-    u8 TransAlphaClass[2048] {};
+    u8 TransAlphaClass[PolygonRAMSize] {};
     // the frame's scanned textures (by TexParam's address, size and format), so polygons sharing one
     // scan it once. a slot is in use when its stamp is this frame's
     static constexpr int TexAlphaSlots = 4096;

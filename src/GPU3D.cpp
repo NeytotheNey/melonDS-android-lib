@@ -169,6 +169,68 @@ void Vertex::DoSavestate(Savestate* file) noexcept
     file->VarArray(HiresPosition, sizeof(HiresPosition));
 }
 
+// savestates have upstream's layout, NativePolygonRAMSize polygons and NativeVertexRAMSize vertices a
+// bank, where the banks here are PolygonRAMSize and VertexRAMSize apart. what's past those in a bank has
+// no index of its own there, it's written as the bank's first one (GP3W has it, see DoWideSavestate)
+static u32 LogicalIndex(u32 physical, u32 bankSize, u32 nativeSize) noexcept
+{
+    u32 i = physical % bankSize;
+    return (physical / bankSize) * nativeSize + (i < nativeSize ? i : 0);
+}
+
+static u32 PhysicalIndex(u32 logical, u32 bankSize, u32 nativeSize) noexcept
+{
+    return (logical / nativeSize) * bankSize + logical % nativeSize;
+}
+
+// a polygon's fields in a savestate, but for its vertex pointers
+static void PolygonFieldsSavestate(Polygon* poly, Savestate* file) noexcept
+{
+    file->Var32(&poly->NumVertices);
+
+    file->VarArray(poly->FinalZ, sizeof(s32)*10);
+    file->VarArray(poly->FinalW, sizeof(s32)*10);
+    file->Bool32(&poly->WBuffer);
+
+    file->Var32(&poly->Attr);
+    file->Var32(&poly->TexParam);
+    file->Var32(&poly->TexPalette);
+
+    file->Bool32(&poly->FacingView);
+    file->Bool32(&poly->Translucent);
+
+    file->Bool32(&poly->IsShadowMask);
+    file->Bool32(&poly->IsShadow);
+
+    if (file->IsAtLeastVersion(4, 1))
+        file->Var32((u32*)&poly->Type);
+    else
+        poly->Type = 0;
+
+    file->Var32(&poly->VTop);
+    file->Var32(&poly->VBottom);
+    file->Var32((u32*)&poly->YTop);
+    file->Var32((u32*)&poly->YBottom);
+    file->Var32((u32*)&poly->XTop);
+    file->Var32((u32*)&poly->XBottom);
+
+    file->Var32(&poly->SortKey);
+}
+
+// after a load, once its vertex pointers are in
+static void LoadedPolygonDegenerate(Polygon* poly) noexcept
+{
+    poly->Degenerate = false;
+
+    for (u32 j = 0; j < poly->NumVertices; j++)
+    {
+        if (poly->Vertices[j]->Position[3] == 0)
+            poly->Degenerate = true;
+    }
+
+    if (poly->YBottom > 192) poly->Degenerate = true;
+}
+
 void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
 {
     CurrentRenderer = std::move(renderer);
@@ -180,8 +242,16 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
     SceneRepeatCheck = false;
     SceneCopyValid = false;
 
-    // software only does 256, so don't keep squeezing geometry for it
+    // software only does 256, so don't keep squeezing geometry for it. WideMelon's wide list stays as
+    // the scene started (or as a state load brought it) until the swap: it works at 256 too, where the
+    // native view is the view, so the native counts a bank past the DS's limits relies on stay right
     ViewWidth = RendererViewWidth();
+}
+
+void GPU3D::LatchViewWidth() noexcept
+{
+    ViewWidth = RendererViewWidth();
+    WideListOn = ViewWidth != WideMelon::NativeWidth && NDS.GPU.WidePolys;
 }
 
 void GPU3D::SetVertexIdLogging(int mode) noexcept
@@ -353,17 +423,28 @@ void GPU3D::Reset() noexcept
     NativeNumVertices = 0;
     NativeNumPolygons = 0;
     NativeStripVerts = 0;
+    WingNumPolygons = 0;
+    WingNumVertices = 0;
+    WideListOverflow = false;
     DroppedPolygons = 0;
     DroppedNativeFit = 0;
-    WideDrops.SceneStartDrops = WideDrops.SecondStartDrops = WideDrops.SecondStartNativeFit = 0;
+    DroppedWing = 0;
+    WideDrops.SceneStartDrops = WideDrops.SecondStartDrops = WideDrops.SecondStartNativeFit = WideDrops.SecondStartWing = 0;
 
     FlushRequest = 0;
     FlushAttributes = 0;
 
     RenderXPos = 0;
 
-    ViewWidth = CurrentRenderer ? RendererViewWidth() : WideMelon::NativeWidth;
+    if (CurrentRenderer)
+        LatchViewWidth();
+    else
+    {
+        ViewWidth = WideMelon::NativeWidth;
+        WideListOn = false;
+    }
     RenderViewWidth = ViewWidth;
+    RenderWideList = WideListOn;
 
     if (CurrentRenderer)
         CurrentRenderer->Reset(NDS.GPU);
@@ -461,20 +542,50 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
     if (file->Saving)
     {
-        u32 index = LastStripPolygon ? (u32)(LastStripPolygon - &PolygonRAM[0]) : UINT32_MAX;
+        // one past what GP3D's layout holds is none here (GP3W has it)
+        u32 index = UINT32_MAX;
+        if (LastStripPolygon)
+        {
+            u32 physical = (u32)(LastStripPolygon - &PolygonRAM[0]);
+            if (physical % PolygonRAMSize < NativePolygonRAMSize)
+                index = LogicalIndex(physical, PolygonRAMSize, NativePolygonRAMSize);
+        }
         file->Var32(&index);
     }
     else
     {
         u32 index = UINT32_MAX;
         file->Var32(&index);
-        LastStripPolygon = (index == UINT32_MAX) ? nullptr : &PolygonRAM[index];
+        LastStripPolygon = (index == UINT32_MAX) ? nullptr : &PolygonRAM[PhysicalIndex(index, PolygonRAMSize, NativePolygonRAMSize)];
     }
 
     file->Var32(&CurRAMBank);
-    file->Var32(&NumVertices);
-    file->Var32(&NumPolygons);
-    file->Var32(&NumOpaquePolygons);
+    // any other value is bank 1, as everything here reads it; GP3W's checks go by 0 or 1
+    if (!file->Saving)
+        CurRAMBank = CurRAMBank ? 1 : 0;
+    if (file->Saving)
+    {
+        // WideMelon's wide list can go past what GP3D holds: the counts are capped (GP3W has the real
+        // ones), and the opaque polygons counted over the ones it has
+        u32 numVertices = std::min(NumVertices, NativeVertexRAMSize);
+        u32 numPolygons = std::min(NumPolygons, NativePolygonRAMSize);
+        u32 numOpaquePolygons = NumOpaquePolygons;
+        if (numPolygons != NumPolygons)
+        {
+            numOpaquePolygons = 0;
+            for (u32 i = 0; i < numPolygons; i++)
+                numOpaquePolygons += !CurPolygonRAM[i].Translucent;
+        }
+        file->Var32(&numVertices);
+        file->Var32(&numPolygons);
+        file->Var32(&numOpaquePolygons);
+    }
+    else
+    {
+        file->Var32(&NumVertices);
+        file->Var32(&NumPolygons);
+        file->Var32(&NumOpaquePolygons);
+    }
 
     if (!file->Saving)
     {
@@ -483,19 +594,25 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
             TempVertexNativeX[i] = TempVertexBuffer[i].Position[0];
         NativeNumVertices = NumVertices;
         NativeNumPolygons = NumPolygons;
+        // and nothing in the wide list's wing budget, unless GP3W says otherwise
+        WingNumVertices = 0;
+        WingNumPolygons = 0;
+        WideListOverflow = false;
     }
 
     file->Var32(&FlushRequest);
     file->Var32(&FlushAttributes);
 
-    for (Vertex& vtx : VertexRAM)
+    // in upstream's layout, NativeVertexRAMSize vertices and NativePolygonRAMSize polygons a bank
+    for (u32 bank = 0; bank < 2; bank++)
     {
-        vtx.DoSavestate(file);
+        for (u32 i = 0; i < NativeVertexRAMSize; i++)
+            VertexRAM[bank * VertexRAMSize + i].DoSavestate(file);
     }
 
-    for(int i = 0; i < 2048*2; i++)
+    for (u32 i = 0; i < NativePolygonRAMSize*2; i++)
     {
-        Polygon* poly = &PolygonRAM[i];
+        Polygon* poly = &PolygonRAM[PhysicalIndex(i, PolygonRAMSize, NativePolygonRAMSize)];
 
         // this is a bit ugly, but eh
         // we can't save the pointers as-is, that's a bad idea
@@ -504,7 +621,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
             for (int j = 0; j < 10; j++)
             {
                 Vertex* ptr = poly->Vertices[j];
-                u32 index = ptr ? (u32)(ptr - &VertexRAM[0]) : UINT32_MAX;
+                u32 index = ptr ? LogicalIndex((u32)(ptr - &VertexRAM[0]), VertexRAMSize, NativeVertexRAMSize) : UINT32_MAX;
                 file->Var32(&index);
             }
         }
@@ -514,52 +631,14 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
             {
                 u32 index = UINT32_MAX;
                 file->Var32(&index);
-                poly->Vertices[j] = index == UINT32_MAX ? nullptr : &VertexRAM[index];
+                poly->Vertices[j] = index == UINT32_MAX ? nullptr : &VertexRAM[PhysicalIndex(index, VertexRAMSize, NativeVertexRAMSize)];
             }
         }
 
-        file->Var32(&poly->NumVertices);
-
-        file->VarArray(poly->FinalZ, sizeof(s32)*10);
-        file->VarArray(poly->FinalW, sizeof(s32)*10);
-        file->Bool32(&poly->WBuffer);
-
-        file->Var32(&poly->Attr);
-        file->Var32(&poly->TexParam);
-        file->Var32(&poly->TexPalette);
-
-        file->Bool32(&poly->FacingView);
-        file->Bool32(&poly->Translucent);
-
-        file->Bool32(&poly->IsShadowMask);
-        file->Bool32(&poly->IsShadow);
-
-        if (file->IsAtLeastVersion(4, 1))
-            file->Var32((u32*)&poly->Type);
-        else
-            poly->Type = 0;
-
-        file->Var32(&poly->VTop);
-        file->Var32(&poly->VBottom);
-        file->Var32((u32*)&poly->YTop);
-        file->Var32((u32*)&poly->YBottom);
-        file->Var32((u32*)&poly->XTop);
-        file->Var32((u32*)&poly->XBottom);
-
-        file->Var32(&poly->SortKey);
+        PolygonFieldsSavestate(poly, file);
 
         if (!file->Saving)
-        {
-            poly->Degenerate = false;
-
-            for (u32 j = 0; j < poly->NumVertices; j++)
-            {
-                if (poly->Vertices[j]->Position[3] == 0)
-                    poly->Degenerate = true;
-            }
-
-            if (poly->YBottom > 192) poly->Degenerate = true;
-        }
+            LoadedPolygonDegenerate(poly);
     }
 
     if (!file->Saving)
@@ -586,40 +665,44 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
         if (VertexIdLog) VertexIdLog->Invalidate();
 
-        CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
-        CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
+        CurVertexRAM = &VertexRAM[CurRAMBank ? VertexRAMSize : 0];
+        CurPolygonRAM = &PolygonRAM[CurRAMBank ? PolygonRAMSize : 0];
     }
 
     // never the in-between scene, the state has the scene itself. first on a load, where the state
     // replaces the list it would put back
     if (HalfCam && !file->Saving)
         HalfCam->Invalidate();
-    const std::array<Polygon*,2048>* renderList = &RenderPolygonRAM;
+    const RenderList* renderList = &RenderPolygonRAM;
     u32 renderNumPolygons = RenderNumPolygons;
     if (HalfCam && file->Saving)
         HalfCam->GetRealRenderList(renderList, renderNumPolygons);
 
-    file->Var32(&renderNumPolygons);
+    // as GP3D's layout holds it, capped like the counts above
+    u32 savedNumPolygons = std::min(renderNumPolygons, NativePolygonRAMSize);
+    file->Var32(&savedNumPolygons);
     if (!file->Saving)
-        RenderNumPolygons = renderNumPolygons;
+        RenderNumPolygons = savedNumPolygons;
     if (file->Saving)
     {
-        for (const Polygon* p : *renderList)
+        for (u32 i = 0; i < NativePolygonRAMSize; i++)
         {
-            u32 index = p ? (p - &PolygonRAM[0]) : UINT32_MAX;
+            const Polygon* p = (*renderList)[i];
+            u32 index = p ? LogicalIndex((u32)(p - &PolygonRAM[0]), PolygonRAMSize, NativePolygonRAMSize) : UINT32_MAX;
 
             file->Var32(&index);
         }
     }
     else
     {
-        for (int i = 0; i < RenderPolygonRAM.size(); ++i)
+        for (u32 i = 0; i < NativePolygonRAMSize; ++i)
         {
             u32 index = UINT32_MAX;
             file->Var32(&index);
 
-            RenderPolygonRAM[i] = index == UINT32_MAX ? nullptr : &PolygonRAM[index];
+            RenderPolygonRAM[i] = index == UINT32_MAX ? nullptr : &PolygonRAM[PhysicalIndex(index, PolygonRAMSize, NativePolygonRAMSize)];
         }
+        std::fill(RenderPolygonRAM.begin() + NativePolygonRAMSize, RenderPolygonRAM.end(), nullptr);
     }
 
     file->VarArray(CurVertex, sizeof(s16)*3);
@@ -646,6 +729,28 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->Var32(&CurPolygonAttr);
     file->Var32(&TexParam);
     file->Var32(&TexPalette);
+
+    // WideMelon's wide list, in a section of its own: only with it on, or a bank holding more than GP3D
+    // can, so a state saved without it is as before
+    bool wideSection = file->Saving ? (WideListOn || WideSavestateExtra(renderList, renderNumPolygons)) : file->HasSection("GP3W");
+    if (wideSection)
+        DoWideSavestate(file, renderList, renderNumPolygons);
+    // the list a load brought is the wide list's if it's longer than the DS's, uses vertices past
+    // theirs (only a GP3W can bring either), or if the list is on now
+    if (!file->Saving)
+    {
+        RenderWideList = WideListOn || RenderNumPolygons > NativePolygonRAMSize;
+        for (u32 i = 0; wideSection && !RenderWideList && i < RenderNumPolygons; i++)
+        {
+            const Polygon* poly = RenderPolygonRAM[i];
+            for (u32 j = 0; poly && j < poly->NumVertices && j < 10; j++)
+            {
+                if (poly->Vertices[j] && (u32)(poly->Vertices[j] - &VertexRAM[0]) % VertexRAMSize >= NativeVertexRAMSize)
+                    RenderWideList = true;
+            }
+        }
+    }
+
     RenderFrameIdentical = false;
     // the state's scene isn't the one the renderers drew. the first VBlank would otherwise call a
     // frame without a swap identical, going by the state's registers alone
@@ -655,6 +760,248 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     {
         softRenderer->EnableRenderThread();
     }
+}
+
+// how far into each bank what a savestate needs goes: the scene being built, its last strip polygon
+// and the render list's polygons, with their vertices
+void GPU3D::WideSavestateHighWater(const RenderList* renderList, u32 renderNumPolygons, u32 polygons[2], u32 vertices[2]) const noexcept
+{
+    polygons[0] = polygons[1] = vertices[0] = vertices[1] = 0;
+    polygons[CurRAMBank ? 1 : 0] = NumPolygons;
+    vertices[CurRAMBank ? 1 : 0] = NumVertices;
+    auto note = [&](const Polygon* poly)
+    {
+        u32 index = (u32)(poly - &PolygonRAM[0]);
+        if (index >= PolygonRAMSize * 2)
+            return;
+        u32 bank = index / PolygonRAMSize;
+        polygons[bank] = std::max(polygons[bank], index % PolygonRAMSize + 1);
+        for (u32 j = 0; j < poly->NumVertices && j < 10; j++)
+        {
+            u32 vertex = poly->Vertices[j] ? (u32)(poly->Vertices[j] - &VertexRAM[0]) : UINT32_MAX;
+            if (vertex < VertexRAMSize * 2)
+                vertices[vertex / VertexRAMSize] = std::max(vertices[vertex / VertexRAMSize], vertex % VertexRAMSize + 1);
+        }
+    };
+    for (u32 i = 0; i < NumPolygons && i < PolygonRAMSize; i++)
+        note(&CurPolygonRAM[i]);
+    if (LastStripPolygon)
+        note(LastStripPolygon);
+    for (u32 i = 0; i < renderNumPolygons && i < PolygonRAMSize; i++)
+    {
+        if ((*renderList)[i])
+            note((*renderList)[i]);
+    }
+}
+
+// whether a bank holds more than GP3D's layout can
+bool GPU3D::WideSavestateExtra(const RenderList* renderList, u32 renderNumPolygons) const noexcept
+{
+    u32 polygons[2], vertices[2];
+    WideSavestateHighWater(renderList, renderNumPolygons, polygons, vertices);
+    return polygons[0] > NativePolygonRAMSize || polygons[1] > NativePolygonRAMSize
+        || vertices[0] > NativeVertexRAMSize || vertices[1] > NativeVertexRAMSize;
+}
+
+// the GP3W section, after GP3D (see DoSavestate): what WideMelon's wide list needs that GP3D's upstream
+// layout doesn't have. whether the scene was being built into the wide list, the native view's counts,
+// strip state and X, and the wing budget's counts, then only when a bank holds more than GP3D can
+// (extra): the real counts, each bank's high-water marks, the polygons and vertices past GP3D's in each
+// bank, the vertex indices of every polygon up to there as they are here, the whole render list and the
+// last strip polygon, which GP3D has capped or as each bank's first. read only when it's there, version
+// 2 (version 1 was a layout without the wide list flag, only in builds before this one). a load reads
+// it all and checks it before anything GP3D loaded changes, but for the polygons and vertices past
+// GP3D's, which nothing points at until then; any other version leaves GP3D's state
+void GPU3D::DoWideSavestate(Savestate* file, const RenderList* renderList, u32 renderNumPolygons) noexcept
+{
+    file->Section("GP3W");
+
+    u32 version = 2;
+    file->Var32(&version);
+    if (version != 2)
+        return;
+
+    // the scalars, as members when saving and checked before they're kept when loading
+    struct
+    {
+        u32 WideList, NativePolygons, NativeVertices, NativeStripVerts, NativeStripClipped, WingPolygons, WingVertices;
+        s32 NativeX[4];
+        u32 Extra;
+        u32 Vertices, Polygons, OpaquePolygons, RenderPolygons;
+        u32 BankPolygons[2], BankVertices[2];
+        u32 LastStrip;
+    } w {};
+    if (file->Saving)
+    {
+        w.WideList = WideListOn ? 1 : 0;
+        w.NativePolygons = NativeNumPolygons;
+        w.NativeVertices = NativeNumVertices;
+        w.NativeStripVerts = NativeStripVerts;
+        w.NativeStripClipped = NativeStripClipped;
+        w.WingPolygons = WingNumPolygons;
+        w.WingVertices = WingNumVertices;
+        memcpy(w.NativeX, TempVertexNativeX, sizeof(w.NativeX));
+        WideSavestateHighWater(renderList, renderNumPolygons, w.BankPolygons, w.BankVertices);
+        w.Extra = w.BankPolygons[0] > NativePolygonRAMSize || w.BankPolygons[1] > NativePolygonRAMSize
+            || w.BankVertices[0] > NativeVertexRAMSize || w.BankVertices[1] > NativeVertexRAMSize;
+        w.Vertices = NumVertices;
+        w.Polygons = NumPolygons;
+        w.OpaquePolygons = NumOpaquePolygons;
+        w.RenderPolygons = renderNumPolygons;
+        w.LastStrip = LastStripPolygon ? (u32)(LastStripPolygon - &PolygonRAM[0]) : UINT32_MAX;
+    }
+
+    file->Var32(&w.WideList);
+    file->Var32(&w.NativePolygons);
+    file->Var32(&w.NativeVertices);
+    file->Var32(&w.NativeStripVerts);
+    file->Var32(&w.NativeStripClipped);
+    file->Var32(&w.WingPolygons);
+    file->Var32(&w.WingVertices);
+    file->VarArray(w.NativeX, sizeof(w.NativeX));
+    file->Var32(&w.Extra);
+
+    auto fail = [file]() { file->Error = true; };
+    if (!file->Saving && (file->Error || w.WideList > 1 || w.Extra > 1
+        || w.NativePolygons > NativePolygonRAMSize || w.NativeVertices > NativeVertexRAMSize || w.NativeStripVerts > 10
+        || w.WingPolygons > NativePolygonRAMSize || w.WingVertices > NativeVertexRAMSize))
+        return fail();
+
+    // the vertex indices of every polygon up to the high-water marks, bank 0's then bank 1's, as loaded
+    std::vector<u32> vertexIndices;
+    if (w.Extra)
+    {
+        file->Var32(&w.Vertices);
+        file->Var32(&w.Polygons);
+        file->Var32(&w.OpaquePolygons);
+        file->Var32(&w.RenderPolygons);
+        for (u32 bank = 0; bank < 2; bank++)
+        {
+            file->Var32(&w.BankPolygons[bank]);
+            file->Var32(&w.BankVertices[bank]);
+        }
+        const u32 cur = CurRAMBank ? 1 : 0;
+        if (!file->Saving && (file->Error || CurRAMBank > 1
+            || w.BankPolygons[0] > PolygonRAMSize || w.BankPolygons[1] > PolygonRAMSize
+            || w.BankVertices[0] > VertexRAMSize || w.BankVertices[1] > VertexRAMSize
+            || w.Polygons > w.BankPolygons[cur] || w.Vertices > w.BankVertices[cur]
+            || w.OpaquePolygons > w.Polygons || w.RenderPolygons > PolygonRAMSize))
+            return fail();
+
+        if (!file->Saving)
+            vertexIndices.resize((size_t)(w.BankPolygons[0] + w.BankPolygons[1]) * 10);
+        size_t next = 0;
+        for (u32 bank = 0; bank < 2; bank++)
+        {
+            // past GP3D's, which nothing points at yet: loaded in place
+            for (u32 i = NativeVertexRAMSize; i < w.BankVertices[bank]; i++)
+                VertexRAM[bank * VertexRAMSize + i].DoSavestate(file);
+            for (u32 i = NativePolygonRAMSize; i < w.BankPolygons[bank]; i++)
+                PolygonFieldsSavestate(&PolygonRAM[bank * PolygonRAMSize + i], file);
+
+            for (u32 i = 0; i < w.BankPolygons[bank]; i++)
+            {
+                const Polygon* poly = &PolygonRAM[bank * PolygonRAMSize + i];
+                for (int j = 0; j < 10; j++)
+                {
+                    u32 index = (file->Saving && poly->Vertices[j]) ? (u32)(poly->Vertices[j] - &VertexRAM[0]) : UINT32_MAX;
+                    file->Var32(&index);
+                    if (!file->Saving)
+                        vertexIndices[next++] = index;
+                }
+            }
+        }
+
+        if (!file->Saving && file->Error)
+            return fail();
+        // every polygon drawn with vertices that are there
+        next = 0;
+        for (u32 bank = 0; !file->Saving && bank < 2; bank++)
+        {
+            for (u32 i = 0; i < w.BankPolygons[bank]; i++, next += 10)
+            {
+                const Polygon& poly = PolygonRAM[bank * PolygonRAMSize + i];
+                if (poly.NumVertices > 10)
+                    return fail();
+                for (u32 j = 0; j < 10; j++)
+                {
+                    u32 index = vertexIndices[next + j];
+                    if ((index == UINT32_MAX && j < poly.NumVertices) || (index != UINT32_MAX && index >= VertexRAMSize * 2))
+                        return fail();
+                }
+            }
+        }
+    }
+
+    // a polygon index inside what was saved of its bank
+    auto savedPolygon = [&](u32 index) { return index < PolygonRAMSize * 2 && index % PolygonRAMSize < w.BankPolygons[index / PolygonRAMSize]; };
+    std::vector<u32> renderIndices;
+    if (w.Extra)
+    {
+        if (!file->Saving)
+            renderIndices.resize(w.RenderPolygons);
+        for (u32 i = 0; i < w.RenderPolygons; i++)
+        {
+            const Polygon* p = file->Saving ? (*renderList)[i] : nullptr;
+            u32 index = p ? (u32)(p - &PolygonRAM[0]) : UINT32_MAX;
+            file->Var32(&index);
+            if (!file->Saving)
+                renderIndices[i] = index;
+        }
+        file->Var32(&w.LastStrip);
+
+        if (!file->Saving)
+        {
+            if (file->Error || (w.LastStrip != UINT32_MAX && !savedPolygon(w.LastStrip)))
+                return fail();
+            // a render list has no holes before its count
+            for (u32 index : renderIndices)
+            {
+                if (!savedPolygon(index))
+                    return fail();
+            }
+        }
+    }
+
+    if (file->Saving)
+        return;
+
+    // all checked: the state's from here on
+    WideListOn = w.WideList != 0;
+    NativeNumPolygons = w.NativePolygons;
+    NativeNumVertices = w.NativeVertices;
+    NativeStripVerts = w.NativeStripVerts;
+    NativeStripClipped = w.NativeStripClipped;
+    WingNumPolygons = w.WingPolygons;
+    WingNumVertices = w.WingVertices;
+    memcpy(TempVertexNativeX, w.NativeX, sizeof(TempVertexNativeX));
+    if (!w.Extra)
+        return;
+
+    NumVertices = w.Vertices;
+    NumPolygons = w.Polygons;
+    // counted again, as VBlank puts the translucent ones from there on (the saved one is the same count)
+    NumOpaquePolygons = 0;
+    for (u32 i = 0; i < NumPolygons; i++)
+        NumOpaquePolygons += !CurPolygonRAM[i].Translucent;
+    size_t next = 0;
+    for (u32 bank = 0; bank < 2; bank++)
+    {
+        for (u32 i = 0; i < w.BankPolygons[bank]; i++, next += 10)
+        {
+            Polygon* poly = &PolygonRAM[bank * PolygonRAMSize + i];
+            for (u32 j = 0; j < 10; j++)
+            {
+                u32 index = vertexIndices[next + j];
+                poly->Vertices[j] = index == UINT32_MAX ? nullptr : &VertexRAM[index];
+            }
+            LoadedPolygonDegenerate(poly);
+        }
+    }
+    for (u32 i = 0; i < w.RenderPolygons; i++)
+        RenderPolygonRAM[i] = renderIndices[i] == UINT32_MAX ? nullptr : &PolygonRAM[renderIndices[i]];
+    RenderNumPolygons = w.RenderPolygons;
+    LastStripPolygon = w.LastStrip == UINT32_MAX ? nullptr : &PolygonRAM[w.LastStrip];
 }
 
 
@@ -1137,6 +1484,8 @@ void GPU3D::SubmitPolygon() noexcept
     };
     // [n] if the native view has room for a polygon of [n] vertices, else 0
     auto fitsnative = [this](int n) { return (NativeNumPolygons < 2048 && NativeNumVertices + n <= 6144) ? n : 0; };
+    // the wide list's wing budget has room for a polygon of [n] vertices
+    auto fitswing = [this](int n) { return WingNumPolygons < NativePolygonRAMSize && WingNumVertices + n <= NativeVertexRAMSize; };
     // the native view's last strip polygon: this one's from here on, which stays none unless that view keeps it
     const u32 nativeprevverts = NativeStripVerts, nativeprevclipped = NativeStripClipped;
     NativeStripVerts = 0;
@@ -1255,14 +1604,61 @@ void GPU3D::SubmitPolygon() noexcept
         return;
     }
 
-    // the native view: how many vertices it would store this polygon with, 0 if it wouldn't. one the wide
-    // view clips away is gone there too. zero-dot polygons are checked again below
-    int nativeverts = wide ? fitsnative(NativeClipVertices(sentverts, nverts, clippedvertices, nativeclipped)) : 0;
+    // the native view: how many vertices it would store this polygon with (nativeclip, 0 if it clips it
+    // away), and 0 if it wouldn't, as its counts are full too (nativeverts). one the wide view clips away is
+    // gone there too. zero-dot polygons are checked again below
+    // (with the wide list kept at 256 after a renderer switch or a load, that's the view itself)
+    int nativeclip = (wide || WideListOn) ? NativeClipVertices(sentverts, nverts, clippedvertices, nativeclipped) : 0;
+    int nativeverts = fitsnative(nativeclip);
     bool nativereused = nativestrip && nativeverts == lastpolyverts;
 
     // reject the polygon if it's not going to fit in polygon/vertex RAM
 
-    if (NumPolygons >= 2048 || NumVertices+nverts > 6144)
+    if (WideListOn)
+    {
+        // WideMelon's wide list: a polygon the native view keeps is dropped where the DS drops it, when the
+        // native counts are full, and then from the wide view too, so the middle 256 never shows one the DS
+        // didn't draw. only that sets bit 13. one only the wide view keeps takes the wing budget, and only
+        // while the native counts could still take a polygon its size, so the wings stop at the same point
+        // of the scene as the middle. a native one the whole list has no room for (only once the native
+        // polygons' wide vertex counts pass VertexRAMSize) is the wide view's cost, nativefit
+        bool listfull = NumPolygons >= PolygonRAMSize || NumVertices+nverts > VertexRAMSize;
+        const bool nativedrop = nativeclip && !nativeverts;
+        bool drop = true;
+        if (nativedrop)
+            DispCnt |= (1<<13);
+        else if (!nativeclip)
+        {
+            drop = listfull || !fitswing(nverts) || !fitsnative(nverts);
+            DroppedWing += drop;
+        }
+        else if (listfull)
+        {
+            // the native view keeps it unless it's zero-dot there (as below)
+            if (!(CurPolygonAttr & (1<<13)) && ZeroDotWLimit < 0xFFFFFF && NativeZeroDot(sentverts))
+                nativeverts = 0;
+            if (nativeverts)
+            {
+                DroppedNativeFit++;
+                keepnative(nativeverts, nativereused);
+                if (!equaltiming) startpipeline(nativeverts);
+            }
+            else
+                DroppedWing++;
+        }
+        else
+            drop = false;
+
+        if (drop)
+        {
+            DroppedPolygons++;
+            WideListOverflow = WideListOverflow || !nativedrop;
+            if (VertexIdLog) VertexIdLog->OnPolygonRejected();
+            LastStripPolygon = NULL;
+            return;
+        }
+    }
+    else if (NumPolygons >= 2048 || NumVertices+nverts > 6144)
     {
         DroppedPolygons++;
         // the native view has room: its zero-dot check is next (as below)
@@ -1274,6 +1670,9 @@ void GPU3D::SubmitPolygon() noexcept
             keepnative(nativeverts, nativereused);
             if (!equaltiming) startpipeline(nativeverts);
         }
+        // for the WIDEDROPS line: one only the wide view keeps
+        else if (wide && !nativeclip)
+            DroppedWing++;
         if (VertexIdLog) VertexIdLog->OnPolygonRejected();
         LastStripPolygon = NULL;
         DispCnt |= (1<<13);
@@ -1412,6 +1811,18 @@ void GPU3D::SubmitPolygon() noexcept
         }
     }
 
+    // the wide list: one the native view keeps but drops as zero-dot (above) is the wings' as well
+    const bool wingpoly = WideListOn && !nativeverts;
+    if (wingpoly && nativeclip && !fitswing(nverts))
+    {
+        DroppedPolygons++;
+        DroppedWing++;
+        WideListOverflow = true;
+        if (VertexIdLog) VertexIdLog->OnPolygonRejected();
+        LastStripPolygon = NULL;
+        return;
+    }
+
     // build the actual polygon
 
     // the timing: with WideMelon on, from the native view, which leaves a polygon it wouldn't keep at
@@ -1422,6 +1833,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     if (nativeverts) keepnative(nativeverts, nativereused);
 
+    const u32 vertsbefore = NumVertices;
     Polygon* poly = &CurPolygonRAM[NumPolygons++];
     if (VertexIdLog) VertexIdLog->OnPolygon(NumPolygons - 1, *this);
     poly->NumVertices = 0;
@@ -1483,6 +1895,12 @@ void GPU3D::SubmitPolygon() noexcept
         if (vtx->FinalColor[1]) vtx->FinalColor[1] = ((vtx->FinalColor[1] << 4) + 0xF);
         vtx->FinalColor[2] = vtx->Color[2] >> 12;
         if (vtx->FinalColor[2]) vtx->FinalColor[2] = ((vtx->FinalColor[2] << 4) + 0xF);
+    }
+
+    if (wingpoly)
+    {
+        WingNumPolygons++;
+        WingNumVertices += NumVertices - vertsbefore;
     }
 
     // determine bounds of the polygon
@@ -3004,6 +3422,7 @@ void GPU3D::VBlank() noexcept
 
                 RenderNumPolygons = NumPolygons;
                 RenderViewWidth = ViewWidth;
+                RenderWideList = WideListOn;
                 RenderFrameIdentical = false;
 
                 // SceneRepeatCheck: the swap is the only thing in the way of an identical frame
@@ -3056,19 +3475,21 @@ void GPU3D::VBlank() noexcept
             if (WideDrops.Enabled) WideDropsOnSwap();
 
             CurRAMBank = CurRAMBank?0:1;
-            CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
-            CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
+            CurVertexRAM = &VertexRAM[CurRAMBank ? VertexRAMSize : 0];
+            CurPolygonRAM = &PolygonRAM[CurRAMBank ? PolygonRAMSize : 0];
 
             NumVertices = 0;
             NumPolygons = 0;
             NumOpaquePolygons = 0;
             NativeNumVertices = 0;
             NativeNumPolygons = 0;
+            WingNumVertices = 0;
+            WingNumPolygons = 0;
 
             FlushRequest = 0;
 
             // the width only changes between frames of geometry: right after a swap...
-            ViewWidth = RendererViewWidth();
+            LatchViewWidth();
 
             if (HalfCam) HalfCam->OnSceneStart();
         }
@@ -3076,7 +3497,7 @@ void GPU3D::VBlank() noexcept
     else if (NumVertices == 0 && NumPolygons == 0 && VertexNumInPoly == 0)
     {
         // ...or while the geometry engine is off with nothing half-built
-        ViewWidth = RendererViewWidth();
+        LatchViewWidth();
     }
 
     // the renderers skip a frame that's the same as the last one, which would keep the in-between scene up
@@ -3220,6 +3641,11 @@ void GPU3D::WideDropsOnSwap() noexcept
     WideDrops.MaxSceneDrops = std::max(WideDrops.MaxSceneDrops, drops);
     WideDrops.PeakPolygons = std::max(WideDrops.PeakPolygons, NumPolygons);
     WideDrops.PeakVertices = std::max(WideDrops.PeakVertices, NumVertices);
+    // the native view's counts are only kept with the view wider or the wide list, otherwise they're the real ones
+    bool wide = ViewWidth != WideMelon::NativeWidth || WideListOn;
+    WideDrops.PeakNativePolygons = std::max(WideDrops.PeakNativePolygons, wide ? NativeNumPolygons : NumPolygons);
+    WideDrops.PeakNativeVertices = std::max(WideDrops.PeakNativeVertices, wide ? NativeNumVertices : NumVertices);
+    WideDrops.PeakWingPolygons = std::max(WideDrops.PeakWingPolygons, WingNumPolygons);
 }
 
 void GPU3D::WideDropsOnVBlank() noexcept
@@ -3228,18 +3654,29 @@ void GPU3D::WideDropsOnVBlank() noexcept
     if (now - WideDrops.LastLog < std::chrono::seconds(1))
         return;
 
-    // scenes: polygon RAM swaps this second, dropscenes: those that dropped any, drops: polygons dropped
-    // as the polygon or vertex RAM was full, nativefit: of those, the ones the native view had room for
-    // (the wide view's cost; always 0 at width 256), maxscene: most drops in one scene, peakpoly and
-    // peakvert: the fullest polygon and vertex RAM at a swap (of 2048 and 6144)
-    Log(LogLevel::Info, "WIDEDROPS width=%d scenes=%u dropscenes=%u drops=%u nativefit=%u maxscene=%u peakpoly=%u peakvert=%u\n",
-        ViewWidth, WideDrops.Scenes, WideDrops.DropScenes, DroppedPolygons - WideDrops.SecondStartDrops,
-        DroppedNativeFit - WideDrops.SecondStartNativeFit, WideDrops.MaxSceneDrops, WideDrops.PeakPolygons, WideDrops.PeakVertices);
+    // widelist: GPU::WidePolys's wide list was on for the scene being built, scenes: polygon RAM swaps
+    // this second, dropscenes: those that dropped any, drops: polygons dropped as the polygon or vertex
+    // RAM (or the wide list or its wing budget) was full, of those native: ones the DS would drop too,
+    // wing: ones only the wide view kept, nativefit: ones the native view had room for (the wide view's
+    // cost; always 0 at width 256, and should be with the wide list), maxscene: most drops in one scene,
+    // peaknpoly and peaknvert: the native view's fullest polygon and vertex RAM at a swap (of 2048 and
+    // 6144), peakpoly and peakvert: the stored ones (of 2048 and 6144, or 4096 and 12288 with the wide
+    // list), peakwing: the most polygons in the wide list's wing budget (of 2048)
+    u32 drops = DroppedPolygons - WideDrops.SecondStartDrops;
+    u32 nativefit = DroppedNativeFit - WideDrops.SecondStartNativeFit;
+    u32 wing = DroppedWing - WideDrops.SecondStartWing;
+    Log(LogLevel::Info, "WIDEDROPS width=%d widelist=%d scenes=%u dropscenes=%u drops=%u native=%u wing=%u nativefit=%u maxscene=%u "
+        "peaknpoly=%u peaknvert=%u peakpoly=%u peakvert=%u peakwing=%u\n",
+        ViewWidth, WideListOn ? 1 : 0, WideDrops.Scenes, WideDrops.DropScenes, drops, drops - nativefit - wing, wing, nativefit,
+        WideDrops.MaxSceneDrops, WideDrops.PeakNativePolygons, WideDrops.PeakNativeVertices, WideDrops.PeakPolygons,
+        WideDrops.PeakVertices, WideDrops.PeakWingPolygons);
 
     WideDrops.LastLog = now;
     WideDrops.Scenes = WideDrops.DropScenes = WideDrops.MaxSceneDrops = WideDrops.PeakPolygons = WideDrops.PeakVertices = 0;
+    WideDrops.PeakNativePolygons = WideDrops.PeakNativeVertices = WideDrops.PeakWingPolygons = 0;
     WideDrops.SecondStartDrops = DroppedPolygons;
     WideDrops.SecondStartNativeFit = DroppedNativeFit;
+    WideDrops.SecondStartWing = DroppedWing;
 }
 
 void GPU3D::SetRenderXPos(u16 xpos) noexcept
@@ -3321,7 +3758,8 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
     {
         if ((CurCommand & 0xFF) || (NumCommands == 4 && CurCommand == 0))
         {
-            CmdFIFOEntry entry;
+            // zeroed, padding too: the FIFOs are saved whole, so stack bytes would make states differ
+            CmdFIFOEntry entry {};
             entry.Command = CurCommand & 0xFF;
             entry.Param = val;
             CmdFIFOWrite(entry);
@@ -3412,11 +3850,19 @@ u16 GPU3D::Read16(u32 addr) noexcept
         }
 
     case 0x04000604:
-        if (WideCheck) WideCheckCountReads++;
-        return NumPolygons;
+        {
+            // WideMelon's wide list: the counts the DS would have (see SubmitPolygon). without it never
+            // past the DS's limits (a bank over them keeps the wide list until its swap, so this only guards)
+            u16 count = WideListOn ? NativeNumPolygons : std::min(NumPolygons, NativePolygonRAMSize);
+            if (WideCheck) NoteWideCheckCount(addr, count);
+            return count;
+        }
     case 0x04000606:
-        if (WideCheck) WideCheckCountReads++;
-        return NumVertices;
+        {
+            u16 count = WideListOn ? NativeNumVertices : std::min(NumVertices, NativeVertexRAMSize);
+            if (WideCheck) NoteWideCheckCount(addr, count);
+            return count;
+        }
 
     case 0x04000630: return VecTestResult[0];
     case 0x04000632: return VecTestResult[1];
@@ -3452,8 +3898,12 @@ u32 GPU3D::Read32(u32 addr) noexcept
         }
 
     case 0x04000604:
-        if (WideCheck) WideCheckCountReads++;
-        return NumPolygons | (NumVertices << 16);
+        {
+            u32 count = WideListOn ? (NativeNumPolygons | (NativeNumVertices << 16))
+                : (std::min(NumPolygons, NativePolygonRAMSize) | (std::min(NumVertices, NativeVertexRAMSize) << 16));
+            if (WideCheck) NoteWideCheckCount(addr, count);
+            return count;
+        }
 
     case 0x04000620: return PosTestResult[0];
     case 0x04000624: return PosTestResult[1];
@@ -3691,7 +4141,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
 
     if (addr >= 0x04000440 && addr < 0x040005CC)
     {
-        CmdFIFOEntry entry;
+        CmdFIFOEntry entry {};
         entry.Command = (addr & 0x1FC) >> 2;
         entry.Param = val;
         CmdFIFOWrite(entry);

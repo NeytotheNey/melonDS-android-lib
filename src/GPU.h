@@ -1060,6 +1060,12 @@ public:
     int SceneStats = 0;
     // compute renderer: logs a COMPDEPTH line once a second on what DepthBlend does per pixel
     bool ComputeDepthStats = false;
+    // WideMelon (docs/plan-widemelon-polylist.md): with the view wider than 256, the polygon and vertex
+    // RAM counts the game sees, and DISP3DCNT bit 13, are the native view's, and the scene is kept in a
+    // list twice the DS's size, half of it for the polygons only the wings show, so the wide view no
+    // longer drops polygons the DS would draw (GPU3D::WideListOn). latched with the view width, at a
+    // polygon RAM swap. off, the default until the phones have checked it, is as before
+    bool WidePolys = false;
     // logs a HASH3D line per frame with a checksum of the 3D image at native resolution, numbered like
     // HASH2D (Renderer3D::QueueHash3D)
     bool Hash3DLogging = false;

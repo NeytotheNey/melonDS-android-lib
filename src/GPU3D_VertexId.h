@@ -119,7 +119,8 @@ private:
     // a scene can submit more than fits in the 6144 vertices of the vertex RAM, as culled polygons
     // don't take any and a strip's polygons share them
     static constexpr u32 MaxVertices = 32768;
-    static constexpr u32 MaxPolygons = 2048;
+    // WideMelon's wide list (PolygonRAMSize in GPU3D_HalfCamera.h, which comes after this)
+    static constexpr u32 MaxPolygons = 4096;
     static constexpr u32 NumMatrixStackEntries = 32;
 
     // open addressing, cleared in constant time. the sizes below keep them at most half full

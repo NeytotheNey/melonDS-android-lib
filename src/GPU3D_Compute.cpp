@@ -194,6 +194,10 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     shaderSource += std::to_string(ScreenHeight);
     shaderSource += "\n#define MaxWorkTiles ";
     shaderSource += std::to_string(MaxWorkTiles);
+    shaderSource += "\n#define MaxPolygons ";
+    shaderSource += std::to_string(MaxPolygons);
+    shaderSource += "\n#define PolyIdxBits ";
+    shaderSource += std::to_string(PolyIdxBits());
     shaderSource += "\n#define TileSize ";
     shaderSource += std::to_string(TileSize);
     shaderSource += "\nconst int CoarseTileCountY = ";
@@ -440,11 +444,11 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     //glEnable(GL_DEBUG_OUTPUT);
     glGenBuffers(1, &result->YSpanSetupMemory);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, result->YSpanSetupMemory);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(SpanSetupY)*MaxYSpanSetups, nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(SpanSetupY)*result->YSpanSetupCapacity, nullptr, GL_DYNAMIC_DRAW);
     
     glGenBuffers(1, &result->RenderPolygonMemory);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, result->RenderPolygonMemory);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RenderPolygon)*2048, nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RenderPolygon)*result->RenderPolygonCapacity, nullptr, GL_DYNAMIC_DRAW);
 
     glGenBuffers(1, &result->XSpanSetupMemory);
     glGenBuffers(1, &result->BinResultMemory);
@@ -724,7 +728,7 @@ int ComputeRenderer::TileSizeFor(int width, int scale, int forced) const noexcep
 
     s64 screenW = (s64)InternalWidthFor(width, scale, forced) * scale;
     s64 maxWorkTiles = (screenW / forced) * (192 * scale / forced) * 16;
-    return maxWorkTiles <= 65535 * 32 ? forced : tileSize;
+    return maxWorkTiles <= WorkTileLimitFor(MaxPolygonsFor(width, WideList)) ? forced : tileSize;
 }
 
 // a native target always fits here: the scale was already fitted to it (FitScale)
@@ -771,10 +775,10 @@ bool ComputeRenderer::BuffersFit(int width, int scale) const noexcept
     s64 screenW = (s64)InternalWidthFor(width, scale, tileSize) * scale;
     s64 largestBuffer = 64 * screenW * (192 * scale);
 
-    // the WorkDescs keep a work tile's index in 21 bits, and SortWork dispatches a group per 32
-    // of them along X, which only goes to 65535
+    // the WorkDescs keep a work tile's index in 21 bits (20 with WideMelon's wide list), and SortWork
+    // dispatches a group per 32 of them along X, which only goes to 65535
     s64 maxWorkTiles = (screenW / tileSize) * (192 * scale / tileSize) * 16;
-    if (maxWorkTiles > 65535 * 32)
+    if (maxWorkTiles > WorkTileLimitFor(MaxPolygonsFor(width, WideList)))
         return false;
     // the sizes are passed to glBufferData as int
     if (largestBuffer > INT32_MAX)
@@ -903,7 +907,27 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
 
     HiresCoordinates = highResolutionCoordinates;
 
-    MaxWorkTiles = TilesPerLine*TileLines*16;
+    // WideMelon's wide list (GPU::WidePolys) on a wide target: twice the polygons, so twice the bin
+    // masks a tile and the Y spans, and a bit more of each WorkDesc for the polygon index, which leaves
+    // the work tile index 20 bits (TileSizeFor and BuffersFit keep MaxWorkTiles under WorkTileLimit)
+    MaxPolygons = MaxPolygonsFor(TargetWidth, WideList);
+    BinStride = MaxPolygons/32;
+    CoarseBinStride = BinStride/32;
+    YSpanSetupLimit = MaxPolygons == (int)PolygonRAMSize ? MaxYSpanSetups : (int)NativeVertexRAMSize*2;
+    if (YSpanSetupLimit != YSpanSetupCapacity)
+    {
+        YSpanSetupCapacity = YSpanSetupLimit;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, YSpanSetupMemory);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(SpanSetupY)*YSpanSetupCapacity, nullptr, GL_DYNAMIC_DRAW);
+    }
+    if (MaxPolygons != RenderPolygonCapacity)
+    {
+        RenderPolygonCapacity = MaxPolygons;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, RenderPolygonMemory);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RenderPolygon)*RenderPolygonCapacity, nullptr, GL_DYNAMIC_DRAW);
+    }
+
+    MaxWorkTiles = (int)std::min<s64>((s64)TilesPerLine*TileLines*16, WorkTileLimit());
 
     // the tile memory's layout, which the shaders compiled after this are built for
     TileLayers = TileLayersFor(OptMask);
@@ -925,7 +949,7 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     GrowRetryIn = GrowRetryWait = 0;
     // eh those are pretty bad guesses
     // though real hw shouldn't be eable to render all 2048 polygons on every line either
-    int maxYSpanIndices = 64*2048 * ScaleFactor;
+    int maxYSpanIndices = 64*MaxPolygons * ScaleFactor;
     YSpanIndices.resize(maxYSpanIndices);
     int startTiles = TilesPerLine*TileLines*6;
     int startSpans = maxYSpanIndices / 16;
@@ -1633,7 +1657,7 @@ void ComputeRenderer::UpdateStats(const GPU& gpu)
     }
 
     Stats->FrameStart(RenderFrameStartNs, ScaleFactor, TileSize, (u32)MaxWorkTiles, (u32)WorkTileRoom,
-        (u32)YSpanIndices.size(), (u32)XSpanRoom, (u32)MaxYSpanSetups, (u32)MaxVariants);
+        (u32)YSpanIndices.size(), (u32)XSpanRoom, (u32)YSpanSetupLimit, (u32)MaxVariants);
 }
 
 // debug.melonade.computedepth, at every RenderFrame while it's on or its counter exists: rebuilds the
@@ -1947,7 +1971,8 @@ bool CheckRead(GLuint buffer, size_t offset, size_t size, void* out)
 // fine masks and the work offsets (BinStride words a tile, one per polygon group of 32), a tile
 // being x + y * TilesPerLine; WorkDescs are uvec2s, the unsorted ones from 0 and the sorted ones
 // from MaxWorkTiles, x = tile x | tile y << 16 in pixels, y = polygon | in-variant offset << 11
-// (sorted: | unsorted index << 11); the X spans are SpanSetupX, one per setup index
+// (sorted: | unsorted index << 11), 12 for PolyIdxBits with MaxPolygons 4096; the X spans are
+// SpanSetupX, one per setup index
 void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupIndices, u32 totalTileBound)
 {
     static_assert(sizeof(BinResultHeader) == 6160, "BinResultHeader must match the std430 BinResultBuffer header");
@@ -1960,6 +1985,8 @@ void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupInd
 
     const int tiles = TilesPerLine * TileLines;
     const int groups = (numPolygons + 31) / 32;
+    const int polyBits = PolyIdxBits();
+    const u32 polyMask = (1u << polyBits) - 1;
 
     std::vector<u32> bin(sizeof(BinResultHeader) / 4 + (size_t)tiles * (CoarseBinStride + 2 * BinStride));
     bool binOk = CheckRead(BinResultMemory, 0, bin.size() * 4, bin.data());
@@ -2031,8 +2058,8 @@ void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupInd
     {
         u32 pos = unsorted[i*2], desc = unsorted[i*2+1];
         int px = (int)(pos & 0xFFFF), py = (int)(pos >> 16);
-        int poly = (int)(desc & 0x7FF);
-        u32 inVariant = desc >> 11;
+        int poly = (int)(desc & polyMask);
+        u32 inVariant = desc >> polyBits;
         bool onScreen = px < ScreenWidth && py < ScreenHeight && px % TileSize == 0 && py % TileSize == 0;
         if (!onScreen)
             offscreenC.Fail("work=%u x=%d y=%d poly=%d screen=%dx%d", i, px, py, poly, ScreenWidth, ScreenHeight);
@@ -2049,13 +2076,13 @@ void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupInd
             varOffsetC.Fail("work=%u poly=%d variant=%u offset=%u count=%u", i, poly, rp.Variant, inVariant,
                 rp.Variant < numVariants ? header.VariantWorkRealCount[rp.Variant] : 0);
         if (onScreen)
-            keys.push_back(((u64)((py / TileSize) * TilesPerLine + px / TileSize) << 11) | (u64)poly);
+            keys.push_back(((u64)((py / TileSize) * TilesPerLine + px / TileSize) << polyBits) | (u64)poly);
     }
     std::sort(keys.begin(), keys.end());
     for (size_t i = 1; i < keys.size(); i++)
     {
         if (keys[i] == keys[i-1])
-            dupesC.Fail("tile=%d,%d poly=%d", (int)((keys[i] >> 11) % TilesPerLine), (int)((keys[i] >> 11) / TilesPerLine), (int)(keys[i] & 0x7FF));
+            dupesC.Fail("tile=%d,%d poly=%d", (int)((keys[i] >> polyBits) % TilesPerLine), (int)((keys[i] >> polyBits) / TilesPerLine), (int)(keys[i] & polyMask));
     }
 
     // c. each tile and group's fine mask against the WorkDescs at its work offset
@@ -2077,7 +2104,7 @@ void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupInd
                     maskC.Fail("tile=%d,%d group=%d bit=%d work=%u past written=%u", t % TilesPerLine, t / TilesPerLine, g, bit, idx, written);
                     continue;
                 }
-                u32 pos = unsorted[idx*2], poly = unsorted[idx*2+1] & 0x7FF;
+                u32 pos = unsorted[idx*2], poly = unsorted[idx*2+1] & polyMask;
                 if (pos != expectPos || poly != (u32)(g * 32 + bit))
                     maskC.Fail("tile=%d,%d group=%d bit=%d work=%u has tile=%u,%u poly=%u", t % TilesPerLine, t / TilesPerLine, g, bit,
                         idx, pos & 0xFFFF, pos >> 16, poly);
@@ -2091,7 +2118,7 @@ void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupInd
     for (u32 j = 0; workOk && j < written; j++)
     {
         u32 pos = sorted[j*2], desc = sorted[j*2+1];
-        u32 poly = desc & 0x7FF, idx = desc >> 11;
+        u32 poly = desc & polyMask, idx = desc >> polyBits;
         if (idx >= written)
         {
             sortC.Fail("sorted=%u unsorted=%u past written=%u", j, idx, written);
@@ -2102,9 +2129,9 @@ void ComputeRenderer::RunCheck(int numPolygons, u32 numVariants, int numSetupInd
         u32 variant = poly < (u32)numPolygons ? RenderPolygons[poly].Variant : MaxVariants;
         bool inRange = variant < numVariants && j >= header.SortedWorkOffset[variant]
             && j - header.SortedWorkOffset[variant] < header.VariantWorkRealCount[variant];
-        if (unsorted[idx*2] != pos || (unsorted[idx*2+1] & 0x7FF) != poly || !inRange)
+        if (unsorted[idx*2] != pos || (unsorted[idx*2+1] & polyMask) != poly || !inRange)
             sortC.Fail("sorted=%u unsorted=%u tile=%u,%u poly=%u, unsorted has tile=%u,%u poly=%u, in variant range=%d", j, idx,
-                pos & 0xFFFF, pos >> 16, poly, unsorted[idx*2] & 0xFFFF, unsorted[idx*2] >> 16, unsorted[idx*2+1] & 0x7FF, inRange ? 1 : 0);
+                pos & 0xFFFF, pos >> 16, poly, unsorted[idx*2] & 0xFFFF, unsorted[idx*2] >> 16, unsorted[idx*2+1] & polyMask, inRange ? 1 : 0);
     }
 
     // d. each polygon's X spans, one a row, inside its box (X1 is exclusive)
@@ -2272,8 +2299,12 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     gpu.GPU3D.SceneRepeatCheck = (OptMask & ComputeOpt_SwapSkip) != 0;
     bool identical = gpu.GPU3D.RenderFrameIdentical
         || ((OptMask & ComputeOpt_SwapSkip) && gpu.GPU3D.RenderSceneRepeated);
+    // the polygon list's size goes by the target and the latched scene's wide list (MaxPolygonsFor),
+    // not GPU::WidePolys itself, which only reaches a scene at its swap
+    WideList = gpu.GPU3D.RenderWideList;
     int targetWidth = FrameTargetWidth(gpu);
-    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSize) != TileSize || optChanged)
+    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSize) != TileSize || optChanged
+        || MaxPolygonsFor(targetWidth, WideList) != MaxPolygons)
     {
         keep = false;
         ResizeTargets(ScaleFactor, HiresCoordinates, targetWidth);
@@ -2464,8 +2495,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     int numYSpans = 0;
     int numSetupIndices = 0;
-    // the polygons that fit in the span buffers, the rest of the frame is dropped
-    int numPolygons = gpu.GPU3D.RenderNumPolygons;
+    // the polygons that fit in the span buffers, the rest of the frame is dropped. at most MaxPolygons:
+    // WideMelon's wide list can have more on the frame its target goes back to native
+    int numPolygons = std::min((int)gpu.GPU3D.RenderNumPolygons, MaxPolygons);
     const int maxSetupIndices = (int)YSpanIndices.size();
 
     /*
@@ -2491,7 +2523,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     bool enableTextureMaps = gpu.GPU3D.RenderDispCnt & (1<<0);
 
-    for (int i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
+    for (int i = 0; i < numPolygons; i++)
     {
         Polygon* polygon = gpu.GPU3D.RenderPolygonRAM[i];
 
@@ -2617,7 +2649,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
         // the span buffers are sized by guesses, so stop before they overflow. each side makes at
         // most one y-span per vertex, and each line one setup index (one if it's flat)
-        if (numYSpans + 2 * (int)nverts > MaxYSpanSetups
+        if (numYSpans + 2 * (int)nverts > YSpanSetupLimit
             || numSetupIndices + std::max(ybot - ytop, 1) > maxSetupIndices)
         {
             numPolygons = i;
@@ -3261,8 +3293,11 @@ int ComputeRenderer::FrameTargetWidth(const GPU& gpu) noexcept
 // Blit reads the image as it was
 bool ComputeRenderer::KeepFrameForBlit(const GPU& gpu)
 {
+    // as RenderFrame will see it, which TileSizeFor goes by too
+    WideList = gpu.GPU3D.RenderWideList;
     int targetWidth = FrameTargetWidth(gpu);
-    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSizeOf(gpu)) != TileSize)
+    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSizeOf(gpu)) != TileSize
+        || MaxPolygonsFor(targetWidth, WideList) != MaxPolygons)
         return false;
 
     KeepRequested = true;

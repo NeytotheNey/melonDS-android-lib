@@ -105,7 +105,7 @@ namespace melonDS
 //   pastbound       frames where wanted went past bound. should stay 0, the room counts on it
 //   xspans a/b      setup indices, which is one X span each, of the most the polygon setup takes
 //   xroom           the X spans their buffers have room for now (b at most)
-//   yspans a/b      Y span setups, of MaxYSpanSetups
+//   yspans a/b      Y span setups, of YSpanSetupLimit (twice with WideMelon's wide list)
 //   variants a/b    of MaxVariants
 //   polys           polygons drawn
 //   cut             frames that dropped polygons because the variants or a span buffer ran out

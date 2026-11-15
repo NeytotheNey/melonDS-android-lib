@@ -34,6 +34,7 @@ struct WideCheckOptions
     int RTC[6] {};
     bool SqueezeBoxTest = false; // box tests as WideMelon does them: memory may differ, only reported
     bool EqualTiming = true;     // every polygon timed alike in both runs, false = as WideMelon times them
+    bool WidePolys = false;      // GPU::WidePolys in both runs: bit 13, the native counts and the count reads must match
 };
 
 // runs the game twice in lockstep, WideMelon off and on, and compares what has to match;

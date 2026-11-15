@@ -21,7 +21,7 @@
 //   sh tools/swi-harness/wide_check.sh
 //
 // or one with swi-harness.exe <rom.nds> --wide-check W --frames N --out <dir> [--state <file.mlN>]
-// [--tap KEY@FRAME ...] [--box-test wide] [--timing native]. Writes summary.txt, frames.tsv and
+// [--tap KEY@FRAME ...] [--box-test wide] [--timing native] [--wide-polys 1]. Writes summary.txt, frames.tsv and
 // diffs.txt to <dir>. Exits 0 on PASS, 1 on FAIL, 2 if it couldn't run, 3 if INCONCLUSIVE.
 //
 // Two emulators run the same frames in lockstep with FreeBIOS: one with WideMelon off, one with
@@ -52,6 +52,10 @@
 // - the window edge fix (native columns 0 and 255 take their neighbor's window mask), which changes
 //   the middle and display capture on purpose: done in both runs (GPU2D_Soft DrawScanline_BGOBJ);
 // - the polygon RAM counts, reported (with how often the game read them).
+// With --wide-polys 1 (GPU::WidePolys in both runs) the wide run keeps its scene in WideMelon's wide
+// list and the game sees the native view's counts, so DISP3DCNT bit 13 is compared like the rest, the
+// wide run's native counts have to be the 256 run's real ones every frame, and the values the game
+// read from the count registers (a hash of them, GPU3D::WideCheckCountHash) have to match.
 // The wings themselves are drawn by the GL compositor, so there's no wing picture here.
 //
 // SWI_HARNESS_SHADOW2D=on (the wide run) or both (both runs) also turns the GPU 2D shadow recorder on
@@ -103,6 +107,7 @@ std::unique_ptr<NDS> Boot(const WideCheckOptions& opts, int width, const std::ve
     nds->GPU.GPU3D.WideCheck = width;
     nds->GPU.GPU3D.WideCheckSqueezeBoxTest = opts.SqueezeBoxTest;
     nds->GPU.GPU3D.WideCheckEqualTiming = opts.EqualTiming;
+    nds->GPU.WidePolys = opts.WidePolys; // latched at the reset below
     nds->SetRenderer3D(std::make_unique<SoftRenderer>()); // sizes the framebuffers for the switch
     if (shadow2d)
     {
@@ -157,7 +162,7 @@ const u32 Disp3DOverflow = 1 << 13;
 
 // which timing values differ between the runs after a frame (bits as in frames.tsv's timing column)
 enum { TimeARM9 = 1, TimeARM7 = 2, Time3D = 4, TimeGXStat = 8, TimeFIFO = 16, TimeDisp3D = 32 };
-u32 TimingDiffs(NDS& off, NDS& on)
+u32 TimingDiffs(NDS& off, NDS& on, u32 dispMask)
 {
     const GPU3D& a = off.GPU.GPU3D;
     const GPU3D& b = on.GPU.GPU3D;
@@ -166,7 +171,7 @@ u32 TimingDiffs(NDS& off, NDS& on)
         | (a.Timestamp != b.Timestamp ? Time3D : 0)
         | (a.GXStat != b.GXStat ? TimeGXStat : 0)
         | (a.CmdFIFO.Level() != b.CmdFIFO.Level() ? TimeFIFO : 0)
-        | (((a.DispCnt ^ b.DispCnt) & ~Disp3DOverflow) ? TimeDisp3D : 0);
+        | (((a.DispCnt ^ b.DispCnt) & dispMask) ? TimeDisp3D : 0);
 }
 
 void AppendF(std::string& out, const char* fmt, ...)
@@ -238,6 +243,9 @@ int RunWideCheck(const WideCheckOptions& opts)
     u32 dropFrames = 0, maxFrameDrops = 0, lastDrops = 0;
     u32 nativeMisses = 0, nativeMaxPolys = 0, nativeMaxVerts = 0;
     u32 timingFrames = 0, firstTiming = 0, timingKinds = 0, overflowFrames = 0;
+    u32 countHashFrames = 0, firstCountHash = 0;
+    // with the wide list, bit 13 is the native view's, so it's compared like the rest
+    const u32 dispMask = opts.WidePolys ? ~0u : ~Disp3DOverflow;
     for (u32 frame = 1; frame <= opts.Frames; frame++)
     {
         u32 keymask = 0xFFF;
@@ -289,7 +297,7 @@ int RunWideCheck(const WideCheckOptions& opts)
             note("%s: %u bytes differ, first at %05X (%02X vs %02X)", r.Name, n, i, r.Off[i], r.On[i]);
         }
 
-        u32 timing = TimingDiffs(*off, *on);
+        u32 timing = TimingDiffs(*off, *on, dispMask);
         if (timing)
         {
             if (!timingFrames++) firstTiming = frame;
@@ -311,21 +319,35 @@ int RunWideCheck(const WideCheckOptions& opts)
         lastDrops += drops;
         dropFrames += drops > 0;
         maxFrameDrops = std::max(maxFrameDrops, drops);
-        // the on run's estimate of the native view's polygon RAM counts against the off run's real ones
+        // the on run's estimate of the native view's polygon RAM counts against the off run's real ones.
+        // with the wide list the game reads them, so they have to match (a fail)
+        bool nativeMiss = false, countHashMiss = false;
         if (opts.Width != 256)
         {
             const GPU3D& g0 = off->GPU.GPU3D;
             const GPU3D& g1 = on->GPU.GPU3D;
             u32 dp = (u32)std::abs((s64)g1.GetNativeNumPolygons() - g0.NumPolygons);
             u32 dv = (u32)std::abs((s64)g1.GetNativeNumVertices() - g0.NumVertices);
-            nativeMisses += dp || dv;
+            nativeMiss = dp || dv;
+            nativeMisses += nativeMiss;
             nativeMaxPolys = std::max(nativeMaxPolys, dp);
             nativeMaxVerts = std::max(nativeMaxVerts, dv);
+            if (nativeMiss && opts.WidePolys && nativeMisses <= 20)
+                note("native counts differ: off %u polygons %u vertices, on (native view) %u / %u", g0.NumPolygons, g0.NumVertices,
+                    g1.GetNativeNumPolygons(), g1.GetNativeNumVertices());
+            // what the game read from the count registers, so far
+            countHashMiss = g0.WideCheckCountHash != g1.WideCheckCountHash;
+            if (countHashMiss && !countHashFrames++)
+            {
+                firstCountHash = frame;
+                if (opts.WidePolys)
+                    note("polygon RAM count reads differ from here on (%u reads off, %u on)", g0.WideCheckCountReads, g1.WideCheckCountReads);
+            }
         }
         planeDiffs += plane; ctrlDiffs += ctrl; memDiffs += mem;
         fprintf(log, "%u\t%u\t%u\t%u\t%02X\t%u\t%u\t%u\t%u\t%u\n", frame, plane, ctrl, mem, timing, pa, pb, wing3d, white, capture);
 
-        if (plane || ctrl || ((mem || timing) && !opts.SqueezeBoxTest))
+        if (plane || ctrl || ((mem || timing) && !opts.SqueezeBoxTest) || (opts.WidePolys && (nativeMiss || countHashMiss)))
         {
             if (!failFrames++)
             {
@@ -352,9 +374,9 @@ int RunWideCheck(const WideCheckOptions& opts)
     const char* result = failFrames ? "FAIL" : inconclusive ? "INCONCLUSIVE" : "PASS";
 
     std::string summary;
-    AppendF(summary, "%s: %u frames, wide %d, %s timing, %s box tests: %s%s%s\n",
+    AppendF(summary, "%s: %u frames, wide %d, %s timing, %s box tests, wide polys %d: %s%s%s\n",
         std::filesystem::path(opts.RomPath).filename().string().c_str(), opts.Frames, opts.Width,
-        opts.EqualTiming ? "equalized" : "native", opts.SqueezeBoxTest ? "squeezed" : "stock", result,
+        opts.EqualTiming ? "equalized" : "native", opts.SqueezeBoxTest ? "squeezed" : "stock", opts.WidePolys ? 1 : 0, result,
         inconclusive ? ", " : "", inconclusive ? inconclusive : "");
 
     // what a PASS here does and doesn't show
@@ -384,15 +406,18 @@ int RunWideCheck(const WideCheckOptions& opts)
         (timingKinds & TimeARM9) ? ", ARM9" : "", (timingKinds & TimeARM7) ? ", ARM7" : "", (timingKinds & Time3D) ? ", 3D" : "",
         (timingKinds & TimeGXStat) ? ", GXSTAT" : "", (timingKinds & TimeFIFO) ? ", FIFO" : "", (timingKinds & TimeDisp3D) ? ", DISP3DCNT" : "");
     AppendF(summary, "  frames with 3D %u, with display capture %u\n", frames3D, captureFrames);
+    if (opts.WidePolys)
+        AppendF(summary, "  wide polys: DISP3DCNT bit 13 compared, the native counts and the count reads have to match: native counts\n"
+            "  off in %u frames, count reads differing from frame %u (%u frames)\n", nativeMisses, firstCountHash, countHashFrames);
     AppendF(summary, "  info: polygons drawn off %llu / on %llu (differ in %llu frames), polygon RAM count reads %u off / %u on,\n"
         "  box tests (%s) %u/%u hit off, %u/%u on (%u by the wide retry)\n",
         (unsigned long long)polysOff, (unsigned long long)polysOn, (unsigned long long)polyFrames,
         g0.WideCheckCountReads, g1.WideCheckCountReads, opts.SqueezeBoxTest ? "squeezed, memory not compared" : "stock",
         g0.WideCheckBoxHits, g0.WideCheckBoxTests, g1.WideCheckBoxHits, g1.WideCheckBoxTests, g1.WideCheckBoxRetryHits);
-    AppendF(summary, "  polygons dropped as the polygon or vertex RAM was full: off %u / on %u (%u of them would have fit natively),\n"
-        "  on in %u frames, at most %u in one; the on run's native polygon RAM counts were off in %u frames\n"
-        "  (by at most %u polygons, %u vertices); the DISP3DCNT overflow flag differed in %u frames\n",
-        g0.DroppedPolygons, g1.DroppedPolygons, g1.DroppedNativeFit, dropFrames, maxFrameDrops,
+    AppendF(summary, "  polygons dropped as the polygon or vertex RAM was full: off %u / on %u (%u of them would have fit natively,\n"
+        "  %u only the wide view kept), on in %u frames, at most %u in one; the on run's native polygon RAM counts were\n"
+        "  off in %u frames (by at most %u polygons, %u vertices); the DISP3DCNT overflow flag differed in %u frames\n",
+        g0.DroppedPolygons, g1.DroppedPolygons, g1.DroppedNativeFit, g1.DroppedWing, dropFrames, maxFrameDrops,
         nativeMisses, nativeMaxPolys, nativeMaxVerts, overflowFrames);
     if (shadowOn)
     {

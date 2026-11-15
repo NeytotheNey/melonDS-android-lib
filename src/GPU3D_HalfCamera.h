@@ -32,6 +32,13 @@ class GPU;
 class GPU3D;
 struct Polygon;
 
+// a bank of the polygon and vertex RAM as the DS has it, and as GPU3D keeps it: WideMelon's wide list
+// (GPU::WidePolys, see GPU3D::SubmitPolygon) can hold twice that. here as GPU3D.h includes this first
+constexpr u32 NativePolygonRAMSize = 2048, NativeVertexRAMSize = 6144;
+constexpr u32 PolygonRAMSize = 4096, VertexRAMSize = 12288;
+// a bank's sorted polygons (GPU3D::RenderPolygonRAM)
+using RenderList = std::array<Polygon*, PolygonRAMSize>;
+
 // experiment, behind the Smooth 30 FPS setting (mode 4, quiet) and, in debug builds, debug.melonade.halfcam
 // (see DebugProperties.h). for games that draw a new
 // 3D scene every other frame: the frame a new scene B arrives shows scene B's own geometry seen from a
@@ -171,7 +178,7 @@ public:
     // through Invalidate, so it ends an in-between frame the same way a state load does
     void SetPaused(bool isPaused);
     // what a savestate has to contain: never the in-between scene
-    void GetRealRenderList(const std::array<Polygon*, 2048>*& list, u32& numPolygons) const noexcept;
+    void GetRealRenderList(const RenderList*& list, u32& numPolygons) const noexcept;
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -308,7 +315,7 @@ private:
     bool IsAfterMid = false;
     u32 MidNumPolygons = 0;
     u32 RealNumPolygons = 0;
-    std::array<Polygon*, 2048> RealList {};
+    RenderList RealList {};
 
     u32 SceneNumber = 0;
     Totals Total {};

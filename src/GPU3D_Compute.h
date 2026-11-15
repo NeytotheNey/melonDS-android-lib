@@ -27,6 +27,7 @@
 #include "types.h"
 
 #include "GPU3D.h"
+#include "WideMelon.h"
 
 #include "OpenGLSupport.h"
 #include "GPU_OpenGL.h"
@@ -251,8 +252,23 @@ private:
     int CoarseTileH {};
     int ClearCoarseBinMaskLocalSize {};
 
-    static constexpr int BinStride = 2048/32;
-    static constexpr int CoarseBinStride = BinStride/32;
+    // the polygons a frame can have: PolygonRAMSize, WideMelon's wide list (GPU::WidePolys), on a wide
+    // target when the latched scene was built into it (MaxPolygonsFor), else NativePolygonRAMSize as
+    // before. a shader define, with the bits a WorkDesc keeps the polygon index in (PolyIdxBits), and
+    // set by ResizeTargets
+    int MaxPolygons = NativePolygonRAMSize;
+    // GPU3D::RenderWideList as RenderFrame (or KeepFrameForBlit) last saw it
+    bool WideList = false;
+    [[nodiscard]] static int MaxPolygonsFor(int targetWidth, bool wideList) noexcept
+    {
+        return (targetWidth != WideMelon::NativeWidth && wideList) ? (int)PolygonRAMSize : (int)NativePolygonRAMSize;
+    }
+    [[nodiscard]] int PolyIdxBits() const noexcept { return MaxPolygons == (int)PolygonRAMSize ? 12 : 11; }
+    // the most work tiles the WorkDescs can count past the polygon index, and SortWork dispatch
+    [[nodiscard]] static s64 WorkTileLimitFor(int maxPolygons) noexcept { return maxPolygons == (int)PolygonRAMSize ? (1 << 20) : 65535 * 32; }
+    [[nodiscard]] s64 WorkTileLimit() const noexcept { return WorkTileLimitFor(MaxPolygons); }
+    int BinStride = NativePolygonRAMSize/32;
+    int CoarseBinStride = NativePolygonRAMSize/32/32;
 
     static constexpr int MaxVariants = 256;
 
@@ -273,10 +289,15 @@ private:
         u32 SortWorkWorkCount[4];
     };
 
-    static const int MaxYSpanSetups = 6144*2;
+    // two a vertex of the wide list, of which a frame has room for YSpanSetupLimit: 2 * VertexRAMSize
+    // with MaxPolygons at PolygonRAMSize, else 2 * NativeVertexRAMSize, as before. the GPU's copy of them
+    // and of RenderPolygons is sized by those (ResizeTargets)
+    static const int MaxYSpanSetups = VertexRAMSize*2;
+    int YSpanSetupLimit = NativeVertexRAMSize*2;
+    int YSpanSetupCapacity = NativeVertexRAMSize*2, RenderPolygonCapacity = NativePolygonRAMSize;
     std::vector<SetupIndices> YSpanIndices;
     SpanSetupY YSpanSetups[MaxYSpanSetups];
-    RenderPolygon RenderPolygons[2048];
+    RenderPolygon RenderPolygons[PolygonRAMSize];
 
     TexcacheOpenGL Texcache;
 
