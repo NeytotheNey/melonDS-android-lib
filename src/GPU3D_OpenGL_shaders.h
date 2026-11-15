@@ -165,6 +165,9 @@ layout(location = 0) out vec4 oColor;
 // so a coplanar decal compares with its own depth, as the software renderer stores it
 uniform int uEdgeScale;
 uniform float uDepthUnbias;
+// GPU::GLEdgeFast bit 0: pixels without the flag are discarded right after the attr fetch, before
+// the depth fetch (the same result: the blend leaves them as they are)
+uniform int uEdgeFast;
 uniform int uClearPolyID;
 uniform float uClearDepth;
 
@@ -223,8 +226,10 @@ void main()
     int scale = uEdgeScale;
 
     vec4 ret = vec4(0,0,0,0);
-    vec4 depth = texelFetch(DepthBuffer, coord, 0);
     vec4 attr = texelFetch(AttrBuffer, coord, 0);
+    if (uEdgeFast != 0 && (AttrG(attr) & 2) == 0)
+        discard;
+    vec4 depth = texelFetch(DepthBuffer, coord, 0);
 
     int polyid = PolyID(attr);
 
@@ -968,6 +973,16 @@ smooth out float fZ;
 // vertices (GLRenderer::BuildEdges), for kRenderFS's EdgeFlag
 in uint vEdgeInfo;
 flat out highp uint fEdgeInfo;
+#ifdef EdgeLines
+// GPU::GLEdgeFast bit 1: the outline of a polygon with up to 4 edges, as kRenderFS's EdgeFlag reads
+// it from EdgeTex otherwise, (nx, ny, c) an edge packed into 12 floats (GLRenderer::BuildEdges)
+in vec4 vEdgeLine0;
+in vec4 vEdgeLine1;
+in vec4 vEdgeLine2;
+flat out highp vec4 fEdgeLine0;
+flat out highp vec4 fEdgeLine1;
+flat out highp vec4 fEdgeLine2;
+#endif
 #endif
 
 #ifdef TexWrapVS
@@ -1015,6 +1030,11 @@ void main()
 #endif
 #ifdef EdgeMark
     fEdgeInfo = vEdgeInfo;
+#ifdef EdgeLines
+    fEdgeLine0 = vEdgeLine0;
+    fEdgeLine1 = vEdgeLine1;
+    fEdgeLine2 = vEdgeLine2;
+#endif
 #endif
 
     gl_Position = fpos;
@@ -1040,20 +1060,42 @@ smooth in float fZ;
 // fragment
 flat in highp uint fEdgeInfo;
 uniform highp sampler2D EdgeTex;
+#ifdef EdgeLines
+// GPU::GLEdgeFast bit 1: polygons with up to 4 edges have them here instead of in EdgeTex
+flat in highp vec4 fEdgeLine0;
+flat in highp vec4 fEdgeLine1;
+flat in highp vec4 fEdgeLine2;
+#endif
 // the vertex shader's: nonzero for a depth-equal polygon's margin (GLRenderer::SetPolygonDepthBias)
 uniform float uDepthBias;
+
+// one edge's test, the same expression for both ways the edges come in
+bool EdgeOutside(vec3 e, vec2 p)
+{
+    return dot(e.xy, p) + e.z < 0.0;
+}
 
 float EdgeFlag()
 {
     uint count = fEdgeInfo >> 16;
     if (count == 0u) return 1.0;
-    int base = int(fEdgeInfo & 0xFFFFu);
     vec2 p = gl_FragCoord.xy;
+#ifdef EdgeLines
+    if (count <= 4u)
+    {
+        if (EdgeOutside(fEdgeLine0.xyz, p)) return 1.0;
+        if (count > 1u && EdgeOutside(vec3(fEdgeLine0.w, fEdgeLine1.xy), p)) return 1.0;
+        if (count > 2u && EdgeOutside(vec3(fEdgeLine1.zw, fEdgeLine2.x), p)) return 1.0;
+        if (count > 3u && EdgeOutside(fEdgeLine2.yzw, p)) return 1.0;
+        return 0.0;
+    }
+#endif
+    int base = int(fEdgeInfo & 0xFFFFu);
     for (int k = 0; k < int(count); k++)
     {
         int idx = base + k;
         vec4 e = texelFetch(EdgeTex, ivec2(idx & 1023, idx >> 10), 0);
-        if (dot(e.xy, p) + e.z < 0.0) return 1.0;
+        if (EdgeOutside(e.xyz, p)) return 1.0;
     }
     return 0.0;
 }

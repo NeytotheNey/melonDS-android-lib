@@ -130,7 +130,8 @@ private:
     // full: the twin with the old decode path (GPU::GLTexCache step 2), RenderShader[FullShader + id]
     // edge: the build whose opaque fragments write the edge flag (GPU::GLEdgeMark 1, E1),
     // RenderShader[EdgeShader + id]
-    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false, bool full = false, bool edge = false);
+    // edge 2: with the outlines of polygons with up to 4 edges as flat varyings (GPU::GLEdgeFast bit 1), RenderShader[EdgeLineShader + id]
+    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false, bool full = false, int edge = 0);
     void UseRenderShader(bool wbuffer, int mode, bool fetch = false, bool nodiscard = false, bool full = false);
     bool PrepareFullShaders();
     void DropFullShaders();
@@ -195,7 +196,9 @@ private:
     // draws of those frames only (UseRenderShader)
     static constexpr int FullShader = 5;
     static constexpr int EdgeShader = 10;
-    static constexpr int NumRenderShaders = 20;
+    // [20] to [29]: the same with GPU::GLEdgeFast bit 1's flat varyings (EdgeLines), for those frames
+    static constexpr int EdgeLineShader = 20;
+    static constexpr int NumRenderShaders = 30;
     GLuint RenderShader[NumRenderShaders] {};
     GLint RenderModeULoc[NumRenderShaders] {};
     GLint DepthBiasLoc[NumRenderShaders] {};
@@ -249,8 +252,8 @@ private:
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
-    // kFinalPassEdgeFS's uEdgeScale, uDepthUnbias, uClearPolyID, uClearDepth
-    GLint EdgeULoc[4] {};
+    // kFinalPassEdgeFS's uEdgeScale, uDepthUnbias, uClearPolyID, uClearDepth, uEdgeFast
+    GLint EdgeULoc[5] {};
 
     // GPU::GLEdgeMark (E1), set per frame: 1 and 2, the frame's opaque draws use
     // RenderShader[EdgeShader + id], whose fragments write attr G: the edge flag (1: near their
@@ -260,6 +263,18 @@ private:
     // again (DropEdgeShaders)
     int EdgeMark = 0;
     bool EdgeShadersFailed = false;
+    // GPU::GLEdgeFast, set per frame: bit 0 the edge pass discards unflagged pixels early and is
+    // scissored to OpaqueBox, the target pixels the opaque-drawn polygons can cover; bit 1 (with
+    // EdgeMark 1) polygons with up to 4 edges carry them as flat varyings (EdgeLineBuffer, the
+    // RenderShader[EdgeLineShader + id] builds). EdgeSet: the program set of the frame's opaque
+    // draws, EdgeShader or EdgeLineShader
+    int EdgeFast = 0;
+    int EdgeSet = EdgeShader;
+    // the EdgeLines builds failed once: bit 1 draws from the texture for the renderer's life.
+    // FailEdgeLines: debug only, GPU::GLEdgeFast 4 makes them fail, to test that
+    bool EdgeLinesFailed = false;
+    bool FailEdgeLines = false;
+    s32 OpaqueBox[4] {};
     // GPU::GLEdgeMark 1: each polygon's outline, one RGBA32F texel an edge (kRenderFS's EdgeFlag),
     // 1024 wide, unit 5, made the first frame that needs it; EdgeInfoBuffer, the per-vertex attribute
     // (location 4, its own buffer EdgeInfoBufferID) saying where a vertex's polygon's edges are
@@ -319,6 +334,9 @@ private:
     u32 NumIndices {};
     // GPU::GLEdgeMark 1: a word per vertex of VertexBuffer, see EdgeTexID
     u32 EdgeInfoBuffer[VertexRAMSize + 3 * PolygonRAMSize] {};
+    // GPU::GLEdgeFast bit 1: 12 floats a vertex (locations 5 to 7), up to 4 edges of its polygon
+    float EdgeLineBuffer[(VertexRAMSize + 3 * PolygonRAMSize) * 12] {};
+    GLuint EdgeLineBufferID {};
 
     GLuint TexMemID {};
     GLuint TexPalMemID {};
@@ -492,6 +510,7 @@ private:
     GLuint CoverAlphaShader = 0;
     GLint CoverAlphaSizeLoc = -1;
     GLint FragPassLoc[NumRenderShaders] {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                          -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     // HASH3D (GPU::Hash3DLogging)
     std::unique_ptr<Hash3DReadback> Hash3D;

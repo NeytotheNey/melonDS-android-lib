@@ -852,6 +852,16 @@ public:
     // depth-equal polygons' own depth (their margin bias undone). 1 is the default since 11-15; the
     // frontend sets 0 or 1 from its setting, and a debug switch can set any of them
     int GLEdgeMark = 1;
+    // OpenGL renderer, E1 speedups (docs/plan-gpu-discovery.md), a bit each, exact on the desktop,
+    // the OnePlus 7 Pro and the Pixel 8. bit 0 (off): the edge pass discards pixels without the edge
+    // flag before fetching their depth, and is scissored to the box of the polygons drawn opaque (a
+    // stencil test can't be used there, the depth/stencil texture is detached for it); no gain
+    // measured on Adreno or Mali (11-15). bit 1 (on): with GLEdgeMark 1, polygons with up to 4 edges
+    // hand them to the fragment shader as flat varyings (3 vec4) instead of texel fetches (OnePlus
+    // opaque pass -11%, Pixel 8 neutral at 8x and -9% at 16x); if those programs don't build, the
+    // texture ones are used. bit 2 (debug builds): those programs fail on purpose. 2 is the default
+    // since 11-15; only changed by a debug switch
+    int GLEdgeFast = 2;
     // OpenGL renderer, experiment D1 (docs/plan-gpu-discovery.md), a bit each. bit 0: the plain
     // clear (not the clear bitmap, DISP3DCNT bit 14) is a glClearBuffer per attachment instead of a
     // full-screen quad, with the same values the quad's shader writes. bit 1: after the frame, the
