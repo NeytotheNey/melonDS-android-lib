@@ -1064,8 +1064,8 @@ public:
     // RAM counts the game sees, and DISP3DCNT bit 13, are the native view's, and the scene is kept in a
     // list twice the DS's size, half of it for the polygons only the wings show, so the wide view no
     // longer drops polygons the DS would draw (GPU3D::WideListOn). latched with the view width, at a
-    // polygon RAM swap. off, the default until the phones have checked it, is as before
-    bool WidePolys = false;
+    // polygon RAM swap. on by default since 11-14 (phones checked); off is as before, for A/Bs
+    bool WidePolys = true;
     // logs a HASH3D line per frame with a checksum of the 3D image at native resolution, numbered like
     // HASH2D (Renderer3D::QueueHash3D)
     bool Hash3DLogging = false;
