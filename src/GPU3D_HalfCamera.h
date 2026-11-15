@@ -77,7 +77,7 @@ using RenderList = std::array<Polygon*, PolygonRAMSize>;
 //   vb scenes interp      VBlanks, swaps, in-between scenes drawn
 //   nolock ...            scenes that showed the real one instead, by reason:
 //     nolock   the swaps aren't on every other frame
-//     render   the renderer can't draw it (only the compute renderer does)
+//     render   the renderer can't draw it (only the compute and OpenGL renderers do)
 //     cap      display capture ran recently, is armed, or was armed by line 215 (capab) or line 0 (capre).
 //              a line 0 redraw reads VRAM later than line 215 would, so with capre above 0, or loadre (the
 //              redraw after a state load or reset that interrupted an in-between frame), a run can't be

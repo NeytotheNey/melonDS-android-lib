@@ -1330,7 +1330,8 @@ bool HalfCamera::ShowReplayedScene()
     // copy isn't valid), the in-between scene is compared with it. the same list by value draws
     // the same picture, so the real one is shown: a frame like any other, which can then be left
     // out as identical, and so can the one after it. anything else is an in-between frame as
-    // before, which is always drawn
+    // before, which is always drawn. only the compute renderer keeps the copy (SceneRepeatCheck), so
+    // with OpenGL every in-between scene is shown
     if (Main.MatchRenderScene(false))
     {
         Main.MidScenesSame++;

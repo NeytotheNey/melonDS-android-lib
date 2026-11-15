@@ -76,6 +76,9 @@ public:
     void PrepareCaptureFrame() override;
     void FlushCommands() override;
     void Blit(const GPU& gpu) override;
+    // HalfCamera: RenderFrame copies what it draws from the polygons (SetupPolygon, BuildPolygons) and
+    // hands it to GL before it returns, and nothing reads them after that (TexCacheOff runs inside it)
+    [[nodiscard]] bool CanDrawReplayedScene() const noexcept override { return true; }
 
     [[nodiscard]] bool SupportsBlitAfterRender() const noexcept override { return true; }
     bool KeepFrameForBlit(const GPU& gpu) override;
