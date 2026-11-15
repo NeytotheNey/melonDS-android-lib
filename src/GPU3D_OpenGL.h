@@ -113,9 +113,6 @@ private:
         u32 IndicesOffset;
         GLuint PrimType;
 
-        u32 NumEdgeIndices;
-        u32 EdgeIndicesOffset;
-
         u32 RenderKey;
         // what the vertices' second polygon word (fPolygonAttr.y) is: TexParam's VRAM offset, or
         // with GPU::GLTexCache 0x40000000 | the texture's heap offset (below 2^22, AssignTexCache),
@@ -131,10 +128,15 @@ private:
     // framebuffer fetch build (GPU::GLTransSkip bit 2), RenderShader[2 + wbuffer]. nodiscard: the
     // opaque-only build without discard (GPU::GLNoDiscard), RenderShader[4], Z-buffer only
     // full: the twin with the old decode path (GPU::GLTexCache step 2), RenderShader[FullShader + id]
-    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false, bool full = false);
+    // edge: the build whose opaque fragments write the edge flag (GPU::GLEdgeMark 1, E1),
+    // RenderShader[EdgeShader + id]
+    bool BuildRenderShader(bool wbuffer, bool fragCount = false, bool fetch = false, bool nodiscard = false, bool full = false, bool edge = false);
     void UseRenderShader(bool wbuffer, int mode, bool fetch = false, bool nodiscard = false, bool full = false);
     bool PrepareFullShaders();
     void DropFullShaders();
+    bool PrepareEdgeShaders();
+    void DropEdgeShaders();
+    void BuildEdges(const RendererPolygon* rp, u32 vidxFirst, u32 vidxEnd);
     static bool PolyFull(const RendererPolygon* rp) { return (rp->RenderKey & RenderKey_TexFull) != 0; }
     bool PrepareFetchShaders();
     bool PrepareNoDiscardShader();
@@ -154,7 +156,6 @@ private:
     void BuildPolygons(RendererPolygon* polygons, int npolys);
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
-    int RenderPolygonEdgeBatch(int i) const;
     void ClearShadowMaskLines(const Polygon* polygon, const bool* lastWasMask) const;
     void SetDepthBias(float bias);
     void SetPolygonDepthBias(u32 polyattr);
@@ -188,11 +189,17 @@ private:
     // step 2's twins of [0] to [4] with the old decode path, for the polygons the heap doesn't serve
     // (RenderKey_TexFull), made the first frame that has such a polygon (PrepareFullShaders); while
     // step 2 runs, [0] to [4] are built without that path (TexCacheOnly)
+    // [10] to [19]: GPU::GLEdgeMark 1's builds of [0] to [9] (EdgeShader + id) whose opaque fragments
+    // write the edge flag, only [10], [11], [14] and the twins [15], [16], [19] (the opaque draws'
+    // programs), made the first edge-marking frame (PrepareEdgeShaders) and used for the opaque
+    // draws of those frames only (UseRenderShader)
     static constexpr int FullShader = 5;
-    GLuint RenderShader[10] {};
-    GLint RenderModeULoc[10] {};
-    GLint DepthBiasLoc[10] {};
-    float DepthBias[10] {};
+    static constexpr int EdgeShader = 10;
+    static constexpr int NumRenderShaders = 20;
+    GLuint RenderShader[NumRenderShaders] {};
+    GLint RenderModeULoc[NumRenderShaders] {};
+    GLint DepthBiasLoc[NumRenderShaders] {};
+    float DepthBias[NumRenderShaders] {};
     int CurShaderID = -1;
     int CurRenderMode = -1;
 
@@ -242,6 +249,28 @@ private:
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
+    // kFinalPassEdgeFS's uEdgeScale, uDepthUnbias, uClearPolyID, uClearDepth
+    GLint EdgeULoc[4] {};
+
+    // GPU::GLEdgeMark (E1), set per frame: 1 and 2, the frame's opaque draws use
+    // RenderShader[EdgeShader + id], whose fragments write attr G: the edge flag (1: near their
+    // polygon's outline, EdgeTex; 2: always) and whether their depth was biased; 0 neither (the
+    // switch, DISP3DCNT bit 5, no polygon drawn opaque, or the programs didn't build).
+    // EdgeShadersFailed: a build failed, the frames draw as 0 until the render programs are made
+    // again (DropEdgeShaders)
+    int EdgeMark = 0;
+    bool EdgeShadersFailed = false;
+    // GPU::GLEdgeMark 1: each polygon's outline, one RGBA32F texel an edge (kRenderFS's EdgeFlag),
+    // 1024 wide, unit 5, made the first frame that needs it; EdgeInfoBuffer, the per-vertex attribute
+    // (location 4, its own buffer EdgeInfoBufferID) saying where a vertex's polygon's edges are
+    static constexpr u32 EdgeTexWidth = 1024;
+    static constexpr u32 MaxEdges = PolygonRAMSize * 10;
+    // the first edge is 16 bits of the vertex's edge info
+    static_assert(MaxEdges <= 65536);
+    GLuint EdgeTexID {};
+    GLuint EdgeInfoBufferID {};
+    u32 NumEdges = 0;
+    float EdgeData[MaxEdges * 4] {};
 
     // std140 compliant structure
     struct
@@ -285,10 +314,11 @@ private:
 
     GLuint VertexArrayID {};
     GLuint IndexBufferID {};
-    u16 IndexBuffer[PolygonRAMSize * 40] {};
-    u32 NumIndices {}, NumEdgeIndices {};
-
-    const u32 EdgeIndicesOffset = PolygonRAMSize * 30;
+    // the most a polygon takes is BetterPolygons' 10 triangles
+    u16 IndexBuffer[PolygonRAMSize * 30] {};
+    u32 NumIndices {};
+    // GPU::GLEdgeMark 1: a word per vertex of VertexBuffer, see EdgeTexID
+    u32 EdgeInfoBuffer[VertexRAMSize + 3 * PolygonRAMSize] {};
 
     GLuint TexMemID {};
     GLuint TexPalMemID {};
@@ -461,7 +491,8 @@ private:
     // the covered count when the clear alpha is 0 (kCoverAlphaCS), and its uSize
     GLuint CoverAlphaShader = 0;
     GLint CoverAlphaSizeLoc = -1;
-    GLint FragPassLoc[10] {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    GLint FragPassLoc[NumRenderShaders] {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     // HASH3D (GPU::Hash3DLogging)
     std::unique_ptr<Hash3DReadback> Hash3D;
     // GLTRANS (GPU::SceneStats, with GPU::GLTransSkip)

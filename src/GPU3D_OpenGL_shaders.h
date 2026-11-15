@@ -137,6 +137,7 @@ void main()
 const char* kFinalPassEdgeFS = kShaderHeader R"(
 
 precision highp float;
+precision highp int;
 
 uniform highp sampler2D DepthBuffer;
 uniform sampler2D AttrBuffer;
@@ -155,6 +156,18 @@ layout(std140) uniform uConfig
 
 layout(location = 0) out vec4 oColor;
 
+// GPU::GLEdgeMark (E1, GLRenderer::RenderSceneChunk): uEdgeScale, the neighbor offset, one DS
+// pixel in target pixels (the 3D scale, wide views too). uClearPolyID and uClearDepth: what a
+// neighbor outside the target reads, the clear plane's ID and depth, as the software renderer
+// fills its screen borders with (texelFetch outside a texture is undefined in GLES). uDepthUnbias:
+// what SetPolygonDepthBias moved a depth-equal polygon's depth nearer by (0x200 Z, 0xFF W, in
+// depth units), added back where attr G says the opaque draw was biased (kRenderFS's EdgeAttrG),
+// so a coplanar decal compares with its own depth, as the software renderer stores it
+uniform int uEdgeScale;
+uniform float uDepthUnbias;
+uniform int uClearPolyID;
+uniform float uClearDepth;
+
 // make up for crapo zbuffer precision
 bool isless(float a, float b)
 {
@@ -165,9 +178,38 @@ bool isless(float a, float b)
     return diff < (256.0 / 16777216.0);
 }
 
-bool isgood(vec4 attr, float depth, int refPolyID, float refDepth)
+// the attr target holds ID/63 in 8 bits, which truncating can read back one low (ID 1 as 0)
+int PolyID(vec4 attr)
 {
-    int polyid = int(attr.r * 63.0);
+    return int(attr.r * 63.0 + 0.5);
+}
+
+// attr G (kRenderFS's EdgeAttrG): (2 * edge flag + depth biased) / 3
+int AttrG(vec4 attr)
+{
+    return int(attr.g * 3.0 + 0.5);
+}
+
+float Depth(float depth, vec4 attr)
+{
+    return ((AttrG(attr) & 1) != 0) ? depth + uDepthUnbias : depth;
+}
+
+bool isgood(ivec2 coord, int refPolyID, float refDepth)
+{
+    int polyid;
+    float depth;
+    if (any(lessThan(coord, ivec2(0))) || any(greaterThanEqual(coord, ivec2(uScreenSize))))
+    {
+        polyid = uClearPolyID;
+        depth = uClearDepth;
+    }
+    else
+    {
+        vec4 attr = texelFetch(AttrBuffer, coord, 0);
+        polyid = PolyID(attr);
+        depth = Depth(texelFetch(DepthBuffer, coord, 0).r, attr);
+    }
 
     if (polyid != refPolyID && isless(refDepth, depth))
         return true;
@@ -178,29 +220,21 @@ bool isgood(vec4 attr, float depth, int refPolyID, float refDepth)
 void main()
 {
     ivec2 coord = ivec2(gl_FragCoord.xy);
-    int scale = 1;//int(uScreenSize.x / 256);
+    int scale = uEdgeScale;
 
     vec4 ret = vec4(0,0,0,0);
     vec4 depth = texelFetch(DepthBuffer, coord, 0);
     vec4 attr = texelFetch(AttrBuffer, coord, 0);
 
-    int polyid = int(attr.r * 63.0);
+    int polyid = PolyID(attr);
 
-    if (attr.g != 0.0)
+    if ((AttrG(attr) & 2) != 0)
     {
-        vec4 depthU = texelFetch(DepthBuffer, coord + ivec2(0,-scale), 0);
-        vec4 attrU = texelFetch(AttrBuffer, coord + ivec2(0,-scale), 0);
-        vec4 depthD = texelFetch(DepthBuffer, coord + ivec2(0,scale), 0);
-        vec4 attrD = texelFetch(AttrBuffer, coord + ivec2(0,scale), 0);
-        vec4 depthL = texelFetch(DepthBuffer, coord + ivec2(-scale,0), 0);
-        vec4 attrL = texelFetch(AttrBuffer, coord + ivec2(-scale,0), 0);
-        vec4 depthR = texelFetch(DepthBuffer, coord + ivec2(scale,0), 0);
-        vec4 attrR = texelFetch(AttrBuffer, coord + ivec2(scale,0), 0);
-
-        if (isgood(attrU, depthU.r, polyid, depth.r) ||
-            isgood(attrD, depthD.r, polyid, depth.r) ||
-            isgood(attrL, depthL.r, polyid, depth.r) ||
-            isgood(attrR, depthR.r, polyid, depth.r))
+        float z = Depth(depth.r, attr);
+        if (isgood(coord + ivec2(0,-scale), polyid, z) ||
+            isgood(coord + ivec2(0,scale), polyid, z) ||
+            isgood(coord + ivec2(-scale,0), polyid, z) ||
+            isgood(coord + ivec2(scale,0), polyid, z))
         {
             // mark this pixel!
 
@@ -929,6 +963,13 @@ const char* kRenderVS = R"(
 smooth out float fZ;
 #endif
 
+#ifdef EdgeMark
+// GPU::GLEdgeMark 1 (E1): where the polygon's outline is in EdgeTex, the same for each of its
+// vertices (GLRenderer::BuildEdges), for kRenderFS's EdgeFlag
+in uint vEdgeInfo;
+flat out highp uint fEdgeInfo;
+#endif
+
 #ifdef TexWrapVS
 // GPU::GLTexCache 64 (T2 step 3): the per-polygon part of TexcoordWrap for the heap's lookup
 // (kRenderFSCommon's TextureLookup_Cached), once a vertex instead of once a fragment. (P, R) for
@@ -972,6 +1013,9 @@ void main()
     ivec2 sy = TexWrapAxis(3 + ((tattr >> 23) & 0x7), wrapmode>>1);
     fTexWrap = ivec4(sx.x, sy.x, sx.y, sy.y);
 #endif
+#ifdef EdgeMark
+    fEdgeInfo = vEdgeInfo;
+#endif
 
     gl_Position = fpos;
 }
@@ -981,6 +1025,48 @@ const char* kRenderFS = R"(
 
 #ifdef WBuffer
 smooth in float fZ;
+#endif
+
+#ifdef EdgeMark
+// GPU::GLEdgeMark (E1, GLRenderer::BuildEdges): the edge flag of an opaque fragment. set
+// when one of its four neighbors one DS pixel away (uEdgeScale target pixels, the edge pass's
+// offset) is outside the polygon, the hi-res form of the software renderer's flags (span ends, top
+// and bottom rows). EdgeTex holds the polygon's outline only, so the fan's inner diagonals don't
+// count: one texel an edge, (nx, ny, c), its inward unit normal and c = -dot(n, v0) - reach, reach
+// being how far the farthest of the four neighbors is from the edge's line, scale * max(|nx|, |ny|),
+// plus a little for neighbors right on it. a neighbor is outside an edge's half plane when
+// dot(n, p) + c < 0. fEdgeInfo: the first texel (low 16 bits) and the edge count (high bits);
+// a count of 0 (lines, polygons without area, every polygon with GPU::GLEdgeMark 2) flags every
+// fragment
+flat in highp uint fEdgeInfo;
+uniform highp sampler2D EdgeTex;
+// the vertex shader's: nonzero for a depth-equal polygon's margin (GLRenderer::SetPolygonDepthBias)
+uniform float uDepthBias;
+
+float EdgeFlag()
+{
+    uint count = fEdgeInfo >> 16;
+    if (count == 0u) return 1.0;
+    int base = int(fEdgeInfo & 0xFFFFu);
+    vec2 p = gl_FragCoord.xy;
+    for (int k = 0; k < int(count); k++)
+    {
+        int idx = base + k;
+        vec4 e = texelFetch(EdgeTex, ivec2(idx & 1023, idx >> 10), 0);
+        if (dot(e.xy, p) + e.z < 0.0) return 1.0;
+    }
+    return 0.0;
+}
+
+// attr G: (2 * edge flag + depth biased) / 3, which the edge pass decodes (kFinalPassEdgeFS's
+// AttrG). the bias bit lets it compare a depth-equal polygon with the depth the DS would store
+float EdgeAttrG()
+{
+    return (EdgeFlag() * 2.0 + (uDepthBias != 0.0 ? 1.0 : 0.0)) / 3.0;
+}
+#define EDGE_ATTR_G EdgeAttrG()
+#else
+#define EDGE_ATTR_G 0.0
 #endif
 
 #ifdef NoDiscard
@@ -993,7 +1079,7 @@ void main()
     vec4 col = FinalColor();
 
     oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
-    oAttr.g = 0.0;
+    oAttr.g = EDGE_ATTR_G;
     oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
     oAttr.a = 1.0;
 
@@ -1017,7 +1103,7 @@ void main()
             if (col.a < 30.5/31.0) discard;
 
             oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
-            oAttr.g = 0.0;
+            oAttr.g = EDGE_ATTR_G;
             oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
             oAttr.a = 1.0;
         }

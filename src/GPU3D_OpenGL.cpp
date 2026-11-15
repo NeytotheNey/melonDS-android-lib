@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <cmath>
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D_OpenGL_shaders.h"
@@ -44,7 +45,7 @@ namespace melonDS
 #define TRANS_SKIPPED(field) do {} while (0)
 #endif
 
-bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard, bool full)
+bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard, bool full, bool edge)
 {
     char shadername[80];
     char probename[16] = "";
@@ -52,21 +53,25 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
         snprintf(probename, sizeof(probename), "TexProbe%d", TexProbe);
     // GPU::GLTexCache 256: the color-only build is only the cache-only programs', never the twins'
     bool colorOnly = TexCache && TexColorPlane && TexColorOnly && TexCacheOnly && !full;
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s%s%s%s%s%s", wbuffer?'W':'Z', fetch ? "Fetch" : "",
         nodiscard ? "NoDiscard" : "", fragCount ? "Count" : "", probename,
         TexCache ? (TexCacheOnly && !full ? "TexCacheOnly" : "TexCache") : "", TexCache && TexWrapVS ? "WrapVS" : "",
-        TexCache && TexColorPlane ? (colorOnly ? "ColorOnly" : "Color") : "");
+        TexCache && TexColorPlane ? (colorOnly ? "ColorOnly" : "Color") : "", edge ? "Edge" : "");
 
     // kShaderHeader has no newline of its own, the common sources start with one
     const char* wbufdef = wbuffer ? "\n#define WBuffer" : "";
     // GPU::GLTexCache 64 (T2 step 3): the heap lookup's per-polygon wrap constants come from the
     // vertex shader, in a flat varying both stages declare under this
     const char* wrapdef = TexCache && TexWrapVS ? "\n#define TexWrapVS" : "";
+    // GPU::GLEdgeMark 1 (E1): the opaque fragments set the edge flag from their polygon's outline,
+    // which the vertex shader passes on where to find (kRenderVS, kRenderFS's EdgeFlag)
+    const char* edgedef = edge ? "\n#define EdgeMark" : "";
 
     std::string vsbuf;
     vsbuf += kShaderHeader;
     vsbuf += wbufdef;
     vsbuf += wrapdef;
+    vsbuf += edgedef;
     vsbuf += kRenderVSCommon;
     vsbuf += kRenderVS;
 
@@ -112,6 +117,7 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
         fsbuf += "\n#error gltexcache 32 makes the twins fail on purpose";
 #endif
     fsbuf += wbufdef;
+    fsbuf += edgedef;
     fsbuf += kRenderFSCommon;
 #ifdef MELONADE_DEBUG_TOOLS
     if (fragCount)
@@ -136,7 +142,7 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
     bool ret = OpenGL::CompileVertexFragmentProgram(prog,
         vsbuf, fsbuf,
         shadername,
-        {{"vPosition", 0}, {"vColor", 1}, {"vTexcoord", 2}, {"vPolygonAttr", 3}},
+        {{"vPosition", 0}, {"vColor", 1}, {"vTexcoord", 2}, {"vPolygonAttr", 3}, {"vEdgeInfo", 4}},
         {{"oColor", 0}, {"oAttr", 1}});
 
     if (!ret) return false;
@@ -157,8 +163,10 @@ bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, boo
         if (TexColorPlane)
             glUniform1i(glGetUniformLocation(prog, "TexColor"), 4);
     }
+    if (edge)
+        glUniform1i(glGetUniformLocation(prog, "EdgeTex"), 5);
 
-    int id = (nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0)) + (full ? FullShader : 0);
+    int id = (nodiscard ? 4 : (int)wbuffer + (fetch ? 2 : 0)) + (full ? FullShader : 0) + (edge ? EdgeShader : 0);
     DepthBiasLoc[id] = glGetUniformLocation(prog, "uDepthBias");
     glUniform1f(DepthBiasLoc[id], 0.0f);
     DepthBias[id] = 0.0f;
@@ -295,6 +303,7 @@ void GLRenderer::SetRenderVariant(int probe, bool cache, bool only, bool wrapvs,
     FragPassLoc[2] = FragPassLoc[3] = FragPassLoc[4] = -1;
 #endif
     DropFullShaders();
+    DropEdgeShaders();
     FetchShadersTried = false;
     NoDiscardTried = false;
     CurShaderID = -1;
@@ -464,7 +473,68 @@ bool GLRenderer::PrepareFullShaders()
 
 void GLRenderer::DropFullShaders()
 {
-    for (int i = FullShader; i < FullShader + 5; i++)
+    // and their edge-marking builds (GPU::GLEdgeMark 1), made again the next edge-marking frame
+    for (int base : {FullShader, EdgeShader + FullShader})
+    {
+        for (int i = base; i < base + 5; i++)
+        {
+            glDeleteProgram(RenderShader[i]);
+            RenderShader[i] = 0;
+#ifdef MELONADE_DEBUG_TOOLS
+            FragPassLoc[i] = -1;
+#endif
+        }
+    }
+}
+
+// GPU::GLEdgeMark 1 (E1): the edge-marking builds of the opaque draws' programs this frame has
+// (Z and W, no-discard with NoDiscard, the twins once PrepareFullShaders made them), each made the
+// first edge-marking frame that has it, after the frame's other programs are settled. false when
+// one doesn't build (logged once): that frame and the ones after it draw without the edge flag
+// until the render programs are made again (DropEdgeShaders)
+bool GLRenderer::PrepareEdgeShaders()
+{
+    if (EdgeShadersFailed)
+        return false;
+
+    bool fragCount = false;
+#ifdef MELONADE_DEBUG_TOOLS
+    fragCount = FragCounter != nullptr;
+#endif
+    bool built = false;
+    auto build = [&](bool wbuffer, bool nodiscard, bool full)
+    {
+        int id = (nodiscard ? 4 : (int)wbuffer) + (full ? FullShader : 0);
+        if (!RenderShader[id] || RenderShader[EdgeShader + id])
+            return true;
+        built = true;
+        if (BuildRenderShader(wbuffer, fragCount && !nodiscard, false, nodiscard, full, true))
+            return true;
+        glDeleteProgram(RenderShader[EdgeShader + id]);
+        RenderShader[EdgeShader + id] = 0;
+        return false;
+    };
+    // the no-discard ones only in frames that use them (NoDiscard)
+    bool ok = build(false, false, false) && build(true, false, false) && (!NoDiscard || build(false, true, false))
+        && build(false, false, true) && build(true, false, true) && (!NoDiscard || build(false, true, true));
+    if (!built)
+        return true;
+
+    // BuildRenderShader leaves its program in use
+    CurShaderID = -1;
+    CurRenderMode = -1;
+    if (!ok)
+    {
+        DropEdgeShaders();
+        EdgeShadersFailed = true;
+        Platform::Log(Platform::LogLevel::Warn, "GLEDGEMARK: the edge-marking render programs didn't build, gledgemark 1 draws as 0\n");
+    }
+    return ok;
+}
+
+void GLRenderer::DropEdgeShaders()
+{
+    for (int i = EdgeShader; i < EdgeShader + 10; i++)
     {
         glDeleteProgram(RenderShader[i]);
         RenderShader[i] = 0;
@@ -472,6 +542,8 @@ void GLRenderer::DropFullShaders()
         FragPassLoc[i] = -1;
 #endif
     }
+    EdgeShadersFailed = false;
+    CurShaderID = -1;
 }
 
 // GPU::GLTexCache step 2, when a twin didn't build: logged once, the programs are built again with
@@ -509,7 +581,9 @@ void GLRenderer::TexCacheOff()
 // full: the twin with the old decode path (GPU::GLTexCache step 2, RenderKey_TexFull)
 void GLRenderer::UseRenderShader(bool wbuffer, int mode, bool fetch, bool nodiscard, bool full)
 {
-    int twin = full ? FullShader : 0;
+    // GPU::GLEdgeMark 1: the opaque draws of an edge-marking frame use the builds that write the edge
+    // flag (PrepareEdgeShaders made them)
+    int twin = (full ? FullShader : 0) + (EdgeMark != 0 && mode == RenderMode_Opaque && !fetch ? EdgeShader : 0);
     if (nodiscard)
     {
         if (CurShaderID != 4 + twin)
@@ -671,6 +745,10 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
     glUniform1i(uni_id, 0);
     uni_id = glGetUniformLocation(result->FinalPassEdgeShader, "AttrBuffer");
     glUniform1i(uni_id, 1);
+    result->EdgeULoc[0] = glGetUniformLocation(result->FinalPassEdgeShader, "uEdgeScale");
+    result->EdgeULoc[1] = glGetUniformLocation(result->FinalPassEdgeShader, "uDepthUnbias");
+    result->EdgeULoc[2] = glGetUniformLocation(result->FinalPassEdgeShader, "uClearPolyID");
+    result->EdgeULoc[3] = glGetUniformLocation(result->FinalPassEdgeShader, "uClearDepth");
 
     uni_id = glGetUniformBlockIndex(result->FinalPassFogShader, "uConfig");
     glUniformBlockBinding(result->FinalPassFogShader, uni_id, 0);
@@ -726,6 +804,14 @@ std::unique_ptr<GLRenderer> GLRenderer::New() noexcept
     glVertexAttribIPointer(2, 2, GL_SHORT, 7*4, (void*)(3*4));
     glEnableVertexAttribArray(3); // attrib
     glVertexAttribIPointer(3, 3, GL_UNSIGNED_INT, 7*4, (void*)(4*4));
+
+    // GPU::GLEdgeMark 1: where a vertex's polygon's outline is in EdgeTex, its own buffer, only
+    // written in edge-marking frames and only read by their programs (the others don't have it)
+    glGenBuffers(1, &result->EdgeInfoBufferID);
+    glBindBuffer(GL_ARRAY_BUFFER, result->EdgeInfoBufferID);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(EdgeInfoBuffer), nullptr, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(4); // edge info
+    glVertexAttribIPointer(4, 1, GL_UNSIGNED_INT, 4, (void*)(0));
 
     glGenBuffers(1, &result->IndexBufferID);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, result->IndexBufferID);
@@ -833,12 +919,14 @@ GLRenderer::~GLRenderer()
     glDeleteVertexArrays(1, &VertexArrayID);
     glDeleteBuffers(1, &VertexBufferID);
     glDeleteBuffers(1, &IndexBufferID);
+    glDeleteBuffers(1, &EdgeInfoBufferID);
+    glDeleteTextures(1, &EdgeTexID);
     glDeleteVertexArrays(1, &ClearVertexArrayID);
     glDeleteBuffers(1, &ClearVertexBufferID);
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < NumRenderShaders; i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -1201,7 +1289,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
     u32 vidx = 0;
 
     u32 iidx = 0;
-    u32 eidx = EdgeIndicesOffset;
+    NumEdges = 0;
 
     for (int i = 0; i < npolys; i++)
     {
@@ -1400,25 +1488,78 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
             }
         }
 
-        rp->EdgeIndicesOffset = eidx;
-        rp->NumEdgeIndices = 0;
-
-        u32 vidx_cur = vidx_first;
-        for (u32 j = 1; j < poly->NumVertices; j++)
-        {
-            IndexBuffer[eidx++] = vidx_cur;
-            IndexBuffer[eidx++] = vidx_cur + 1;
-            vidx_cur++;
-            rp->NumEdgeIndices += 2;
-        }
-        IndexBuffer[eidx++] = vidx_cur;
-        IndexBuffer[eidx++] = vidx_first;
-        rp->NumEdgeIndices += 2;
+        if (EdgeMark != 0)
+            BuildEdges(rp, vidx_first, vidx);
     }
 
     NumVertices = vidx;
     NumIndices = iidx;
-    NumEdgeIndices = eidx - EdgeIndicesOffset;
+}
+
+// GPU::GLEdgeMark 1 (E1): the outline of the polygon whose vertices BuildPolygons just wrote
+// (VertexBuffer[vidxFirst] up to vidxEnd), for kRenderFS's EdgeFlag. the rim's edges only, in the
+// target pixels the vertices were placed at, so a fan's inner diagonals and BetterPolygons' centre
+// vertex don't count. a fragment is flagged when one of its four neighbors one DS pixel away (the
+// edge pass's offset, ScaleFactor target pixels) is outside an edge's half plane, which for a
+// convex polygon is outside the polygon: the hi-res form of the software renderer's flags on the
+// span ends and the top and bottom rows. only polygons the opaque draws use; lines and polygons
+// without area flag all their fragments (count 0), and so does every polygon with GPU::GLEdgeMark 2
+void GLRenderer::BuildEdges(const RendererPolygon* rp, u32 vidxFirst, u32 vidxEnd)
+{
+    const Polygon* poly = rp->PolyData;
+    u32 info = 0;
+
+    bool opaqueDraw = !poly->IsShadowMask
+        && (!poly->Translucent || (poly->Attr & 0x001F0000) == 0x001F0000);
+    // GPU::GLEdgeMark 2: every opaque fragment is flagged
+    if (EdgeMark == 1 && opaqueDraw && poly->Type != 1 && NumEdges + poly->NumVertices <= MaxEdges)
+    {
+        u32 n = poly->NumVertices;
+        // BetterPolygons' centre vertex comes first, before the rim
+        u32 rim = vidxEnd - n;
+        s32 x[10], y[10];
+        for (u32 j = 0; j < n; j++)
+        {
+            u32 pos = VertexBuffer[(rim + j) * 7];
+            x[j] = pos & 0xFFFF;
+            y[j] = pos >> 16;
+        }
+
+        s64 area = 0;
+        for (u32 j = 0; j < n; j++)
+        {
+            u32 k = (j + 1 == n) ? 0 : j + 1;
+            area += (s64)x[j] * y[k] - (s64)x[k] * y[j];
+        }
+
+        if (area != 0)
+        {
+            double sign = area > 0 ? 1.0 : -1.0;
+            u32 first = NumEdges;
+            for (u32 j = 0; j < n; j++)
+            {
+                u32 k = (j + 1 == n) ? 0 : j + 1;
+                double dx = x[k] - x[j], dy = y[k] - y[j];
+                double len = std::sqrt(dx * dx + dy * dy);
+                if (len == 0.0) continue;
+
+                // the inward normal: left of each edge when the area is positive
+                double nx = -dy * sign / len, ny = dx * sign / len;
+                double reach = ScaleFactor * std::max(std::abs(nx), std::abs(ny)) + 1.0 / 64;
+                float* e = &EdgeData[NumEdges * 4];
+                e[0] = (float)nx;
+                e[1] = (float)ny;
+                e[2] = (float)(-(nx * x[j] + ny * y[j]) - reach);
+                e[3] = 0.0f;
+                NumEdges++;
+            }
+            if (NumEdges > first)
+                info = first | ((NumEdges - first) << 16);
+        }
+    }
+
+    for (u32 v = vidxFirst; v < vidxEnd; v++)
+        EdgeInfoBuffer[v] = info;
 }
 
 int GLRenderer::RenderSinglePolygon(int i) const
@@ -1449,26 +1590,6 @@ int GLRenderer::RenderPolygonBatch(int i) const
     }
 
     glDrawElements(primtype, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
-    return numpolys;
-}
-
-int GLRenderer::RenderPolygonEdgeBatch(int i) const
-{
-    const RendererPolygon* rp = &PolygonList[i];
-    u32 key = rp->RenderKey;
-    int numpolys = 0;
-    u32 numindices = 0;
-
-    for (int iend = i; iend < NumFinalPolys; iend++)
-    {
-        const RendererPolygon* cur_rp = &PolygonList[iend];
-        if (cur_rp->RenderKey != key) break;
-
-        numpolys++;
-        numindices += cur_rp->NumEdgeIndices;
-    }
-
-    glDrawElements(GL_LINES, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->EdgeIndicesOffset * 2));
     return numpolys;
 }
 
@@ -2379,34 +2500,9 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         i += RenderPolygonBatch(i);
     }
 
-    // if edge marking is enabled, mark all opaque edges
-    // TODO BETTER EDGE MARKING!!! THIS SUCKS
-    /*if (RenderDispCnt & (1<<5))
-    {
-        UseRenderShader(wbuffer, RenderMode_Edge); // no such mode exists any more, the edge pass was never built
-        glLineWidth(1.5);
-
-        glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-        glColorMaski(1, GL_FALSE, GL_TRUE, GL_FALSE, GL_FALSE);
-
-        glDepthFunc(GL_ALWAYS);
-        glDepthMask(GL_FALSE);
-
-        glStencilFunc(GL_ALWAYS, 0, 0xFF);
-        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-        glStencilMask(0);
-
-        for (int i = 0; i < NumFinalPolys; )
-        {
-            RendererPolygon* rp = &PolygonList[i];
-
-            if (rp->PolyData->IsShadowMask) { i++; continue; }
-
-            i += RenderPolygonEdgeBatch(i);
-        }
-
-        glDepthMask(GL_TRUE);
-    }*/
+    // edge flags (GPU::GLEdgeMark 1): the opaque draws above (and the need-opaque ones below) set
+    // attr G with UseRenderShader's edge-marking programs, the translucent ones mask it off
+    // (translucent pixels keep the flag and ID of the opaque pixel under them, like software)
 
     glEnable(GL_BLEND);
     glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
@@ -2823,12 +2919,11 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         CountCoveredByAlpha();
 #endif
 
-    // GPU::GLEdgeSkip (E2): the edge draw can't change a pixel while nothing writes the edge flag
-    // (attr G is 0 from every clear and opaque draw, the translucent ones mask it off, and the old
-    // edge line pass is gone, see above), since the edge shader blends (0, 0, 0, 0) over every
-    // pixel without it. once edge marking works (E1), this must key on whether any polygon of the
-    // frame can set the flag
-    bool edgepass = (gpu3d.RenderDispCnt & (1<<5)) && !EdgeSkip;
+    // GPU::GLEdgeSkip (E2): the edge draw can't change a pixel when nothing set the edge flag this
+    // frame (GPU::GLEdgeMark 0, or nothing drawn opaque, see RenderFrame: attr G is then 0 from
+    // every clear and opaque draw, and the translucent ones mask it off), since the edge shader
+    // blends (0, 0, 0, 0) over every pixel without it
+    bool edgepass = (gpu3d.RenderDispCnt & (1<<5)) && (EdgeMark != 0 || !EdgeSkip);
     bool fogpass = (gpu3d.RenderDispCnt & (1<<7)) != 0;
 
     if (edgepass || fogpass) // fog/edge enabled
@@ -2862,10 +2957,15 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
         if (edgepass)
         {
-            // edge marking
-            // TODO: depth/polyid values at screen edges
-
+            // edge marking: a pixel with the flag whose neighbor one DS pixel away has another
+            // opaque ID and is further away (depth-equal polygons' bias undone). outside the
+            // target, the neighbor is the clear plane's ID and depth, as the software renderer's
+            // screen borders are
             glUseProgram(FinalPassEdgeShader);
+            glUniform1i(EdgeULoc[0], ScaleFactor);
+            glUniform1f(EdgeULoc[1], (wbuffer ? 255.0f : 512.0f) / 16777216.0f);
+            glUniform1i(EdgeULoc[2], (gpu3d.RenderClearAttr1 >> 24) & 0x3F);
+            glUniform1f(EdgeULoc[3], (float)(((gpu3d.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF) / 16777216.0f);
 
             glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 
@@ -3038,6 +3138,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     EqualDepthMargin = gpu.EqualDepthMargin;
     GLTransSkip = gpu.GLTransSkip;
     EdgeSkip = gpu.GLEdgeSkip != 0;
+    // GPU::GLEdgeMark (E1): only for frames with edge marking on, and only once a polygon is drawn
+    // opaque (below), as nothing else can set the flag
+    EdgeMark = (gpu.GPU3D.RenderDispCnt & (1<<5)) ? std::clamp(gpu.GLEdgeMark, 0, 2) : 0;
     ClearFast = gpu.GLClearFast;
     // GPU::GLTransSkip bit 2: without the extension, or when its programs don't build, the frame
     // draws as without the bit
@@ -3294,15 +3397,20 @@ void GLRenderer::RenderFrame(GPU& gpu)
         int npolys = 0;
         int firsttrans = -1;
         bool texturing = (gpu.GPU3D.RenderDispCnt & (1<<0)) != 0;
+        bool anyOpaqueDraw = false;
         for (u32 i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
         {
-            if (gpu.GPU3D.RenderPolygonRAM[i]->Degenerate) continue;
+            const Polygon* polygon = gpu.GPU3D.RenderPolygonRAM[i];
+            if (polygon->Degenerate) continue;
 
             SetupPolygon(&PolygonList[npolys], gpu.GPU3D.RenderPolygonRAM[i]);
-            if (NoDiscard && NoDiscardClass(gpu.GPU3D.RenderPolygonRAM[i], texturing) == NoDiscard_Yes)
+            if (NoDiscard && NoDiscardClass(polygon, texturing) == NoDiscard_Yes)
                 PolygonList[npolys].RenderKey |= RenderKey_NoDiscard;
-            if (firsttrans < 0 && gpu.GPU3D.RenderPolygonRAM[i]->Translucent)
+            if (firsttrans < 0 && polygon->Translucent)
                 firsttrans = npolys;
+            // GPU::GLEdgeMark: what can set the edge flag, opaque and need-opaque polygons
+            if (!polygon->IsShadowMask && (!polygon->Translucent || (polygon->Attr & 0x001F0000) == 0x001F0000))
+                anyOpaqueDraw = true;
 
             npolys++;
         }
@@ -3318,15 +3426,44 @@ void GLRenderer::RenderFrame(GPU& gpu)
             if (AssignTexCache(gpu, texturing) && !PrepareFullShaders())
                 TexCacheOff();
         }
+        // GPU::GLEdgeMark 1: the edge-marking builds of this frame's opaque programs, which are
+        // settled now (the twins and TexCacheOff above). without them the frame marks nothing
+        if (!anyOpaqueDraw || (EdgeMark != 0 && !PrepareEdgeShaders()))
+            EdgeMark = 0;
 
         BuildPolygons(&PolygonList[0], npolys);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
+        if (EdgeMark != 0)
+        {
+            glBindBuffer(GL_ARRAY_BUFFER, EdgeInfoBufferID);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*4, EdgeInfoBuffer);
+        }
+        if (EdgeMark == 1)
+        {
+            // the outlines BuildPolygons made (BuildEdges), whole rows of EdgeTex
+            glActiveTexture(GL_TEXTURE5);
+            if (!EdgeTexID)
+            {
+                glGenTextures(1, &EdgeTexID);
+                glBindTexture(GL_TEXTURE_2D, EdgeTexID);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, EdgeTexWidth, MaxEdges / EdgeTexWidth, 0, GL_RGBA, GL_FLOAT, nullptr);
+            }
+            else
+                glBindTexture(GL_TEXTURE_2D, EdgeTexID);
+            u32 rows = (NumEdges + EdgeTexWidth - 1) / EdgeTexWidth;
+            if (rows)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, EdgeTexWidth, rows, GL_RGBA, GL_FLOAT, EdgeData);
+            glActiveTexture(GL_TEXTURE0);
+        }
 
         // bind to access the index buffer
         glBindVertexArray(VertexArrayID);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, NumIndices * 2, IndexBuffer);
-        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
 
         // VRAMFlat_Texture is what TexMem was just brought up to date from
         bool classify = (GLTransSkip & 2) != 0;
@@ -3669,8 +3806,10 @@ void GLRenderer::SetupFragCount()
     glDeleteProgram(RenderShader[3]);
     RenderShader[2] = RenderShader[3] = 0;
     FragPassLoc[2] = FragPassLoc[3] = -1;
-    // and GPU::GLTexCache step 2's twins, the next frame a polygon needs them
+    // and GPU::GLTexCache step 2's twins, the next frame a polygon needs them, and GPU::GLEdgeMark 1's
+    // builds, the next edge-marking frame
     DropFullShaders();
+    DropEdgeShaders();
     FetchShadersTried = false;
     CurShaderID = -1;
     CurRenderMode = -1;
@@ -3687,7 +3826,7 @@ void GLRenderer::SetupFragCount()
 // the counter the render programs add to from here on, set in both
 void GLRenderer::SetFragPass(int pass)
 {
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < NumRenderShaders; i++)
     {
         if (RenderShader[i] && FragPassLoc[i] >= 0)
             glProgramUniform1i(RenderShader[i], FragPassLoc[i], pass);

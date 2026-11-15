@@ -3090,7 +3090,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         finalPassShader |= 0x4;
     if (gpu.GPU3D.RenderDispCnt & (1<<7))
         finalPassShader |= 0x2;
-    if (gpu.GPU3D.RenderDispCnt & (1<<5))
+    // GPU::GLEdgeMark 0 (the app's "Edge marking" setting off) leaves edge marking out here too
+    if ((gpu.GPU3D.RenderDispCnt & (1<<5)) && gpu.GLEdgeMark != 0)
         finalPassShader |= 0x1;
     
     UseProgram(ShaderFinalPass[finalPassShader]);

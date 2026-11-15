@@ -836,12 +836,22 @@ public:
     int GLTransSkip = 3;
     // OpenGL renderer, experiment E2 (docs/plan-gpu-discovery.md): 1 leaves out the edge-marking
     // draw of the final pass, and the whole pass (the depth detach, binds and reattach) when fog is
-    // off too. exact while nothing writes the edge flag (attr G): the edge shader only marks pixels
-    // whose flag is set, and blends (0, 0, 0, 0) over the rest, which keeps them as they are. once
-    // edge marking works (E1), this must key on whether any polygon of the frame can set the flag.
-    // 1 is the default in every build since 11-12; 0 draws as before, for A/Bs. only changed by a
-    // debug switch
+    // off too, in frames where nothing set the edge flag (attr G): GLEdgeMark 0, or no polygon drawn
+    // opaque. exact: the edge shader only marks pixels whose flag is set, and blends (0, 0, 0, 0)
+    // over the rest, which keeps them as they are. 1 is the default in every build since 11-12;
+    // 0 draws as before, for A/Bs. only changed by a debug switch
     int GLEdgeSkip = 1;
+    // OpenGL renderer, experiment E1 (docs/plan-gpu-discovery.md), edge marking (DISP3DCNT bit 5),
+    // which the GL renderer never drew before E1. 0: no edge flags, and the compute renderer leaves
+    // its edge marking out too (the app's "Edge marking" setting off). 1: opaque fragments next to their
+    // polygon's outline (a neighbor one DS pixel away outside it) set the edge flag, the
+    // software renderer's rule at any scale, through program builds used only in edge-marking
+    // frames (GLRenderer::PrepareEdgeShaders, BuildEdges). 2: every opaque fragment sets the flag
+    // (no outline work, marks more where a polygon is just in front of another inside its outline).
+    // both use a one-DS-pixel neighbor offset, the clear plane past the target's borders, and the
+    // depth-equal polygons' own depth (their margin bias undone). 1 is the default since 11-15; the
+    // frontend sets 0 or 1 from its setting, and a debug switch can set any of them
+    int GLEdgeMark = 1;
     // OpenGL renderer, experiment D1 (docs/plan-gpu-discovery.md), a bit each. bit 0: the plain
     // clear (not the clear bitmap, DISP3DCNT bit 14) is a glClearBuffer per attachment instead of a
     // full-screen quad, with the same values the quad's shader writes. bit 1: after the frame, the
