@@ -955,6 +955,16 @@ void ARMJIT::SetFastBlockLoads(bool enabled) noexcept
         ResetBlockCache();
 }
 
+void ARMJIT::SetJitDispatch(bool enabled) noexcept
+{
+    if (JitDispatch == enabled)
+        return;
+    JitDispatch = enabled;
+    // as SetFastBlockLoads: the app sets it right after creating the NDS, before anything compiles
+    if (!JitBlocks9.empty() || !JitBlocks7.empty())
+        ResetBlockCache();
+}
+
 void ARMJIT::SetLdmStats(bool enabled) noexcept
 {
     LdmStats::SetEnabled(enabled);

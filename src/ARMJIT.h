@@ -78,6 +78,9 @@ private:
     // melonade: block transfers on the slow path done straight in host memory when every word is in one plain region
     // (DirectBlockTransfer9/7 in ARMJIT.cpp); an A/B switch (debug.melonade.ldmdirect)
     bool DirectBlockTransfers = true;
+    // melonade: ARM64, a block exit looks up and jumps to the next block itself (Compiler::Gen_DispatchStubs) instead of
+    // going back to the Execute loop for it; same emulation either way. An A/B switch (debug.melonade.jitdispatch)
+    bool JitDispatch = false;
 
 public:
     melonDS::NDS& NDS;
@@ -92,6 +95,7 @@ public:
     bool FastMemoryEnabled() const noexcept { return FastMemory; }
     bool FastBlockLoadsEnabled() const noexcept { return FastBlockLoads; }
     bool DirectBlockTransfersEnabled() const noexcept { return DirectBlockTransfers; }
+    bool JitDispatchEnabled() const noexcept { return JitDispatch; }
 
     void SetJITArgs(JITArgs args) noexcept;
     void SetMaxBlockSize(int size) noexcept;
@@ -102,6 +106,8 @@ public:
     void SetFastBlockLoads(bool enabled) noexcept;
     // read on every slow block transfer, so it can change at any time; nothing compiled depends on it
     void SetDirectBlockTransfers(bool enabled) noexcept { DirectBlockTransfers = enabled; }
+    // ARM64 only (no effect on x64). Read when a block compiles, so blocks already compiled are thrown away when it changes
+    void SetJitDispatch(bool enabled) noexcept;
     // melonade: LDMSTATS lines on the slow block transfers (ARMJIT_LdmStats.h, debug.melonade.ldmstats); clears the counts
     void SetLdmStats(bool enabled) noexcept;
     bool LdmStatsEnabled() const noexcept;
@@ -213,6 +219,8 @@ public:
     void SetFastBlockLoads(bool) noexcept {}
     bool DirectBlockTransfersEnabled() const noexcept { return false; }
     void SetDirectBlockTransfers(bool) noexcept {}
+    bool JitDispatchEnabled() const noexcept { return false; }
+    void SetJitDispatch(bool) noexcept {}
     void SetLdmStats(bool) noexcept {}
     bool LdmStatsEnabled() const noexcept { return false; }
     template <u32, int>

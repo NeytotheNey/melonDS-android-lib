@@ -448,6 +448,91 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
     JitMemMainSize -= JitMemSecondarySize;
 
     SetCodeBase((u8*)GetRWPtr(), (u8*)GetRXPtr());
+
+    // after the base moved, since a lookup entry is an offset from it
+    Gen_DispatchStubs();
+}
+
+// melonade (jitdispatch): one round of ARMv5/ARMv4::Execute's JIT loop without leaving generated code.
+// A block exit jumps here instead of ARM_Ret. In the plain case (StopExecution clear, the timestamp
+// still before the target, the PC inside the CPU's lookup window and a block in the table for it) it
+// does what ARM_Ret, the loop and ARM_Dispatch would: add Cycles to the timestamp and clear them,
+// look the block up as LookUpBlock does, store Cycles and CPSR as ARM_Ret does and jump to the
+// block. Anything else goes to ARM_Ret at the point where it stopped, so the loop carries on from
+// the same state: before the add when StopExecution is set, after it otherwise (Cycles are 0 by
+// then, and the loop adds 0 again).
+void Compiler::Gen_DispatchStubs()
+{
+    // the LDP below reads the target with the timestamp
+    static_assert(offsetof(melonDS::NDS, ARM9Target) == offsetof(melonDS::NDS, ARM9Timestamp) + 8, "");
+    static_assert(offsetof(melonDS::NDS, ARM7Target) == offsetof(melonDS::NDS, ARM7Timestamp) + 8, "");
+    for (int num = 0; num < 2; num++)
+    {
+        AlignCode16();
+        DispatchStubs[num] = GetRXPtr();
+
+        // if (StopExecution): IRQs, halts and idle loops are the loop's
+        LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, StopExecution));
+        FixupBranch stop = CBNZ(W0);
+
+        // Timestamp += Cycles; Cycles = 0; while (Timestamp < Target)
+        MOVP2R(X1, num == 0 ? &NDS.ARM9Timestamp : &NDS.ARM7Timestamp);
+        LDP(INDEX_SIGNED, X2, X3, X1, 0);
+        SXTW(X0, RCycles);
+        ADD(X2, X2, X0);
+        STR(INDEX_UNSIGNED, X2, X1, 0);
+        MOVI2R(RCycles, 0);
+        CMP(X2, X3);
+        FixupBranch targetReached = B(CC_HS);
+
+        // instrAddr = R[15] - ((CPSR&0x20)?2:4)
+        LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+        UBFX(W1, RCPSR, 5, 1);
+        SUB(W0, W0, 4);
+        ADD(W0, W0, W1, ArithOption(W1, ST_LSL, 1));
+
+        // the loop's window check, with its 32 bit end (a window ending at 4 GB always misses)
+        LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, FastBlockLookupStart));
+        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, FastBlockLookupSize));
+        ADD(W3, W2, W3);
+        CMP(W0, W2);
+        FixupBranch belowWindow = B(CC_LO);
+        CMP(W0, W3);
+        FixupBranch aboveWindow = B(CC_HS);
+
+        // LookUpBlock: entry = FastBlockLookup[(instrAddr - start) / 2], (instrAddr | num) in the top half
+        LDR(INDEX_UNSIGNED, X4, RCPU, offsetof(ARM, FastBlockLookup));
+        SUB(W2, W0, W2);
+        LSR(W2, W2, 1);
+        ADD(X4, X4, X2, ArithOption(X2, ST_LSL, 3));
+        LDP(INDEX_SIGNED, W5, W6, X4, 0); // W5 the entry offset, W6 the tag
+        if (num)
+            ORRI2R(W0, W0, 1);
+        CMP(W6, W0);
+        FixupBranch noBlock = B(CC_NEQ);
+
+        // ARM_Ret's stores (Cycles is 0 here), then ARM_Dispatch's jump
+        SaveCycles();
+        STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+        MOVP2R(X1, GetRXBase());
+        ADD(X1, X1, X5);
+        BR(X1);
+
+        SetJumpTarget(stop);
+        SetJumpTarget(targetReached);
+        SetJumpTarget(belowWindow);
+        SetJumpTarget(aboveWindow);
+        SetJumpTarget(noBlock);
+        QuickTailCall(X0, ARM_Ret);
+    }
+
+    FlushIcache();
+}
+
+// melonade (jitdispatch): read when a block is compiled; ARMJIT::SetJitDispatch throws compiled blocks away when it changes
+const void* Compiler::BlockExit()
+{
+    return NDS.JIT.JitDispatchEnabled() ? DispatchStubs[Num] : (const void*)ARM_Ret;
 }
 
 Compiler::~Compiler()
@@ -669,7 +754,7 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 
         if (ConstantCycles)
             ADDI2R(RCycles, RCycles, ConstantCycles, W0); // may not fit a 12-bit immediate
-        QuickTailCall(X0, ARM_Ret);
+        QuickTailCall(X0, BlockExit());
     }
 }
 
@@ -852,7 +937,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
     if (ConstantCycles)
         ADDI2R(RCycles, RCycles, ConstantCycles, W0); // may not fit a 12-bit immediate
-    QuickTailCall(X0, ARM_Ret);
+    QuickTailCall(X0, BlockExit());
 
     FlushIcache();
 
@@ -870,6 +955,8 @@ void Compiler::Reset()
 
     for (int i = 0; i < (JitMemMainSize + JitMemSecondarySize) / 4; i++)
         *(((u32*)GetRWPtr()) + i) = brk_0;
+
+    Gen_DispatchStubs();
 }
 
 s32 Compiler::CyclesC()

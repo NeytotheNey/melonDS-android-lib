@@ -225,6 +225,9 @@ public:
     // 0 = switch mode, 1 = stay arm, 2 = stay thumb
     void* Gen_JumpTo9(int kind);
     void* Gen_JumpTo7(int kind);
+    // melonade (jitdispatch): the two block dispatchers at the start of the code region, made again on every Reset
+    void Gen_DispatchStubs();
+    const void* BlockExit();
 
     void Comp_BranchSpecialBehaviour(bool taken);
 
@@ -292,6 +295,9 @@ public:
 
     void* JumpToFuncs9[3];
     void* JumpToFuncs7[3];
+
+    // melonade (jitdispatch): per CPU, where a block's exit goes instead of ARM_Ret
+    void* DispatchStubs[2];
 
     // [Console Type][Num][Size][Sign Extend][Output register]
     void* PatchedLoadFuncs[2][2][3][2][32];
