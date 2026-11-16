@@ -75,6 +75,9 @@ private:
     // melonade: multi-register loads (LDM, POP, Thumb LDMIA) take the fastmem path on ARM64 as well as stores.
     // Not part of JITArgs, so the app's JITArgs stay as they are; an A/B switch (debug.melonade.ldmfast)
     bool FastBlockLoads = true;
+    // melonade: block transfers on the slow path done straight in host memory when every word is in one plain region
+    // (DirectBlockTransfer9/7 in ARMJIT.cpp); an A/B switch (debug.melonade.ldmdirect)
+    bool DirectBlockTransfers = true;
 
 public:
     melonDS::NDS& NDS;
@@ -88,6 +91,7 @@ public:
     bool BranchOptimizationsEnabled() const noexcept { return BranchOptimizations; }
     bool FastMemoryEnabled() const noexcept { return FastMemory; }
     bool FastBlockLoadsEnabled() const noexcept { return FastBlockLoads; }
+    bool DirectBlockTransfersEnabled() const noexcept { return DirectBlockTransfers; }
 
     void SetJITArgs(JITArgs args) noexcept;
     void SetMaxBlockSize(int size) noexcept;
@@ -96,6 +100,8 @@ public:
     void SetFastMemory(bool enabled) noexcept;
     // ARM64 only (x64 always has loads on the fast path). Blocks already compiled are thrown away when it changes
     void SetFastBlockLoads(bool enabled) noexcept;
+    // read on every slow block transfer, so it can change at any time; nothing compiled depends on it
+    void SetDirectBlockTransfers(bool enabled) noexcept { DirectBlockTransfers = enabled; }
     // melonade: LDMSTATS lines on the slow block transfers (ARMJIT_LdmStats.h, debug.melonade.ldmstats); clears the counts
     void SetLdmStats(bool enabled) noexcept;
     bool LdmStatsEnabled() const noexcept;
@@ -205,6 +211,8 @@ public:
     void ResetBlockCache() noexcept {}
     bool FastBlockLoadsEnabled() const noexcept { return false; }
     void SetFastBlockLoads(bool) noexcept {}
+    bool DirectBlockTransfersEnabled() const noexcept { return false; }
+    void SetDirectBlockTransfers(bool) noexcept {}
     void SetLdmStats(bool) noexcept {}
     bool LdmStatsEnabled() const noexcept { return false; }
     template <u32, int>

@@ -447,6 +447,142 @@ void EndFrame() noexcept
 
 }
 
+// melonade: the whole block transfer straight in host memory when every word is in one plain region (debug.melonade.ldmdirect).
+// ARM9: ITCM, DTCM or main RAM at 0x02xxxxxx; ARM7: main RAM at 0x02xxxxxx, or ARM7 WRAM at 0x038xxxxx-0x03Fxxxxx on the DS.
+// Same words, same order and the same code invalidation per word as SlowRead/SlowWrite would do; false (nothing done) for
+// anything else: another region, a transfer that leaves its region, wraps inside its memory or wraps the address space.
+// addr is word aligned already
+template <bool Write, int ConsoleType>
+bool DirectBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
+{
+    if (num == 0)
+        return false;
+    u32 bytes = num * 4;
+    u32 last = addr + bytes - 4;
+    if (last < addr)
+        return false;
+
+    // ITCM comes first, as in SlowRead9/SlowWrite9: any word below ITCMSize is ITCM
+    if (last < cpu->ITCMSize)
+    {
+        u32 offset = addr & 0x7FFF;
+        if (offset + bytes > 0x8000)
+            return false;
+        u8* mem = &cpu->ITCM[offset];
+        for (u32 i = 0; i < num; i++)
+        {
+            if (Write)
+            {
+                cpu->NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr + i * 4);
+                *(u32*)&mem[i * 4] = (u32)data[i];
+            }
+            else
+                data[i] = *(u32*)&mem[i * 4];
+        }
+        return true;
+    }
+    if (addr < cpu->ITCMSize)
+        return false;
+
+    // DTCM next. It's one aligned block (DTCMMask is all high bits), [DTCMBase, DTCMBase | ~DTCMMask]. When it's off
+    // (base FFFFFFFF, mask 0) no word aligned address is in it, which matches (addr & 0) != FFFFFFFF
+    u32 dtcmStart = cpu->DTCMBase;
+    u32 dtcmEnd = cpu->DTCMBase | ~cpu->DTCMMask;
+    if (addr >= dtcmStart && last <= dtcmEnd)
+    {
+        u32 offset = addr & 0x3FFF;
+        if (offset + bytes > 0x4000)
+            return false;
+        u8* mem = &cpu->DTCM[offset];
+        // SlowWrite9 invalidates nothing for DTCM (no code runs from it)
+        for (u32 i = 0; i < num; i++)
+        {
+            if (Write)
+                *(u32*)&mem[i * 4] = (u32)data[i];
+            else
+                data[i] = *(u32*)&mem[i * 4];
+        }
+        return true;
+    }
+    if (addr <= dtcmEnd && last >= dtcmStart)
+        return false;
+
+    // main RAM, which ARM9Read32/ARM9Write32 (NDS and DSi) read and write at MainRAM[addr & MainRAMMask], invalidating code
+    // first on writes. The DSi's mirror at 0x0C000000 takes the per-word path
+    if ((addr >> 24) != 0x02 || (last >> 24) != 0x02)
+        return false;
+    // DSi::ARM9Read32's region lock hack reads FFFFFFFF there
+    if (ConsoleType == 1 && !Write && addr <= 0x02FE71B0 && last >= 0x02FE71B0)
+        return false;
+    NDS& nds = *NDS::Current;
+    u32 offset = addr & nds.MainRAMMask;
+    if (offset + bytes > nds.MainRAMMask + 1)
+        return false;
+    u8* mem = &nds.MainRAM[offset];
+    for (u32 i = 0; i < num; i++)
+    {
+        if (Write)
+        {
+            nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr + i * 4);
+            *(u32*)&mem[i * 4] = (u32)data[i];
+        }
+        else
+            data[i] = *(u32*)&mem[i * 4];
+    }
+    return true;
+}
+
+template <bool Write, int ConsoleType>
+bool DirectBlockTransfer7(u32 addr, u64* data, u32 num)
+{
+    if (num == 0)
+        return false;
+    u32 bytes = num * 4;
+    u32 last = addr + bytes - 4;
+    if (last < addr)
+        return false;
+
+    NDS& nds = *NDS::Current;
+    u8* mem;
+    u32 offset;
+    int region;
+    if ((addr >> 24) == 0x02 && (last >> 24) == 0x02)
+    {
+        // main RAM: NDS::ARM7Read32/ARM7Write32 (the DSi ones pass 0x02xxxxxx on to them) use MainRAM[addr & MainRAMMask]
+        offset = addr & nds.MainRAMMask;
+        if (offset + bytes > nds.MainRAMMask + 1)
+            return false;
+        mem = &nds.MainRAM[offset];
+        region = ARMJIT_Memory::memregion_MainRAM;
+    }
+    else if (ConsoleType == 0 && (addr & 0xFF800000) == 0x03800000 && (last & 0xFF800000) == 0x03800000)
+    {
+        // ARM7 WRAM and its mirrors. On the DSi the new shared WRAM can be mapped over it, so the DSi takes the per-word path
+        offset = addr & (ARM7WRAMSize - 1);
+        if (offset + bytes > ARM7WRAMSize)
+            return false;
+        mem = &nds.ARM7WRAM[offset];
+        region = ARMJIT_Memory::memregion_WRAM7;
+    }
+    else
+        return false;
+
+    for (u32 i = 0; i < num; i++)
+    {
+        if (Write)
+        {
+            if (region == ARMJIT_Memory::memregion_MainRAM)
+                nds.JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr + i * 4);
+            else
+                nds.JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr + i * 4);
+            *(u32*)&mem[i * 4] = (u32)data[i];
+        }
+        else
+            data[i] = *(u32*)&mem[i * 4];
+    }
+    return true;
+}
+
 template <bool Write, int ConsoleType>
 void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
@@ -454,6 +590,8 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
         LdmStats::NoteTransfer(0, Write, addr, num, __builtin_return_address(0));
 
     addr &= ~0x3;
+    if (cpu->NDS.JIT.DirectBlockTransfersEnabled() && DirectBlockTransfer9<Write, ConsoleType>(addr, data, num, cpu))
+        return;
     for (u32 i = 0; i < num; i++)
     {
         if (Write)
@@ -471,6 +609,8 @@ void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
         LdmStats::NoteTransfer(1, Write, addr, num, __builtin_return_address(0));
 
     addr &= ~0x3;
+    if (NDS::Current->JIT.DirectBlockTransfersEnabled() && DirectBlockTransfer7<Write, ConsoleType>(addr, data, num))
+        return;
     for (u32 i = 0; i < num; i++)
     {
         if (Write)
