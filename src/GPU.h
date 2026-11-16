@@ -1126,8 +1126,9 @@ public:
     // line 0, into a pixel buffer of its own that line 0 swaps in. then the GPU runs
     // the 3D render and the readback that line 192's map waits for before the compositor and the
     // filtered 2D passes, not after them. what the game reads back is the same frame either way.
-    // off by default here until it's tested on a phone; debug builds turn it on (DebugProperties)
-    bool BlitAfterReadback = false;
+    // on by default since it passed the OnePlus, Fold and three-game tests; debug builds can turn
+    // it off (DebugProperties) to compare
+    bool BlitAfterReadback = true;
     // compute renderer: before mapping the capture readback, poll a fence for up to this many µs
     // (yielding in between) instead of sleeping in the driver's map, which keeps the emulator
     // thread's clock up. 0 = no fence, no poll. only changed by a debug switch
