@@ -617,8 +617,22 @@ void Compiler::Comp_Mul_Mla(bool S, bool mla, ARM64Reg rd, ARM64Reg rm, ARM64Reg
     }
     else
     {
-        CLS(W0, rs);
-        Comp_AddCycles_CI(mla ? 1 : 0, W0, ArithOption(W0, ST_LSR, 3));
+        // ARM7 multiplies stop early. W0 = index of the multiplier's highest
+        // bit that differs from its sign bit (0 if none), so W0 >> 3 is the
+        // number of extra internal cycles: 0 when bits 31-8 are all 0s or
+        // all 1s, 1 for bits 31-16, 2 for bits 31-24, else 3.
+        // Thumb MUL (Rd = Rd * Rm) is timed on Rd, passed here as rm, and
+        // the interpreter only checks it for leading 0s there.
+        if (Thumb)
+            ORRI2R(W0, rm, 1);
+        else
+        {
+            EOR(W0, rs, rs, ArithOption(rs, ST_ASR, 31));
+            ORRI2R(W0, W0, 1);
+        }
+        CLZ(W0, W0);
+        EORI2R(W0, W0, 31); // 31 - clz
+        Comp_AddCycles_CI(mla ? 2 : 1, W0, ArithOption(W0, ST_LSR, 3));
     }
 
     if (mla)
@@ -650,11 +664,18 @@ void Compiler::A_Comp_Mul_Long()
     }
     else
     {
+        // Same early termination as Comp_Mul_Mla. UMULL/UMLAL only stop
+        // early on leading 0s, SMULL/SMLAL on leading 0s or 1s.
         if (sign)
-            CLS(W0, rs);
+        {
+            EOR(W0, rs, rs, ArithOption(rs, ST_ASR, 31));
+            ORRI2R(W0, W0, 1);
+        }
         else
-            CLZ(W0, rs);
-        Comp_AddCycles_CI(0, W0, ArithOption(W0, ST_LSR, 3));
+            ORRI2R(W0, rs, 1);
+        CLZ(W0, W0);
+        EORI2R(W0, W0, 31); // 31 - clz
+        Comp_AddCycles_CI(2, W0, ArithOption(W0, ST_LSR, 3));
     }
 
     if (add)
@@ -851,9 +872,10 @@ void Compiler::T_Comp_ALU()
     ARM64Reg rd = MapReg(CurInstr.T_Reg(0));
     ARM64Reg rs = MapReg(CurInstr.T_Reg(3));
     
+    // MUL (0xD) charges its own CI in Comp_Mul_Mla, like the interpreter's T_MUL_REG
     if ((op >= 0x2 && op <= 0x4) || op == 0x7)
         Comp_AddCycles_CI(1);
-    else
+    else if (op != 0xD)
         Comp_AddCycles_C();
 
     switch (op)
