@@ -18,8 +18,13 @@
 
 #include "ARMJIT.h"
 #include "ARMJIT_Memory.h"
+#include "ARMJIT_LdmStats.h"
 #include <string.h>
 #include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <algorithm>
+#include <chrono>
 #include <unordered_map>
 
 #define XXH_STATIC_LINKING_ONLY
@@ -177,9 +182,277 @@ void SlowWrite7(u32 addr, u32 val)
         NDS::Current->ARM7Write8(addr, val);
 }
 
+namespace LdmStats
+{
+
+bool Enabled = false;
+
+namespace
+{
+
+// the JIT's memory regions (ARMJIT_Memory::ClassifyAddress9/7), with VRAM split by where it's mapped and palette, OAM
+// and the GBA slot taken out of memregion_Other
+enum
+{
+    Region_Main,
+    Region_DTCM,
+    Region_ITCM,
+    Region_SWRAM,
+    Region_WRAM7,
+    Region_NWRAM,
+    Region_IO,
+    Region_Wifi,
+    Region_VRAMLCDC,
+    Region_VRAMABG,
+    Region_VRAMBBG,
+    Region_VRAMAOBJ,
+    Region_VRAMBOBJ,
+    Region_VRAM7,
+    Region_Palette,
+    Region_OAM,
+    Region_BIOS,
+    Region_GBA,
+    Region_Other,
+    Region_Count
+};
+
+const char* const RegionNames[Region_Count] =
+{
+    "main", "dtcm", "itcm", "swram", "wram7", "nwram", "io", "wifi",
+    "vlcdc", "vabg", "vbbg", "vaobj", "vbobj", "vram7", "pal", "oam", "bios", "gba", "other"
+};
+
+const char* const StreamNames[4] = { "9r", "9w", "7r", "7w" };
+
+const char* const OutcomeNames[Compile_Count] =
+{
+    "fast", "fastcond", "fastthumb", "single", "nofastmem", "ldmfast", "user", "region"
+};
+
+struct Stream
+{
+    u64 Calls, Words, NoFast, Patched, Cross;
+    u64 RegionCalls[Region_Count], RegionWords[Region_Count];
+};
+
+// since the last LDMSTATS lines, by stream (num * 2 + write)
+struct Counters
+{
+    Stream Run[4];
+    u64 Compiled[4][Compile_Count];
+    u64 SlowRegions[4][Region_Count];
+    u64 Patches[4];
+    u64 SinglePatches;
+};
+
+Counters Counts {};
+s64 PeriodStartNs = 0;
+
+s64 NowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int ClassifyRegion(NDS& nds, u32 num, u32 addr)
+{
+    ARMJIT_Memory& memory = nds.JIT.Memory;
+    switch (num == 0 ? memory.ClassifyAddress9(addr) : memory.ClassifyAddress7(addr))
+    {
+    case ARMJIT_Memory::memregion_MainRAM: return Region_Main;
+    case ARMJIT_Memory::memregion_DTCM: return Region_DTCM;
+    case ARMJIT_Memory::memregion_ITCM: return Region_ITCM;
+    case ARMJIT_Memory::memregion_SharedWRAM: return Region_SWRAM;
+    case ARMJIT_Memory::memregion_WRAM7: return Region_WRAM7;
+    case ARMJIT_Memory::memregion_NewSharedWRAM_A:
+    case ARMJIT_Memory::memregion_NewSharedWRAM_B:
+    case ARMJIT_Memory::memregion_NewSharedWRAM_C: return Region_NWRAM;
+    case ARMJIT_Memory::memregion_IO9:
+    case ARMJIT_Memory::memregion_IO7: return Region_IO;
+    case ARMJIT_Memory::memregion_Wifi: return Region_Wifi;
+    case ARMJIT_Memory::memregion_VRAM:
+        switch (addr & 0x00E00000)
+        {
+        case 0x00000000: return Region_VRAMABG;
+        case 0x00200000: return Region_VRAMBBG;
+        case 0x00400000: return Region_VRAMAOBJ;
+        case 0x00600000: return Region_VRAMBOBJ;
+        default: return Region_VRAMLCDC;
+        }
+    case ARMJIT_Memory::memregion_VWRAM: return Region_VRAM7;
+    case ARMJIT_Memory::memregion_BIOS9:
+    case ARMJIT_Memory::memregion_BIOS7:
+    case ARMJIT_Memory::memregion_BIOS9DSi:
+    case ARMJIT_Memory::memregion_BIOS7DSi: return Region_BIOS;
+    default: break;
+    }
+
+    // memregion_Other
+    switch (addr >> 24)
+    {
+    case 0x05: return num == 0 ? Region_Palette : Region_Other;
+    case 0x07: return num == 0 ? Region_OAM : Region_Other;
+    case 0x08:
+    case 0x09:
+    case 0x0A: return Region_GBA;
+    default: return Region_Other;
+    }
+}
+
+// one log line, cut short rather than overrun (the app's log lines are 1024 bytes at most)
+struct LineBuffer
+{
+    char Text[1000];
+    int Length = 0;
+
+    LineBuffer() { Text[0] = '\0'; }
+
+    void Add(const char* format, ...)
+    {
+        if (Length >= (int)sizeof(Text) - 1)
+            return;
+        va_list args;
+        va_start(args, format);
+        int written = vsnprintf(Text + Length, sizeof(Text) - Length, format, args);
+        va_end(args);
+        if (written > 0)
+            Length = std::min(Length + written, (int)sizeof(Text) - 1);
+    }
+};
+
+unsigned long long ULL(u64 value) { return value; }
+
+void AddRunStream(LineBuffer& line, int index)
+{
+    const Stream& stream = Counts.Run[index];
+    line.Add(" %s=%llu/%llu", StreamNames[index], ULL(stream.Calls), ULL(stream.Words));
+#if defined(__aarch64__)
+    if (stream.Calls)
+        line.Add(",nofast=%llu,patched=%llu", ULL(stream.NoFast), ULL(stream.Patched));
+#endif
+    if (stream.Cross)
+        line.Add(",cross=%llu", ULL(stream.Cross));
+    for (int region = 0; region < Region_Count; region++)
+    {
+        if (stream.RegionCalls[region])
+            line.Add(",%s=%llu/%llu", RegionNames[region], ULL(stream.RegionCalls[region]), ULL(stream.RegionWords[region]));
+    }
+}
+
+}
+
+void SetEnabled(bool enabled) noexcept
+{
+    Enabled = enabled;
+    Counts = {};
+    PeriodStartNs = NowNs();
+}
+
+void NoteTransfer(u32 num, bool write, u32 addr, u32 words, const void* returnAddress) noexcept
+{
+    NDS& nds = *NDS::Current;
+    addr &= ~0x3;
+    Stream& stream = Counts.Run[num * 2 + write];
+    int region = ClassifyRegion(nds, num, addr);
+    stream.Calls++;
+    stream.Words += words;
+    stream.RegionCalls[region]++;
+    stream.RegionWords[region] += words;
+    if (words > 1 && ClassifyRegion(nds, num, addr + (words - 1) * 4) != region)
+        stream.Cross++;
+#if defined(__aarch64__)
+    // a block transfer compiled with a fast path has its slow path in the second code region, reached only once the fault
+    // handler patched the fast path into a call to it (RewriteMemAccess)
+    if (nds.JIT.JITCompiler.IsOutOfLineCode(returnAddress))
+        stream.Patched++;
+    else
+        stream.NoFast++;
+#else
+    (void)returnAddress;
+#endif
+}
+
+void NoteCompile(u32 num, bool store, int outcome, u32 predictedAddr) noexcept
+{
+    u32 index = num * 2 + store;
+    Counts.Compiled[index][outcome]++;
+    if (outcome == Compile_Region)
+        Counts.SlowRegions[index][ClassifyRegion(*NDS::Current, num, predictedAddr)]++;
+}
+
+void NotePatch(int block) noexcept
+{
+    if (block < 0)
+        Counts.SinglePatches++;
+    else
+        Counts.Patches[block]++;
+}
+
+void EndFrame() noexcept
+{
+    s64 now = NowNs();
+    s64 elapsed = now - PeriodStartNs;
+    if (elapsed < 5000000000LL)
+        return;
+    PeriodStartNs = now;
+    double secs = elapsed / 1e9;
+
+    LineBuffer run9, run7;
+    AddRunStream(run9, 0);
+    AddRunStream(run9, 1);
+    AddRunStream(run7, 2);
+    AddRunStream(run7, 3);
+    // one line, or one per CPU when that gets too long for the log
+    if (run9.Length + run7.Length < 900)
+        Log(LogLevel::Info, "LDMSTATS run secs=%.1f%s%s\n", secs, run9.Text, run7.Text);
+    else
+    {
+        Log(LogLevel::Info, "LDMSTATS run secs=%.1f%s%s\n", secs, run9.Text, "");
+        Log(LogLevel::Info, "LDMSTATS run secs=%.1f%s%s\n", secs, "", run7.Text);
+    }
+
+    LineBuffer jit;
+    for (int index = 0; index < 4; index++)
+    {
+        jit.Add(" %s=", StreamNames[index]);
+        bool any = false;
+        for (int outcome = 0; outcome < Compile_Count; outcome++)
+        {
+            if (!Counts.Compiled[index][outcome])
+                continue;
+            jit.Add("%s%s:%llu", any ? "," : "", OutcomeNames[outcome], ULL(Counts.Compiled[index][outcome]));
+            any = true;
+        }
+        if (!any)
+            jit.Add("0");
+    }
+    for (int index = 0; index < 4; index++)
+    {
+        bool any = false;
+        for (int region = 0; region < Region_Count; region++)
+        {
+            if (!Counts.SlowRegions[index][region])
+                continue;
+            if (!any)
+                jit.Add(" %s.rgn=", StreamNames[index]);
+            jit.Add("%s%s:%llu", any ? "," : "", RegionNames[region], ULL(Counts.SlowRegions[index][region]));
+            any = true;
+        }
+    }
+    jit.Add(" patch=9r:%llu,9w:%llu,7r:%llu,7w:%llu,single:%llu", ULL(Counts.Patches[0]), ULL(Counts.Patches[1]),
+            ULL(Counts.Patches[2]), ULL(Counts.Patches[3]), ULL(Counts.SinglePatches));
+    Log(LogLevel::Info, "LDMSTATS jit secs=%.1f%s\n", secs, jit.Text);
+
+    Counts = {};
+}
+
+}
+
 template <bool Write, int ConsoleType>
 void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
+    if (__builtin_expect(LdmStats::Enabled, 0))
+        LdmStats::NoteTransfer(0, Write, addr, num, __builtin_return_address(0));
+
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {
@@ -194,6 +467,9 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 template <bool Write, int ConsoleType>
 void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 {
+    if (__builtin_expect(LdmStats::Enabled, 0))
+        LdmStats::NoteTransfer(1, Write, addr, num, __builtin_return_address(0));
+
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {
@@ -537,6 +813,16 @@ void ARMJIT::SetFastBlockLoads(bool enabled) noexcept
     // nothing to throw away before the first block (the app sets it right after creating the NDS)
     if (!JitBlocks9.empty() || !JitBlocks7.empty())
         ResetBlockCache();
+}
+
+void ARMJIT::SetLdmStats(bool enabled) noexcept
+{
+    LdmStats::SetEnabled(enabled);
+}
+
+bool ARMJIT::LdmStatsEnabled() const noexcept
+{
+    return LdmStats::Enabled;
 }
 
 void ARMJIT::CompileBlock(ARM* cpu) noexcept

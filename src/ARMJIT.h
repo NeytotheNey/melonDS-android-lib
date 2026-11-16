@@ -96,6 +96,9 @@ public:
     void SetFastMemory(bool enabled) noexcept;
     // ARM64 only (x64 always has loads on the fast path). Blocks already compiled are thrown away when it changes
     void SetFastBlockLoads(bool enabled) noexcept;
+    // melonade: LDMSTATS lines on the slow block transfers (ARMJIT_LdmStats.h, debug.melonade.ldmstats); clears the counts
+    void SetLdmStats(bool enabled) noexcept;
+    bool LdmStatsEnabled() const noexcept;
 
     Compiler JITCompiler;
     std::unordered_map<u32, JitBlock*> JitBlocks9 {};
@@ -202,6 +205,8 @@ public:
     void ResetBlockCache() noexcept {}
     bool FastBlockLoadsEnabled() const noexcept { return false; }
     void SetFastBlockLoads(bool) noexcept {}
+    void SetLdmStats(bool) noexcept {}
+    bool LdmStatsEnabled() const noexcept { return false; }
     template <u32, int>
     void CheckAndInvalidate(u32 addr) noexcept {}
 

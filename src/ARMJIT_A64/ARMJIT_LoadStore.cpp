@@ -21,6 +21,7 @@
 #include "../ARMJIT.h"
 
 #include "../ARMJIT_Memory.h"
+#include "../ARMJIT_LdmStats.h"
 #include "../NDS.h"
 
 using namespace Arm64Gen;
@@ -43,6 +44,9 @@ u8* Compiler::RewriteMemAccess(u8* pc)
     {
         LoadStorePatch patch = it->second;
         LoadStorePatches.erase(it);
+
+        if (__builtin_expect(LdmStats::Enabled, 0))
+            LdmStats::NotePatch(patch.Block);
 
         ptrdiff_t curCodeOffset = GetCodeOffset();
 
@@ -484,6 +488,9 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
             flags |= memop_SubtractOffset;
         Op2 offset = preinc ? Op2(4) : Op2(0);
 
+        if (__builtin_expect(LdmStats::Enabled, 0))
+            LdmStats::NoteCompile(Num, store, LdmStats::Compile_Single, CurInstr.DataRegion);
+
         Comp_MemAccess(firstReg, rn, offset, 32, flags);
 
         return decrement ? -4 : 4;
@@ -508,6 +515,26 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
         && (store || NDS.JIT.FastBlockLoadsEnabled())
         && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+
+    // debug.melonade.ldmstats: why, in the order compileFastPath checks. A Thumb instruction's Cond() isn't a condition (it's
+    // the top of the next halfword the ARM9 fetched with it, or 0), so most Thumb block transfers take the fast path whatever
+    // region they were predicted to touch (fastthumb)
+    if (__builtin_expect(LdmStats::Enabled, 0))
+    {
+        int outcome;
+        if (compileFastPath)
+            outcome = NDS.JIT.Memory.IsFastmemCompatible(expectedTarget) ? LdmStats::Compile_Fast
+                : Thumb ? LdmStats::Compile_FastThumb : LdmStats::Compile_FastCond;
+        else if (!NDS.JIT.FastMemoryEnabled())
+            outcome = LdmStats::Compile_NoFastmem;
+        else if (!store && !NDS.JIT.FastBlockLoadsEnabled())
+            outcome = LdmStats::Compile_LdmFast;
+        else if (usermode)
+            outcome = LdmStats::Compile_UserMode;
+        else
+            outcome = LdmStats::Compile_Region;
+        LdmStats::NoteCompile(Num, store, outcome, CurInstr.DataRegion);
+    }
 
     {
         s32 offset = decrement
@@ -629,6 +656,7 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         SwapCodeRegion();
         patchFunc = (u8*)GetRXPtr();
         patch.PatchFunc = patchFunc;
+        patch.Block = Num * 2 + store;
         u32 numLoadStores = i;
         for (i = 0; i < numLoadStores; i++)
         {

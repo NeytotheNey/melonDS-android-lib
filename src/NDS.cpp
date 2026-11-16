@@ -44,6 +44,7 @@
 #include "DSi_DSP.h"
 #include "ARMJIT.h"
 #include "ARMJIT_Memory.h"
+#include "ARMJIT_LdmStats.h"
 
 namespace melonDS
 {
@@ -1068,6 +1069,12 @@ u32 NDS::RunFrame()
     NumFrames++;
     if (LagFrameFlag)
         NumLagFrames++;
+
+#ifdef JIT_ENABLED
+    // melonade: the LDMSTATS lines (debug.melonade.ldmstats)
+    if (__builtin_expect(LdmStats::Enabled, 0))
+        LdmStats::EndFrame();
+#endif
 
     if (Running)
         return GPU.TotalScanlines;

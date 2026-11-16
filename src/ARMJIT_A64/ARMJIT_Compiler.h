@@ -91,6 +91,8 @@ struct LoadStorePatch
     void* PatchFunc;
     s32 PatchOffset;
     u32 PatchSize;
+    // melonade, for LdmStats only: Num * 2 + store for a block transfer's fast path, -1 for a single load or store
+    s8 Block = -1;
 };
 
 class Compiler : public Arm64Gen::ARM64XEmitter
@@ -238,6 +240,13 @@ public:
 
     bool IsJITFault(const u8* pc);
     u8* RewriteMemAccess(u8* pc);
+
+    // melonade (LdmStats): whether p is in the second code region, where a block transfer with a fast path keeps its slow path
+    bool IsOutOfLineCode(const void* p)
+    {
+        u64 offset = (u64)p - (u64)GetRXBase();
+        return offset >= JitMemMainSize && offset < (u64)JitMemMainSize + JitMemSecondarySize;
+    }
 
     void SwapCodeRegion()
     {
