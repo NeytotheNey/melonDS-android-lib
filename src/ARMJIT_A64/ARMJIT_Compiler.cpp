@@ -668,7 +668,7 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
         RegCache.PrepareExit();
 
         if (ConstantCycles)
-            ADD(RCycles, RCycles, ConstantCycles);
+            ADDI2R(RCycles, RCycles, ConstantCycles, W0); // may not fit a 12-bit immediate
         QuickTailCall(X0, ARM_Ret);
     }
 }
@@ -729,6 +729,8 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             }
         }
 
+        bool reloadAfterInterp = comp == NULL;
+
         if (comp == NULL)
         {
             SaveCycles();
@@ -770,6 +772,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             else
             {
                 IrregularCycles = comp == NULL;
+                u32 constantCyclesBefore = ConstantCycles;
 
                 FixupBranch skipExecute;
                 if (cond < 0xE)
@@ -779,22 +782,50 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
                 {
                     MOV(X0, RCPU);
                     QuickCallFunction(X1, InterpretARM[CurInstr.Info.Kind]);
+
+                    if (cond < 0xE)
+                    {
+                        // Reload on the executed path only, so an early exit
+                        // below keeps the interpreter's cycles and CPSR, and
+                        // the skip path keeps the C it adds to RCycles.
+                        LoadCycles();
+                        LoadCPSR();
+                        reloadAfterInterp = false;
+                    }
                 }
                 else
                 {
                     (this->*comp)();
                 }
 
+                // The interpreter charges a skipped instruction C, and a run
+                // one whatever its handler charges. If this instruction only
+                // added C to ConstantCycles, both paths cost the same and
+                // nothing else is needed. Otherwise its constant part moves
+                // to run time on the executed path, and the skip path adds C.
+                bool skipAddsC = false;
+                if (cond < 0xE)
+                {
+                    u32 execConstant = ConstantCycles - constantCyclesBefore;
+                    if (IrregularCycles || execConstant != (u32)CyclesC())
+                    {
+                        ConstantCycles = constantCyclesBefore;
+                        if (execConstant)
+                            ADD(RCycles, RCycles, execConstant);
+                        skipAddsC = true;
+                    }
+                }
+
                 Comp_BranchSpecialBehaviour(true);
 
                 if (cond < 0xE)
                 {
-                    if (IrregularCycles || (CurInstr.BranchFlags & branch_FollowCondTaken))
+                    if (skipAddsC || (CurInstr.BranchFlags & branch_FollowCondTaken))
                     {
                         FixupBranch skipNop = B();
                         SetJumpTarget(skipExecute);
 
-                        if (IrregularCycles)
+                        if (skipAddsC)
                             Comp_AddCycles_C(true);
 
                         Comp_BranchSpecialBehaviour(false);
@@ -810,7 +841,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             }
         }
 
-        if (comp == NULL)
+        if (reloadAfterInterp)
         {
             LoadCycles();
             LoadCPSR();
@@ -820,7 +851,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     RegCache.Flush();
 
     if (ConstantCycles)
-        ADD(RCycles, RCycles, ConstantCycles);
+        ADDI2R(RCycles, RCycles, ConstantCycles, W0); // may not fit a 12-bit immediate
     QuickTailCall(X0, ARM_Ret);
 
     FlushIcache();
@@ -841,16 +872,25 @@ void Compiler::Reset()
         *(((u32*)GetRWPtr()) + i) = brk_0;
 }
 
-void Compiler::Comp_AddCycles_C(bool forceNonConstant)
+s32 Compiler::CyclesC()
 {
-    s32 cycles = Num ?
+    return Num ?
         NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 1 : 3]
         : ((R15 & 0x2) ? 0 : CurInstr.CodeCycles);
+}
+
+// A plain C costs the same whether a conditional instruction runs or is
+// skipped, so it goes to ConstantCycles. CompileBlock moves it to run time
+// if the same instruction also has irregular cycles.
+// forceNonConstant adds it at run time, for code that only runs on one path.
+void Compiler::Comp_AddCycles_C(bool forceNonConstant)
+{
+    s32 cycles = CyclesC();
 
     if (forceNonConstant)
-        ConstantCycles += cycles;
-    else
         ADD(RCycles, RCycles, cycles);
+    else
+        ConstantCycles += cycles;
 }
 
 void Compiler::Comp_AddCycles_CI(u32 numI)

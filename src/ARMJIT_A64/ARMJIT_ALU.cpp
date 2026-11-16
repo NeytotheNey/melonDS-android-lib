@@ -645,6 +645,21 @@ void Compiler::Comp_Mul_Mla(bool S, bool mla, ARM64Reg rd, ARM64Reg rm, ARM64Reg
         TST(rd, rd);
         Comp_RetriveFlags(false);
     }
+
+    Comp_MulClearCarry7(S);
+}
+
+// The ARM7 clears C on a flag-setting multiply, like the interpreter's
+// SetC(0). The decoder only lists N and Z as written by multiplies, so
+// SetFlags never has C here and we can't tell whether it gets read; always
+// clear it. That's still exact, since liveness treats C as passing through.
+void Compiler::Comp_MulClearCarry7(bool S)
+{
+    if (S && Num == 1)
+    {
+        CPSRDirty = true;
+        ANDI2R(RCPSR, RCPSR, ~(1 << 29));
+    }
 }
 
 void Compiler::A_Comp_Mul_Long()
@@ -703,6 +718,8 @@ void Compiler::A_Comp_Mul_Long()
     
     if (S)
         Comp_RetriveFlags(false);
+
+    Comp_MulClearCarry7(S);
 }
 
 void Compiler::A_Comp_Mul_Short()

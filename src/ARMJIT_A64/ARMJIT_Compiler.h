@@ -121,6 +121,8 @@ public:
 
     void Reset();
 
+    s32 CyclesC();
+    void Comp_MulClearCarry7(bool S);
     void Comp_AddCycles_C(bool forceNonConstant = false);
     void Comp_AddCycles_CI(u32 numI);
     void Comp_AddCycles_CI(u32 c, Arm64Gen::ARM64Reg numI, Arm64Gen::ArithOption shift);
