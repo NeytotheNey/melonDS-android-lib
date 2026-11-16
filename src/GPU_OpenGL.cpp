@@ -160,35 +160,70 @@ void GLCompositor::BuildCompShader(bool highScale) noexcept
     glUseProgram(wasBound ? CompShader : (GLuint)bound);
 }
 
-GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
+// the main draw's two quads (CompVertices 0-11) for an output with [margin] (see SetRenderSettings)
+void GLCompositor::SetupCompVertices(int margin) noexcept
 {
-    SetupCompShader();
-
-    // all this mess is to prevent bleeding
+    if (margin == 0)
+    {
+        // all this mess is to prevent bleeding
 #define SETVERTEX(i, x, y, offset) \
     CompVertices[i].Position[0] = x; \
     CompVertices[i].Position[1] = y + offset; \
     CompVertices[i].Texcoord[0] = (x + 1.f) * (256.f / 2.f); \
     CompVertices[i].Texcoord[1] = (y + 1.f) * (384.f / 2.f)
 
-    const float padOffset = 1.f/(192*2.f+2.f)*2.f;
-    // top screen
-    SETVERTEX(0, -1, 1, 0);
-    SETVERTEX(1, 1, 0, padOffset);
-    SETVERTEX(2, 1, 1, 0);
-    SETVERTEX(3, -1, 1, 0);
-    SETVERTEX(4, -1, 0, padOffset);
-    SETVERTEX(5, 1, 0, padOffset);
+        const float padOffset = 1.f/(192*2.f+2.f)*2.f;
+        // top screen
+        SETVERTEX(0, -1, 1, 0);
+        SETVERTEX(1, 1, 0, padOffset);
+        SETVERTEX(2, 1, 1, 0);
+        SETVERTEX(3, -1, 1, 0);
+        SETVERTEX(4, -1, 0, padOffset);
+        SETVERTEX(5, 1, 0, padOffset);
 
-    // bottom screen
-    SETVERTEX(6, -1, 0, -padOffset);
-    SETVERTEX(7, 1, -1, 0);
-    SETVERTEX(8, 1, 0, -padOffset);
-    SETVERTEX(9, -1, 0, -padOffset);
-    SETVERTEX(10, -1, -1, 0);
-    SETVERTEX(11, 1, -1, 0);
+        // bottom screen
+        SETVERTEX(6, -1, 0, -padOffset);
+        SETVERTEX(7, 1, -1, 0);
+        SETVERTEX(8, 1, 0, -padOffset);
+        SETVERTEX(9, -1, 0, -padOffset);
+        SETVERTEX(10, -1, -1, 0);
+        SETVERTEX(11, 1, -1, 0);
 
 #undef SETVERTEX
+        return;
+    }
+
+    // half 1 (texture rows 192-384) over the output's last 192 rows, half 0 (-margin to 192 + margin)
+    // over its first 192 + 2 x margin, in clip space of the whole (384 + 2 + 2 x margin) rows
+    const float rows = 384.f + 2.f + 2.f * margin;
+    const float half1Bottom = 1.f - 2.f * 192.f / rows;
+    const float half0Top = -1.f + 2.f * (192.f + 2.f * margin) / rows;
+    const float top0 = 192.f + margin, bottom0 = -(float)margin;
+    auto set = [this](int i, float x, float y, float v)
+    {
+        CompVertices[i].Position = {x, y};
+        CompVertices[i].Texcoord = {(x + 1.f) * (256.f / 2.f), v};
+    };
+    set(0, -1, 1, 384.f);
+    set(1, 1, half1Bottom, 192.f);
+    set(2, 1, 1, 384.f);
+    set(3, -1, 1, 384.f);
+    set(4, -1, half1Bottom, 192.f);
+    set(5, 1, half1Bottom, 192.f);
+
+    set(6, -1, half0Top, top0);
+    set(7, 1, -1, bottom0);
+    set(8, 1, half0Top, top0);
+    set(9, -1, half0Top, top0);
+    set(10, -1, -1, bottom0);
+    set(11, 1, -1, bottom0);
+}
+
+GLCompositor::GLCompositor(GLuint compShader) noexcept : CompShader(compShader)
+{
+    SetupCompShader();
+
+    SetupCompVertices(0);
 
     // GPU::Comp1x: each half over a whole viewport, in the same order (see DrawHalfAt1x)
     for (int half = 0; half < 2; half++)
@@ -263,6 +298,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     Scale(other.Scale),
     Scale3D(other.Scale3D),
     ViewWidth(other.ViewWidth),
+    Margin(other.Margin),
     ScreenH(other.ScreenH),
     ScreenW(other.ScreenW),
     CompScaleLoc(other.CompScaleLoc),
@@ -281,6 +317,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     CompWideRatioLoc(other.CompWideRatioLoc),
     CompWideOffsetLoc(other.CompWideOffsetLoc),
     CompWideHiresCapLoc(other.CompWideHiresCapLoc),
+    CompWideMarginLoc(other.CompWideMarginLoc),
     WingPlanesTex(other.WingPlanesTex),
     WingHold(other.WingHold),
     WingCopy(other.WingCopy),
@@ -333,6 +370,7 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         Scale = other.Scale;
         Scale3D = other.Scale3D;
         ViewWidth = other.ViewWidth;
+        Margin = other.Margin;
         ScreenH = other.ScreenH;
         ScreenW = other.ScreenW;
         CompScaleLoc = other.CompScaleLoc;
@@ -348,6 +386,7 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         CompWideRatioLoc = other.CompWideRatioLoc;
         CompWideOffsetLoc = other.CompWideOffsetLoc;
         CompWideHiresCapLoc = other.CompWideHiresCapLoc;
+        CompWideMarginLoc = other.CompWideMarginLoc;
         WingHold = other.WingHold;
         WingCopy = other.WingCopy;
         WingHoldLines = other.WingHoldLines;
@@ -463,6 +502,7 @@ bool GLCompositor::PrepareWide() noexcept
     CompWideRatioLoc = glGetUniformLocation(CompShaderWide, "uWideRatio");
     CompWideOffsetLoc = glGetUniformLocation(CompShaderWide, "uWideOffset");
     CompWideHiresCapLoc = glGetUniformLocation(CompShaderWide, "uHiresCap");
+    CompWideMarginLoc = glGetUniformLocation(CompShaderWide, "uWideMargin");
 
     glUseProgram(CompShaderWide);
     glUniform1i(glGetUniformLocation(CompShaderWide, "ScreenTex"), 0);
@@ -526,6 +566,7 @@ bool GLCompositor::PrepareDown3D(bool wide, int mode, bool filter) noexcept
     {
         program.WideRatioLoc = glGetUniformLocation(shader, "uWideRatio");
         program.WideOffsetLoc = glGetUniformLocation(shader, "uWideOffset");
+        program.WideMarginLoc = glGetUniformLocation(shader, "uWideMargin");
     }
     if (filter)
     {
@@ -600,7 +641,7 @@ void GLCompositor::SetOutputCap3D(const GPU& gpu) noexcept
     // asked for, or drops it while filtered 2D's don't build (and caps again once the filter's off).
     // otherwise the next cap builds them
     if (AskedScale != Scale3D)
-        SetRenderSettings(AskedScale, Scale3D, ViewWidth);
+        SetRenderSettings(AskedScale, Scale3D, ViewWidth, Margin);
 }
 
 void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
@@ -725,10 +766,10 @@ int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) noexcept
 
 void GLCompositor::SetScaleFactor(int scale) noexcept
 {
-    SetRenderSettings(scale, scale, ViewWidth);
+    SetRenderSettings(scale, scale, ViewWidth, Margin);
 }
 
-void GLCompositor::SetRenderSettings(int scale, int scale3D, int viewWidth) noexcept
+void GLCompositor::SetRenderSettings(int scale, int scale3D, int viewWidth, int margin) noexcept
 {
     // what's asked, which SetOutputCap3D asks for again when what a cap needs changes
     AskedScale = scale;
@@ -749,7 +790,7 @@ void GLCompositor::SetRenderSettings(int scale, int scale3D, int viewWidth) noex
             scale = scale3D;
     }
 
-    if (scale == Scale && scale3D == Scale3D && viewWidth == ViewWidth)
+    if (scale == Scale && scale3D == Scale3D && viewWidth == ViewWidth && margin == Margin)
         return;
 
     if (scale != scale3D || Scale != Scale3D)
@@ -770,9 +811,20 @@ void GLCompositor::SetRenderSettings(int scale, int scale3D, int viewWidth) noex
     Scale3D = scale3D;
     ViewWidth = viewWidth;
     ScreenW = viewWidth * scale;
-    ScreenH = (384+2) * scale;
+    if (margin != Margin)
+    {
+        Margin = margin;
+        SetupCompVertices(margin);
+        // the renderer's own buffer stays bound (a margin change is rare, so the glGet is fine)
+        GLint arrayBuffer = 0;
+        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &arrayBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, 12 * sizeof(CompVertex), &CompVertices[0]);
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)arrayBuffer);
+    }
+    ScreenH = (384+2 + 2*Margin) * scale;
 
-    // held wings are only reused at the width and scale they were made at
+    // held wings are only reused at the width, margin and scale they were made at
     ResetWingHold();
 
     // a frontend's textures are at the old size, so the buffers go back to the compositor's own
@@ -817,7 +869,7 @@ void GLCompositor::PrepareOutput(int buf) noexcept
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     // fill the padding
     u8* zeroPixels = (u8*) calloc(1, ScreenW*2*Scale*4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192*Scale, ScreenW, 2*Scale, GL_RGBA, GL_UNSIGNED_BYTE, zeroPixels);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, TopRows()*Scale, ScreenW, 2*Scale, GL_RGBA, GL_UNSIGNED_BYTE, zeroPixels);
     free(zeroPixels);
 
     GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
@@ -924,8 +976,10 @@ int GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
     WingCopy[0] = live[0] && WingHold[1].SinceLive <= 2;
     WingCopy[1] = live[1] && WingHold[0].SinceLive <= 2;
 
+    // with a margin, the output's size, as the margin rows are kept full width (CopyHeldWings)
     int wingW = (ViewWidth - 256) / 2 * Scale;
-    if ((WingCopy[0] || WingCopy[1]) && (HeldWingsW != wingW * 2 || HeldWingsH != ScreenH))
+    int heldW = Margin ? ScreenW : wingW * 2;
+    if ((WingCopy[0] || WingCopy[1]) && (HeldWingsW != heldW || HeldWingsH != ScreenH))
     {
         if (!HeldWingsTex)
         {
@@ -939,12 +993,12 @@ int GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wingW * 2, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, heldW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, HeldWingsFB);
         glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HeldWingsTex, 0);
 
-        HeldWingsW = wingW * 2;
+        HeldWingsW = heldW;
         HeldWingsH = ScreenH;
         // what was in the old texture is gone
         WingHold[0].SinceCopy = WingHold[1].SinceCopy = WingHoldNever;
@@ -998,7 +1052,8 @@ int GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
 
 // copies the wings of the halves PrepareWingHold picked from the output just drawn. the
 // wings are the output's first and last wingW columns, and its halves are 192 lines each
-// with the 2 padding lines between them
+// with the 2 padding lines between them. with a margin they're copied where they are, and the
+// top half's margin rows too, full width: a margin is held on the frames its edge line is
 void GLCompositor::CopyHeldWings(int backbuf) noexcept
 {
     int wingW = (ViewWidth - 256) / 2 * Scale;
@@ -1010,11 +1065,19 @@ void GLCompositor::CopyHeldWings(int backbuf) noexcept
         if (!WingCopy[half])
             continue;
 
-        int y0 = half * 194 * Scale;
+        int y0 = HalfLineRow(half) * Scale;
         int y1 = y0 + 192 * Scale;
+        int rightX = Margin ? ScreenW - wingW : wingW;
         glBlitFramebuffer(0, y0, wingW, y1, 0, y0, wingW, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        glBlitFramebuffer(ScreenW - wingW, y0, ScreenW, y1, wingW, y0, wingW * 2, y1,
+        glBlitFramebuffer(ScreenW - wingW, y0, ScreenW, y1, rightX, y0, rightX + wingW, y1,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if (half == 0 && Margin)
+        {
+            int m = Margin * Scale, bottom = (192 + Margin) * Scale;
+            glBlitFramebuffer(0, 0, ScreenW, m, 0, 0, ScreenW, m, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            glBlitFramebuffer(0, bottom, ScreenW, bottom + m, 0, bottom, ScreenW, bottom + m,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
         WingHold[half].SinceCopy = 0;
     }
 
@@ -1056,7 +1119,7 @@ void GLCompositor::ClearOutput(int mode) noexcept
         glGetIntegerv(GL_SCISSOR_BOX, box);
         if (!scissor)
             glEnable(GL_SCISSOR_TEST);
-        glScissor(0, 192 * Scale, ScreenW, 2 * Scale);
+        glScissor(0, TopRows() * Scale, ScreenW, 2 * Scale);
         glClearBufferfv(GL_COLOR, 0, zero);
         glScissor(box[0], box[1], box[2], box[3]);
         if (!scissor)
@@ -1246,11 +1309,11 @@ void GLCompositor::LogComp1x(const GPU& gpu) noexcept
     const std::array<u32, Comp1xOff_Count>& off = OneX.LogOff;
     Log(LogLevel::Info, "COMP1X mode=%d scale=%d width=%d frames=%u top=%u bottom=%u both=%u off front=%u scale=%u "
         "view=%u nolines=%u filter=%u shadow=%u checks=%u checkpx=%u mismatches=%u mismatchnative=%u failed=%d "
-        "filtered=%u\n",
+        "filtered=%u margin=%u\n",
         gpu.Comp1x, Scale, ViewWidth, OneX.LogFrames, OneX.LogHalves[0], OneX.LogHalves[1], OneX.LogHalves[2],
         off[Comp1xOffFront], off[Comp1xOffScale], off[Comp1xOffView], off[Comp1xOffLines], off[Comp1xOffFilter],
         off[Comp1xOffShadow], OneX.Checks, OneX.CheckPixels, OneX.Mismatches, OneX.MismatchNative,
-        OneX.CheckFailed ? 1 : 0, OneX.LogFiltered);
+        OneX.CheckFailed ? 1 : 0, OneX.LogFiltered, off[Comp1xOffMargin]);
 
     OneX.LogStartNs = now;
     OneX.LogFrames = 0;
@@ -1279,6 +1342,7 @@ bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
     layout.Scale = OneX.Scale[buf];
     layout.HalfScale = OneX.HalfScale[buf];
     layout.TopWingLines = OneX.TopWingLines[buf];
+    layout.TopMargin = OneX.TopMargin[buf];
     return true;
 }
 
@@ -1380,6 +1444,8 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
             off = Comp1xOffFilter;
         else if (shadowLines > 0)
             off = Comp1xOffShadow;
+        else if (Margin > 0)
+            off = Comp1xOffMargin;
         OneX.LogOff[off]++;
 
         if (off == Comp1xOn)
@@ -1424,6 +1490,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         {
             glUniform1f(capProgram.WideRatioLoc, ViewWidth / 256.0f);
             glUniform1i(capProgram.WideOffsetLoc, (ViewWidth - 256) / 2);
+            glUniform1i(capProgram.WideMarginLoc, Margin);
         }
         if (filterPasses > 0)
         {
@@ -1443,6 +1510,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         {
             glUniform1f(filterComp.RatioLoc, ViewWidth / 256.0f);
             glUniform1i(filterComp.OffsetLoc, (ViewWidth - 256) / 2);
+            glUniform1i(filterComp.MarginLoc, Margin);
         }
     }
     else if (ViewWidth == 256)
@@ -1458,6 +1526,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
         glUniform1f(CompWideRatioLoc, ViewWidth / 256.0f);
         glUniform1i(CompWideOffsetLoc, (ViewWidth - 256) / 2);
         glUniform1i(CompWideHiresCapLoc, hiresDisplay);
+        glUniform1i(CompWideMarginLoc, Margin);
     }
 
     // the frame's wing planes, screen planes and control words
@@ -1558,6 +1627,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     OneX.HalfScale[backbuf] = halvesAt1x != 0 ? smallDraw.DrawScale : 1;
     OneX.Drawn[backbuf] = true;
     OneX.TopWingLines[backbuf] = topWingLines;
+    OneX.TopMargin[backbuf] = Margin;
 
     // before anything else draws or reads, with the main draw's state still set
     if (checkHalves != 0 && (OneX.CheckFrames++ % 30) == 0)
@@ -1695,6 +1765,7 @@ bool GLCompositor::PrepareFilter2DShaders(bool wide) noexcept
         comp.ScaleLoc = glGetUniformLocation(shader, "u3DScale");
         comp.RatioLoc = glGetUniformLocation(shader, "uWideRatio");
         comp.OffsetLoc = glGetUniformLocation(shader, "uWideOffset");
+        comp.MarginLoc = glGetUniformLocation(shader, "uWideMargin");
         comp.HiresCapLoc = glGetUniformLocation(shader, "uHiresCap");
         comp.MapScaleLoc = glGetUniformLocation(shader, "uFilterMapScale");
         comp.IdentityLoc = glGetUniformLocation(shader, "uFilterIdentity");
@@ -2429,6 +2500,7 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
         glUseProgram(shader.Program);
         glUniform1i(shader.ScaleLoc, Scale);
         glUniform1i(shader.WideOffsetLoc, (ViewWidth - 256) / 2);
+        glUniform1i(shader.WideMarginLoc, Margin);
         glUniform1i(shader.DstRowLoc, dstRow);
         int ratioP, ratioQ;
         Down3DRatio(ratioP, ratioQ);
@@ -2446,6 +2518,7 @@ void GLCompositor::RunHiresCapture(const GPU& gpu, int backbuf) noexcept
         glUseProgram(HiresCap.Shader);
         glUniform1i(HiresCap.ScaleLoc, Scale);
         glUniform1i(HiresCap.WideOffsetLoc, (ViewWidth - 256) / 2);
+        glUniform1i(HiresCap.WideMarginLoc, Margin);
         glUniform1i(HiresCap.DstRowLoc, dstRow);
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
@@ -2502,6 +2575,7 @@ bool GLCompositor::PrepareHiresCaptureShader() noexcept
     HiresCap.Shader = shader;
     HiresCap.ScaleLoc = glGetUniformLocation(shader, "uScale");
     HiresCap.WideOffsetLoc = glGetUniformLocation(shader, "uWideOffset");
+    HiresCap.WideMarginLoc = glGetUniformLocation(shader, "uWideMargin");
     HiresCap.DstRowLoc = glGetUniformLocation(shader, "uDstRow");
 
     glUseProgram(shader);
@@ -2536,6 +2610,7 @@ bool GLCompositor::PrepareHiresCaptureDown3D(int mode) noexcept
     shader.Program = program;
     shader.ScaleLoc = glGetUniformLocation(program, "uScale");
     shader.WideOffsetLoc = glGetUniformLocation(program, "uWideOffset");
+    shader.WideMarginLoc = glGetUniformLocation(program, "uWideMargin");
     shader.DstRowLoc = glGetUniformLocation(program, "uDstRow");
     shader.RatioLoc = glGetUniformLocation(program, "u3DRatio");
 
@@ -2833,6 +2908,7 @@ bool GLCompositor::PrepareShadow2DProgram(int variant) noexcept
     comp.ScaleLoc = glGetUniformLocation(shader, "u3DScale");
     comp.WideOffsetLoc = glGetUniformLocation(shader, "uWideOffset");
     comp.ObjOffsetLoc = glGetUniformLocation(shader, "uObjOffset");
+    comp.WideMarginLoc = glGetUniformLocation(shader, "uWideMargin");
 
     glUseProgram(shader);
     glUniform1i(glGetUniformLocation(shader, "ScreenTex"), 0);
@@ -2940,8 +3016,8 @@ void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
 }
 
 // two triangles per run of drawn lines in a screen that are alike in whether they cover the wings: in
-// the output (rows of Scale pixels, the 2 padding lines between the screens) or the check target
-// (256x384 at 1x, no padding)
+// the output (rows of Scale pixels, the 2 padding lines between the screens, the top screen's lines
+// below its margin, whose rows are the compositor's) or the check target (256x384 at 1x, no padding)
 void GLCompositor::BuildShadow2DQuads(bool check) noexcept
 {
     using namespace Shadow2D;
@@ -2986,8 +3062,8 @@ void GLCompositor::BuildShadow2DQuads(bool check) noexcept
             {
                 x0 = wide ? 0.0f : (float)(offset * Scale);
                 x1 = wide ? w : (float)((offset + 256) * Scale);
-                y0 = (float)((half * 194 + line) * Scale);
-                y1 = (float)((half * 194 + end) * Scale);
+                y0 = (float)((HalfLineRow(half) + line) * Scale);
+                y1 = (float)((HalfLineRow(half) + end) * Scale);
             }
             x0 = x0 / w * 2.0f - 1.0f;
             x1 = x1 / w * 2.0f - 1.0f;
@@ -3017,6 +3093,7 @@ void GLCompositor::RunShadow2D(int backbuf) noexcept
     glUniform1ui(comp.ScaleLoc, Scale);
     glUniform1i(comp.WideOffsetLoc, (ViewWidth - 256) / 2);
     glUniform1i(comp.ObjOffsetLoc, (ViewWidth - 256) / 2);
+    glUniform1i(comp.WideMarginLoc, Margin);
 
     glActiveTexture(GL_TEXTURE0 + Shadow2DMemUnit);
     glBindTexture(GL_TEXTURE_2D, Shadow.MemTex);

@@ -58,7 +58,12 @@ public:
     // it the output pixel covers. when the program doesn't build, the output stays at scale3D. a call
     // that changes the output's scale works like a scale change, so the hi-res copies, which are at
     // the output's scale, start over
-    void SetRenderSettings(int scale, int scale3D, int viewWidth) noexcept;
+    // [margin] is the 3D's vertical margin (camera stage 2, 0 unless viewWidth is wide): the 3D
+    // target is 192 + 2 x margin rows tall, all shown in the top half, which the output's layout
+    // follows (OutputLayout::TopMargin): (192 + 2 x margin) x scale rows, the 2 x scale padding rows,
+    // then the bottom screen's 192 x scale. a margin row has no 2D line, so it's drawn as a wing
+    // pixel of the nearest DS line (0 or 191), with the 3D at its own row and column (MarginEdge)
+    void SetRenderSettings(int scale, int scale3D, int viewWidth, int margin) noexcept;
     // GPU::OutputCap: the output scale for 3D at [scale] when what shows the output needs [need]x:
     // the smallest s >= need that divides scale with scale / s up to 4 or, with [anyRatio] (GPU::OutputCap
     // bit 2), is also above scale / 2 (8x gives 5x-7x, 12x 7x-11x, 16x 9x-15x), so an output pixel
@@ -86,6 +91,7 @@ public:
     // gave them, so it only costs a few compares in a frame that changes nothing
     void LogOutputCap(const GPU& gpu, int frontendNeed) noexcept;
     [[nodiscard]] int GetViewWidth() const noexcept { return ViewWidth; }
+    [[nodiscard]] int GetMargin() const noexcept { return Margin; }
     bool PrepareWide() noexcept;
 
     void Stop(const GPU& gpu) noexcept;
@@ -156,6 +162,7 @@ private:
         Comp1xOffFilter,    // filtered 2D the map's scale can't do (K3): the output's scale isn't a multiple
                             // of the map's above it, or Filter2D 3's 256 view
         Comp1xOffShadow,    // the GPU 2D shadow draws over the output
+        Comp1xOffMargin,    // the output has a vertical margin (camera stage 2), which the 1x halves don't
         Comp1xOff_Count
     };
     struct Comp1xState
@@ -165,8 +172,9 @@ private:
         std::array<int, 2> Scale {};
         std::array<int, 2> HalfScale {};
         std::array<bool, 2> Drawn {};
-        // and for the WideMelon camera (OutputLayout::TopWingLines)
+        // and for the WideMelon camera (OutputLayout::TopWingLines and TopMargin)
         std::array<int, 2> TopWingLines {};
+        std::array<int, 2> TopMargin {};
 
         // the check mode's target, made the first time a check runs and freed with the switch off:
         // GL_RGBA8 CheckW x 384 at CheckScale, half h at it from row h * 192 * CheckScale
@@ -209,6 +217,11 @@ private:
     // output pixel spans p / q 3D pixels a side (q is 1 at a whole ratio)
     void Down3DRatio(int& p, int& q) const noexcept;
     int ViewWidth = 256;
+    // the vertical margin (see SetRenderSettings), and the output rows the top half's DS line 0 and the
+    // bottom half start at, in native rows (0 and 194 without a margin)
+    int Margin = 0;
+    [[nodiscard]] int TopRows() const noexcept { return 192 + 2 * Margin; }
+    [[nodiscard]] int HalfLineRow(int half) const noexcept { return half ? TopRows() + 2 : Margin; }
     int ScreenH = 0, ScreenW = 0;
 
     GLuint CompShader {};
@@ -237,6 +250,7 @@ private:
         GLuint HiresCapLoc = 0;
         GLuint WideRatioLoc = 0;
         GLuint WideOffsetLoc = 0;
+        GLint WideMarginLoc = -1;
         // filtered 2D's (FILTER2D, in Filter2DState::Down3D) only: uFilterMapScale and uFilterRowOffset
         GLint MapScaleLoc = -1;
         GLint RowOffsetLoc = -1;
@@ -300,6 +314,7 @@ private:
     GLuint CompWideRatioLoc = 0;
     GLuint CompWideOffsetLoc = 0;
     GLuint CompWideHiresCapLoc = 0;
+    GLint CompWideMarginLoc = -1;
 
     // the wide programs' wing planes (see GPU2D::AccelWingPlanesStart), GL_RGBA8UI, 6 texels per
     // line, both screens' 192 lines like the screen texture. made with the wide program and
@@ -310,7 +325,8 @@ private:
     // WideMelon wing hold. games with 3D on both screens move unit A (and the 3D) to the other
     // screen every frame, so each half only gets 3D wings every other frame. the frames in
     // between reuse the half's wings from the last frame that had them, kept in HeldWingsTex
-    // (both wings side by side, full output height). see PrepareWingHold
+    // (both wings side by side, full output height, or with a margin the output's size, everything
+    // where it is in the output, as the margin rows are held full width). see PrepareWingHold
     static constexpr int WingHoldNever = 1000;
     struct WingHoldHalf
     {
@@ -387,6 +403,7 @@ private:
         GLuint Shader = 0;
         bool ShaderFailed = false;
         GLuint ScaleLoc = 0, WideOffsetLoc = 0, DstRowLoc = 0;
+        GLint WideMarginLoc = -1;
         // GPU::OutputCap: the pass's programs for a capped output, one per GPU::OutputCap3D mode
         // (HiresCaptureDown3DFS), which read the 3D at its own scale. made alongside the compositor's
         // (PrepareCapped) while hi-res capture is on, or by the first capped pass that needs one
@@ -395,6 +412,7 @@ private:
             GLuint Program = 0;
             bool Failed = false;
             GLuint ScaleLoc = 0, WideOffsetLoc = 0, DstRowLoc = 0, RatioLoc = 0;
+            GLint WideMarginLoc = -1;
         };
         std::array<Down3DShader, 4> Down3D {};
 
@@ -445,6 +463,7 @@ private:
         GLuint Program = 0;
         GLuint ScaleLoc = 0, RatioLoc = 0, OffsetLoc = 0, HiresCapLoc = 0, MapScaleLoc = 0, IdentityLoc = 0;
         GLint RowOffsetLoc = -1;
+        GLint MarginLoc = -1;
     };
     struct Filter2DState
     {
@@ -512,7 +531,7 @@ private:
     struct Shadow2DProgram
     {
         GLuint Program = 0;
-        GLint ScaleLoc = -1, WideOffsetLoc = -1, ObjOffsetLoc = -1;
+        GLint ScaleLoc = -1, WideOffsetLoc = -1, ObjOffsetLoc = -1, WideMarginLoc = -1;
     };
     struct Shadow2DState
     {
@@ -565,8 +584,10 @@ private:
     };
     // 0-5 half 1's quad (output rows from 194 * Scale, the bottom screen: the top of clip space, as
     // the frontend reads the output upside down) and 6-11 half 0's. GPU::Comp1x: 12-17 half 0 over a
-    // whole viewport, 18-23 half 1 (see DrawHalfAt1x)
+    // whole viewport, 18-23 half 1 (see DrawHalfAt1x). with a margin, half 0's texture coordinates
+    // run from -margin to 192 + margin over its 192 + 2 x margin rows (SetupCompVertices)
     std::array<CompVertex, 2*3*2*2> CompVertices {};
+    void SetupCompVertices(int margin) noexcept;
 
     GLuint CompScreenInputTex = 0;
     // the compositor's own output textures only exist while a buffer is drawn into without a

@@ -214,6 +214,17 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
         shaderSource += std::to_string(TargetWidth * ScaleFactor);
         shaderSource += "\n#define WideLowResOffset ";
         shaderSource += std::to_string((TargetWidth - WideMelon::NativeWidth) / 2);
+        if (TargetMargin != 0)
+        {
+            // camera stage 2: the real height (ScreenHeight is rounded up to whole coarse tiles, so the
+            // scale is given too) and the rows above DS line 0 in native pixels, for capture
+            shaderSource += "\n#define ScreenScale ";
+            shaderSource += std::to_string(ScaleFactor);
+            shaderSource += "\n#define WideOutputHeight ";
+            shaderSource += std::to_string(OutputHeight);
+            shaderSource += "\n#define WideLowResMargin ";
+            shaderSource += std::to_string(TargetMargin);
+        }
     }
 
     shaderSource += ComputeRendererShaders::Common;
@@ -693,14 +704,26 @@ static int TileSizeForScale(int scale)
     return std::min(8 * TileScale, 32);
 }
 
+// the binning dispatch covers whole coarse tiles, so a target with a margin is rounded up to whole
+// coarse tile rows (192 always is, at any scale and tile size). the rows past the real height are
+// rendered, but the final pass doesn't store them
+static int InternalHeightFor(int margin, int scale, int tileSize)
+{
+    int coarseTileH = (tileSize < 32 ? 4 : 6) * tileSize; // CoarseTileCountY tiles
+    int height = 192 + 2 * margin;
+    while ((height * scale) % coarseTileH != 0)
+        height++;
+    return height;
+}
+
 // the binning dispatch covers whole coarse tiles and the bin mask clear whole groups of tiles, so
 // a wide target is rounded up until both divide evenly (256 always does). the columns past the
 // real width are rendered, but the final pass doesn't store them
-static int InternalWidthFor(int width, int scale, int tileSize)
+static int InternalWidthFor(int width, int margin, int scale, int tileSize)
 {
     int coarseTileW = 8 * tileSize; // CoarseTileCountX tiles
     int clearLocalSize = tileSize < 32 ? 64 : 48; // ClearCoarseBinMaskLocalSize
-    int tileLines = 192 * scale / tileSize;
+    int tileLines = InternalHeightFor(margin, scale, tileSize) * scale / tileSize;
     while ((width * scale) % coarseTileW != 0 ||
            ((width * scale / tileSize) * tileLines) % clearLocalSize != 0)
         width++;
@@ -718,7 +741,8 @@ static int ForcedTileSizeOf(const GPU& gpu)
 // work group rasterises a tile with a thread per pixel, and the work tiles have to fit SortWork's
 // dispatch and the WorkDescs (see TargetFits). the rest follows from the size: the coarse tiles
 // divide 192 lines at any scale for all three sizes, and InternalWidthFor rounds the width up
-int ComputeRenderer::TileSizeFor(int width, int scale, int forced) const noexcept
+// (InternalHeightFor the height with a margin)
+int ComputeRenderer::TileSizeFor(int width, int margin, int scale, int forced) const noexcept
 {
     int tileSize = TileSizeForScale(scale);
     if (forced == 0 || forced == tileSize)
@@ -726,15 +750,26 @@ int ComputeRenderer::TileSizeFor(int width, int scale, int forced) const noexcep
     if (MaxGroupThreads > 0 && forced * forced > MaxGroupThreads)
         return tileSize;
 
-    s64 screenW = (s64)InternalWidthFor(width, scale, forced) * scale;
-    s64 maxWorkTiles = (screenW / forced) * (192 * scale / forced) * 16;
+    s64 screenW = (s64)InternalWidthFor(width, margin, scale, forced) * scale;
+    s64 maxWorkTiles = (screenW / forced) * (InternalHeightFor(margin, scale, forced) * scale / forced) * 16;
     return maxWorkTiles <= WorkTileLimitFor(MaxPolygonsFor(width, WideList)) ? forced : tileSize;
 }
 
 // a native target always fits here: the scale was already fitted to it (FitScale)
 bool ComputeRenderer::TargetFits(int width, int scale) const noexcept
 {
-    return width == WideMelon::NativeWidth || BuffersFit(width, scale);
+    return width == WideMelon::NativeWidth || BuffersFit(width, 0, scale);
+}
+
+// a margin on a wide target: its rows fit the texture and viewport limits (as in GLRenderer::MarginFits)
+// and the taller work buffers BuffersFit's
+bool ComputeRenderer::MarginFits(int width, int margin, int scale) const noexcept
+{
+    if (margin == 0)
+        return true;
+    if (MaxTargetHeight > 0 && (384 + 2 + 2 * margin) * scale > MaxTargetHeight)
+        return false;
+    return BuffersFit(width, margin, scale);
 }
 
 // the scale's native target fits the texture, viewport and work group limits and its work buffers
@@ -745,10 +780,10 @@ bool ComputeRenderer::ScaleFits(int scale) const noexcept
 {
     if (MaxTargetHeight > 0 && (384 + 2) * scale > MaxTargetHeight)
         return false;
-    int tileSize = TileSizeFor(WideMelon::NativeWidth, scale, ForcedTileSize);
+    int tileSize = TileSizeFor(WideMelon::NativeWidth, 0, scale, ForcedTileSize);
     if (MaxGroupThreads > 0 && tileSize * tileSize > MaxGroupThreads)
         return false;
-    return BuffersFit(WideMelon::NativeWidth, scale);
+    return BuffersFit(WideMelon::NativeWidth, 0, scale);
 }
 
 // as GLRenderer::FitScale
@@ -763,7 +798,7 @@ int ComputeRenderer::FitScale(int scale) const noexcept
     return fit;
 }
 
-bool ComputeRenderer::BuffersFit(int width, int scale) const noexcept
+bool ComputeRenderer::BuffersFit(int width, int margin, int scale) const noexcept
 {
     if (MaxTargetWidth > 0 && width * scale > MaxTargetWidth)
         return false;
@@ -771,13 +806,14 @@ bool ComputeRenderer::BuffersFit(int width, int scale) const noexcept
     // the biggest work buffer is a tile memory layer: 4*TileSize^2 bytes for each of the
     // MaxWorkTiles (16 per tile), so 64 bytes per pixel of the rounded up target. the one buffer
     // of ComputeOpt_OneTileBuffer is twice that, and only used where it fits (TileLayersFor)
-    int tileSize = TileSizeFor(width, scale, ForcedTileSize);
-    s64 screenW = (s64)InternalWidthFor(width, scale, tileSize) * scale;
-    s64 largestBuffer = 64 * screenW * (192 * scale);
+    int tileSize = TileSizeFor(width, margin, scale, ForcedTileSize);
+    s64 screenW = (s64)InternalWidthFor(width, margin, scale, tileSize) * scale;
+    s64 screenH = (s64)InternalHeightFor(margin, scale, tileSize) * scale;
+    s64 largestBuffer = 64 * screenW * screenH;
 
     // the WorkDescs keep a work tile's index in 21 bits (20 with WideMelon's wide list), and SortWork
     // dispatches a group per 32 of them along X, which only goes to 65535
-    s64 maxWorkTiles = (screenW / tileSize) * (192 * scale / tileSize) * 16;
+    s64 maxWorkTiles = (screenW / tileSize) * (screenH / tileSize) * 16;
     if (maxWorkTiles > WorkTileLimitFor(MaxPolygonsFor(width, WideList)))
         return false;
     // the sizes are passed to glBufferData as int
@@ -804,30 +840,56 @@ int ComputeRenderer::ResolveViewWidth(int width, int scale) noexcept
     return width;
 }
 
+int ComputeRenderer::ResolveViewMargin(int margin, int width, int scale) noexcept
+{
+    margin = WideMelon::SanitizeMargin(margin, width);
+    if (!MarginFits(width, margin, scale))
+    {
+        Platform::Log(Platform::LogLevel::Warn, "WideMelon: a margin of %d at %dx%d does not fit in %d rows or its buffers in %lld bytes, using none\n",
+            margin, width, scale, MaxTargetHeight, (long long)MaxBufferSize);
+        return 0;
+    }
+    return margin;
+}
+
 void ComputeRenderer::SetViewWidth(int width) noexcept
 {
     RequestedViewWidth = WideMelon::SanitizeWidth(width);
 
     // the scale decides whether it fits, the first SetRenderSettings resolves it otherwise.
-    // the targets follow in RenderFrame
+    // the targets follow in RenderFrame. the margin goes with the width
     if (ScaleFactor > 0)
+    {
         ViewWidth = ResolveViewWidth(RequestedViewWidth, ScaleFactor);
+        ViewMargin = ResolveViewMargin(RequestedViewMargin, ViewWidth, ScaleFactor);
+    }
+}
+
+void ComputeRenderer::SetViewMargin(int margin) noexcept
+{
+    RequestedViewMargin = std::clamp(margin, 0, WideMelon::MaxMargin);
+    if (ScaleFactor > 0)
+        ViewMargin = ResolveViewMargin(RequestedViewMargin, ViewWidth, ScaleFactor);
 }
 
 void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinates)
 {
     scale = FitScale(scale);
     ViewWidth = ResolveViewWidth(RequestedViewWidth, scale);
+    ViewMargin = ResolveViewMargin(RequestedViewMargin, ViewWidth, scale);
 
     // a new renderer has no polygons drawn yet, so it starts at the view width and its shaders
     // are only compiled once
     int targetWidth = ScaleFactor == -1 ? ViewWidth : TargetWidth;
     if (!TargetFits(targetWidth, scale))
         targetWidth = ViewWidth;
+    int targetMargin = WideMelon::SanitizeMargin(ScaleFactor == -1 ? ViewMargin : TargetMargin, targetWidth);
+    if (!MarginFits(targetWidth, targetMargin, scale))
+        targetMargin = MarginFits(targetWidth, ViewMargin, scale) ? WideMelon::SanitizeMargin(ViewMargin, targetWidth) : 0;
 
     // the frontend calls this on every settings change, but the shaders and work buffers only
     // depend on the scale and the target width. hi-res coordinates are only used here on the CPU
-    if (scale == ScaleFactor && targetWidth == TargetWidth)
+    if (scale == ScaleFactor && targetWidth == TargetWidth && targetMargin == TargetMargin)
     {
         if (highResolutionCoordinates != HiresCoordinates)
         {
@@ -837,7 +899,7 @@ void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinate
         return;
     }
 
-    ResizeTargets(scale, highResolutionCoordinates, targetWidth);
+    ResizeTargets(scale, highResolutionCoordinates, targetWidth, targetMargin);
 }
 
 // GPU::OutputCap: the targets stay as they are, only the compositor's output follows the need
@@ -854,7 +916,7 @@ void ComputeRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
         OutputAnyRatio = anyRatio;
         // before the targets' first setup, that one caps it
         if (ScaleFactor > 0)
-            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need, anyRatio), ScaleFactor, TargetWidth);
+            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need, anyRatio), ScaleFactor, TargetWidth, TargetMargin);
     }
 
     // debug: a line when the cap's outcome or its reason changes
@@ -870,9 +932,9 @@ void ComputeRenderer::SetColorDither(bool dither) noexcept
     }
 }
 
-void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth)
+void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth, int targetMargin)
 {
-    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth);
+    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth, targetMargin);
 
     if (ScaleFactor != -1)
     {
@@ -883,9 +945,10 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
 
     ScaleFactor = scale;
     TargetWidth = targetWidth;
-    ScreenHeight = 192 * ScaleFactor;
+    TargetMargin = targetMargin;
+    OutputHeight = (192 + 2 * TargetMargin) * ScaleFactor;
 
-    TileSize = TileSizeFor(TargetWidth, ScaleFactor, ForcedTileSize);
+    TileSize = TileSizeFor(TargetWidth, TargetMargin, ScaleFactor, ForcedTileSize);
     if (ForcedTileSize != 0 && TileSize != ForcedTileSize && !TileFallbackLogged)
     {
         TileFallbackLogged = true;
@@ -902,7 +965,9 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     CoarseTileW = CoarseTileCountX * TileSize;
     CoarseTileH = CoarseTileCountY * TileSize;
 
-    ScreenWidth = InternalWidthFor(TargetWidth, ScaleFactor, TileSize) * ScaleFactor;
+    ScreenWidth = InternalWidthFor(TargetWidth, TargetMargin, ScaleFactor, TileSize) * ScaleFactor;
+    // 192 x scale without a margin
+    ScreenHeight = InternalHeightFor(TargetMargin, ScaleFactor, TileSize) * ScaleFactor;
 
     TilesPerLine = ScreenWidth/TileSize;
     TileLines = ScreenHeight/TileSize;
@@ -989,8 +1054,8 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
         glDeleteTextures(1, &Framebuffer);
     glGenTextures(1, &Framebuffer);
     glBindTexture(GL_TEXTURE_2D, Framebuffer);
-    // only the real width, the wide compositor clips its 3D reads to the texture's size
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, TargetWidth * ScaleFactor, ScreenHeight);
+    // only the real width and height, the wide compositor clips its 3D reads to the texture's size
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, TargetWidth * ScaleFactor, OutputHeight);
     // it's empty, so the next frame has to fill it even if it's the same
     ForceRender = true;
 
@@ -1026,7 +1091,8 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
 
 ComputeWorkRooms::Key ComputeRenderer::RoomKey() const noexcept
 {
-    return { RoomGameCode, RoomHeaderCRC, (u32)ScaleFactor, (u32)TileSize, (u32)TileLayers, (u32)TargetWidth,
+    // the margin in the width's upper bits, so a target without one has the key it always had
+    return { RoomGameCode, RoomHeaderCRC, (u32)ScaleFactor, (u32)TileSize, (u32)TileLayers, (u32)TargetWidth | ((u32)TargetMargin << 16),
         (u32)MaxWorkTiles, (u32)YSpanIndices.size() };
 }
 
@@ -1639,6 +1705,13 @@ s32 ComputeRenderer::WideVertexX(s32 hiresx) const
 {
     s32 x = std::max(hiresx + WideXAdjust, 0);
     return HiresCoordinates ? (x * ScaleFactor) >> 4 : (x >> 4) * ScaleFactor;
+}
+
+// and Y with a margin, on the target's rows, which start TargetMargin rows above DS line 0
+s32 ComputeRenderer::WideVertexY(s32 hiresy) const
+{
+    s32 y = std::max(hiresy + WideYAdjust, 0);
+    return HiresCoordinates ? (y * ScaleFactor) >> 4 : (y >> 4) * ScaleFactor;
 }
 
 #ifdef MELONADE_DEBUG_TOOLS
@@ -2305,11 +2378,13 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     // not GPU::WidePolys itself, which only reaches a scene at its swap
     WideList = gpu.GPU3D.RenderWideList;
     int targetWidth = FrameTargetWidth(gpu);
-    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSize) != TileSize || optChanged
+    int targetMargin = FrameTargetMargin(gpu, targetWidth);
+    if (targetWidth != TargetWidth || targetMargin != TargetMargin
+        || TileSizeFor(targetWidth, targetMargin, ScaleFactor, ForcedTileSize) != TileSize || optChanged
         || MaxPolygonsFor(targetWidth, WideList) != MaxPolygons)
     {
         keep = false;
-        ResizeTargets(ScaleFactor, HiresCoordinates, targetWidth);
+        ResizeTargets(ScaleFactor, HiresCoordinates, targetWidth, targetMargin);
         int current, count;
         while (NeedsShaderCompile())
             ShaderCompileStep(current, count);
@@ -2332,6 +2407,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
+    WideFrameY = TargetMargin != 0 || gpu.GPU3D.RenderViewMargin != 0;
+    WideYAdjust = (TargetMargin - gpu.GPU3D.RenderViewMargin) << 4;
 
     assert(!NeedsShaderCompile());
     // new targets are empty (here or after SetRenderSettings), so they're drawn even if the frame is the same
@@ -2645,6 +2722,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             }
             if (WideFrame)
                 scaledPositions[i][0] = WideVertexX(polygon->Vertices[i]->HiresPosition[0]);
+            if (WideFrameY)
+                scaledPositions[i][1] = WideVertexY(polygon->Vertices[i]->HiresPosition[1]);
             ytop = std::min(scaledPositions[i][1], ytop);
             ybot = std::max(scaledPositions[i][1], ybot);
         }
@@ -2858,7 +2937,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         // centre 256 columns of a wide one (like the capture readback and GLRenderer)
         int xorigin = (TargetWidth - WideMelon::NativeWidth) / 2;
         meta.ClearBitmapOffset[0] = ((int)((gpu.GPU3D.RenderClearAttr2 >> 16) & 0xFF) - xorigin) & 0xFF;
-        meta.ClearBitmapOffset[1] = (gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF;
+        meta.ClearBitmapOffset[1] = ((int)((gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF) - TargetMargin) & 0xFF;
     }
     for (u32 i = 0; i < 32; i++)
     {
@@ -3290,6 +3369,18 @@ int ComputeRenderer::FrameTargetWidth(const GPU& gpu) noexcept
     return targetWidth;
 }
 
+// and the margin, as in GLRenderer
+int ComputeRenderer::FrameTargetMargin(const GPU& gpu, int targetWidth) const noexcept
+{
+    if (targetWidth == WideMelon::NativeWidth)
+        return 0;
+    int viewMargin = gpu.WideY ? WideMelon::SanitizeMargin(ViewMargin, targetWidth) : 0;
+    int targetMargin = std::max(viewMargin, gpu.GPU3D.RenderViewMargin);
+    if (!MarginFits(targetWidth, targetMargin, ScaleFactor))
+        targetMargin = MarginFits(targetWidth, viewMargin, ScaleFactor) ? viewMargin : 0;
+    return targetMargin;
+}
+
 // GPU::BlitAfterReadback, at line 215: the compositor's size follows the targets, so a render that
 // resizes them gets the Blit first. otherwise the render writes the spare 3D image and the one it
 // replaces stays for the Blit (see KeepFramebuffer). a render that's skipped keeps nothing, and the
@@ -3299,7 +3390,9 @@ bool ComputeRenderer::KeepFrameForBlit(const GPU& gpu)
     // as RenderFrame will see it, which TileSizeFor goes by too
     WideList = gpu.GPU3D.RenderWideList;
     int targetWidth = FrameTargetWidth(gpu);
-    if (targetWidth != TargetWidth || TileSizeFor(targetWidth, ScaleFactor, ForcedTileSizeOf(gpu)) != TileSize
+    int targetMargin = FrameTargetMargin(gpu, targetWidth);
+    if (targetWidth != TargetWidth || targetMargin != TargetMargin
+        || TileSizeFor(targetWidth, targetMargin, ScaleFactor, ForcedTileSizeOf(gpu)) != TileSize
         || MaxPolygonsFor(targetWidth, WideList) != MaxPolygons)
         return false;
 
@@ -3315,7 +3408,7 @@ void ComputeRenderer::KeepFramebuffer() noexcept
     {
         glGenTextures(1, &SpareFramebuffer);
         glBindTexture(GL_TEXTURE_2D, SpareFramebuffer);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, TargetWidth * ScaleFactor, ScreenHeight);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, TargetWidth * ScaleFactor, OutputHeight);
     }
 
     KeptFramebuffer = Framebuffer;

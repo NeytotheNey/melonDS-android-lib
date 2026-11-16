@@ -132,6 +132,9 @@ public:
     // it follows the renderer's GetViewWidth(), latched when the polygon RAM is swapped (or at
     // VBlank while the geometry engine is off)
     [[nodiscard]] int GetViewWidth() const noexcept { return ViewWidth; }
+    // and the vertical margin, the 3D rows above and below the 192 (0 unless the width is wide),
+    // latched with it from the renderer's GetViewMargin() (0 with GPU::WideY off)
+    [[nodiscard]] int GetViewMargin() const noexcept { return ViewMargin; }
     u32* GetLine(int line) noexcept { return GetLine(line, RenderXPos, AbortFrame); }
     // with the X scroll and abort state a line had when it was built, for a display capture
     // line that is drawn later (see GPU::Begin2DJob)
@@ -291,6 +294,11 @@ private:
     u16 RenderXPos = 0;
     int ViewWidth = 256;
     int RendererViewWidth() const noexcept;
+    // WideMelon camera stage 2: the margin, 0..128 rows above and below the 192, so the view is
+    // 192 + 2 * ViewMargin rows tall (ViewHeight). only with ViewWidth wide, latched with it
+    int ViewMargin = 0;
+    int RendererViewMargin() const noexcept;
+    [[nodiscard]] int ViewHeight() const noexcept { return 192 + 2 * ViewMargin; }
     // WideMelon's wide list (GPU::WidePolys): with the view wider than 256, a bank holds up to
     // PolygonRAMSize polygons and VertexRAMSize vertices, the native view's counts take the DS's limits
     // and only they set DISP3DCNT bit 13 and feed the count registers, and the polygons only the wide view
@@ -463,6 +471,7 @@ public:
     // vertices by value. with save the copy becomes this scene, without it nothing changes
     bool MatchRenderScene(bool save) noexcept;
     int RenderViewWidth = 256; // the view width RenderPolygonRAM was built for, not serialized either
+    int RenderViewMargin = 0;  // and its margin
     // and whether it was built into WideMelon's wide list (WideListOn at the swap), for the renderers'
     // list sizes. derived on a state load
     bool RenderWideList = false;
@@ -500,9 +509,10 @@ public:
     s16 VecTestResult[3] {};
 
     Vertex TempVertexBuffer[4] {};
-    // the clip space X of each of them before WideMelon's squeeze (the same with it off). derived again
-    // on a state load, not serialized
+    // the clip space X and Y of each of them before WideMelon's squeeze (the same with it off). derived
+    // again on a state load, or from GP3W
     s32 TempVertexNativeX[4] {};
+    s32 TempVertexNativeY[4] {};
     u32 VertexNum = 0;
     u32 VertexNumInPoly = 0;
     u32 NumConsecutivePolygons = 0;
@@ -545,6 +555,11 @@ struct OutputLayout
     // WideMelon camera: the top screen's lines with 3D wings, its own (control word bit 18) or
     // held from an earlier frame by the dual-screen wing hold
     int TopWingLines = 0;
+    // WideMelon camera stage 2: the output's vertical margin (Renderer3D::GetOutputMargin when it
+    // was drawn). the top half is (192 + 2 * TopMargin) * Scale rows, then 2 * Scale padding rows,
+    // then the bottom screen's 192 * Scale, and the top screen's DS line y is at row
+    // (y + TopMargin) * Scale. 0 is the old 386-row layout
+    int TopMargin = 0;
 };
 
 class Renderer3D
@@ -607,6 +622,11 @@ public:
     // only the GL and compute renderers go wider than 256
     [[nodiscard]] virtual int GetViewWidth() const noexcept { return 256; }
     [[nodiscard]] virtual int GetOutputWidth() const noexcept { return 256; }
+    // and the vertical margin (camera stage 2): the 3D rows above and below the top screen's 192
+    // new geometry is built for, and the margin of the output right now, which lags like the width.
+    // 0 unless the width is wide
+    [[nodiscard]] virtual int GetViewMargin() const noexcept { return 0; }
+    [[nodiscard]] virtual int GetOutputMargin() const noexcept { return 0; }
 
     // hi-res display capture (GPU::HiresCapture): whether the GL compositor's capture pass would
     // run with this frame's capture (GLCompositor::RunsHiresCapture). off without a compositor

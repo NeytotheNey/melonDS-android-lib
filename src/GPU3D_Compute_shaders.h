@@ -1783,9 +1783,14 @@ void main()
     {
         // clear bitmap: tiled at native resolution across the whole target, scrolled by
         // ClearAttr2 (with a wide target's centre folded in, see RenderFrame) and wrapping at
-        // 256. ScreenWidth is the tile-rounded width, so the scale comes from the height.
+        // 256. ScreenWidth is the tile-rounded width, so the scale comes from the height, or
+        // with a margin (whose height is rounded too) from ScreenScale.
         // the colour is already the packed 6-bit format, the depth texel is depth24 | fog<<24
+#ifdef ScreenScale
+        const int scale = ScreenScale;
+#else
         const int scale = ScreenHeight/192;
+#endif
         ivec2 pos = (ivec2(gl_GlobalInvocationID.xy) / scale + ClearBitmapOffset) & 0xFF;
         color = uvec2(texelFetch(ClearBitmapColor, pos, 0).r, 0U);
         depth = uvec2(texelFetch(ClearBitmapDepth, pos, 0).r, 0U);
@@ -2000,13 +2005,23 @@ void main()
 
     vec4 result = vec4(float(bitfieldExtract(color.x, 16, 8)), float(bitfieldExtract(color.x, 8, 8)), float(color.x & 0x3FU), float(bitfieldExtract(color.x, 24, 8)));
     result /= vec4(63.0, 63.0, 63.0, 31.0);
-#ifdef WideOutputWidth
+#ifdef WideOutputHeight
+    // camera stage 2: the rows the tiles were rounded up by too
+    if (gl_GlobalInvocationID.x < uint(WideOutputWidth) && gl_GlobalInvocationID.y < uint(WideOutputHeight))
+#elif defined(WideOutputWidth)
     // WideMelon: the columns the tiles were rounded up by stay out of the output
     if (gl_GlobalInvocationID.x < uint(WideOutputWidth))
 #endif
     imageStore(FinalFB, ivec2(gl_GlobalInvocationID.xy), result);
 
-#ifdef WideOutputWidth
+#ifdef WideOutputHeight
+    // the middle 192 rows of a view with a margin, the centre 256 columns as below
+    const int scale = ScreenScale;
+    ivec2 lowresCoordinate = ivec2(gl_GlobalInvocationID.xy) / scale - ivec2(WideLowResOffset, WideLowResMargin);
+    ivec2 lowresCoordinateRest = ivec2(gl_GlobalInvocationID.xy) % scale;
+    if (lowresCoordinateRest == ivec2(0, 0) && lowresCoordinate.x >= 0 && lowresCoordinate.x < 256
+        && lowresCoordinate.y >= 0 && lowresCoordinate.y < 192)
+#elif defined(WideOutputWidth)
     // the game only ever sees the native 256 it asked for, so capture (and GetLine) take the
     // centre of a wide view
     const int scale = ScreenHeight/192;

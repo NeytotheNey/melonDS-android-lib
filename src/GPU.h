@@ -1097,6 +1097,9 @@ public:
     // longer drops polygons the DS would draw (GPU3D::WideListOn). latched with the view width, at a
     // polygon RAM swap. on by default since 11-14 (phones checked); off is as before, for A/Bs
     bool WidePolys = true;
+    // WideMelon camera stage 2 (docs/plan-widemelon.md): false treats the renderers' vertical margin
+    // (SetViewMargin) as 0, for A/Bs. read where the margin is latched, with the view width
+    bool WideY = true;
     // logs a HASH3D line per frame with a checksum of the 3D image at native resolution, numbered like
     // HASH2D (Renderer3D::QueueHash3D)
     bool Hash3DLogging = false;

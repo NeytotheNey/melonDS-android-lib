@@ -65,6 +65,16 @@ public:
     void SetViewWidth(int width) noexcept;
     [[nodiscard]] int GetViewWidth() const noexcept override { return ViewWidth; }
     [[nodiscard]] int GetOutputWidth() const noexcept override { return TargetWidth; }
+    // WideMelon camera stage 2: the 3D rows above and below the top screen's 192 (0..128, see
+    // WideMelon::SanitizeMargin: 0 while the width is 256). same rules as the width: kept across
+    // SetRenderSettings and width changes, dropped to 0 when (384 + 2 + 2 x margin) x scale rows don't
+    // fit, latched by GPU3D with the width (GPU::WideY off treats it as 0), and the targets and the
+    // compositor's output follow at RenderFrame. GetOutputMargin is the output's margin, which lags
+    // like GetOutputWidth: the frontend's output texture must be (384 + 2 + 2 x GetOutputMargin()) x
+    // scale rows tall, the top half's (192 + 2 x margin) x scale first (see OutputLayout::TopMargin)
+    void SetViewMargin(int margin) noexcept;
+    [[nodiscard]] int GetViewMargin() const noexcept override { return ViewMargin; }
+    [[nodiscard]] int GetOutputMargin() const noexcept override { return TargetMargin; }
     [[nodiscard]] bool RunsHiresCapture(int debug) const noexcept override { return CurGLCompositor.RunsHiresCapture(debug); }
 
     void VCount144(GPU& gpu) override {};
@@ -146,12 +156,17 @@ private:
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const;
     u32 WideVertexX(s32 hiresx) const;
+    u32 WideVertexY(s32 hiresy) const;
+    int TargetRow(int line) const noexcept;
     bool TargetFits(int width, int scale) const noexcept;
+    bool MarginFits(int margin, int scale) const noexcept;
+    int ResolveViewMargin(int margin, int width, int scale) noexcept;
+    int FrameTargetMargin(const GPU& gpu, int targetWidth) const noexcept;
     bool ScaleFits(int scale) const noexcept;
     int FitScale(int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
     int FrameTargetWidth(const GPU& gpu) noexcept;
-    bool ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept;
+    bool ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept;
     void KeepColorBuffer() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
@@ -383,13 +398,23 @@ private:
     int TargetWidth = 256;
     int MaxTargetWidth {};
     // the tallest texture and viewport there can be, which the compositor's (384+2) x scale rows
-    // have to fit in (see FitScale)
+    // (plus twice the margin) have to fit in (see FitScale and MarginFits)
     int MaxTargetHeight {};
+    // the margin asked for (0..128), the one new geometry gets (0 with the width at 256) and the
+    // targets' (TargetWidth's), whose height is 192 + 2 x TargetMargin rows at the scale
+    int RequestedViewMargin = 0;
+    int ViewMargin = 0;
+    int TargetMargin = 0;
 
     // set per frame: the polygons were built for a wide view, or are drawn into one. when the
-    // two widths differ (right after a change), WideXAdjust keeps them centred
+    // two widths differ (right after a change), WideXAdjust keeps them centred. the same for the
+    // margin (WideFrameY and WideYAdjust, in hi-res rows)
     bool WideFrame {};
     s32 WideXAdjust {};
+    bool WideFrameY {};
+    s32 WideYAdjust {};
+    // the margin the frame's polygons were built for (GPU3D::RenderViewMargin), for TargetRow
+    int FrameMargin = 0;
 
     // set per frame from GPU::ShadowMaskLineClear, GPU::ShadowMaskDepthTest and GPU::EqualDepthMargin
     bool ShadowMaskLineClear = true;

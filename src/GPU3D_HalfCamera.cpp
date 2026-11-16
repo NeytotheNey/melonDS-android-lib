@@ -139,6 +139,7 @@ struct HalfCamera::GeometryState
 
     Vertex TempVertexBuffer[4];
     s32 TempVertexNativeX[4];
+    s32 TempVertexNativeY[4];
     u32 VertexNum, VertexNumInPoly, NumConsecutivePolygons;
     u32 ExecParams[32];
     u32 ExecParamCount;
@@ -164,7 +165,7 @@ static void CopyGeometry(Dst& dst, const Src& src)
     COPY_FIELD(MatDiffuse); COPY_FIELD(MatAmbient); COPY_FIELD(MatSpecular); COPY_FIELD(MatEmission);
     COPY_FIELD(UseShininessTable); COPY_FIELD(ShininessTable);
     COPY_FIELD(PolygonAttr); COPY_FIELD(CurPolygonAttr); COPY_FIELD(TexParam); COPY_FIELD(TexPalette);
-    COPY_FIELD(TempVertexBuffer); COPY_FIELD(TempVertexNativeX);
+    COPY_FIELD(TempVertexBuffer); COPY_FIELD(TempVertexNativeX); COPY_FIELD(TempVertexNativeY);
     COPY_FIELD(VertexNum); COPY_FIELD(VertexNumInPoly); COPY_FIELD(NumConsecutivePolygons);
     COPY_FIELD(ExecParams); COPY_FIELD(ExecParamCount);
     COPY_FIELD(FlushAttributes);
@@ -1184,6 +1185,7 @@ void HalfCamera::ResetShadow()
     CopyGeometry(shadow, *Start);
     // what the scene was built for: it's only updated after this, at the swap
     shadow.ViewWidth = Main.ViewWidth;
+    shadow.ViewMargin = Main.ViewMargin;
     shadow.WideListOn = Main.WideListOn;
     shadow.ZeroDotWLimit = Main.ZeroDotWLimit;
     shadow.ClipMatrixDirty = true;

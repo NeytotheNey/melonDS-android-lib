@@ -1017,6 +1017,13 @@ bool GLRenderer::TargetFits(int width, int scale) const noexcept
     return width == WideMelon::NativeWidth || MaxTargetWidth <= 0 || width * scale <= MaxTargetWidth;
 }
 
+// with a margin the output is (384+2+2 x margin) x scale tall, which has to fit too. the compositor's
+// output can be at a lower scale than this (GPU::OutputCap), so the 3D's is the one checked
+bool GLRenderer::MarginFits(int margin, int scale) const noexcept
+{
+    return margin == 0 || MaxTargetHeight <= 0 || (384 + 2 + 2 * margin) * scale <= MaxTargetHeight;
+}
+
 // the native targets (256 x 192 at the scale) and the compositor's output, and the frontend's
 // textures made like it, (384+2) x scale tall, have to fit in a texture and a viewport. at 16x
 // that's 4096 x 6176, past a GPU whose limit is 4096. a limit that wasn't read counts as no limit
@@ -1056,14 +1063,36 @@ int GLRenderer::ResolveViewWidth(int width, int scale) noexcept
     return width;
 }
 
+int GLRenderer::ResolveViewMargin(int margin, int width, int scale) noexcept
+{
+    margin = WideMelon::SanitizeMargin(margin, width);
+    if (!MarginFits(margin, scale))
+    {
+        Platform::Log(Platform::LogLevel::Warn, "WideMelon: a margin of %d at %dx does not fit in %d rows, using none\n",
+            margin, scale, MaxTargetHeight);
+        return 0;
+    }
+    return margin;
+}
+
 void GLRenderer::SetViewWidth(int width) noexcept
 {
     RequestedViewWidth = WideMelon::SanitizeWidth(width);
 
     // the scale decides whether it fits, the first SetRenderSettings resolves it otherwise.
-    // the targets follow in RenderFrame
+    // the targets follow in RenderFrame. the margin goes with the width
     if (ScaleFactor > 0)
+    {
         ViewWidth = ResolveViewWidth(RequestedViewWidth, ScaleFactor);
+        ViewMargin = ResolveViewMargin(RequestedViewMargin, ViewWidth, ScaleFactor);
+    }
+}
+
+void GLRenderer::SetViewMargin(int margin) noexcept
+{
+    RequestedViewMargin = std::clamp(margin, 0, WideMelon::MaxMargin);
+    if (ScaleFactor > 0)
+        ViewMargin = ResolveViewMargin(RequestedViewMargin, ViewWidth, ScaleFactor);
 }
 
 void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
@@ -1071,12 +1100,16 @@ void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
     // GetScaleFactor is the scale that's used, which the frontend sizes its textures by
     scale = FitScale(scale);
     ViewWidth = ResolveViewWidth(RequestedViewWidth, scale);
+    ViewMargin = ResolveViewMargin(RequestedViewMargin, ViewWidth, scale);
 
     int targetWidth = TargetWidth;
     if (!TargetFits(targetWidth, scale))
         targetWidth = ViewWidth;
+    int targetMargin = WideMelon::SanitizeMargin(TargetMargin, targetWidth);
+    if (!MarginFits(targetMargin, scale))
+        targetMargin = WideMelon::SanitizeMargin(ViewMargin, targetWidth);
 
-    ResizeTargets(betterpolygons, scale, targetWidth);
+    ResizeTargets(betterpolygons, scale, targetWidth, targetMargin);
 }
 
 // GPU::OutputCap: the targets stay as they are, only the compositor's output follows the need
@@ -1093,7 +1126,7 @@ void GLRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
         OutputAnyRatio = anyRatio;
         // before the targets' first setup, that one caps it
         if (ScaleFactor > 0)
-            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need, anyRatio), ScaleFactor, TargetWidth);
+            CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(ScaleFactor, need, anyRatio), ScaleFactor, TargetWidth, TargetMargin);
     }
 
     // debug: a line when the cap's outcome or its reason changes
@@ -1101,21 +1134,22 @@ void GLRenderer::SetOutputNeed(const GPU& gpu, int frontendNeed) noexcept
 }
 
 // true when anything changed
-bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth) noexcept
+bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept
 {
-    if (betterpolygons == BetterPolygons && scale == ScaleFactor && targetWidth == TargetWidth)
+    if (betterpolygons == BetterPolygons && scale == ScaleFactor && targetWidth == TargetWidth && targetMargin == TargetMargin)
         return false;
 
-    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth);
+    CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth, targetMargin);
     ScaleFactor = scale;
     TargetWidth = targetWidth;
+    TargetMargin = targetMargin;
     BetterPolygons = betterpolygons;
     TargetsChanged = true;
     // the pixel buffers are reallocated below
     EarlyCapture = false;
 
     ScreenW = targetWidth * scale;
-    ScreenH = 192 * scale;
+    ScreenH = (192 + 2 * targetMargin) * scale;
 
     // the other color buffers are at the old size. nothing is kept here: a kept frame only lives
     // from the render at line 215 to the Blit right after it, and KeepFrameForBlit refuses a render
@@ -1166,13 +1200,26 @@ int GLRenderer::FrameTargetWidth(const GPU& gpu) noexcept
     return targetWidth;
 }
 
+// and the margin, the same way: the larger of the view's and the polygons', on a wide target
+int GLRenderer::FrameTargetMargin(const GPU& gpu, int targetWidth) const noexcept
+{
+    if (targetWidth == WideMelon::NativeWidth)
+        return 0;
+    int viewMargin = gpu.WideY ? ViewMargin : 0;
+    int targetMargin = std::max(viewMargin, gpu.GPU3D.RenderViewMargin);
+    if (!MarginFits(targetMargin, ScaleFactor))
+        targetMargin = viewMargin;
+    return targetMargin;
+}
+
 // GPU::BlitAfterReadback, at line 215: the compositor's size follows the targets, so a render that
 // resizes them gets the Blit first. otherwise the render draws into the spare color buffer and the
 // one it replaces stays for the Blit (see KeepColorBuffer). a render that's skipped keeps nothing,
 // and the Blit reads the color buffer as it was
 bool GLRenderer::KeepFrameForBlit(const GPU& gpu)
 {
-    if (FrameTargetWidth(gpu) != TargetWidth)
+    int targetWidth = FrameTargetWidth(gpu);
+    if (targetWidth != TargetWidth || FrameTargetMargin(gpu, targetWidth) != TargetMargin)
         return false;
 
     KeepRequested = true;
@@ -1292,6 +1339,8 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
 
     if (WideFrame)
         x = WideVertexX(vtx->HiresPosition[0]);
+    if (WideFrameY)
+        y = WideVertexY(vtx->HiresPosition[1]);
 
     *vptr++ = x | (y << 16);
     *vptr++ = z | (w << 16);
@@ -1316,6 +1365,25 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
 u32 GLRenderer::WideVertexX(s32 hiresx) const
 {
     return (std::max(hiresx + WideXAdjust, 0) * ScaleFactor) >> 4;
+}
+
+// and Y with a margin (camera stage 2), on the target's rows, which start TargetMargin rows above DS line 0
+u32 GLRenderer::WideVertexY(s32 hiresy) const
+{
+    return (std::max(hiresy + WideYAdjust, 0) * ScaleFactor) >> 4;
+}
+
+// the target row a polygon line [line] (0..192, of the frame its polygons were built for, squeezed with
+// a margin) starts at: the squeeze maps the 192 lines over the whole view, 192 + 2 x FrameMargin rows,
+// exactly for a full-screen viewport, and the view sits TargetMargin - FrameMargin rows down the
+// target. clamped to it
+int GLRenderer::TargetRow(int line) const noexcept
+{
+    if (!WideFrameY)
+        return line * ScaleFactor;
+    // in the target's rows at the scale, as a line's edge lands between native rows when stretched
+    int row = line * (192 + 2 * FrameMargin) * ScaleFactor / 192 + (TargetMargin - FrameMargin) * ScaleFactor;
+    return std::clamp(row, 0, ScreenH);
 }
 
 void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys)
@@ -1471,7 +1539,10 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                     cX = WideVertexX((s32)cX);
                 else
                     cX = (cX * ScaleFactor) >> 4;
-                cY = (cY * ScaleFactor) >> 4;
+                if (WideFrameY)
+                    cY = WideVertexY((s32)cY);
+                else
+                    cY = (cY * ScaleFactor) >> 4;
 
                 u32 w = (u32)cW;
 
@@ -1694,7 +1765,9 @@ void GLRenderer::ClearShadowMaskLines(const Polygon* polygon, const bool* lastWa
             scissorOn = true;
         }
 
-        glScissor(0, y*ScaleFactor, ScreenW, (yend-y)*ScaleFactor);
+        // with a margin the lines are the squeezed frame's, stretched over the target (TargetRow)
+        int row0 = TargetRow(y), row1 = TargetRow(yend);
+        glScissor(0, row0, ScreenW, row1 - row0);
         glClear(GL_STENCIL_BUFFER_BIT);
 
         y = yend;
@@ -3185,7 +3258,8 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // the targets match the polygons drawn here (see FrameTargetWidth). this runs after the
     // frame's Blit, so the compositor's width only changes between frames as well. with a Blit
     // after it (KeepFrameForBlit), only when the targets stay as they are
-    if (ResizeTargets(BetterPolygons, ScaleFactor, FrameTargetWidth(gpu)))
+    int frameTargetWidth = FrameTargetWidth(gpu);
+    if (ResizeTargets(BetterPolygons, ScaleFactor, frameTargetWidth, FrameTargetMargin(gpu, frameTargetWidth)))
         keep = false;
 
     // nothing changed since the last frame: MainFramebuffer still holds it, so Blit and the
@@ -3226,6 +3300,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
     WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
+    WideFrameY = TargetMargin != 0 || gpu.GPU3D.RenderViewMargin != 0;
+    WideYAdjust = (TargetMargin - gpu.GPU3D.RenderViewMargin) << 4;
+    FrameMargin = gpu.GPU3D.RenderViewMargin;
     ShadowMaskLineClear = gpu.ShadowMaskLineClear;
     ShadowMaskDepthTest = gpu.ShadowMaskDepthTest;
     EqualDepthMargin = gpu.EqualDepthMargin;
@@ -3433,7 +3510,8 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
             int xorigin = ((TargetWidth - WideMelon::NativeWidth) / 2);
             int xoff = ((int)((gpu.GPU3D.RenderClearAttr2 >> 16) & 0xFF) - xorigin) & 0xFF;
-            int yoff = (gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF;
+            // native y=0 at DS line 0, TargetMargin rows down a target with a margin
+            int yoff = ((int)((gpu.GPU3D.RenderClearAttr2 >> 24) & 0xFF) - TargetMargin) & 0xFF;
 
             glUniform1i(ClearBitmapULoc[0], ScaleFactor);
             glUniform2i(ClearBitmapULoc[1], xoff, yoff);
@@ -3653,9 +3731,10 @@ void GLRenderer::ReadBackCaptureFrame(GLuint pixelBuffer) noexcept
     GLenum bufferAttachment = GL_COLOR_ATTACHMENT0;
     glDrawBuffers(1, &bufferAttachment);
     // the game only ever sees the native 256 it asked for, so capture
-    // (and GetLine) read back the centre of a wide target
+    // (and GetLine) read back the centre of a wide target, and its middle 192 rows with a margin
     int captureX = ((TargetWidth - WideMelon::NativeWidth) / 2) * ScaleFactor;
-    glBlitFramebuffer(captureX, 0, captureX + WideMelon::NativeWidth * ScaleFactor, ScreenH,
+    int captureY = TargetMargin * ScaleFactor;
+    glBlitFramebuffer(captureX, captureY, captureX + WideMelon::NativeWidth * ScaleFactor, captureY + 192 * ScaleFactor,
                       0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pixelBuffer);
@@ -3818,7 +3897,8 @@ void GLRenderer::QueueHash3D(GPU& gpu, u32 frame)
     GLenum bufferAttachment = GL_COLOR_ATTACHMENT0;
     glDrawBuffers(1, &bufferAttachment);
     int captureX = ((TargetWidth - WideMelon::NativeWidth) / 2) * ScaleFactor;
-    glBlitFramebuffer(captureX, 0, captureX + WideMelon::NativeWidth * ScaleFactor, ScreenH,
+    int captureY = TargetMargin * ScaleFactor;
+    glBlitFramebuffer(captureX, captureY, captureX + WideMelon::NativeWidth * ScaleFactor, captureY + 192 * ScaleFactor,
                       0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, DownscaleFramebuffer);

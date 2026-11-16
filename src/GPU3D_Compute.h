@@ -69,6 +69,12 @@ public:
     void SetViewWidth(int width) noexcept;
     [[nodiscard]] int GetViewWidth() const noexcept override { return ViewWidth; }
     [[nodiscard]] int GetOutputWidth() const noexcept override { return TargetWidth; }
+    // and the vertical margin (camera stage 2), same rules as GLRenderer's. the internal height is
+    // rounded up to whole coarse tiles like the width, and only the first (192 + 2 x GetOutputMargin())
+    // x scale rows reach the compositor. a change recompiles the shaders like a width change
+    void SetViewMargin(int margin) noexcept;
+    [[nodiscard]] int GetViewMargin() const noexcept override { return ViewMargin; }
+    [[nodiscard]] int GetOutputMargin() const noexcept override { return TargetMargin; }
     [[nodiscard]] bool RunsHiresCapture(int debug) const noexcept override { return CurGLCompositor.RunsHiresCapture(debug); }
     void SavestateLoaded() override;
 
@@ -220,7 +226,7 @@ private:
     int ForcedTileSize = 0;
     int MaxGroupThreads = 0;
     bool TileFallbackLogged = false;
-    int TileSizeFor(int width, int scale, int forced) const noexcept;
+    int TileSizeFor(int width, int margin, int scale, int forced) const noexcept;
     // GPU::ComputeOpt as of the last RenderFrame, which the shaders are compiled for. it starts at
     // GPU's default (0xDF), so only a changed debug switch compiles them twice, and the first
     // ResizeTargets already gives the tile memory the default's two layers
@@ -515,14 +521,23 @@ private:
     int ViewWidth = 256;
     int TargetWidth = 256;
     int MaxTargetWidth {};
-    // as in GLRenderer: the compositor's (384+2) x scale rows have to fit (see FitScale)
+    // as in GLRenderer: the compositor's (384+2) x scale rows have to fit (see FitScale), plus
+    // twice the margin
     int MaxTargetHeight {};
     s64 MaxBufferSize {};
+    // the margin, as in GLRenderer, and the 3D image's real height in pixels, (192 + 2 x TargetMargin)
+    // x scale (ScreenHeight is that rounded up to whole coarse tiles)
+    int RequestedViewMargin = 0;
+    int ViewMargin = 0;
+    int TargetMargin = 0;
+    int OutputHeight = 0;
 
     // set per frame, as in GLRenderer: the polygons were built for a wide view, or are drawn into
-    // one, and how far to move them when the two widths differ
+    // one, and how far to move them when the two widths differ. the same for the margin
     bool WideFrame {};
     s32 WideXAdjust {};
+    bool WideFrameY {};
+    s32 WideYAdjust {};
 
     GLCompositor CurGLCompositor;
 
@@ -538,11 +553,14 @@ private:
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
-    bool BuffersFit(int width, int scale) const noexcept;
+    bool BuffersFit(int width, int margin, int scale) const noexcept;
+    bool MarginFits(int width, int margin, int scale) const noexcept;
+    int ResolveViewMargin(int margin, int width, int scale) noexcept;
+    int FrameTargetMargin(const GPU& gpu, int targetWidth) const noexcept;
     bool ScaleFits(int scale) const noexcept;
     int FitScale(int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
-    void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth);
+    void ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth, int targetMargin);
     bool AllocTileMemory(int workTiles);
     bool AllocXSpans(int spans);
     void GrowWorkBuffers(u32 workTiles, u32 spans);
@@ -551,6 +569,7 @@ private:
     void ReadBackCaptureFrame(GLuint pixelBuffer, GLsync& fence) noexcept;
     void DropEarlyCapture() noexcept;
     s32 WideVertexX(s32 hiresx) const;
+    s32 WideVertexY(s32 hiresy) const;
 
     void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to);
     void SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2]);

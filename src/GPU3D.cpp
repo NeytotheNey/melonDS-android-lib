@@ -246,11 +246,13 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
     // the scene started (or as a state load brought it) until the swap: it works at 256 too, where the
     // native view is the view, so the native counts a bank past the DS's limits relies on stay right
     ViewWidth = RendererViewWidth();
+    ViewMargin = RendererViewMargin();
 }
 
 void GPU3D::LatchViewWidth() noexcept
 {
     ViewWidth = RendererViewWidth();
+    ViewMargin = RendererViewMargin();
     WideListOn = ViewWidth != WideMelon::NativeWidth && NDS.GPU.WidePolys;
 }
 
@@ -420,6 +422,7 @@ void GPU3D::Reset() noexcept
     CurRAMBank = 0;
 
     memset(TempVertexNativeX, 0, sizeof(TempVertexNativeX));
+    memset(TempVertexNativeY, 0, sizeof(TempVertexNativeY));
     NativeNumVertices = 0;
     NativeNumPolygons = 0;
     NativeStripVerts = 0;
@@ -441,9 +444,11 @@ void GPU3D::Reset() noexcept
     else
     {
         ViewWidth = WideMelon::NativeWidth;
+        ViewMargin = 0;
         WideListOn = false;
     }
     RenderViewWidth = ViewWidth;
+    RenderViewMargin = ViewMargin;
     RenderWideList = WideListOn;
 
     if (CurrentRenderer)
@@ -589,9 +594,12 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
     if (!file->Saving)
     {
-        // WideMelon's native view counts and X aren't stored: as if the native view had the same so far
+        // WideMelon's native view counts, X and Y aren't stored: as if the native view had the same so far
         for (int i = 0; i < 4; i++)
+        {
             TempVertexNativeX[i] = TempVertexBuffer[i].Position[0];
+            TempVertexNativeY[i] = TempVertexBuffer[i].Position[1];
+        }
         NativeNumVertices = NumVertices;
         NativeNumPolygons = NumPolygons;
         // and nothing in the wide list's wing budget, unless GP3W says otherwise
@@ -809,16 +817,18 @@ bool GPU3D::WideSavestateExtra(const RenderList* renderList, u32 renderNumPolygo
 // (extra): the real counts, each bank's high-water marks, the polygons and vertices past GP3D's in each
 // bank, the vertex indices of every polygon up to there as they are here, the whole render list and the
 // last strip polygon, which GP3D has capped or as each bank's first. read only when it's there, version
-// 2 (version 1 was a layout without the wide list flag, only in builds before this one). a load reads
-// it all and checks it before anything GP3D loaded changes, but for the polygons and vertices past
+// 3, which has the native view's Y and the margin the scene was built with after its X (camera stage 2),
+// or 2, without them, whose Y is then taken as GP3D's (version 1 was a layout without the wide list flag,
+// only in builds before this one). the margin is only checked, as the width isn't stored either. a load
+// reads it all and checks it before anything GP3D loaded changes, but for the polygons and vertices past
 // GP3D's, which nothing points at until then; any other version leaves GP3D's state
 void GPU3D::DoWideSavestate(Savestate* file, const RenderList* renderList, u32 renderNumPolygons) noexcept
 {
     file->Section("GP3W");
 
-    u32 version = 2;
+    u32 version = 3;
     file->Var32(&version);
-    if (version != 2)
+    if (version != 2 && version != 3)
         return;
 
     // the scalars, as members when saving and checked before they're kept when loading
@@ -826,6 +836,8 @@ void GPU3D::DoWideSavestate(Savestate* file, const RenderList* renderList, u32 r
     {
         u32 WideList, NativePolygons, NativeVertices, NativeStripVerts, NativeStripClipped, WingPolygons, WingVertices;
         s32 NativeX[4];
+        s32 NativeY[4];
+        u32 Margin;
         u32 Extra;
         u32 Vertices, Polygons, OpaquePolygons, RenderPolygons;
         u32 BankPolygons[2], BankVertices[2];
@@ -841,6 +853,8 @@ void GPU3D::DoWideSavestate(Savestate* file, const RenderList* renderList, u32 r
         w.WingPolygons = WingNumPolygons;
         w.WingVertices = WingNumVertices;
         memcpy(w.NativeX, TempVertexNativeX, sizeof(w.NativeX));
+        memcpy(w.NativeY, TempVertexNativeY, sizeof(w.NativeY));
+        w.Margin = (u32)ViewMargin;
         WideSavestateHighWater(renderList, renderNumPolygons, w.BankPolygons, w.BankVertices);
         w.Extra = w.BankPolygons[0] > NativePolygonRAMSize || w.BankPolygons[1] > NativePolygonRAMSize
             || w.BankVertices[0] > NativeVertexRAMSize || w.BankVertices[1] > NativeVertexRAMSize;
@@ -859,10 +873,21 @@ void GPU3D::DoWideSavestate(Savestate* file, const RenderList* renderList, u32 r
     file->Var32(&w.WingPolygons);
     file->Var32(&w.WingVertices);
     file->VarArray(w.NativeX, sizeof(w.NativeX));
+    if (version >= 3)
+    {
+        file->VarArray(w.NativeY, sizeof(w.NativeY));
+        file->Var32(&w.Margin);
+    }
+    else
+    {
+        for (int i = 0; i < 4; i++)
+            w.NativeY[i] = TempVertexBuffer[i].Position[1];
+        w.Margin = 0;
+    }
     file->Var32(&w.Extra);
 
     auto fail = [file]() { file->Error = true; };
-    if (!file->Saving && (file->Error || w.WideList > 1 || w.Extra > 1
+    if (!file->Saving && (file->Error || w.WideList > 1 || w.Extra > 1 || w.Margin > (u32)WideMelon::MaxMargin
         || w.NativePolygons > NativePolygonRAMSize || w.NativeVertices > NativeVertexRAMSize || w.NativeStripVerts > 10
         || w.WingPolygons > NativePolygonRAMSize || w.WingVertices > NativeVertexRAMSize))
         return fail();
@@ -975,6 +1000,7 @@ void GPU3D::DoWideSavestate(Savestate* file, const RenderList* renderList, u32 r
     WingNumPolygons = w.WingPolygons;
     WingNumVertices = w.WingVertices;
     memcpy(TempVertexNativeX, w.NativeX, sizeof(TempVertexNativeX));
+    memcpy(TempVertexNativeY, w.NativeY, sizeof(TempVertexNativeY));
     if (!w.Extra)
         return;
 
@@ -1401,21 +1427,21 @@ bool ClipCoordsEqual(Vertex* a, Vertex* b)
            a->Position[3] == b->Position[3];
 }
 
-// the dot product SubmitPolygon culls by, from the first three vertices, with their X given separately
-// (from before WideMelon's squeeze)
-static s64 CullingDot(const Vertex* v, s32 x0, s32 x1, s32 x2)
+// the dot product SubmitPolygon culls by, from the first three vertices, with their X and Y given
+// separately (from before WideMelon's squeeze)
+static s64 CullingDot(const Vertex* v, const s32* x, const s32* y)
 {
     // TODO: work out how it works on the real thing
     // the normalization part is a wild guess
 
     s64 normalX, normalY, normalZ;
 
-    normalX = ((s64)(v[0].Position[1]-v[1].Position[1]) * (v[2].Position[3]-v[1].Position[3]))
-        - ((s64)(v[0].Position[3]-v[1].Position[3]) * (v[2].Position[1]-v[1].Position[1]));
-    normalY = ((s64)(v[0].Position[3]-v[1].Position[3]) * (x2-x1))
-        - ((s64)(x0-x1) * (v[2].Position[3]-v[1].Position[3]));
-    normalZ = ((s64)(x0-x1) * (v[2].Position[1]-v[1].Position[1]))
-        - ((s64)(v[0].Position[1]-v[1].Position[1]) * (x2-x1));
+    normalX = ((s64)(y[0]-y[1]) * (v[2].Position[3]-v[1].Position[3]))
+        - ((s64)(v[0].Position[3]-v[1].Position[3]) * (y[2]-y[1]));
+    normalY = ((s64)(v[0].Position[3]-v[1].Position[3]) * (x[2]-x[1]))
+        - ((s64)(x[0]-x[1]) * (v[2].Position[3]-v[1].Position[3]));
+    normalZ = ((s64)(x[0]-x[1]) * (y[2]-y[1]))
+        - ((s64)(y[0]-y[1]) * (x[2]-x[1]));
 
     while ((((normalX>>31) ^ (normalX>>63)) != 0) ||
            (((normalY>>31) ^ (normalY>>63)) != 0) ||
@@ -1426,7 +1452,7 @@ static s64 CullingDot(const Vertex* v, s32 x0, s32 x1, s32 x2)
         normalZ >>= 4;
     }
 
-    return ((s64)x1 * normalX) + ((s64)v[1].Position[1] * normalY) + ((s64)v[1].Position[3] * normalZ);
+    return ((s64)x[1] * normalX) + ((s64)y[1] * normalY) + ((s64)v[1].Position[3] * normalZ);
 }
 
 void GPU3D::SubmitPolygon() noexcept
@@ -1461,7 +1487,7 @@ void GPU3D::SubmitPolygon() noexcept
     // WideMelon: the native view, what this polygon would do without the squeeze. it gets its polygon and
     // vertex RAM counts (NativeNumPolygons), for the drop counter, and it picks the polygon's timing, so
     // the game sees stock geometry timing. the polygon is the same but for the X before the squeeze
-    // (TempVertexNativeX), and both cull alike (below)
+    // and Y (TempVertexNativeX and Y), and both cull alike (below)
     const bool wide = ViewWidth != WideMelon::NativeWidth;
     const int sentverts = nverts;
     // a kept polygon keeps the pipeline busy by its clipped vertex count
@@ -1502,11 +1528,11 @@ void GPU3D::SubmitPolygon() noexcept
     };
 
     // culling
-    // from the X before WideMelon's squeeze, the same as the vertices' X with it off. the squeeze keeps
-    // which way a polygon faces but rounds, which flips the sign for some seen almost edge on, so this
-    // way the wide view culls what the native one does
+    // from the X and Y before WideMelon's squeeze, the same as the vertices' with it off. the squeeze
+    // keeps which way a polygon faces but rounds, which flips the sign for some seen almost edge on, so
+    // this way the wide view culls what the native one does
 
-    s64 dot = CullingDot(TempVertexBuffer, TempVertexNativeX[0], TempVertexNativeX[1], TempVertexNativeX[2]);
+    s64 dot = CullingDot(TempVertexBuffer, TempVertexNativeX, TempVertexNativeY);
 
     bool facingview = (dot <= 0);
 
@@ -1742,6 +1768,18 @@ void GPU3D::SubmitPolygon() noexcept
 
                 // the native formula can't go negative, but a wrapped viewport (x1 < x0) can here
                 vtx->HiresPosition[0] = std::clamp<s64>(wideX, 0, 0x3FFF);
+            }
+            if (ViewMargin != 0)
+            {
+                // the same for Y (camera stage 2): squeezed by 192/H around clip Y = 0, the viewport's
+                // centre, so stretched back by H/192 around it, on a target ViewMargin rows taller
+                // each side. clip Y points up and the rows down, as in the native formula
+                s64 centre = ((s64)Viewport[3] << 4) + ((s64)Viewport[5] << 3) + ((s64)ViewMargin << 4);
+                s64 num = -(s64)vtx->Position[1] * Viewport[5] * ViewHeight();
+                s64 den = (s64)w * 24;
+                s64 wideY = centre + (num >= 0 ? num / den : -((den - 1 - num) / den));
+
+                vtx->HiresPosition[1] = std::clamp<s64>(wideY, 0, 0x3FFF);
             }
         }
     }
@@ -1993,22 +2031,29 @@ void GPU3D::SubmitPolygon() noexcept
 
 // WideMelon: the vertex count the polygon in TempVertexBuffer would have after clipping with the native
 // view, 0 if it would be clipped away, given that the squeezed view keeps it with [wideverts]. the
-// squeeze only scales X by a positive factor, so the Y and Z planes come out the same, and only the X
-// planes can differ: a polygon inside them natively clips the same way in both views, one wholly past
-// one of them is gone, and only one across them is clipped again, positions only
+// squeeze only scales X and Y (Y with a margin) by positive factors, so the Z planes come out the same,
+// and only the X and Y planes can differ: a polygon inside them natively clips the same way in both
+// views, one wholly past one of them is gone, and only one across them is clipped again, positions only
 // [clippedmask] gets which of its vertices clipping made, a bit each. [wideclipped] is the squeezed
 // view's clipped polygon
 int GPU3D::NativeClipVertices(int sentverts, int wideverts, const Vertex* wideclipped, u32& clippedmask) noexcept
 {
     clippedmask = 0;
     NativeClipSame = false;
-    int inside = 0, left = 0, right = 0;
+    int inside = 0, left = 0, right = 0, below = 0, above = 0;
     for (int i = 0; i < sentverts; i++)
     {
-        s32 x = TempVertexNativeX[i], w = TempVertexBuffer[i].Position[3];
-        if (x > w) right++;
-        else if (x < -w) left++;
-        else inside++;
+        s32 x = TempVertexNativeX[i], y = TempVertexNativeY[i], w = TempVertexBuffer[i].Position[3];
+        bool in = true;
+        if (x > w) { right++; in = false; }
+        else if (x < -w) { left++; in = false; }
+        // without a margin Y isn't squeezed, so its planes clip alike in both views (as before the margin)
+        if (ViewMargin != 0)
+        {
+            if (y > w) { above++; in = false; }
+            else if (y < -w) { below++; in = false; }
+        }
+        inside += in;
     }
     if (inside == sentverts)
     {
@@ -2017,12 +2062,12 @@ int GPU3D::NativeClipVertices(int sentverts, int wideverts, const Vertex* widecl
             clippedmask |= wideclipped[i].Clipped << i;
         return wideverts;
     }
-    if (left == sentverts || right == sentverts) return 0;
+    if (left == sentverts || right == sentverts || below == sentverts || above == sentverts) return 0;
 
     ClipPosition* native = NativeClipped;
     for (int i = 0; i < sentverts; i++)
     {
-        native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
+        native[i] = {{TempVertexNativeX[i], TempVertexNativeY[i], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
     }
     int n = NativeClippedCount = ClipPolygon<false>(*this, native, sentverts, 0);
     for (int i = 0; i < n; i++)
@@ -2041,7 +2086,7 @@ bool GPU3D::NativeZeroDot(int sentverts) noexcept
     {
         for (int i = 0; i < sentverts; i++)
         {
-            native[i] = {{TempVertexNativeX[i], TempVertexBuffer[i].Position[1], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
+            native[i] = {{TempVertexNativeX[i], TempVertexNativeY[i], TempVertexBuffer[i].Position[2], TempVertexBuffer[i].Position[3]}, false};
         }
         n = ClipPolygon<false>(*this, native, sentverts, 0);
     }
@@ -2087,8 +2132,11 @@ void GPU3D::SubmitVertex() noexcept
     vertextrans->Position[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
 
     TempVertexNativeX[VertexNumInPoly] = vertextrans->Position[0];
+    TempVertexNativeY[VertexNumInPoly] = vertextrans->Position[1];
     if (ViewWidth != WideMelon::NativeWidth)
         vertextrans->Position[0] = WideMelon::ProjectX(vertextrans->Position[0], ViewWidth);
+    if (ViewMargin != 0)
+        vertextrans->Position[1] = WideMelon::ProjectY(vertextrans->Position[1], ViewHeight());
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -2139,6 +2187,7 @@ void GPU3D::SubmitVertex() noexcept
             TempVertexBuffer[1] = TempVertexBuffer[0];
             TempVertexBuffer[0] = tmp;
             std::swap(TempVertexNativeX[0], TempVertexNativeX[1]);
+            std::swap(TempVertexNativeY[0], TempVertexNativeY[1]);
 
             VertexNumInPoly = 2;
             SubmitPolygon();
@@ -2146,6 +2195,7 @@ void GPU3D::SubmitVertex() noexcept
 
             TempVertexBuffer[1] = TempVertexBuffer[2];
             TempVertexNativeX[1] = TempVertexNativeX[2];
+            TempVertexNativeY[1] = TempVertexNativeY[2];
         }
         else if (VertexNumInPoly == 3)
         {
@@ -2157,6 +2207,8 @@ void GPU3D::SubmitVertex() noexcept
             TempVertexBuffer[1] = TempVertexBuffer[2];
             TempVertexNativeX[0] = TempVertexNativeX[1];
             TempVertexNativeX[1] = TempVertexNativeX[2];
+            TempVertexNativeY[0] = TempVertexNativeY[1];
+            TempVertexNativeY[1] = TempVertexNativeY[2];
         }
         break;
 
@@ -2167,6 +2219,7 @@ void GPU3D::SubmitVertex() noexcept
             TempVertexBuffer[3] = TempVertexBuffer[2];
             TempVertexBuffer[2] = tmp;
             std::swap(TempVertexNativeX[2], TempVertexNativeX[3]);
+            std::swap(TempVertexNativeY[2], TempVertexNativeY[3]);
 
             VertexNumInPoly = 2;
             SubmitPolygon();
@@ -2176,6 +2229,8 @@ void GPU3D::SubmitVertex() noexcept
             TempVertexBuffer[1] = TempVertexBuffer[2];
             TempVertexNativeX[0] = TempVertexNativeX[3];
             TempVertexNativeX[1] = TempVertexNativeX[2];
+            TempVertexNativeY[0] = TempVertexNativeY[3];
+            TempVertexNativeY[1] = TempVertexNativeY[2];
         }
         break;
     }
@@ -2338,13 +2393,17 @@ void GPU3D::BoxTest(const u32* params) noexcept
 
     // WideMelon: a box that misses the native view gets one more try against the wide view plus about
     // 4 px a side (the squeeze for a view 8 px wider, in pixels of a full-screen viewport), so games that
-    // cull with box tests don't drop objects in the wings. a native hit stays a hit, so nothing that shows
-    // natively changes. the wide check answers them as stock unless asked (WideCheckSqueezeBoxTest), so
-    // the game's memory can be compared
+    // cull with box tests don't drop objects in the wings. with a margin, Y is squeezed the same way, 4 rows
+    // past it top and bottom. a native hit stays a hit, so nothing that shows natively changes. the wide
+    // check answers them as stock unless asked (WideCheckSqueezeBoxTest), so the game's memory can be compared
     if (!hit && ViewWidth != WideMelon::NativeWidth && (!WideCheck || WideCheckSqueezeBoxTest))
     {
         for (int i = 0; i < 8; i++)
+        {
             cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], ViewWidth + 8);
+            if (ViewMargin != 0)
+                cube[i].Position[1] = WideMelon::ProjectY(cube[i].Position[1], ViewHeight() + 8);
+        }
         hit = BoxTestHits(*this, cube);
         if (WideCheck) WideCheckBoxRetryHits += hit;
     }
@@ -3247,7 +3306,7 @@ bool GPU3D::MatchRenderScene(bool save) noexcept
         pos += count;
     };
 
-    item[0] = (u32)RenderViewWidth;
+    item[0] = (u32)RenderViewWidth | ((u32)RenderViewMargin << 16);
     item[1] = RenderNumPolygons;
     put(2);
 
@@ -3322,7 +3381,8 @@ u64 GPU3D::HashRenderScene() const noexcept
         s32 Position[10][2], HiresPosition[10][2], Color[10][3], TexCoords[10][2];
     } item;
 
-    u64 hash = XXH64(&RenderNumPolygons, sizeof(RenderNumPolygons), (u64)(u32)RenderViewWidth ^ ((u64)FlushAttributes << 32));
+    u64 hash = XXH64(&RenderNumPolygons, sizeof(RenderNumPolygons),
+        (u64)((u32)RenderViewWidth | ((u32)RenderViewMargin << 16)) ^ ((u64)FlushAttributes << 32));
     for (u32 i = 0; i < RenderNumPolygons; i++)
     {
         const Polygon* poly = RenderPolygonRAM[i];
@@ -3422,6 +3482,7 @@ void GPU3D::VBlank() noexcept
 
                 RenderNumPolygons = NumPolygons;
                 RenderViewWidth = ViewWidth;
+                RenderViewMargin = ViewMargin;
                 RenderWideList = WideListOn;
                 RenderFrameIdentical = false;
 
@@ -3666,10 +3727,10 @@ void GPU3D::WideDropsOnVBlank() noexcept
     u32 nativefit = DroppedNativeFit - WideDrops.SecondStartNativeFit;
     u32 wing = DroppedWing - WideDrops.SecondStartWing;
     Log(LogLevel::Info, "WIDEDROPS width=%d widelist=%d scenes=%u dropscenes=%u drops=%u native=%u wing=%u nativefit=%u maxscene=%u "
-        "peaknpoly=%u peaknvert=%u peakpoly=%u peakvert=%u peakwing=%u\n",
+        "peaknpoly=%u peaknvert=%u peakpoly=%u peakvert=%u peakwing=%u margin=%d\n",
         ViewWidth, WideListOn ? 1 : 0, WideDrops.Scenes, WideDrops.DropScenes, drops, drops - nativefit - wing, wing, nativefit,
         WideDrops.MaxSceneDrops, WideDrops.PeakNativePolygons, WideDrops.PeakNativeVertices, WideDrops.PeakPolygons,
-        WideDrops.PeakVertices, WideDrops.PeakWingPolygons);
+        WideDrops.PeakVertices, WideDrops.PeakWingPolygons, ViewMargin);
 
     WideDrops.LastLog = now;
     WideDrops.Scenes = WideDrops.DropScenes = WideDrops.MaxSceneDrops = WideDrops.PeakPolygons = WideDrops.PeakVertices = 0;
@@ -3733,6 +3794,14 @@ u32* GPU3D::GetLine(int line, u16 xpos, bool abort) noexcept
 int GPU3D::RendererViewWidth() const noexcept
 {
     return WideCheck ? WideCheck : CurrentRenderer->GetViewWidth();
+}
+
+// with the width RendererViewWidth just gave (ViewWidth). the wide check has no margin
+int GPU3D::RendererViewMargin() const noexcept
+{
+    if (WideCheck || !NDS.GPU.WideY)
+        return 0;
+    return WideMelon::SanitizeMargin(CurrentRenderer->GetViewMargin(), ViewWidth);
 }
 
 bool GPU3D::IsRendererAccelerated() const noexcept

@@ -146,10 +146,17 @@ precision mediump usampler2D;
 uniform uint u3DScale;
 #ifdef WIDE
 uniform int uWideOffset;
+// WideMelon camera stage 2 (GLCompositor::Margin): the top half's rows are the 3D target's
+// 192 + 2 * uWideMargin, with DS line 0 uWideMargin rows down, and the bottom half starts 2 padding
+// rows below them. 0 is the old layout. the 256 view never has one (WIDE_MARGIN)
+uniform int uWideMargin;
+#define WIDE_MARGIN uWideMargin
 uniform mediump sampler2D HeldWingsTex;
 // each line's wing planes (GPU2D::AccelWingPlanesStart): planes 0-2 of the left wing's pixel in
 // texels 0-2, the right one's in 3-5, at the screen texture's rows
 uniform usampler2D WingPlanesTex;
+#else
+#define WIDE_MARGIN 0
 #endif
 
 uniform usampler2D ScreenTex;
@@ -212,6 +219,38 @@ ivec4 Fetch3D(float xpos, float ypos)
 }
 
 #ifdef WIDE
+// the 3D target's row, in native rows, for this pixel: the top half's rows are the target's, its
+// margins included (fTexcoord.y runs from -uWideMargin there), and the bottom half shows the target's
+// middle 192. without a margin it's as before
+float Row3D()
+{
+    if (uWideMargin == 0)
+        return mod(fTexcoord.y, 192.0);
+    if (gl_FragCoord.y < float((192 + 2 * uWideMargin) * int(u3DScale)))
+        return fTexcoord.y + float(uWideMargin);
+    return fTexcoord.y - 192.0 + float(uWideMargin);
+}
+#define ROW3D Row3D()
+
+// with a margin, a pixel of the top half's margin rows (above DS line 0 or below line 191) has no 2D
+// line, so it's drawn as a wing pixel of the nearest one: this is that line (0 or 191), or -1 for a
+// pixel on a DS line
+int MarginEdge()
+{
+    if (uWideMargin == 0 || gl_FragCoord.y >= float((192 + 2 * uWideMargin) * int(u3DScale)))
+        return -1;
+    return fTexcoord.y < 0.0 ? 0 : fTexcoord.y >= 192.0 ? 191 : -1;
+}
+
+// the wing side a pixel takes its planes from (0 the left wing's, 3 the right's): a wing's own, and
+// for a margin pixel the half of the width it's in
+int WingSide(int edge)
+{
+    if (edge >= 0)
+        return fTexcoord.x < 128.0 ? 0 : 3;
+    return fTexcoord.x < 0.0 ? 0 : 3;
+}
+
 // the wide output's extra columns. only unit A's 3D layer goes there, on the lines where it
 // shows it (control word bit 18), and the 2D layers stay native. unit A writes its control
 // words into whichever screen it's on, so the wings follow the 3D to the bottom half too (the
@@ -220,10 +259,10 @@ ivec4 Fetch3D(float xpos, float ypos)
 // GPU2D::SoftRenderer::DrawWingPlanes): where the edge visibly shows the backdrop, through 3D
 // that's transparent there, the wing shows the 3D over the backdrop too, so the backdrop shows
 // where the wing's 3D is transparent. lines that are all white (bit 21, from either unit) get
-// white wings
-ivec4 WingPixel()
+// white wings. [row] is the line (the screen texture's row), [side] the wing's planes (WingSide):
+// a margin pixel is its edge line's wing pixel, with the 3D at its own row and column
+ivec4 WingPixel(int row, int side)
 {
-    int row = int(fTexcoord.y);
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
     int dispmode = mbright.b & 0x3;
 
@@ -234,14 +273,13 @@ ivec4 WingPixel()
     }
     else if ((mbright.b & 0x4) != 0)
     {
-        int side = fTexcoord.x < 0.0 ? 0 : 3;
         ivec4 val1 = ivec4(texelFetch(WingPlanesTex, ivec2(side, row), 0));
         ivec4 val2 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 1, row), 0));
         ivec4 val3 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 2, row), 0));
 
         // same X scroll as the middle
         float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
-        ivec4 _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
+        ivec4 _3dpix = Fetch3D(fTexcoord.x + _3dxpos, Row3D());
 
         // GPU2D::WingRaw3D: there's no backdrop under the 3D at the edge, so the wing shows the
         // 3D as it is, transparent or not (then planes 0 and 1 are never read). otherwise the
@@ -255,7 +293,7 @@ ivec4 WingPixel()
         // neighbor's window mask)
         if ((val3.a & 0x10) != 0)
             _3dpix.a = max(_3dpix.a, 1);
-        else if (_3dpix.a == 0 && Fetch3D((side == 0 ? 1.5 : 254.5) + _3dxpos, mod(fTexcoord.y, 192.0)).a != 0)
+        else if (_3dpix.a == 0 && Fetch3D((side == 0 ? 1.5 : 254.5) + _3dxpos, Row3D()).a != 0)
             _3dpix.a = (val3.a & 0xF) == 4 ? 31 : 1;
 
         bool opaque;
@@ -272,6 +310,8 @@ ivec4 WingPixel()
 
     return pixel;
 }
+#else
+#define ROW3D mod(fTexcoord.y, 192.0)
 #endif
 
 #ifdef FILTER2D
@@ -283,8 +323,11 @@ highp ivec2 FilterSubPixel()
     highp ivec2 coord = ivec2(gl_FragCoord.xy);
     coord.y -= uFilterRowOffset;
     highp int scale = int(u3DScale);
-    if (coord.y >= 194 * scale)
-        coord.y -= 2 * scale;
+    // the top screen's DS lines start WIDE_MARGIN rows down (only DS lines get here, see main)
+    if (coord.y >= (194 + 2 * WIDE_MARGIN) * scale)
+        coord.y -= (2 + 2 * WIDE_MARGIN) * scale;
+    else
+        coord.y -= WIDE_MARGIN * scale;
 #ifdef WIDE
     coord.x -= uWideOffset * scale;
 #endif
@@ -328,7 +371,7 @@ ivec2 FilterPlaneCoord(highp ivec2 subPixel, highp ivec2 native, ivec2 rowCoord,
 ivec4 FilterFetch3D(float xscroll, highp ivec2 subPixel)
 {
 #ifdef WIDE
-    return Fetch3D(fTexcoord.x + xscroll, mod(fTexcoord.y, 192.0));
+    return Fetch3D(fTexcoord.x + xscroll, Row3D());
 #else
     if (uFilterIdentity != 0)
     {
@@ -350,25 +393,28 @@ const char* kCompositorFS_Nearest_Entry = R"(
 void main()
 {
 #ifdef WIDE
-    if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
+    int edge = MarginEdge();
+    if (edge >= 0 || fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
     {
         // a held line (control word bit 13, set by GLCompositor::PrepareWingHold in the copy
         // of the control words it uploads) takes the wings from an earlier frame's output as
-        // they are. HeldWingsTex has the left wing, then the right one, at the output's rows.
-        // the flag isn't a uniform bit mask: Adreno dropped the hold for lines 0-31 when that
-        // was read as uWingHold[line >> 7][(line >> 5) & 3]
-        ivec4 ctrl = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+        // they are. HeldWingsTex has the left wing, then the right one, at the output's rows,
+        // or with a margin the whole output's wings and margins where they are, and a margin
+        // is held with its edge line. the flag isn't a uniform bit mask: Adreno dropped the
+        // hold for lines 0-31 when that was read as uWingHold[line >> 7][(line >> 5) & 3]
+        int row = edge >= 0 ? edge : int(fTexcoord.y);
+        ivec4 ctrl = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
         if ((ctrl.g & 0x20) != 0)
         {
             ivec2 coord = ivec2(gl_FragCoord.xy);
             int wingW = uWideOffset * int(u3DScale);
-            if (coord.x >= wingW)
+            if (uWideMargin == 0 && coord.x >= wingW)
                 coord.x -= 256 * int(u3DScale);
             oColor = vec4(texelFetch(HeldWingsTex, coord, 0).rgb, 1.0);
             return;
         }
 
-        ivec4 wing = WingPixel();
+        ivec4 wing = WingPixel(row, WingSide(edge));
         wing.rgb <<= 2;
         wing.rgb |= (wing.rgb >> 6);
         oColor = vec4(vec3(wing.bgr) / 255.0, 1.0);
@@ -398,11 +444,14 @@ void main()
     {
         // from a hi-res image, whose rows are the bank rows (display line L shows row L). the
         // output has 2 padding lines between the halves, so the second half's rows start at 194
-        // lines, and the wide output's wing comes before the middle
+        // lines (plus twice the margin, which the top screen's lines start below), and the wide
+        // output's wing comes before the middle
         highp ivec2 coord = ivec2(gl_FragCoord.xy);
         int scale = int(u3DScale);
-        if (coord.y >= 194 * scale)
-            coord.y -= 194 * scale;
+        if (coord.y >= (194 + 2 * WIDE_MARGIN) * scale)
+            coord.y -= (194 + 2 * WIDE_MARGIN) * scale;
+        else
+            coord.y -= WIDE_MARGIN * scale;
 #ifdef WIDE
         coord.x -= uWideOffset * scale;
 #endif
@@ -427,7 +476,7 @@ void main()
 #ifdef FILTER2D
             _3dpix = FilterFetch3D(_3dxpos, subPixel);
 #else
-            _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
+            _3dpix = Fetch3D(fTexcoord.x + _3dxpos, ROW3D);
 #endif
 
         bool opaque;
@@ -776,14 +825,15 @@ ivec4 FinishPixel(ivec4 pixel, ivec4 mbright, int dispmode)
     return pixel;
 }
 
-// the output pixel in its half's rows: the output has 2 padding lines between the halves, so the
-// second half's rows start at 194 lines
+// the output pixel in its half's rows, which are the 3D's: the output has 2 padding lines between the
+// halves, so the second half's rows start at 194 lines. with a margin (WIDE_MARGIN) the top half has
+// the 3D's 192 + 2 * margin rows, and the bottom one shows its middle 192, from row margin
 highp ivec2 OutputPixel()
 {
     highp int scale = int(u3DScale);
     highp ivec2 base = ivec2(gl_FragCoord.xy);
-    if (base.y >= 194 * scale)
-        base.y -= 194 * scale;
+    if (base.y >= (194 + 2 * WIDE_MARGIN) * scale)
+        base.y -= (194 + WIDE_MARGIN) * scale;
     return base;
 }
 
@@ -820,10 +870,9 @@ ivec4 WingComposite(ivec4 val1, ivec4 val2, ivec4 val3, ivec4 _3dpix, bool edge)
 // the block's alphas are the same and, for a transparent one the probe matters to, the probe has 3D
 // in all of the block's rows or none (the edge colors the transparent 3D, so a block with no alpha
 // still reads its average), and each sub-pixel otherwise. lines without 3D wings are the same in
-// every sub-pixel
-ivec3 WingDown3D()
+// every sub-pixel. [row] and [side] as for WingPixel
+ivec3 WingDown3D(int row, int side)
 {
-    int row = int(fTexcoord.y);
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
     int dispmode = mbright.b & 0x3;
 
@@ -832,7 +881,6 @@ ivec3 WingDown3D()
     if ((mbright.b & 0x4) == 0)
         return FinishPixel(ivec4(0), mbright, dispmode).bgr;
 
-    int side = fTexcoord.x < 0.0 ? 0 : 3;
     ivec4 val1 = ivec4(texelFetch(WingPlanesTex, ivec2(side, row), 0));
     ivec4 val2 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 1, row), 0));
     ivec4 val3 = ivec4(texelFetch(WingPlanesTex, ivec2(side + 2, row), 0));
@@ -980,22 +1028,24 @@ ivec3 MiddleDown3D(ivec4 pixel, ivec4 val2, ivec4 val3, ivec4 mbright, int dispm
 void main()
 {
 #ifdef WIDE
-    if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
+    int edge = MarginEdge();
+    if (edge >= 0 || fTexcoord.x < 0.0 || fTexcoord.x >= 256.0)
     {
         // a held line takes the wings from an earlier frame's output as they are, as in
-        // kCompositorFS_Nearest_Entry: that output was at this scale too
-        ivec4 ctrl = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+        // kCompositorFS_Nearest_Entry: that output was at this scale too. margins as there too
+        int row = edge >= 0 ? edge : int(fTexcoord.y);
+        ivec4 ctrl = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
         if ((ctrl.g & 0x20) != 0)
         {
             highp ivec2 coord = ivec2(gl_FragCoord.xy);
             highp int wingW = uWideOffset * int(u3DScale);
-            if (coord.x >= wingW)
+            if (uWideMargin == 0 && coord.x >= wingW)
                 coord.x -= 256 * int(u3DScale);
             oColor = vec4(texelFetch(HeldWingsTex, coord, 0).rgb, 1.0);
             return;
         }
 
-        oColor = vec4(vec3(WingDown3D()) / 255.0, 1.0);
+        oColor = vec4(vec3(WingDown3D(row, WingSide(edge))) / 255.0, 1.0);
         return;
     }
 #endif
@@ -1052,8 +1102,10 @@ void main()
         // from a hi-res image at the output's scale, as in kCompositorFS_Nearest_Entry
         highp ivec2 coord = ivec2(gl_FragCoord.xy);
         highp int scale = int(u3DScale);
-        if (coord.y >= 194 * scale)
-            coord.y -= 194 * scale;
+        if (coord.y >= (194 + 2 * WIDE_MARGIN) * scale)
+            coord.y -= (194 + 2 * WIDE_MARGIN) * scale;
+        else
+            coord.y -= WIDE_MARGIN * scale;
 #ifdef WIDE
         coord.x -= uWideOffset * scale;
 #endif
@@ -1150,6 +1202,7 @@ precision highp usampler2D;
 
 uniform int uScale;
 uniform int uWideOffset;    // native columns the 3D target has on each side of the middle 256
+uniform int uWideMargin;    // and the rows above DS line 0 (camera stage 2), 0 without a margin
 uniform int uDstRow;        // the bank row the capture starts at
 
 // per capture line: the 3 planes (columns 0-767) as GPU::HiresCapRecord has them, then 2 control
@@ -1173,7 +1226,7 @@ ivec4 Fetch3DCapture(int x, int y)
     if (x < 0 || x >= 256 * uScale)
         return ivec4(0);
 
-    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * uScale, y), 0);
+    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * uScale, y + uWideMargin * uScale), 0);
     return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
 }
 
@@ -1196,7 +1249,7 @@ ivec4 Fetch3DCaptureAt(int x, int y, int scale3D)
     if (x < 0 || x >= 256 * scale3D)
         return ivec4(0);
 
-    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * scale3D, y), 0);
+    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * scale3D, y + uWideMargin * scale3D), 0);
     return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
 }
 
@@ -1214,7 +1267,7 @@ ivec4 Average3DCapture(int x, int y, Block3D block, int scale3D)
         return ivec4(0);
 
 #if DOWN3D_MODE == 1 || DOWN3D_MODE == 3
-    block.first = ivec2(x + uWideOffset * scale3D, y);
+    block.first = ivec2(x + uWideOffset * scale3D, y + uWideMargin * scale3D);
     vec4 average = Bilinear3DBlock(block);
     return ivec4(average.bgra * 255.0 + 0.5) >> ivec4(2, 2, 2, 3);
 #else
@@ -1273,7 +1326,7 @@ void SourceADown3D(ivec2 frag, int row, int x, int line, uint capcnt, int xscrol
     if (x3d >= 0 && x3d < 256 * scale3D)
     {
         Block3D texels = block;
-        texels.first = ivec2(x3d + uWideOffset * scale3D, y3d);
+        texels.first = ivec2(x3d + uWideOffset * scale3D, y3d + uWideMargin * scale3D);
         int alphas = Block3DAlphas(texels);
         exact = alphas == 2 || (alphas == 1 && BlendSaturates(val3));
     }
@@ -2125,9 +2178,10 @@ void main()
     int screen = frag.y >= 192 ? 1 : 0;
     int subY = frag.y - screen * 192;
 #else
-    // the output has 2 padding lines between the screens
-    int screen = frag.y >= 194 * scale ? 1 : 0;
-    int subY = frag.y - screen * 194 * scale;
+    // the output has 2 padding lines between the screens, and the top screen's lines start WIDE_MARGIN
+    // rows down (the margins are never drawn here, see GLCompositor::BuildShadow2DQuads)
+    int screen = frag.y >= (194 + 2 * WIDE_MARGIN) * scale ? 1 : 0;
+    int subY = frag.y - (screen != 0 ? 194 + 2 * WIDE_MARGIN : WIDE_MARGIN) * scale;
 #endif
     int line = subY / scale;
     int row = screen * 192 + line;
@@ -2276,7 +2330,7 @@ void main()
     // a wing pixel with no 2D layer of its own is the compositor's, edge checks and all
     if (wing && !any2D)
     {
-        ivec4 wingPixel = WingPixel();
+        ivec4 wingPixel = WingPixel(int(fTexcoord.y), WingSide(-1));
         wingPixel.rgb <<= 2;
         wingPixel.rgb |= (wingPixel.rgb >> 6);
         oColor = vec4(vec3(wingPixel.bgr) / 255.0, 1.0);
@@ -2293,7 +2347,7 @@ void main()
 
     ivec4 _3dpix = ivec4(0);
     if ((val3.a & 0xF) <= 4)
-        _3dpix = Fetch3D(fTexcoord.x + _3dxpos, mod(fTexcoord.y, 192.0));
+        _3dpix = Fetch3D(fTexcoord.x + _3dxpos, ROW3D);
 
     bool opaque;
     ivec4 pixel = CompositePixel(val1, val2, val3, _3dpix, opaque);
