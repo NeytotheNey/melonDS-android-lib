@@ -806,9 +806,10 @@ public:
     bool DeferCapture2D = true;
     // while display capture lines are held, draw engine B's part of each line right away and hold
     // only engine A's, which is all that display capture reads and all that needs the 3D readback.
-    // then a game writing engine B's VRAM, palette or OAM doesn't draw the held lines early. off by
-    // default here; debug builds turn it on (DebugProperties) to compare. set between games only
-    bool EngineBNoHold = false;
+    // then a game writing engine B's VRAM, palette or OAM doesn't draw the held lines early. on by
+    // default since it passed gameplay, save state and OnePlus tests; debug builds can turn it off
+    // (DebugProperties) to compare. set between games only
+    bool EngineBNoHold = true;
     // with DeferCapture2D, submit the GPU work held lines wait for (the 3D frame at line 215, its
     // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
     // line 192. only turned off by a debug switch, to compare
