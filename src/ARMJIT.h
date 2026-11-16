@@ -72,6 +72,9 @@ private:
     bool LiteralOptimizations = false;
     bool BranchOptimizations = false;
     bool FastMemory = false;
+    // melonade: multi-register loads (LDM, POP, Thumb LDMIA) take the fastmem path on ARM64 as well as stores.
+    // Not part of JITArgs, so the app's JITArgs stay as they are; an A/B switch (debug.melonade.ldmfast)
+    bool FastBlockLoads = true;
 
 public:
     melonDS::NDS& NDS;
@@ -84,12 +87,15 @@ public:
     bool LiteralOptimizationsEnabled() const noexcept { return LiteralOptimizations; }
     bool BranchOptimizationsEnabled() const noexcept { return BranchOptimizations; }
     bool FastMemoryEnabled() const noexcept { return FastMemory; }
+    bool FastBlockLoadsEnabled() const noexcept { return FastBlockLoads; }
 
     void SetJITArgs(JITArgs args) noexcept;
     void SetMaxBlockSize(int size) noexcept;
     void SetLiteralOptimizations(bool enabled) noexcept;
     void SetBranchOptimizations(bool enabled) noexcept;
     void SetFastMemory(bool enabled) noexcept;
+    // ARM64 only (x64 always has loads on the fast path). Blocks already compiled are thrown away when it changes
+    void SetFastBlockLoads(bool enabled) noexcept;
 
     Compiler JITCompiler;
     std::unordered_map<u32, JitBlock*> JitBlocks9 {};
@@ -194,6 +200,8 @@ public:
     void JitEnableExecute() noexcept {}
     void CompileBlock(ARM*) noexcept {}
     void ResetBlockCache() noexcept {}
+    bool FastBlockLoadsEnabled() const noexcept { return false; }
+    void SetFastBlockLoads(bool) noexcept {}
     template <u32, int>
     void CheckAndInvalidate(u32 addr) noexcept {}
 

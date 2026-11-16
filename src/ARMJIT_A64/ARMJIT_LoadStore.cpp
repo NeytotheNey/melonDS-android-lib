@@ -498,16 +498,30 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         ? NDS.JIT.Memory.ClassifyAddress9(CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(CurInstr.DataRegion);
 
+    // Loads take the fast path too, as on x64 (melonade; upstream had it store only since the A64 fastmem port).
+    // The cycles above are the same either way: neither path adds any at run time (SlowBlockTransfer9/7 use the
+    // bus functions, which don't count cycles). If a load faults partway, the fault handler either maps the page
+    // and reruns the faulting LDR/LDP, or patches the whole fast path into a call to the slow path below and
+    // reruns it from the start. That's safe because the fast path only writes registers the slow path loads
+    // again (a skipped rn, skipLoadingRn, goes to W3/W4, never its host register) and the address stays in W0.
+    // FastBlockLoadsEnabled() is the A/B switch back to stores only (debug.melonade.ldmfast 0 in the app)
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && store && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && (store || NDS.JIT.FastBlockLoadsEnabled())
+        && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 
     {
         s32 offset = decrement
             ? -regsCount * 4 + (preinc ? 0 : 4)
             : (preinc ? 4 : 0);
 
+        // the fast path needs the word aligned address the slow path uses (SlowBlockTransfer aligns it itself),
+        // with an offset too, for an unaligned rn
         if (offset)
+        {
             ADDI2R(W0, MapReg(rn), offset);
+            if (compileFastPath)
+                ANDI2R(W0, W0, ~3);
+        }
         else if (compileFastPath)
             ANDI2R(W0, MapReg(rn), ~3);
         else
@@ -531,11 +545,18 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
             int reg = *it;
             it++;
 
+            bool skip = !store && reg == rn && skipLoadingRn;
+
             ARM64Reg first = W3;
             if (RegCache.LoadedRegs & (1 << reg))
-                first = MapReg(reg);
+            {
+                if (!skip)
+                    first = MapReg(reg);
+            }
             else if (store)
+            {
                 LoadReg(reg, first);
+            }
 
             loadStoreOffsets[i++] = GetCodeOffset();
 
@@ -543,11 +564,13 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
             {
                 STR(INDEX_UNSIGNED, first, X1, offset);
             }
-            else if (!(reg == rn && skipLoadingRn))
+            else
             {
+                // a skipped rn still touches the word (into W3), like x64, so a word in an unmapped page
+                // faults to the slow path, which reads it too
                 LDR(INDEX_UNSIGNED, first, X1, offset);
 
-                if (!(RegCache.LoadedRegs & (1 << reg)))
+                if (!(RegCache.LoadedRegs & (1 << reg)) && !skip)
                     SaveReg(reg, first);
             }
 
@@ -588,11 +611,13 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
             }
             else
             {
+                // a skipped rn loads into W3 or W4 and isn't kept (first and second are never the same
+                // register: two guest registers never share a host one, and W3/W4 only go to one each)
                 LDP(INDEX_SIGNED, first, second, X1, offset);
-            
-                if (!(RegCache.LoadedRegs & (1 << reg)))
+
+                if (!(RegCache.LoadedRegs & (1 << reg)) && !(reg == rn && skipLoadingRn))
                     SaveReg(reg, first);
-                if (!(RegCache.LoadedRegs & (1 << nextReg)))
+                if (!(RegCache.LoadedRegs & (1 << nextReg)) && !(nextReg == rn && skipLoadingRn))
                     SaveReg(nextReg, second);
             }
 
