@@ -80,7 +80,7 @@ private:
     bool DirectBlockTransfers = true;
     // melonade: ARM64, a block exit looks up and jumps to the next block itself (Compiler::Gen_DispatchStubs) instead of
     // going back to the Execute loop for it; same emulation either way. An A/B switch (debug.melonade.jitdispatch)
-    bool JitDispatch = false;
+    bool JitDispatch = true;
 
 public:
     melonDS::NDS& NDS;
