@@ -892,8 +892,9 @@ void GLCompositor::ResetShadow2D() noexcept
 // set whatever the windows do, so a window that hides the wings on every line of unit A's
 // screen still counts as unit A being there. games with 3D on one screen never have unit A's
 // 3D in both halves, so they never copy or hold
-void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
+int GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
 {
+    int topWingLines = 0;
     std::array<bool, 2> live {};
     std::array<std::array<u32, 6>, 2> liveLines {}, blackLines {};
     for (int half = 0; half < 2; half++)
@@ -906,7 +907,10 @@ void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
                 live[half] = true;
 
             if (ctrl & (1 << 18))
+            {
                 liveLines[half][line >> 5] |= 1u << (line & 31);
+                topWingLines += half == 0;
+            }
             else if (!(ctrl & (1 << 21)))
                 blackLines[half][line >> 5] |= 1u << (line & 31);
         }
@@ -985,6 +989,11 @@ void GLCompositor::PrepareWingHold(const GPU& gpu, int backbuf) noexcept
         if (WingCopy[half])
             WingHold[half].CopyLines = liveLines[half];
     }
+    // held lines show 3D wings too (only black lines are held, so they're never counted twice),
+    // which keeps a dual-screen 3D game's top screen counted on the frames unit A is away
+    for (int i = 0; i < 6; i++)
+        topWingLines += __builtin_popcount(WingHoldLines[i]);
+    return topWingLines;
 }
 
 // copies the wings of the halves PrepareWingHold picked from the output just drawn. the
@@ -1269,6 +1278,7 @@ bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
     layout.HalvesAt1x = OneX.Halves[buf];
     layout.Scale = OneX.Scale[buf];
     layout.HalfScale = OneX.HalfScale[buf];
+    layout.TopWingLines = OneX.TopWingLines[buf];
     return true;
 }
 
@@ -1291,8 +1301,9 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
 
     // before the output is bound, as this can set up the held wings' framebuffer
     bool wingHold = ViewWidth != 256 && hasFramebuffers;
+    int topWingLines = 0;
     if (wingHold)
-        PrepareWingHold(gpu, backbuf);
+        topWingLines = PrepareWingHold(gpu, backbuf);
     else
         WingHoldLines = {};
 
@@ -1546,6 +1557,7 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     OneX.Scale[backbuf] = Scale;
     OneX.HalfScale[backbuf] = halvesAt1x != 0 ? smallDraw.DrawScale : 1;
     OneX.Drawn[backbuf] = true;
+    OneX.TopWingLines[backbuf] = topWingLines;
 
     // before anything else draws or reads, with the main draw's state still set
     if (checkHalves != 0 && (OneX.CheckFrames++ % 30) == 0)

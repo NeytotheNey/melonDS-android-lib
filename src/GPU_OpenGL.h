@@ -165,6 +165,8 @@ private:
         std::array<int, 2> Scale {};
         std::array<int, 2> HalfScale {};
         std::array<bool, 2> Drawn {};
+        // and for the WideMelon camera (OutputLayout::TopWingLines)
+        std::array<int, 2> TopWingLines {};
 
         // the check mode's target, made the first time a check runs and freed with the switch off:
         // GL_RGBA8 CheckW x 384 at CheckScale, half h at it from row h * 192 * CheckScale
@@ -337,7 +339,8 @@ private:
     GLuint HeldWingsFB = 0;
     int HeldWingsW = 0, HeldWingsH = 0;
 
-    void PrepareWingHold(const GPU& gpu, int backbuf) noexcept;
+    // returns the top screen's lines with 3D wings, held ones included (OutputLayout::TopWingLines)
+    int PrepareWingHold(const GPU& gpu, int backbuf) noexcept;
     void CopyHeldWings(int backbuf) noexcept;
 
     // hi-res display capture (see GPU::HiresCapture). one copy per capture bank (A-D, the only

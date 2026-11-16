@@ -542,6 +542,9 @@ struct OutputLayout
     int HalvesAt1x = 0;
     int Scale = 1;
     int HalfScale = 1;
+    // WideMelon camera: the top screen's lines with 3D wings, its own (control word bit 18) or
+    // held from an earlier frame by the dual-screen wing hold
+    int TopWingLines = 0;
 };
 
 class Renderer3D
