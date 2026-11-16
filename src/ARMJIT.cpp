@@ -529,6 +529,16 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
     SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, BranchOptimizations, enabled});
 }
 
+void ARMJIT::SetFastBlockLoads(bool enabled) noexcept
+{
+    if (FastBlockLoads == enabled)
+        return;
+    FastBlockLoads = enabled;
+    // nothing to throw away before the first block (the app sets it right after creating the NDS)
+    if (!JitBlocks9.empty() || !JitBlocks7.empty())
+        ResetBlockCache();
+}
+
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
     bool thumb = cpu->CPSR & 0x20;
