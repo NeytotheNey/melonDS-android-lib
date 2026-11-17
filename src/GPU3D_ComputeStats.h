@@ -113,7 +113,8 @@ namespace melonDS
 struct ComputeStats
 {
     static constexpr int SetCount = 16;
-    // a render uses 8 (Clear..Final), a Blit up to 9 (CompExtra twice and each other part once)
+    // a render uses 8 (Clear..Final), a Blit up to 11 (CompExtra twice, CompShadowObj three times
+    // and each other part once)
     static constexpr int SetQueries = 12;
     static_assert(ComputePass::Count <= 32, "the passes a set ran are a u32 mask");
 
