@@ -204,10 +204,13 @@ public:
     /// only a check while no line is waiting
     void Sync2D(u8 flushCause = CapFlush_Other, bool blitAfter3D = true) noexcept
     {
-        if (Is2DRingBusy())
-            Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+        // the lines line 192 queued first: Held2DDone waits for the whole ring itself, and bit 32
+        // needs to see whether the 2D thread was still drawing them. after a VCount write that
+        // skipped line 215, the frame end or the next line drawn is where they're waited for as planned
         if (Held2DQueued)
-            Held2DDone();
+            Held2DDone(flushCause == CapFlush_FrameEnd || flushCause == CapFlush_LateBlit);
+        if (Is2DRingBusy())
+            Wait2DJobs(Jobs2DEnd);
         if (Deferred2DPending)
             Flush2DDeferred(flushCause);
         if (BlitPending || (BlitAfter3DPending && blitAfter3D))
@@ -242,10 +245,11 @@ public:
     T ReadVRAM_LCDC(u32 addr) noexcept
     {
         // display capture writes an LCDC bank, so the lines held back for it are drawn first, and
-        // the ones line 192 queued for the 2D thread (HeldTo2DThread) waited for
+        // the ones line 192 queued for the 2D thread (HeldTo2DThread) waited for: with bit 8 only
+        // for a bank they write
         if (Deferred2DPending)
             Flush2DDeferred(CapFlush_Read);
-        if (Held2DQueued)
+        if (Held2DQueued && !(HeldTo2DThread & 8))
             Held2DDone();
 
         int bank;
@@ -304,6 +308,9 @@ public:
 
         default: return 0;
         }
+
+        if (Held2DQueued && (Held2DWrites & (1 << bank)))
+            Held2DDone();
 
         if (VRAMMap_LCDC & (1<<bank))
         {
@@ -820,8 +827,15 @@ public:
     // drawn on the emulator thread. 2: in frames whose Blit waits for the 3D render
     // (BlitAfterReadback), the held lines are queued at line 192 instead of drawn there, with their
     // 3D lines fetched first (GetLine needs the GL context), so they're drawn while lines 192-215
-    // run (the parts queued read palette and OAM copies, see Start2DJob). 0, the default, is the
-    // old path. only changed by a debug switch, set between games
+    // run (the parts queued read palette and OAM copies, see Start2DJob). with 2: 4 waits for them
+    // at the Blit after the 3D render instead of before the render at line 215, 8 doesn't wait for
+    // them at a POWCNT write (SetPowerCnt), nor at an LCDC read of a bank they don't write. 16: bit
+    // 1's engine B parts are shown to the 2D thread in batches (Publish2DJobs), so it sleeps instead
+    // of spinning between them, a wait for the ring draws the ones not shown yet itself when the
+    // thread is idle (Wait2DJobs), and both threads read the clock less often while they spin.
+    // 32: with 2, when the emulator thread keeps waiting for the queued lines before the Blit (in 2
+    // of the last 8 frames that queued them), they're drawn at line 192 for the next 120 such
+    // frames. 0, the default, is the old path. only changed by a debug switch, set between games
     int HeldTo2DThread = 0;
     // with DeferCapture2D, submit the GPU work held lines wait for (the 3D frame at line 215, its
     // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
@@ -1289,9 +1303,11 @@ private:
     bool HeldEngineBQueued() const noexcept { return (HeldTo2DThread & 1) && EngineBNoHold && Threaded2D; }
     bool Queue2DDeferred() noexcept;
     u32 Cur2DPalOAM() noexcept;
-    void Held2DDone() noexcept;
+    void Held2DDone(bool planned = false) noexcept;
+    void ResetHeldBackoff() noexcept;
     void KeepHiresCaptureDst() noexcept;
-    void Queue2DJob(const GPU2D::LineJob& job, u32 engines) noexcept;
+    void Queue2DJob(const GPU2D::LineJob& job, u32 engines, bool publish = true) noexcept;
+    void Publish2DJobs() noexcept;
     void NoteCaptureFlush(u8 flushCause) noexcept;
     void NoteCaptureMap(bool end) noexcept;
     void NoteCaptureFlatCheck(const CaptureFlatDirty* dirty, u32 count) noexcept;
@@ -1304,13 +1320,13 @@ private:
     // threaded 2D, see SetThreaded2D in GPU.cpp
     bool Is2DRingBusy() const noexcept
     {
-        return Jobs2DQueued.load(std::memory_order_relaxed) != Jobs2DDone.load(std::memory_order_acquire);
+        return Jobs2DEnd != Jobs2DDone.load(std::memory_order_acquire);
     }
     void Wait2DJobs(u32 count) noexcept;
     void Start2DThread() noexcept;
     void Stop2DThread() noexcept;
     void Run2DThread() noexcept;
-    bool Wait2DWork(u32 done, u32 spinUs) noexcept;
+    bool Wait2DWork(u32 done, u32 spinUs, bool spinLess) noexcept;
 
     template<typename T>
     T ReadVRAM_ABGExtPal(u32 addr) const noexcept
@@ -1413,13 +1429,28 @@ private:
     std::unique_ptr<GPU2D::LineJob[]> Deferred2DJobs;
     u32 Deferred2DEnd = 0;
     u32 Deferred2DPending = 0;
+    // threaded 2D, emulator thread only: the jobs put in the ring, ahead of Jobs2DQueued by the
+    // ones not shown to the 2D thread yet (HeldTo2DThread bit 16, see Publish2DJobs). the barriers
+    // count from it. here, off the line the 2D thread polls Jobs2DQueued on
+    u32 Jobs2DEnd = 0;
     // set when this frame holds a line that reads 3D (Snapshot2DScanline), cleared at line 215
     // (see StartHBlank)
     bool CaptureHeldThisFrame = false;
     // HeldTo2DThread bit 2: line 192 queued the held lines (Queue2DDeferred), and Held2DDone hasn't
-    // waited for them yet. it does at line 215 (after a VCount write that skips it, at the next
-    // line drawn or the frame end), and before anything reads or writes the LCDC banks
+    // waited for them yet. it does at line 215 before the 3D render, or with bit 4 at the Blit
+    // after it (after a VCount write that skips line 215, at the next line drawn or the frame end),
+    // and before an LCDC write or mapping change, an LCDC read (with bit 8 only of a bank they
+    // write) or a POWCNT write (not with bit 8)
     bool Held2DQueued = false;
+    // and the banks their display capture writes (in LCDC mode, the only VRAM a 2D line writes)
+    u8 Held2DWrites = 0;
+    // HeldTo2DThread bit 32 (see Held2DDone): the last 8 frames that queued them, a bit set for each
+    // one waited for early, and how many frames that would queue them still draw them at line 192.
+    // the counts are for the log line
+    u8 HeldEarlyHistory = 0;
+    u32 HeldBackoff = 0;
+    u32 HeldQueuedFrames = 0;
+    u32 HeldBackedOff = 0;
     // the Blit StartScanline(192) left for line 215 (see LateBlit). Sync2D runs it, so whatever
     // syncs before reading or changing the 2D output, the 3D frame or the renderer gets it first
     bool BlitPending = false;
