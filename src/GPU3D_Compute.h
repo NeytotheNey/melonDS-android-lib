@@ -472,7 +472,7 @@ private:
 
     bool ColorDither = false;
 
-    // Mali diagnostics (docs/shelved/compute-on-mali.md): GPU::ComputeBin and ComputeSSBO as the
+    // Mali diagnostics (docs/compute-on-mali.md): GPU::ComputeBin and ComputeSSBO as the
     // programs are compiled for (a change recompiles them at RenderFrame, like ComputeOpt), and
     // GPU::ComputeCheck's readback (RunCheck): its own program and scratch buffer, made at the
     // first check, and the renders with polygons counted to pick every Nth

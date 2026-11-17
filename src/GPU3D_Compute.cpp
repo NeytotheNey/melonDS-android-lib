@@ -438,7 +438,7 @@ std::unique_ptr<ComputeRenderer> ComputeRenderer::New()
     glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &maxGroupThreads);
     result->MaxGroupThreads = maxGroupThreads;
     // which driver this is, once, and the texture buffer limit the setup indices are read under
-    // (docs/shelved/compute-on-mali.md)
+    // (docs/compute-on-mali.md)
     GLint maxTexBuffer = 0;
     glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &maxTexBuffer);
     result->MaxTexBufferSize = maxTexBuffer;
@@ -1995,7 +1995,7 @@ void ComputeRenderer::ResetPace() noexcept
     CapturedSinceRender = false;
 }
 
-// GPU::ComputeCheck (docs/shelved/compute-on-mali.md): one count of the COMPCHECK line, with the
+// GPU::ComputeCheck (docs/compute-on-mali.md): one count of the COMPCHECK line, with the
 // first few cases it counted for the lines after it
 namespace
 {

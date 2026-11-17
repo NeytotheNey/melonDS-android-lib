@@ -1094,7 +1094,7 @@ public:
     // (ComputeRenderer::LogWhy). it also has GPU3D hash every scene, to tell a swap that brought
     // the same polygons again
     bool ComputeWhy = false;
-    // diagnostics, compute renderer on Mali (docs/shelved/compute-on-mali.md), all off by default.
+    // diagnostics, compute renderer on Mali (docs/compute-on-mali.md), all off by default.
     // ComputeCheck N: every Nth render with polygons waits for the GPU, reads binning's and the
     // x-spans' buffers back and logs a COMPCHECK line on what's inconsistent
     // (ComputeRenderer::RunCheck). ComputeBin 1-3: BinCombined experiments (BinFirstPass32,

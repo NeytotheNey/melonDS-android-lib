@@ -61,7 +61,7 @@ static u64 MixWords(u64 hash, const u32* words, u32 count)
     return hash;
 }
 
-// the old polygon matcher, from the shelved geometry interpolation (docs/shelved/frame-interpolation.md).
+// the old polygon matcher, from the shelved geometry interpolation (docs/frame-interpolation.md).
 // all distances are in 1/16 pixels, like the hi-res positions
 static constexpr s32 Pixel = 16;
 static constexpr u32 SearchWindow = 32;

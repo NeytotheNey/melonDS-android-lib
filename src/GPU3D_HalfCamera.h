@@ -43,7 +43,7 @@ using RenderList = std::array<Polygon*, PolygonRAMSize>;
 // (see DebugProperties.h). for games that draw a new
 // 3D scene every other frame: the frame a new scene B arrives shows scene B's own geometry seen from a
 // camera halfway between scene A's and B's, and the next frame shows real B, so only the 3D is a frame
-// late. the shelved polygon matching (docs/shelved/frame-interpolation.md) isn't needed for geometry
+// late. the shelved polygon matching (docs/frame-interpolation.md) isn't needed for geometry
 // that doesn't move, and clipping and culling run again for the polygons scene B sent. it can't bring
 // back what the game itself culled for B (BoxTest per block and per prop), so geometry leaving the view
 // can be gone from the in-between scene, which is a frame early at that screen edge.
