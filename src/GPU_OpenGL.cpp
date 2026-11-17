@@ -68,10 +68,11 @@ std::string GLCompositor::Shadow2DFS(int variant)
 {
     std::string fs = std::string(kCompositorFS_Nearest_Head) + kCompositePixelFS + kCompositorFS_Nearest_Main
                    + kShadow2DMemFS + kShadow2DFS_Main;
-    static const char* const defines[3] = {
+    static const char* const defines[Shadow2DPrograms] = {
         "#define SHADOW2D\n",
         "#define WIDE\n#define SHADOW2D\n",
         "#define SHADOW2D\n#define SHADOW2D_PLANES\n",
+        "#define WIDE\n#define SHADOW2D\n#define SHADOW2D_PLANES\n",
     };
     // after the #version line, as in PrepareWide
     fs.insert(fs.find('\n') + 1, defines[variant]);
@@ -2801,7 +2802,8 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
     // nothing to draw: the dirty pages wait for a frame that draws something
     if (!drawn)
         return 0;
-    if (!PrepareShadow2DResources() || !PrepareShadow2DProgram(wideView ? 1 : 0))
+    if (!PrepareShadow2DResources() || !PrepareShadow2DProgram(wideView ? Shadow2DCompWide : Shadow2DComp)
+        || !PrepareShadow2DProgram(wideView ? Shadow2DPlanesWide : Shadow2DPlanes))
     {
         Log(LogLevel::Error, "GPU2D: the shadow renderer couldn't be set up, staying on the CPU\n");
         Shadow.Failed = true;
@@ -2811,6 +2813,8 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
     BeginGPUTimer(ComputePass::CompShadowObj);
     UploadShadow2D(gpu, *rec);
     RunShadow2DObj(*rec);
+    // RenderFrame checks this frame (CheckShadow2D) by the same test
+    RunShadow2DPlanes(rec->Check && (Shadow.CheckFrames % 30) == 0);
     Shadow.DrawnLines = drawn;
     return drawn;
 }
@@ -2849,6 +2853,24 @@ bool GLCompositor::PrepareShadow2DResources() noexcept
         if (!complete)
             return false;
         Shadow.ObjW = ViewWidth;
+    }
+
+    if (Shadow.PlanesW != ViewWidth)
+    {
+        glDeleteFramebuffers(1, &Shadow.PlanesFB);
+        glDeleteTextures(1, &Shadow.PlanesTex);
+
+        Shadow.PlanesTex = MakeHiresTexture(GL_RGBA32UI, ViewWidth, 384);
+        GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
+        glGenFramebuffers(1, &Shadow.PlanesFB);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Shadow.PlanesFB);
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, Shadow.PlanesTex, 0);
+        glDrawBuffers(1, fbassign);
+        bool complete = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        if (!complete)
+            return false;
+        Shadow.PlanesW = ViewWidth;
     }
 
     if (!Shadow.InstanceBuffer)
@@ -2899,9 +2921,11 @@ bool GLCompositor::PrepareShadow2DProgram(int variant) noexcept
         return true;
 
     GLuint shader {};
-    static const char* const names[3] = {"Shadow2DShader", "Shadow2DShaderWide", "Shadow2DCheckShader"};
+    static const char* const names[Shadow2DPrograms] = {"Shadow2DShader", "Shadow2DShaderWide", "Shadow2DPlanesShader",
+                                                        "Shadow2DPlanesShaderWide"};
+    const bool planes = variant == Shadow2DPlanes || variant == Shadow2DPlanesWide;
     if (!OpenGL::CompileVertexFragmentProgram(shader, kShadow2DVS, Shadow2DFS(variant), names[variant],
-            {{"vPosition", 0}}, {{variant == 2 ? "oPlanes" : "oColor", 0}}))
+            {{"vPosition", 0}}, {{planes ? "oPlanes" : "oColor", 0}}))
         return false;
 
     comp.Program = shader;
@@ -2920,6 +2944,7 @@ bool GLCompositor::PrepareShadow2DProgram(int variant) noexcept
     glUniform1i(glGetUniformLocation(shader, "MemTex"), Shadow2DMemUnit);
     glUniform1i(glGetUniformLocation(shader, "LineStateTex"), Shadow2DStateUnit);
     glUniform1i(glGetUniformLocation(shader, "ObjTex"), Shadow2DObjUnit);
+    glUniform1i(glGetUniformLocation(shader, "PlanesTex"), Shadow2DPlanesUnit);
     return true;
 }
 
@@ -3017,19 +3042,21 @@ void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
 
 // two triangles per run of drawn lines in a screen that are alike in whether they cover the wings: in
 // the output (rows of Scale pixels, the 2 padding lines between the screens, the top screen's lines
-// below its margin, whose rows are the compositor's) or the check target (256x384 at 1x, no padding)
-void GLCompositor::BuildShadow2DQuads(bool check) noexcept
+// below its margin, whose rows are the compositor's) or PlanesTex (ViewWidth x 384 at 1x, no padding)
+void GLCompositor::BuildShadow2DQuads(bool planes) noexcept
 {
     using namespace Shadow2D;
 
     Shadow.Quads.clear();
     const bool wideView = ViewWidth != 256;
     const int offset = (ViewWidth - 256) / 2;
-    const float w = check ? 256.0f : (float)ScreenW;
-    const float h = check ? 384.0f : (float)ScreenH;
+    const int scale = planes ? 1 : Scale;
+    const float w = planes ? (float)ViewWidth : (float)ScreenW;
+    const float h = planes ? 384.0f : (float)ScreenH;
 
     for (int half = 0; half < 2; half++)
     {
+        const int firstRow = planes ? half * 192 : HalfLineRow(half);
         int line = 0;
         while (line < 192)
         {
@@ -3040,31 +3067,19 @@ void GLCompositor::BuildShadow2DQuads(bool check) noexcept
                 continue;
             }
 
-            bool wide = !check && wideView && (block[W_Flags] & F_Wide);
+            bool wide = wideView && (block[W_Flags] & F_Wide);
             int end = line + 1;
             while (end < 192)
             {
                 u32 flags = Shadow.State[(half * 192 + end) * GPU2D::ShadowStateWords + W_Flags];
-                if (!(flags & F_Drawn) || (!check && wideView && (flags & F_Wide)) != wide)
+                if (!(flags & F_Drawn) || (wideView && (flags & F_Wide)) != wide)
                     break;
                 end++;
             }
 
-            float x0, x1, y0, y1;
-            if (check)
-            {
-                x0 = 0.0f;
-                x1 = 256.0f;
-                y0 = (float)(half * 192 + line);
-                y1 = (float)(half * 192 + end);
-            }
-            else
-            {
-                x0 = wide ? 0.0f : (float)(offset * Scale);
-                x1 = wide ? w : (float)((offset + 256) * Scale);
-                y0 = (float)((HalfLineRow(half) + line) * Scale);
-                y1 = (float)((HalfLineRow(half) + end) * Scale);
-            }
+            float x0 = wide ? 0.0f : (float)(offset * scale);
+            float x1 = wide ? w : (float)((offset + 256) * scale);            float y0 = (float)((firstRow + line) * scale);
+            float y1 = (float)((firstRow + end) * scale);
             x0 = x0 / w * 2.0f - 1.0f;
             x1 = x1 / w * 2.0f - 1.0f;
             y0 = y0 / h * 2.0f - 1.0f;
@@ -3077,13 +3092,61 @@ void GLCompositor::BuildShadow2DQuads(bool check) noexcept
     }
 }
 
+// the planes pass, right after the OBJ pass and before the output is bound, so a tiled GPU doesn't
+// store and load the output around it: each drawn native pixel's planes 0-2, and whether a 2D layer
+// drew it, into PlanesTex at 1x (the wings too on lines that draw them). the composite reads them,
+// so the layers are worked out once per native pixel rather than at every sub-pixel. [checked]: the
+// frame CheckShadow2D reads back, which starts from a sentinel instead of the last frame's planes, so
+// a texel this pass misses shows up as a mismatch
+void GLCompositor::RunShadow2DPlanes(bool checked) noexcept
+{
+    BuildShadow2DQuads(true);
+
+    // PlanesTex isn't read while it's drawn, and the composite only reads texels this draws, so
+    // nothing needs loading first
+    glActiveTexture(GL_TEXTURE0 + Shadow2DPlanesUnit);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Shadow.PlanesFB);
+    if (checked)
+    {
+        const GLuint sentinel[4] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF};
+        glClearBufferuiv(GL_COLOR, 0, sentinel);
+    }
+    else
+    {
+        const GLenum color = GL_COLOR_ATTACHMENT0;
+        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &color);
+    }
+    glViewport(0, 0, ViewWidth, 384);
+
+    const Shadow2DProgram& comp = Shadow.Comp[ViewWidth != 256 ? Shadow2DPlanesWide : Shadow2DPlanes];
+    glUseProgram(comp.Program);
+    glUniform1i(comp.WideOffsetLoc, (ViewWidth - 256) / 2);
+    glUniform1i(comp.ObjOffsetLoc, (ViewWidth - 256) / 2);
+    glActiveTexture(GL_TEXTURE0 + Shadow2DMemUnit);
+    glBindTexture(GL_TEXTURE_2D, Shadow.MemTex);
+    glActiveTexture(GL_TEXTURE0 + Shadow2DStateUnit);
+    glBindTexture(GL_TEXTURE_2D, Shadow.StateTex);
+
+    glBindVertexArray(Shadow.QuadVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, Shadow.QuadBuffer);
+    glBufferData(GL_ARRAY_BUFFER, Shadow.Quads.size() * sizeof(float), Shadow.Quads.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(Shadow.Quads.size() / 2));
+
+    glBindVertexArray(CompVertexArrayID);
+    glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
+    glActiveTexture(GL_TEXTURE0 + Shadow2DPlanesUnit);
+    glBindTexture(GL_TEXTURE_2D, Shadow.PlanesTex);
+    glActiveTexture(GL_TEXTURE0);
+}
+
 // the composite pass, over the compositor's output just drawn (bound, with its viewport), its
 // screen texture on unit 0 and the 3D frame on unit 1. drawn lines lose the filter for now (the
 // shadow draws over them). the state is RenderFrame's again afterwards, the program aside
 void GLCompositor::RunShadow2D(int backbuf) noexcept
 {
     const bool wideView = ViewWidth != 256;
-    const Shadow2DProgram& comp = Shadow.Comp[wideView ? 1 : 0];
+    const Shadow2DProgram& comp = Shadow.Comp[wideView ? Shadow2DCompWide : Shadow2DComp];
     BuildShadow2DQuads(false);
     if (Shadow.Quads.empty())
         return;
@@ -3092,15 +3155,10 @@ void GLCompositor::RunShadow2D(int backbuf) noexcept
     glUseProgram(comp.Program);
     glUniform1ui(comp.ScaleLoc, Scale);
     glUniform1i(comp.WideOffsetLoc, (ViewWidth - 256) / 2);
-    glUniform1i(comp.ObjOffsetLoc, (ViewWidth - 256) / 2);
     glUniform1i(comp.WideMarginLoc, Margin);
 
-    glActiveTexture(GL_TEXTURE0 + Shadow2DMemUnit);
-    glBindTexture(GL_TEXTURE_2D, Shadow.MemTex);
-    glActiveTexture(GL_TEXTURE0 + Shadow2DStateUnit);
-    glBindTexture(GL_TEXTURE_2D, Shadow.StateTex);
-    glActiveTexture(GL_TEXTURE0 + Shadow2DObjUnit);
-    glBindTexture(GL_TEXTURE_2D, Shadow.ObjTex);
+    glActiveTexture(GL_TEXTURE0 + Shadow2DPlanesUnit);
+    glBindTexture(GL_TEXTURE_2D, Shadow.PlanesTex);
 
     glBindVertexArray(Shadow.QuadVAO);
     glBindBuffer(GL_ARRAY_BUFFER, Shadow.QuadBuffer);
@@ -3112,64 +3170,19 @@ void GLCompositor::RunShadow2D(int backbuf) noexcept
     glActiveTexture(GL_TEXTURE1);
 }
 
-// check mode: the drawn lines' planes 0-2 at 1x into CheckTex, read back and compared word for word
-// with what the CPU drew into the frame's buffers. a synchronous readback, every 30 frames that draw
+// check mode: the middle 256 columns of the planes pass's output read back and compared word for word
+// with what the CPU drew into the frame's buffers, on the drawn lines. a synchronous readback, every
+// 30 frames that draw
 void GLCompositor::CheckShadow2D(const GPU& gpu, int backbuf) noexcept
 {
     using namespace Shadow2D;
 
-    if (!PrepareShadow2DProgram(2))
-    {
-        Shadow.Failed = true;
-        return;
-    }
-    if (!Shadow.CheckTex)
-    {
-        Shadow.CheckTex = MakeHiresTexture(GL_RGBA32UI, 256, 384);
-        GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
-        glGenFramebuffers(1, &Shadow.CheckFB);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Shadow.CheckFB);
-        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, Shadow.CheckTex, 0);
-        glDrawBuffers(1, fbassign);
-        if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        {
-            Log(LogLevel::Error, "GPU2D: the check target is incomplete\n");
-            Shadow.Failed = true;
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
-            return;
-        }
-    }
-
-    BuildShadow2DQuads(true);
-    if (Shadow.Quads.empty())
-        return;
-
-    const Shadow2DProgram& comp = Shadow.Comp[2];
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Shadow.CheckFB);
-    glViewport(0, 0, 256, 384);
-    const GLuint zero[4] = {0, 0, 0, 0};
-    glClearBufferuiv(GL_COLOR, 0, zero);
-
-    glUseProgram(comp.Program);
-    glUniform1ui(comp.ScaleLoc, 1);
-    glUniform1i(comp.ObjOffsetLoc, (ViewWidth - 256) / 2);
-    glActiveTexture(GL_TEXTURE0 + Shadow2DMemUnit);
-    glBindTexture(GL_TEXTURE_2D, Shadow.MemTex);
-    glActiveTexture(GL_TEXTURE0 + Shadow2DStateUnit);
-    glBindTexture(GL_TEXTURE_2D, Shadow.StateTex);
-    glActiveTexture(GL_TEXTURE0 + Shadow2DObjUnit);
-    glBindTexture(GL_TEXTURE_2D, Shadow.ObjTex);
-
-    glBindVertexArray(Shadow.QuadVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, Shadow.QuadBuffer);
-    glBufferData(GL_ARRAY_BUFFER, Shadow.Quads.size() * sizeof(float), Shadow.Quads.data(), GL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(Shadow.Quads.size() / 2));
-
     std::vector<u32> texels(256 * 384 * 4);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, Shadow.CheckFB);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, Shadow.PlanesFB);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    glReadPixels(0, 0, 256, 384, GL_RGBA_INTEGER, GL_UNSIGNED_INT, texels.data());
+    glReadPixels((ViewWidth - 256) / 2, 0, 256, 384, GL_RGBA_INTEGER, GL_UNSIGNED_INT, texels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 
     u32 mismatches = 0, lines = 0;
     for (int half = 0; half < 2; half++)
@@ -3201,13 +3214,6 @@ void GLCompositor::CheckShadow2D(const GPU& gpu, int backbuf) noexcept
     Shadow.Checks++;
     Shadow.CheckLines += lines;
     Shadow.Mismatches += mismatches;
-
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
-    glViewport(0, 0, ScreenW, ScreenH);
-    glBindVertexArray(CompVertexArrayID);
-    glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
-    glActiveTexture(GL_TEXTURE1);
 }
 
 // debug only (Shadow2DRecorder::Logging): once a second, the frames, the lines drawn out of all of
@@ -3256,7 +3262,7 @@ void GLCompositor::LogShadow2D(const GPU& gpu) noexcept
 // when the recorder is off: the textures and buffers go, the programs stay
 void GLCompositor::FreeShadow2DTextures() noexcept
 {
-    if (!Shadow.MemTex && !Shadow.ObjTex && !Shadow.CheckTex && !Shadow.InstanceBuffer)
+    if (!Shadow.MemTex && !Shadow.ObjTex && !Shadow.PlanesTex && !Shadow.InstanceBuffer)
         return;
 
     glDeleteTextures(1, &Shadow.MemTex);
@@ -3264,8 +3270,8 @@ void GLCompositor::FreeShadow2DTextures() noexcept
     glDeleteFramebuffers(1, &Shadow.ObjFB);
     glDeleteRenderbuffers(1, &Shadow.ObjDepth);
     glDeleteTextures(1, &Shadow.ObjTex);
-    glDeleteFramebuffers(1, &Shadow.CheckFB);
-    glDeleteTextures(1, &Shadow.CheckTex);
+    glDeleteFramebuffers(1, &Shadow.PlanesFB);
+    glDeleteTextures(1, &Shadow.PlanesTex);
     glDeleteBuffers(1, &Shadow.InstanceBuffer);
     glDeleteVertexArrays(1, &Shadow.InstanceVAO);
     glDeleteBuffers(1, &Shadow.QuadBuffer);
@@ -3273,7 +3279,8 @@ void GLCompositor::FreeShadow2DTextures() noexcept
     Shadow.MemTex = Shadow.StateTex = 0;
     Shadow.ObjFB = Shadow.ObjDepth = Shadow.ObjTex = 0;
     Shadow.ObjW = 0;
-    Shadow.CheckFB = Shadow.CheckTex = 0;
+    Shadow.PlanesFB = Shadow.PlanesTex = 0;
+    Shadow.PlanesW = 0;
     Shadow.InstanceBuffer = Shadow.InstanceVAO = 0;
     Shadow.QuadBuffer = Shadow.QuadVAO = 0;
     Shadow.MemGeneration = 0;

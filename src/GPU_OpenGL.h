@@ -522,12 +522,17 @@ private:
     // the GPU 2D shadow renderer (GPU_Shadow2D.h, docs/plan-gpu-2d-shadow.md), while GPU::Shadow2D is on.
     // the recorder decides what a line can be drawn from, PrepareShadow2D which lines are drawn this
     // frame (the copy of their blocks with Shadow2D::F_Drawn), uploads what they read and runs the OBJ
-    // pass, and RunShadow2D draws them over the compositor's output. everything is made the first time
-    // a frame draws a line and freed once the recorder is off. units 11-13 are its textures (14 is
-    // for the page log of increment 1b, 15 stays spare)
+    // pass and the planes pass (RunShadow2DPlanes), and RunShadow2D draws the lines over the
+    // compositor's output from those planes. everything is made the first time a frame draws a line
+    // and freed once the recorder is off. units 11-13 and 15 are its textures (14 is for the page log
+    // of increment 1b)
     static constexpr int Shadow2DMemUnit = 11;
     static constexpr int Shadow2DStateUnit = 12;
     static constexpr int Shadow2DObjUnit = 13;
+    static constexpr int Shadow2DPlanesUnit = 15;
+    // the programs (Shadow2DFS): the composite in the middle only and wide, the planes pass in the 256
+    // view and wide
+    enum { Shadow2DComp, Shadow2DCompWide, Shadow2DPlanes, Shadow2DPlanesWide, Shadow2DPrograms };
     struct Shadow2DProgram
     {
         GLuint Program = 0;
@@ -542,10 +547,12 @@ private:
         int ObjW = 0;
         GLuint InstanceBuffer = 0, InstanceVAO = 0;
         GLuint QuadBuffer = 0, QuadVAO = 0;
-        GLuint CheckTex = 0, CheckFB = 0;   // GL_RGBA32UI 256x384, check mode only
+        // GL_RGBA32UI ViewWidth x 384: each drawn native pixel's planes 0-2, and whether a 2D layer drew it
+        GLuint PlanesTex = 0, PlanesFB = 0;
+        int PlanesW = 0;
         GLuint ObjProgram = 0;
         GLint ObjWLoc = -1, ObjWideOffsetLoc = -1;
-        std::array<Shadow2DProgram, 3> Comp {};  // middle only, wide, check (SHADOW2D_PLANES)
+        std::array<Shadow2DProgram, Shadow2DPrograms> Comp {};
         bool Failed = false;
 
         std::vector<u32> State;             // the blocks as uploaded, 384 lines
@@ -567,7 +574,8 @@ private:
     bool PrepareShadow2DProgram(int variant) noexcept;
     void UploadShadow2D(const GPU& gpu, Shadow2DRecorder& rec) noexcept;
     void RunShadow2DObj(const Shadow2DRecorder& rec) noexcept;
-    void BuildShadow2DQuads(bool check) noexcept;
+    void RunShadow2DPlanes(bool checked) noexcept;
+    void BuildShadow2DQuads(bool planes) noexcept;
     void RunShadow2D(int backbuf) noexcept;
     void CheckShadow2D(const GPU& gpu, int backbuf) noexcept;
     void LogShadow2D(const GPU& gpu) noexcept;
