@@ -835,8 +835,9 @@ public:
     // thread is idle (Wait2DJobs), and both threads read the clock less often while they spin.
     // 32: with 2, when the emulator thread keeps waiting for the queued lines before the Blit (in 2
     // of the last 8 frames that queued them), they're drawn at line 192 for the next 120 such
-    // frames. 0, the default, is the old path. only changed by a debug switch, set between games
-    int HeldTo2DThread = 0;
+    // frames. 0 is the old path; 63, the default, is all of them. only changed by a debug switch,
+    // set between games
+    int HeldTo2DThread = 63;
     // with DeferCapture2D, submit the GPU work held lines wait for (the 3D frame at line 215, its
     // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
     // line 192. only turned off by a debug switch, to compare
