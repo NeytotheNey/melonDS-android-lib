@@ -1925,12 +1925,17 @@ void main()
 }
 )";
 
-// the composite pass (GLCompositor::RunShadow2D): row-run quads over the output lines it draws, after
-// the compositor's own pass. kCompositorFS_Nearest_Head with SHADOW2D (and WIDE for a wide view, or
-// SHADOW2D_PLANES for the check program, at 1x into a 256x384 RGBA32UI target with no gap between
-// the screens) + kCompositePixelFS + kCompositorFS_Nearest_Main + kShadow2DMemFS + this. it rebuilds
-// the line's planes the way SoftRenderer::DrawScanline_BGOBJ does (text BGs, normal sprites, BLDCNT
-// blending since increment 5; no windows, no mosaic yet), then runs the compositor's own maths on them
+// the shadow's two passes, kCompositorFS_Nearest_Head with SHADOW2D (and WIDE for a wide view) +
+// kCompositePixelFS + kCompositorFS_Nearest_Main + kShadow2DMemFS + this. both draw row-run quads
+// over the drawn lines.
+// the planes pass (SHADOW2D_PLANES, GLCompositor::RunShadow2DPlanes) rebuilds each native pixel's
+// planes 0-2 the way SoftRenderer::DrawScanline_BGOBJ does (text BGs, normal sprites, BLDCNT blending
+// since increment 5; no windows, no mosaic yet) into PlanesTex, ViewWidth x 384 at 1x with no gap
+// between the screens. the composite (GLCompositor::RunShadow2D), at the output's resolution after
+// the compositor's own pass, reads its native pixel's planes and runs the compositor's own maths on
+// them. the planes don't depend on the sub-pixel while every drawn layer is a text BG or a normal
+// sprite, so this is what working them out per sub-pixel gives, for 1/Scale^2 of the layer work
+// (working them out per output pixel cost the Adreno 640 14 ms a frame at 4x)
 const char* kShadow2DVS = R"(#version 320 es
 
 in vec2 vPosition;
@@ -1949,6 +1954,8 @@ uniform highp usampler2D LineStateTex;
 uniform highp usampler2D ObjTex;
 // the columns ObjTex has left of X 0
 uniform int uObjOffset;
+// the planes pass's output: planes 0-2, and in A whether a 2D layer drew the pixel
+uniform highp usampler2D PlanesTex;
 
 #ifdef WIDE
 #define SHADOW_OFFSET uWideOffset
@@ -2170,21 +2177,16 @@ uint ColorComposite(uint val1, uint val2, uint blend, uint evy, uint win)
 // DrawPixel_Accel's 3-entry stack, top first
 #define PUSH(v) { if (found == 0) top = (v); else if (found == 1) second = (v); else third = (v); found++; }
 
+#ifdef SHADOW2D_PLANES
 void main()
 {
+    // one native pixel: PlanesTex's rows are the lines with no gap between the screens, and its
+    // columns start SHADOW_OFFSET left of X 0, so the native X is signed: the wings are negative or
+    // past 255
     highp ivec2 frag = ivec2(gl_FragCoord.xy);
-    int scale = int(u3DScale);
-#ifdef SHADOW2D_PLANES
-    int screen = frag.y >= 192 ? 1 : 0;
-    int subY = frag.y - screen * 192;
-#else
-    // the output has 2 padding lines between the screens, and the top screen's lines start WIDE_MARGIN
-    // rows down (the margins are never drawn here, see GLCompositor::BuildShadow2DQuads)
-    int screen = frag.y >= (194 + 2 * WIDE_MARGIN) * scale ? 1 : 0;
-    int subY = frag.y - (screen != 0 ? 194 + 2 * WIDE_MARGIN : WIDE_MARGIN) * scale;
-#endif
-    int line = subY / scale;
-    int row = screen * 192 + line;
+    int row = frag.y;
+    int line = row >= 192 ? row - 192 : row;
+    int nx = frag.x - SHADOW_OFFSET;
 
     uvec4 s0 = texelFetch(LineStateTex, ivec2(0, row), 0);  // flags, frame, DISPCNT, BGCNT 0-1
     uint flags = s0.x;
@@ -2195,12 +2197,6 @@ void main()
     uvec4 s5 = texelFetch(LineStateTex, ivec2(5, row), 0);  // window state, mosaic, BLDCNT with EVA and EVB
     uvec4 s6 = texelFetch(LineStateTex, ivec2(6, row), 0);  // EVY and backdrop, lines, wide modes, left extents
     uvec4 s7 = texelFetch(LineStateTex, ivec2(7, row), 0);  // right extents
-
-    // the native X, floor(sub-pixel / scale), signed: the wings are negative or past 255
-    int subX = frag.x - SHADOW_OFFSET * scale;
-    int nx = subX >= 0 ? subX / scale : -((scale - 1 - subX) / scale);
-    fTexcoord = vec2((float(frag.x) + 0.5) / float(scale) - float(SHADOW_OFFSET),
-                     float(screen * 192) + (float(subY) + 0.5) / float(scale));
 
     bool unitB = (flags & 0x1u) != 0u;
     uint dispcnt = s0.z;
@@ -2323,12 +2319,32 @@ void main()
         p2 = 0x07000000u;
     }
 
-#ifdef SHADOW2D_PLANES
-    oPlanes = uvec4(p0, p1, p2, 0u);
+    oPlanes = uvec4(p0, p1, p2, any2D ? 1u : 0u);
+}
 #else
+void main()
+{
+    highp ivec2 frag = ivec2(gl_FragCoord.xy);
+    int scale = int(u3DScale);
+    // the output has 2 padding lines between the screens, and the top screen's lines start WIDE_MARGIN
+    // rows down (the margins are never drawn here, see GLCompositor::BuildShadow2DQuads)
+    int screen = frag.y >= (194 + 2 * WIDE_MARGIN) * scale ? 1 : 0;
+    int subY = frag.y - (screen != 0 ? 194 + 2 * WIDE_MARGIN : WIDE_MARGIN) * scale;
+    int row = screen * 192 + subY / scale;
+
+    // the native X, floor(sub-pixel / scale), signed: the wings are negative or past 255
+    int subX = frag.x - SHADOW_OFFSET * scale;
+    int nx = subX >= 0 ? subX / scale : -((scale - 1 - subX) / scale);
+    fTexcoord = vec2((float(frag.x) + 0.5) / float(scale) - float(SHADOW_OFFSET),
+                     float(screen * 192) + (float(subY) + 0.5) / float(scale));
+
+    // the quads only cover drawn lines, whose pixels the planes pass wrote
+    uvec4 planes = texelFetch(PlanesTex, ivec2(nx + SHADOW_OFFSET, row), 0);
+    uint p0 = planes.x, p1 = planes.y, p2 = planes.z;
+
 #ifdef WIDE
     // a wing pixel with no 2D layer of its own is the compositor's, edge checks and all
-    if (wing && !any2D)
+    if ((nx < 0 || nx > 255) && planes.w == 0u)
     {
         ivec4 wingPixel = WingPixel(int(fTexcoord.y), WingSide(-1));
         wingPixel.rgb <<= 2;
@@ -2362,8 +2378,8 @@ void main()
     pixel.rgb <<= 2;
     pixel.rgb |= (pixel.rgb >> 6);
     oColor = vec4(vec3(pixel.bgr) / 255.0, 1.0);
-#endif
 }
+#endif
 )";
 
 const char* kCompositorFS_Linear = R"(#version 140

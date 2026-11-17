@@ -88,14 +88,15 @@ enum
 //   comp compx     µs per timed Blit: the compositor's draw, and everything else it runs (the GPU 2D
 //                  shadow, filtered 2D, held wings, hi-res capture)
 //   total          upload..fog + capture + comp + compx
-//   untimed        sets left out because the ring was full, disjoint the disjoint operations seen
+//   untimed        sets left out because the ring was full, disjoint the disjoint operations seen,
+//                  bad the sets dropped for a pass over a second (a negative time read as unsigned)
 //   comp_hd .. cx_hicap
 //                  the compositor's parts (GLCompositor::RenderFrame), µs per timed Blit like comp
 //                  and compx, a Blit a part didn't run in counting 0. comp_hd is the part of comp
 //                  from Blits that showed hi-res captures (the draw reads the copies then), and the
 //                  cx_ ones add up to compx: cx_misc the state setup and CPU work between the parts
-//                  (and before the first one), cx_sobj the GPU 2D shadow's uploads and OBJ pass,
-//                  cx_up the screen texture uploads (planes, control words, wing planes), cx_filter
+//                  (and before the first one), cx_sobj the GPU 2D shadow's uploads, OBJ pass
+//                  and planes pass, cx_up the screen texture uploads (planes, control words, wing planes), cx_filter
 //                  filtered 2D's key and MMPX passes (not on a frame that reuses the map), cx_shadow
 //                  the shadow's composite, cx_wings the held wings' copy, cx_hicap the hi-res
 //                  capture pass with its uploads. each but cx_misc has an _n, the timed Blits it ran
@@ -127,7 +128,7 @@ struct GLTimerStats
     {
         u32 Frames = 0, Skipped = 0;
         u32 Timed[Set_Kinds] {};
-        u32 Untimed = 0, Disjoint = 0;
+        u32 Untimed = 0, Disjoint = 0, Bad = 0;
         u64 PassNs[GLPass::Count] {};
         // the timed sets each pass ran in
         u32 PassSets[GLPass::Count] {};
@@ -377,14 +378,29 @@ private:
                 }
             }
 
+            // the Adreno 640 can give a pass a negative time, which reads as nearly 2^64, when the GPU
+            // is far behind (OnePlus, 11-17): a set with a pass over a second is dropped whole
+            GLuint64 ns[SetQueries] {};
+            bool bad = false;
+            for (int i = 0; i < set.Count; i++)
+            {
+                GetQueryObjectui64v(set.Query[i], GL_QUERY_RESULT_EXT, &ns[i]);
+                bad |= ns[i] > 1000000000;
+            }
+            set.Pending = false;
+            Tail = (Tail + 1) % SetCount;
+            if (bad)
+            {
+                Sec.Bad++;
+                continue;
+            }
+
             u64 setNs = 0;
             u32 seen = 0;
             for (int i = 0; i < set.Count; i++)
             {
-                GLuint64 ns = 0;
-                GetQueryObjectui64v(set.Query[i], GL_QUERY_RESULT_EXT, &ns);
-                Sec.PassNs[set.Pass[i]] += ns;
-                setNs += ns;
+                Sec.PassNs[set.Pass[i]] += ns[i];
+                setNs += ns[i];
                 seen |= 1u << set.Pass[i];
             }
             for (int pass = 0; pass < GLPass::Count; pass++)
@@ -392,9 +408,6 @@ private:
             Sec.Timed[set.Kind]++;
             TimedSetsRead++;
             ZeroSetsRead += setNs == 0;
-
-            set.Pending = false;
-            Tail = (Tail + 1) % SetCount;
         }
 
         // the Adreno 640 reads 0 for compute dispatches. if every set so far came back 0, say so once
@@ -436,12 +449,12 @@ private:
 
         const u32* n = Sec.PassSets;
         Platform::Log(Platform::LogLevel::Info, "GLTIME mode=%s frames=%u skipped=%u timed=%u/%u/%u upload=%.0f clear=%.0f opaque=%.0f "
-            "clear0=%.0f trans=%.0f edge=%.0f fog=%.0f capture=%.0f comp=%.0f compx=%.0f total=%.0f untimed=%u disjoint=%u scale=%d "
+            "clear0=%.0f trans=%.0f edge=%.0f fog=%.0f capture=%.0f comp=%.0f compx=%.0f total=%.0f untimed=%u disjoint=%u bad=%u scale=%d "
             "comp_hd=%.0f comp_hd_n=%u cx_misc=%.0f cx_sobj=%.0f cx_sobj_n=%u cx_up=%.0f cx_up_n=%u cx_filter=%.0f cx_filter_n=%u "
             "cx_shadow=%.0f cx_shadow_n=%u cx_wings=%.0f cx_wings_n=%u cx_hicap=%.0f cx_hicap_n=%u%s\n",
             Mode == 2 ? "glfinish(inflated,read_shares)" : "queries", Sec.Frames, Sec.Skipped, Sec.Timed[Set_Render],
             Sec.Timed[Set_Capture], Sec.Timed[Set_Blit], us[Upload], us[Clear], us[Opaque], us[Clear0], us[Trans], us[Edge],
-            us[Fog], us[Capture], comp, compx, total, Sec.Untimed, Sec.Disjoint, scale,
+            us[Fog], us[Capture], comp, compx, total, Sec.Untimed, Sec.Disjoint, Sec.Bad, scale,
             us[CompHires], n[CompHires], us[CompExtra], us[CompShadowObj], n[CompShadowObj], us[CompUpload], n[CompUpload],
             us[CompFilter], n[CompFilter], us[CompShadow], n[CompShadow], us[CompWings], n[CompWings], us[CompHiCap],
             n[CompHiCap], share);
