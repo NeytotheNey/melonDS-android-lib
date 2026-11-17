@@ -49,6 +49,9 @@ private:
     melonDS::GPU& GPU;
     alignas(8) u32 BGOBJLine[256*3];
     u32* _3DLine;
+    // the palette and OAM of the job CurUnit is in, set with it
+    const u8* CurPalette;
+    const u8* CurOAM;
 
     alignas(8) u8 WindowMask[256];
 

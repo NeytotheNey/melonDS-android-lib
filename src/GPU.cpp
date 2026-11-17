@@ -50,7 +50,8 @@ enum
 // threaded 2D (how it works is explained above GPU::SetThreaded2D)
 
 // a frame queues 193 jobs at most (line 262's sprites, usually drawn inline instead, then lines 0-191) before the frame-end
-// barrier, so the ring is only full if a game rewrites VCount to stay in the visible lines
+// barrier, so the ring is only full if a game rewrites VCount to stay in the visible lines. with HeldTo2DThread a frame
+// that holds its lines can queue 384 (their engine B parts, then the rest at line 192), and the last of them wait for a slot
 static constexpr u32 Ring2DSize = 256;
 
 // copies of palette and OAM that queued jobs read (see Start2DJob). a new one is only made after
@@ -76,6 +77,10 @@ static constexpr u32 Spin2DSyncUs = 2000;
 struct GPU::Threaded2DState
 {
     std::unique_ptr<GPU2D::LineJob[]> Jobs = std::make_unique<GPU2D::LineJob[]>(Ring2DSize);
+    // what each slot draws: its own job with both engines, or with HeldTo2DThread a part of a held
+    // job in Deferred2DJobs
+    const GPU2D::LineJob* JobPtr[Ring2DSize] {};
+    u32 JobEngines[Ring2DSize] {};
     Platform::Thread* Thread = nullptr;
     std::atomic<bool> Stopping {false};
 
@@ -389,6 +394,8 @@ void GPU::DoSavestate(Savestate* file) noexcept
 
 void GPU::SetCaptureReadLogging(bool enable) noexcept
 {
+    // DoCapture counts in it, and the 2D thread may be running one (HeldTo2DThread)
+    Sync2D();
     if (enable && !CapReads)
         CapReads = std::make_unique<CaptureReadCounter>();
     else if (!enable)
@@ -1279,7 +1286,10 @@ void GPU::StartHBlank(u32 line) noexcept
 
         // lines still held for display capture (a VCount write skipped line 192) read the GL
         // readback buffer, which the 3D render can reallocate, so they're drawn first. only the
-        // held lines: nothing is queued while lines are held, and software 3D needs no ring sync here
+        // held lines (Flush2DDeferred waits for the ring, which can hold their engine B parts with
+        // HeldTo2DThread), and the ones line 192 queued: software 3D needs no ring sync here
+        if (Held2DQueued)
+            Held2DDone();
         if (Deferred2DPending)
             Flush2DDeferred(CapFlush_Line215);
 
@@ -1362,14 +1372,31 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     job.EngineBNoHold = EngineBNoHold;
 
     // a queued job reads palette and OAM from a copy made when it's built, so CPU writes don't wait
-    // for the 2D thread. the other jobs are drawn before any write (see WritePalette)
-    if (!Is2DJobQueued(job) || Is2DJobDeferred(job))
+    // for the 2D thread. the other jobs are drawn before any write (see WritePalette), and so are
+    // held ones' engine A parts. with HeldTo2DThread bit 1 a held job's engine B part is queued, and
+    // only it reads a copy: engine B writes don't draw the held lines, so the live engine A half
+    // stays right for them (see Queue2DDeferred for bit 2)
+    bool heldB = Is2DJobDeferred(job) && HeldEngineBQueued();
+    if (!Is2DJobQueued(job) || (Is2DJobDeferred(job) && !heldB))
     {
         job.Palette = Palette;
         job.OAM = OAM;
+        job.PaletteB = Palette;
+        job.OAMB = OAM;
         return;
     }
 
+    Threaded2DState::PalOAMCopy& copy = Threaded2D->PalOAM[Cur2DPalOAM()];
+    job.Palette = heldB ? Palette : copy.Palette;
+    job.OAM = heldB ? OAM : copy.OAM;
+    job.PaletteB = copy.Palette;
+    job.OAMB = copy.OAM;
+}
+
+// the palette and OAM copy for the job queued next, made now if they were written since the last
+// one. it's kept until that job is drawn
+u32 GPU::Cur2DPalOAM() noexcept
+{
     Threaded2DState& state = *Threaded2D;
     u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
     if (PalOAMWritten)
@@ -1388,8 +1415,7 @@ void GPU::Start2DJob(GPU2D::LineJob& job) noexcept
     }
 
     state.PalOAMUntil[state.PalOAMCur] = queued + 1;
-    job.Palette = state.PalOAM[state.PalOAMCur].Palette;
-    job.OAM = state.PalOAM[state.PalOAMCur].OAM;
+    return state.PalOAMCur;
 }
 
 // for DrawScanline(line): call after PreDrawScanline, before PostDrawScanline
@@ -1518,11 +1544,18 @@ void GPU::MakeVRAMFlat_2DBGCoherent(u32 line) noexcept
         Shadow2D->NoteBGDirty(*this, line, bits, words);
     }
 
-    // with EngineBNoHold, held lines have no engine B part left to read engine B's copies
+    // with EngineBNoHold, held lines have no engine B part left to read engine B's copies, and with
+    // HeldTo2DThread bit 1 the ring may hold those parts, so then the ring alone is waited for (no
+    // flush, as NoteCaptureFlatCheck already counts it with EngineBNoHold)
     bool dirtyA = bgDirtyA || bgExtPalDirtyA || objExtPalDirtyA;
     bool dirtyB = bgDirtyB || bgExtPalDirtyB || objExtPalDirtyB;
     if (EngineBNoHold ? ((dirtyA && Is2DThreadBusy()) || (dirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (dirtyA || dirtyB)))
-        Sync2D(CapFlush_FlatBG);
+    {
+        if (EngineBNoHold && !(dirtyA && Is2DThreadBusy()) && Deferred2DPending)
+            Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+        else
+            Sync2D(CapFlush_FlatBG);
+    }
 
     MakeVRAMFlat_ABGCoherent(bgDirtyA);
     MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirtyA);
@@ -1577,7 +1610,13 @@ void GPU::MakeVRAMFlat_2DOBJCoherent(u32 line) noexcept
     }
 
     if (EngineBNoHold ? ((objDirtyA && Is2DThreadBusy()) || (objDirtyB && Is2DRingBusy())) : (Is2DThreadBusy() && (objDirtyA || objDirtyB)))
-        Sync2D(CapFlush_FlatOBJ);
+    {
+        // as for the BG copies
+        if (EngineBNoHold && !(objDirtyA && Is2DThreadBusy()) && Deferred2DPending)
+            Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+        else
+            Sync2D(CapFlush_FlatOBJ);
+    }
 
     MakeVRAMFlat_AOBJCoherent(objDirtyA);
     MakeVRAMFlat_BOBJCoherent(objDirtyB);
@@ -1617,11 +1656,26 @@ void GPU::MakeVRAMFlat_2DOBJCoherent(u32 line) noexcept
 // after the render), and the first captured line maps that buffer (GetLine(0)), which waits for
 // the GPU. drawing it at line 192 instead gives the GPU the whole frame to finish. this works with
 // threaded 2D on or off: the ring is drained when the first line is held, and a line that isn't
-// held draws the held ones first, so nothing is queued while lines are held.
+// held draws the held ones first, so nothing is queued while lines are held (but see HeldTo2DThread).
 // held lines count as not drawn yet for every barrier: Sync2D draws them, Is2DThreadBusy is true
 // (the flat copies), LCDC writes sync (Queued2DReadsLCDC is set) and LCDC reads draw them first
 // (ReadVRAM_LCDC), since DoCapture writes an LCDC bank and capture source B reads one. a game that
 // touches any of that mid-frame gets an early draw, which costs what drawing at HBlank did
+//
+// HeldTo2DThread moves held lines to the 2D thread, and then held lines read palette and OAM copies
+// like queued ones. 2D is still drawn on one thread at a time (the renderer has state of its own),
+// so every draw on the emulator thread waits for the ring first. bit 1: engine B's part of each
+// held line is queued at its HBlank (a ring slot points at the held job), so the ring holds those
+// parts while lines are held, and only those, as it's drained at the first held line. engine B
+// reads no LCDC bank and only engine B's flat copies, palette and OAM, so its barriers wait for the
+// ring and leave the held lines held, and the held lines' copies of palette and OAM stay until
+// their engine A part is drawn (Start2DJob). bit 2: in frames whose Blit waits for the 3D render,
+// line 192 fetches the held lines' 3D lines into the jobs and queues them (Queue2DDeferred), so
+// DoCapture runs on the 2D thread during lines 192-215. what it writes (the LCDC bank, its
+// VRAMDirty, the hi-res capture record, which it makes if there's none yet, and
+// NativeCapturedSincePass) is only read or written on the emulator thread after Held2DDone: Sync2D
+// (savestates, mapping changes, LCDC writes, POWCNT, a Blit, FinishFrame), LCDC reads, and line 215
+// before the 3D render (or, after a VCount write, the next line drawn or the frame end)
 
 static inline void CPURelax() noexcept
 {
@@ -1715,11 +1769,13 @@ void GPU::Run2DThread() noexcept
         u32 queued = Jobs2DQueued.load(std::memory_order_acquire);
         while (done != queued)
         {
-            const GPU2D::LineJob& job = state.Jobs[done % Ring2DSize];
-            GPU2D_Renderer->RunJob(job);
+            const GPU2D::LineJob& job = *state.JobPtr[done % Ring2DSize];
+            u32 engines = state.JobEngines[done % Ring2DSize];
+            GPU2D_Renderer->RunJob(job, engines);
             // after line 191 the next job is the next frame's line 0 (line 262's sprites are
-            // usually drawn inline), with the frontend's frame gap in between
-            frameDone = !job.DrawBG || job.Line == 191;
+            // usually drawn inline), with the frontend's frame gap in between. not after a held
+            // line's engine B part (HeldTo2DThread): its engine A part can come at line 192
+            frameDone = (engines & GPU2D::Renderer2D::EngineA) && (!job.DrawBG || job.Line == 191);
             done++;
 
             // a release for the barrier (the line is drawn and its memory read), and seq_cst so
@@ -1865,13 +1921,20 @@ static constexpr u32 Deferred2DSize = 192;
 
 GPU2D::LineJob* GPU::BeginDeferred2DJob() noexcept
 {
-    // the lines queued before it are drawn first. only the ring: the held lines stay held
-    if (Is2DRingBusy())
+    // the lines line 192 queued are in the buffer this starts over (Begin2DJob has already synced
+    // for the late Blit then, so this is only in case)
+    if (Held2DQueued)
+        Held2DDone();
+
+    // the lines queued before it are drawn first. only the ring: the held lines stay held. with
+    // HeldTo2DThread bit 1, the ring holds only held lines' engine B parts after the first held line
+    if (Is2DRingBusy() && (!Deferred2DPending || !HeldEngineBQueued()))
         Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
 
     if (!Deferred2DJobs)
         Deferred2DJobs = std::make_unique<GPU2D::LineJob[]>(Deferred2DSize);
 
+    // a flush waits for the ring, so no slot points at the buffer when it starts over
     if (Deferred2DEnd == Deferred2DSize)
         Flush2DDeferred(CapFlush_Full);
     if (!Deferred2DPending)
@@ -1887,10 +1950,13 @@ GPU2D::LineJob* GPU::BeginDeferred2DJob() noexcept
 }
 
 // draws the held display capture lines, in order, as StartHBlank would have drawn them. the 2D
-// thread is idle here (nothing is queued while lines are held), and the job being built, if any,
-// isn't held yet (it's at Deferred2DEnd)
+// thread is idle here, or with HeldTo2DThread bit 1 waited for (it may still be drawing their
+// engine B parts), and the job being built, if any, isn't held yet (it's at Deferred2DEnd)
 void GPU::Flush2DDeferred(u8 flushCause) noexcept
 {
+    if (Deferred2DPending && Is2DRingBusy())
+        Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+
     // debug only, see GPU_CaptureReads.h
     if (CapReads && Deferred2DPending)
         NoteCaptureFlush(flushCause);
@@ -1933,11 +1999,16 @@ void GPU::End2DJob(GPU2D::LineJob& job) noexcept
             CapReads->NoteHeldLine(job.BG[0].CaptureCnt, job.BG[0].CaptureLatch, job.VCount, job.VRAMMap_LCDC);
 
         // engine B's part is drawn when an unheld line would be, against the same flat copies. a
-        // held job then only ever means engine A's part is left, so no barrier needs to know more
+        // held job then only ever means engine A's part is left, so no barrier needs to know more.
+        // with HeldTo2DThread bit 1 it's queued, and the barriers that engine B's part needs wait
+        // for the ring
         if (EngineBNoHold)
         {
-            GPU2D_Renderer->RunJob(job, GPU2D::Renderer2D::EngineB);
             job.EngineBDrawn = true;
+            if (HeldEngineBQueued())
+                Queue2DJob(job, GPU2D::Renderer2D::EngineB);
+            else
+                GPU2D_Renderer->RunJob(job, GPU2D::Renderer2D::EngineB);
         }
 
         Deferred2DEnd++;
@@ -1945,13 +2016,106 @@ void GPU::End2DJob(GPU2D::LineJob& job) noexcept
         return;
     }
 
+    Queue2DJob(job, GPU2D::Renderer2D::EngineA | GPU2D::Renderer2D::EngineB);
+}
+
+// puts a job's draw in the next ring slot: a ring job, or with HeldTo2DThread a part of a held one
+void GPU::Queue2DJob(const GPU2D::LineJob& job, u32 engines) noexcept
+{
+    Threaded2DState& state = *Threaded2D;
+    u32 queued = Jobs2DQueued.load(std::memory_order_relaxed);
+    // ring jobs waited for their slot in Begin2DJob
+    if (queued - Jobs2DDone.load(std::memory_order_acquire) >= Ring2DSize)
+        Wait2DJobs(queued - Ring2DSize + 1);
+
+    state.JobPtr[queued % Ring2DSize] = &job;
+    state.JobEngines[queued % Ring2DSize] = engines;
+
     // a release (the job is written before the count says so), and seq_cst so that it pairs with
     // WorkSleeping: a thread going to sleep either sees this job or gets woken
-    Jobs2DQueued.store(Jobs2DQueued.load(std::memory_order_relaxed) + 1, std::memory_order_seq_cst);
-    if (Threaded2D->WorkSleeping.load(std::memory_order_seq_cst))
+    Jobs2DQueued.store(queued + 1, std::memory_order_seq_cst);
+    if (state.WorkSleeping.load(std::memory_order_seq_cst))
     {
-        std::lock_guard lock(Threaded2D->Mutex);
-        Threaded2D->WorkWake.notify_one();
+        std::lock_guard lock(state.Mutex);
+        state.WorkWake.notify_one();
+    }
+}
+
+// HeldTo2DThread bit 2, at line 192 in a frame whose Blit waits for the 3D render: the held lines
+// are queued instead of drawn here, so the 2D thread draws them (and their display capture) while
+// lines 192-215 run. their 3D lines are fetched here, as GetLine needs the GL context, into the jobs'
+// own buffers, as the render at line 215 can reallocate the renderer's. false when they're drawn
+// here as before
+bool GPU::Queue2DDeferred() noexcept
+{
+    // CAPREADS counts on the emulator thread, also in DoCapture
+    if (!(HeldTo2DThread & 2) || !Threaded2D || !Deferred2DPending || CapReads)
+        return false;
+
+    // the bank the Blit keeps a copy of (KeepHiresCaptureDst) must be one only the capture lines
+    // write until Held2DDone: in LCDC mode, as any write to it or a mapping change syncs then. the
+    // jobs' LCDC banks are the current ones for the same reason
+    u32 first = Deferred2DEnd - Deferred2DPending;
+    if (HiresCapRecord && HiresCapRecord->DstMask && !(VRAMMap_LCDC & (1 << ((HiresCapRecord->Layout >> 16) & 0x3))))
+        return false;
+    for (u32 i = first; i < Deferred2DEnd; i++)
+    {
+        const GPU2D::LineJob& job = Deferred2DJobs[i];
+        if (job.HiresCapture && job.DrawBG && job.BG[0].CaptureLatch && !(job.VRAMMap_LCDC & (1 << ((job.BG[0].CaptureCnt >> 16) & 0x3))))
+            return false;
+    }
+
+    // the held parts read the live palette and OAM until now, and what they read of them is as it
+    // was when they were built, as writes to it draw the held lines first (see WritePalette). so
+    // one copy of them now does for all of them, kept until the last one is drawn. engine B parts
+    // bit 1 queued keep the copies they have
+    Threaded2DState& state = *Threaded2D;
+    u32 copy = Cur2DPalOAM();
+    for (u32 i = first; i < Deferred2DEnd; i++)
+    {
+        GPU2D::LineJob& job = Deferred2DJobs[i];
+        // the ring can still be drawing this job's engine B part (bit 1), which never reads Line3D
+        // or Line3DBuffer, nor engine A's palette and OAM pointers
+        if (job.Fetch3DLine)
+        {
+            memcpy(job.Line3DBuffer, GPU3D.GetLine(job.Line, job.RenderXPos, job.Abort3DLine), sizeof(job.Line3DBuffer));
+            job.Line3D = job.Line3DBuffer;
+        }
+
+        job.Palette = state.PalOAM[copy].Palette;
+        job.OAM = state.PalOAM[copy].OAM;
+        if (!job.EngineBDrawn)
+        {
+            job.PaletteB = state.PalOAM[copy].Palette;
+            job.OAMB = state.PalOAM[copy].OAM;
+        }
+
+        Queue2DJob(job, job.EngineBDrawn ? (u32)GPU2D::Renderer2D::EngineA : (GPU2D::Renderer2D::EngineA | GPU2D::Renderer2D::EngineB));
+    }
+    state.PalOAMUntil[copy] = Jobs2DQueued.load(std::memory_order_relaxed);
+
+    Deferred2DPending = 0;
+    Held2DQueued = true;
+    return true;
+}
+
+// waits for the held lines Queue2DDeferred queued, and keeps the copy line 192 would have kept
+void GPU::Held2DDone() noexcept
+{
+    Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+    Held2DQueued = false;
+    KeepHiresCaptureDst();
+}
+
+// BlitAfterReadback: the hi-res capture pass's destination bank as the frame's capture lines left
+// it, since the CPU can write it before the Blit
+void GPU::KeepHiresCaptureDst() noexcept
+{
+    if (HiresCapRecord && HiresCapRecord->DstMask)
+    {
+        HiresCapRecord->DstNativeKept = true;
+        memcpy(HiresCapRecord->DstNative, VRAM[(HiresCapRecord->Layout >> 16) & 0x3],
+               sizeof(HiresCapRecord->DstNative));
     }
 }
 
@@ -2223,27 +2387,27 @@ void GPU::StartScanline(u32 line) noexcept
             else if (GPU3D.IsRendererAccelerated())
             {
                 // the compositor uploads this frame's 2D back buffers, so every line must be drawn.
-                // this is where the lines held for display capture are usually drawn
-                Sync2D(CapFlush_Line192);
+                // this is where the lines held for display capture are usually drawn. with
+                // HeldTo2DThread bit 2 and the Blit after the 3D render, the 2D thread draws them by then
+                bool blitAfter = BlitAfterReadback && CaptureHeldThisFrame && GPU3D.GetCurrentRenderer().SupportsBlitAfterRender();
+                if (!blitAfter || !Queue2DDeferred())
+                    Sync2D(CapFlush_Line192);
 
-                if (BlitAfterReadback && CaptureHeldThisFrame && GPU3D.GetCurrentRenderer().SupportsBlitAfterRender())
+                if (blitAfter)
                 {
                     // the Blit runs right after the 3D render at line 215 (see BlitAfterReadback).
                     // what it reads stays as it is now until then: the 2D back buffers (no line is
                     // drawn before line 215 without a Sync2D), the hi-res capture record (only
                     // capture lines write it) and the 3D frame, which the render keeps. the bank
                     // write masks are kept as of now, like LateBlit's, and the capture pass's
-                    // destination bank is copied, as the CPU can write it meanwhile
+                    // destination bank is copied, as the CPU can write it meanwhile (once the 2D
+                    // thread has drawn the held lines, with HeldTo2DThread: see Held2DDone)
                     LateBlitCapWrites = HiresCapWrites;
                     LateBlitCapWritesInCapture = HiresCapWritesInCapture;
                     HiresCapWrites = 0;
                     HiresCapWritesInCapture = 0;
-                    if (HiresCapRecord && HiresCapRecord->DstMask)
-                    {
-                        HiresCapRecord->DstNativeKept = true;
-                        memcpy(HiresCapRecord->DstNative, VRAM[(HiresCapRecord->Layout >> 16) & 0x3],
-                               sizeof(HiresCapRecord->DstNative));
-                    }
+                    if (!Held2DQueued)
+                        KeepHiresCaptureDst();
                     BlitAfter3DPending = true;
                 }
                 else

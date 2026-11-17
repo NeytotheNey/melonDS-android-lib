@@ -192,6 +192,8 @@ struct LineJob
     bool EngineBDrawn;      // held for display capture: engine B's part is drawn already, only engine A's is left
     const u8* Palette;      // palette and OAM as they were when the job was built: a copy for a queued job (see GPU::Start2DJob)
     const u8* OAM;
+    const u8* PaletteB;     // the same for engine B's part, which differs for a held job whose engine B part is queued
+    const u8* OAMB;
 
     UnitState BG[2];        // after PreDrawScanline, before PostDrawScanline
     UnitState OBJ[2];       // after PostDrawScanline (line 0: after ResetOBJMosaicCounters)

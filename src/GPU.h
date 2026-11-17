@@ -206,6 +206,8 @@ public:
     {
         if (Is2DRingBusy())
             Wait2DJobs(Jobs2DQueued.load(std::memory_order_relaxed));
+        if (Held2DQueued)
+            Held2DDone();
         if (Deferred2DPending)
             Flush2DDeferred(flushCause);
         if (BlitPending || (BlitAfter3DPending && blitAfter3D))
@@ -239,9 +241,12 @@ public:
     template<typename T>
     T ReadVRAM_LCDC(u32 addr) noexcept
     {
-        // display capture writes an LCDC bank, so the lines held back for it are drawn first
+        // display capture writes an LCDC bank, so the lines held back for it are drawn first, and
+        // the ones line 192 queued for the 2D thread (HeldTo2DThread) waited for
         if (Deferred2DPending)
             Flush2DDeferred(CapFlush_Read);
+        if (Held2DQueued)
+            Held2DDone();
 
         int bank;
 
@@ -810,6 +815,14 @@ public:
     // default since it passed gameplay, save state and OnePlus tests; debug builds can turn it off
     // (DebugProperties) to compare. set between games only
     bool EngineBNoHold = true;
+    // threaded 2D, experiment: held capture lines are drawn on the 2D thread too, a sum of bits.
+    // 1: with EngineBNoHold, engine B's part of each held line is queued at its HBlank instead of
+    // drawn on the emulator thread. 2: in frames whose Blit waits for the 3D render
+    // (BlitAfterReadback), the held lines are queued at line 192 instead of drawn there, with their
+    // 3D lines fetched first (GetLine needs the GL context), so they're drawn while lines 192-215
+    // run (the parts queued read palette and OAM copies, see Start2DJob). 0, the default, is the
+    // old path. only changed by a debug switch, set between games
+    int HeldTo2DThread = 0;
     // with DeferCapture2D, submit the GPU work held lines wait for (the 3D frame at line 215, its
     // readback at line 0) right away instead of at the frontend's frame-end flush or the map at
     // line 192. only turned off by a debug switch, to compare
@@ -1272,6 +1285,13 @@ private:
     }
     GPU2D::LineJob* BeginDeferred2DJob() noexcept;
     void Flush2DDeferred(u8 flushCause = CapFlush_Other) noexcept;
+    // HeldTo2DThread: bit 1 is on, so the ring can hold held lines' engine B parts while they're held
+    bool HeldEngineBQueued() const noexcept { return (HeldTo2DThread & 1) && EngineBNoHold && Threaded2D; }
+    bool Queue2DDeferred() noexcept;
+    u32 Cur2DPalOAM() noexcept;
+    void Held2DDone() noexcept;
+    void KeepHiresCaptureDst() noexcept;
+    void Queue2DJob(const GPU2D::LineJob& job, u32 engines) noexcept;
     void NoteCaptureFlush(u8 flushCause) noexcept;
     void NoteCaptureMap(bool end) noexcept;
     void NoteCaptureFlatCheck(const CaptureFlatDirty* dirty, u32 count) noexcept;
@@ -1396,6 +1416,10 @@ private:
     // set when this frame holds a line that reads 3D (Snapshot2DScanline), cleared at line 215
     // (see StartHBlank)
     bool CaptureHeldThisFrame = false;
+    // HeldTo2DThread bit 2: line 192 queued the held lines (Queue2DDeferred), and Held2DDone hasn't
+    // waited for them yet. it does at line 215 (after a VCount write that skips it, at the next
+    // line drawn or the frame end), and before anything reads or writes the LCDC banks
+    bool Held2DQueued = false;
     // the Blit StartScanline(192) left for line 215 (see LateBlit). Sync2D runs it, so whatever
     // syncs before reading or changing the 2D output, the 3D frame or the renderer gets it first
     bool BlitPending = false;
