@@ -912,6 +912,17 @@ public:
     // frame, so each frame scans afresh. any nonzero value turns step 1 on (2 acts as 3). only
     // changed by a debug switch
     int GLNoDiscard = 3;
+    // OpenGL renderer, floor seams (docs/plan-gl-floor-seams.md), a sum of bits. GL only fills pixels
+    // whose center is inside a polygon, where the DS fills each span from the left edge's pixel to the
+    // right edge's inclusive, so where a T-junction's vertex is rounded off its neighbor's edge
+    // (Pokemon Gen 4 floors) GL leaves a crack under a pixel wide that the DS covers. bit 0 (1): the
+    // vertices keep the hi-res position's fraction at scales above 1x instead of being truncated to
+    // whole target pixels. bit 1 (2): opaque polygons (not lines, translucent, wireframe, depth-equal,
+    // shadow or shadow mask polygons) get a skirt a target pixel wide (half a DS pixel at 1x) along
+    // their edge normals, its outer corners' depth, color and texcoords taken from the polygon's own
+    // planes, drawn after the opaque pass and only over the clear plane (GLRenderer::BuildSkirt). 0,
+    // the default, draws as before. only changed by a debug switch
+    int GLSeams = 0;
     // OpenGL renderer, a measurement probe for experiment T2 (docs/plan-gpu-discovery.md), and it
     // renders WRONG on purpose: it bounds what a decoded texture cache could save. 1 makes the render
     // programs' texture lookup one texelFetch from TexPalMem at a coordinate taken from the texcoord,

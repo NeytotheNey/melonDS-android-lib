@@ -1314,16 +1314,17 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
     u32 zshift = 0;
     while (z > 0xFFFF) { z >>= 1; zshift++; }
 
+    // in 1/(1 << PosFrac) target pixels (GPU::GLSeams), whole target pixels without it
     u32 x, y;
     if (ScaleFactor > 1)
     {
-        x = (vtx->HiresPosition[0] * ScaleFactor) >> 4;
-        y = (vtx->HiresPosition[1] * ScaleFactor) >> 4;
+        x = HiresToPos(vtx->HiresPosition[0] * ScaleFactor);
+        y = HiresToPos(vtx->HiresPosition[1] * ScaleFactor);
     }
     else
     {
-        x = vtx->FinalPosition[0];
-        y = vtx->FinalPosition[1];
+        x = vtx->FinalPosition[0] << PosFrac;
+        y = vtx->FinalPosition[1] << PosFrac;
     }
 
     // correct nearly-vertical edges that would look vertical on the DS
@@ -1352,7 +1353,7 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
     if (WideFrameY)
         y = WideVertexY(vtx->HiresPosition[1]);
 
-    *vptr++ = x | (y << 16);
+    *vptr++ = std::min(x, 0xFFFFu) | (std::min(y, 0xFFFFu) << 16);
     *vptr++ = z | (w << 16);
 
     *vptr++ =  (vtx->FinalColor[0] >> 1) |
@@ -1371,16 +1372,26 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
     return vptr;
 }
 
+// a hi-res position times the scale (4 fraction bits, in target pixels) as a vertex position, in
+// 1/(1 << PosFrac) target pixels. GPU::GLSeams bit 0 (PosSub) keeps the fraction, rounded to PosFrac
+// bits; without it the position is truncated to whole target pixels first, as it always was
+u32 GLRenderer::HiresToPos(s32 scaled) const
+{
+    if (PosSub)
+        return (((u32)scaled << PosFrac) + (8u >> PosFrac)) >> 4;
+    return ((u32)scaled >> 4) << PosFrac;
+}
+
 // wide views always go through the hi-res position, which GPU3D already placed on the wide target
 u32 GLRenderer::WideVertexX(s32 hiresx) const
 {
-    return (std::max(hiresx + WideXAdjust, 0) * ScaleFactor) >> 4;
+    return HiresToPos(std::max(hiresx + WideXAdjust, 0) * ScaleFactor);
 }
 
 // and Y with a margin (camera stage 2), on the target's rows, which start TargetMargin rows above DS line 0
 u32 GLRenderer::WideVertexY(s32 hiresy) const
 {
-    return (std::max(hiresy + WideYAdjust, 0) * ScaleFactor) >> 4;
+    return HiresToPos(std::max(hiresy + WideYAdjust, 0) * ScaleFactor);
 }
 
 // the target row a polygon line [line] (0..192, of the frame its polygons were built for, squeezed with
@@ -1402,6 +1413,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
     u32 vidx = 0;
 
     u32 iidx = 0;
+    u32 sidx = 0;
     NumEdges = 0;
 
     for (int i = 0; i < npolys; i++)
@@ -1548,11 +1560,11 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                 if (WideFrame)
                     cX = WideVertexX((s32)cX);
                 else
-                    cX = (cX * ScaleFactor) >> 4;
+                    cX = HiresToPos(cX * ScaleFactor);
                 if (WideFrameY)
                     cY = WideVertexY((s32)cY);
                 else
-                    cY = (cY * ScaleFactor) >> 4;
+                    cY = HiresToPos(cY * ScaleFactor);
 
                 u32 w = (u32)cW;
 
@@ -1606,10 +1618,259 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
 
         if (EdgeMark != 0)
             BuildEdges(rp, vidx_first, vidx);
+
+        // GPU::GLSeams bit 1: the ring around the polygon, its own indices drawn after the opaque pass
+        rp->NumSkirtIndices = 0;
+        rp->SkirtIndicesOffset = sidx;
+        if (PosGrow && poly->Type != 1 && GrowsSeams(poly))
+        {
+            BuildSkirt(rp, vidx - poly->NumVertices, vidx, sidx);
+            vptr = &VertexBuffer[vidx * 7];
+        }
     }
+
+    // the skirts' indices go after the polygons'
+    for (int i = 0; i < npolys; i++)
+        polygons[i].SkirtIndicesOffset += iidx;
+    memcpy(&IndexBuffer[iidx], SkirtIndexBuffer, sidx * sizeof(u16));
+    iidx += sidx;
 
     NumVertices = vidx;
     NumIndices = iidx;
+}
+
+// GPU::GLSeams bit 1: the polygons that get a skirt (BuildSkirt), the ones the opaque pass fills as
+// solid area: not translucent (alpha below 31 or a translucent texture format), not wireframe
+// (alpha 0), not shadows or shadow masks, not depth-equal (decals sit on a surface already drawn),
+// and with an area
+bool GLRenderer::GrowsSeams(const Polygon* poly)
+{
+    u32 alpha = (poly->Attr >> 16) & 0x1F;
+    return !poly->Translucent && alpha != 0 && !poly->IsShadow && !poly->IsShadowMask && !poly->Degenerate
+        && !(poly->Attr & (1<<14)) && poly->NumVertices >= 3;
+}
+
+// rounded to the nearest, halves away from 0, without a libm call (these are small)
+static inline s32 RoundToInt(double v)
+{
+    return v >= 0 ? (s32)(v + 0.5) : -(s32)(0.5 - v);
+}
+
+// GPU::GLSeams bit 1 (docs/plan-gl-floor-seams.md): a skirt around the polygon whose rim BuildPolygons
+// just wrote (VertexBuffer[rim] on, poly->NumVertices vertices in the polygon's order), a target pixel
+// wide, half a DS pixel at 1x. the DS fills a span from the left edge's pixel to the right edge's
+// inclusive, so a pixel an edge passes through belongs to the polygons on both sides of it, and where
+// a T-junction's vertex is rounded a little off its neighbor's edge the crack is covered; GL only
+// fills pixels whose center is inside, and leaves it open.
+// each edge moves out along its normal and a corner goes where its two moved edges meet, capped at
+// twice the distance for sharp corners (and left where it is for a spike that turns back on itself).
+// the outer corner's depth, W, color and texcoords come from the plane of the corner's triangle with
+// its two neighbors, perspective-correct as GL interpolates them (over 1/W, the Z-buffer's depth
+// linear), so the texture carries on across the skirt. colors stay within the polygon's own range,
+// and texcoords too on an axis that repeats, so a cut-out's border can't wrap round to the texture's
+// other side; depth and W within their range widened by its own span.
+// the skirt is new vertices (the outer corners, with the rim vertex's edge info) and two triangles an
+// edge between rim and outer corners, in SkirtIndexBuffer. RenderSceneChunk draws the skirts after the
+// opaque polygons and only over the clear plane (by stencil), so they fill the cracks and the edges'
+// pixels against the background: the polygons stay as they were, and where two of them overlap on a
+// surface nothing fights over the overlap
+void GLRenderer::BuildSkirt(RendererPolygon* rp, u32 rim, u32& vidx, u32& sidx)
+{
+    const Polygon* poly = rp->PolyData;
+    const u32 n = poly->NumVertices;
+    if (vidx + n > MaxGLVertices || sidx + 6 * n > MaxSkirtIndices)
+        return;
+
+    const double scale = 1 << PosFrac;
+    const double dist = ScaleFactor > 1 ? 1.0 : 0.5;
+
+    double px[10], py[10];
+    for (u32 j = 0; j < n; j++)
+    {
+        u32 pos = VertexBuffer[(rim + j) * 7];
+        px[j] = (pos & 0xFFFF) / scale;
+        py[j] = (pos >> 16) / scale;
+    }
+
+    double area = 0;
+    for (u32 j = 0; j < n; j++)
+    {
+        u32 k = (j + 1 == n) ? 0 : j + 1;
+        area += px[j] * py[k] - px[k] * py[j];
+    }
+    if (std::abs(area) < 1.0 / 64)
+        return;
+    const double sign = area > 0 ? 1.0 : -1.0;
+
+    // the outward unit normal of edge j (vertex j to j+1), none for an edge without length
+    double ex[10], ey[10];
+    bool has[10];
+    for (u32 j = 0; j < n; j++)
+    {
+        u32 k = (j + 1 == n) ? 0 : j + 1;
+        double dx = px[k] - px[j], dy = py[k] - py[j];
+        double len = std::sqrt(dx * dx + dy * dy);
+        has[j] = len > 1.0 / 1024;
+        if (has[j])
+        {
+            ex[j] = dy * sign / len;
+            ey[j] = -dx * sign / len;
+        }
+    }
+
+    // what's extrapolated: 1/W, then color, texcoords and depth, over W where GL interpolates them
+    // perspective-correct (all but the Z-buffer's depth)
+    enum { Q, R, G, B, S, T, Z, NumAttr };
+    double attr[10][NumAttr];
+    double lo[NumAttr], hi[NumAttr];
+    for (u32 j = 0; j < n; j++)
+    {
+        const Vertex* vtx = poly->Vertices[j];
+        if (poly->FinalW[j] <= 0)
+            return;
+        double q = 1.0 / poly->FinalW[j];
+        attr[j][Q] = q;
+        attr[j][R] = (vtx->FinalColor[0] >> 1) * q;
+        attr[j][G] = (vtx->FinalColor[1] >> 1) * q;
+        attr[j][B] = (vtx->FinalColor[2] >> 1) * q;
+        attr[j][S] = vtx->TexCoords[0] * q;
+        attr[j][T] = vtx->TexCoords[1] * q;
+        attr[j][Z] = poly->WBuffer ? poly->FinalZ[j] * q : (double)poly->FinalZ[j];
+
+        // the ranges, unweighted (W in Q's slot)
+        double plain[NumAttr] = {(double)poly->FinalW[j], (double)(vtx->FinalColor[0] >> 1), (double)(vtx->FinalColor[1] >> 1),
+            (double)(vtx->FinalColor[2] >> 1), (double)vtx->TexCoords[0], (double)vtx->TexCoords[1], (double)poly->FinalZ[j]};
+        for (int a = 0; a < NumAttr; a++)
+        {
+            lo[a] = j == 0 ? plain[a] : std::min(lo[a], plain[a]);
+            hi[a] = j == 0 ? plain[a] : std::max(hi[a], plain[a]);
+        }
+    }
+    // W and depth may go past the polygon's range, by up to its own span
+    for (int a : {(int)Q, (int)Z})
+    {
+        double span = hi[a] - lo[a];
+        lo[a] -= span;
+        hi[a] += span;
+    }
+    lo[Q] = std::max(lo[Q], 1.0);
+    hi[Q] = std::min(hi[Q], 65535.0);
+    lo[Z] = std::max(lo[Z], 0.0);
+    hi[Z] = std::min(hi[Z], (double)0xFFFFFF);
+    // texcoords on an axis that doesn't repeat can go anywhere (the lookup clamps them)
+    if (!(poly->TexParam & (1 << 16))) { lo[S] = -32768; hi[S] = 32767; }
+    if (!(poly->TexParam & (1 << 17))) { lo[T] = -32768; hi[T] = 32767; }
+
+    const u32 outer = vidx;
+    for (u32 j = 0; j < n; j++)
+    {
+        // the outer corner starts as a copy of the rim vertex: the polygon's words, its edge info
+        u32* v = &VertexBuffer[(outer + j) * 7];
+        memcpy(v, &VertexBuffer[(rim + j) * 7], 7 * sizeof(u32));
+        if (EdgeMark != 0)
+            EdgeInfoBuffer[outer + j] = EdgeInfoBuffer[rim + j];
+        if (EdgeMark == 1 && EdgeSet == EdgeLineShader)
+            memcpy(&EdgeLineBuffer[(outer + j) * 12], &EdgeLineBuffer[(rim + j) * 12], 12 * sizeof(float));
+
+        // the edges into and out of this corner, past any without length
+        int ea = -1, eb = -1;
+        for (u32 t = 1; t <= n && ea < 0; t++)
+        {
+            u32 i = (j + n - t) % n;
+            if (has[i]) ea = i;
+        }
+        for (u32 t = 0; t < n && eb < 0; t++)
+        {
+            u32 i = (j + t) % n;
+            if (has[i]) eb = i;
+        }
+        if (ea < 0 || eb < 0 || ea == eb)
+            continue;
+
+        double mx = ex[ea] + ex[eb], my = ey[ea] + ey[eb];
+        double denom = 1.0 + ex[ea] * ex[eb] + ey[ea] * ey[eb];
+        double ox, oy;
+        if (denom >= 0.5)
+        {
+            // where the two moved edges meet, at most twice the distance out
+            ox = dist * mx / denom;
+            oy = dist * my / denom;
+        }
+        else
+        {
+            double ml = std::sqrt(mx * mx + my * my);
+            if (ml < 1.0 / 1024)
+                continue;
+            ox = 2 * dist * mx / ml;
+            oy = 2 * dist * my / ml;
+        }
+
+        u32 nx = (u32)std::clamp(RoundToInt((px[j] + ox) * scale), 0, 0xFFFF);
+        u32 ny = (u32)std::clamp(RoundToInt((py[j] + oy) * scale), 0, 0xFFFF);
+        ox = nx / scale - px[j];
+        oy = ny / scale - py[j];
+        v[0] = nx | (ny << 16);
+        // GPU::GLEdgeFast bit 0's box takes the skirt in too
+        if (EdgeMark != 0 && (EdgeFast & 1))
+        {
+            s32 x = nx >> PosFrac, y = ny >> PosFrac;
+            OpaqueBox[0] = std::min(OpaqueBox[0], x - 1);
+            OpaqueBox[1] = std::min(OpaqueBox[1], y - 1);
+            OpaqueBox[2] = std::max(OpaqueBox[2], x + 2);
+            OpaqueBox[3] = std::max(OpaqueBox[3], y + 2);
+        }
+
+        // the plane of this corner's triangle with the vertices the two edges lead to
+        u32 p1 = ea, p2 = (eb + 1) % n;
+        double x1 = px[p1] - px[j], y1 = py[p1] - py[j];
+        double x2 = px[p2] - px[j], y2 = py[p2] - py[j];
+        double det = x1 * y2 - x2 * y1;
+        if (std::abs(det) < 0.25)
+            continue;
+
+        // f(corner + o) = f0 + grad . o, the gradient from the two edges: (f1 - f0) c1 + (f2 - f0) c2
+        double c1 = (y2 * ox - x2 * oy) / det, c2 = (x1 * oy - y1 * ox) / det;
+        double out[NumAttr];
+        for (int a = 0; a < NumAttr; a++)
+        {
+            double f0 = attr[j][a];
+            out[a] = f0 + (attr[p1][a] - f0) * c1 + (attr[p2][a] - f0) * c2;
+        }
+        if (out[Q] <= 0)
+            continue;
+        double w = 1.0 / out[Q];
+        for (int a = R; a <= T; a++)
+            out[a] *= w;
+        if (poly->WBuffer)
+            out[Z] *= w;
+        w = std::clamp(w, lo[Q], hi[Q]);
+        for (int a = R; a < NumAttr; a++)
+            out[a] = std::clamp(out[a], lo[a], hi[a]);
+
+        u32 z = (u32)RoundToInt(out[Z]);
+        u32 zshift = 0;
+        while (z > 0xFFFF) { z >>= 1; zshift++; }
+        v[1] = z | ((u32)RoundToInt(w) << 16);
+        v[2] = (v[2] & 0xFF000000) | (u32)RoundToInt(out[R]) | ((u32)RoundToInt(out[G]) << 8) | ((u32)RoundToInt(out[B]) << 16);
+        v[3] = (u16)(s16)RoundToInt(out[S]) | ((u32)(u16)(s16)RoundToInt(out[T]) << 16);
+        v[4] = (v[4] & ~(0x1Fu << 16)) | (zshift << 16);
+    }
+    vidx += n;
+
+    // two triangles an edge, rim j and j+1 to their outer corners
+    for (u32 j = 0; j < n; j++)
+    {
+        if (!has[j])
+            continue;
+        u32 k = (j + 1 == n) ? 0 : j + 1;
+        SkirtIndexBuffer[sidx++] = rim + j;
+        SkirtIndexBuffer[sidx++] = rim + k;
+        SkirtIndexBuffer[sidx++] = outer + k;
+        SkirtIndexBuffer[sidx++] = rim + j;
+        SkirtIndexBuffer[sidx++] = outer + k;
+        SkirtIndexBuffer[sidx++] = outer + j;
+        rp->NumSkirtIndices += 6;
+    }
 }
 
 // GPU::GLEdgeMark 1 (E1): the outline of the polygon whose vertices BuildPolygons just wrote
@@ -1631,14 +1892,16 @@ void GLRenderer::BuildEdges(const RendererPolygon* rp, u32 vidxFirst, u32 vidxEn
     // drawn opaque (one pixel more, for lines)
     if (opaqueDraw && (EdgeFast & 1))
     {
+        // (vertex positions are in 1/(1 << PosFrac) target pixels, GPU::GLSeams)
+        s32 round = (1 << PosFrac) - 1;
         for (u32 v = vidxFirst; v < vidxEnd; v++)
         {
             u32 pos = VertexBuffer[v * 7];
             s32 x = pos & 0xFFFF, y = pos >> 16;
-            OpaqueBox[0] = std::min(OpaqueBox[0], x - 1);
-            OpaqueBox[1] = std::min(OpaqueBox[1], y - 1);
-            OpaqueBox[2] = std::max(OpaqueBox[2], x + 1);
-            OpaqueBox[3] = std::max(OpaqueBox[3], y + 1);
+            OpaqueBox[0] = std::min(OpaqueBox[0], (x >> PosFrac) - 1);
+            OpaqueBox[1] = std::min(OpaqueBox[1], (y >> PosFrac) - 1);
+            OpaqueBox[2] = std::max(OpaqueBox[2], ((x + round) >> PosFrac) + 1);
+            OpaqueBox[3] = std::max(OpaqueBox[3], ((y + round) >> PosFrac) + 1);
         }
     }
     // GPU::GLEdgeMark 2: every opaque fragment is flagged
@@ -1647,19 +1910,21 @@ void GLRenderer::BuildEdges(const RendererPolygon* rp, u32 vidxFirst, u32 vidxEn
         u32 n = poly->NumVertices;
         // BetterPolygons' centre vertex comes first, before the rim
         u32 rim = vidxEnd - n;
-        s32 x[10], y[10];
+        // in target pixels: the positions are in 1/(1 << PosFrac) of them (GPU::GLSeams)
+        double unit = 1.0 / (1 << PosFrac);
+        double x[10], y[10];
         for (u32 j = 0; j < n; j++)
         {
             u32 pos = VertexBuffer[(rim + j) * 7];
-            x[j] = pos & 0xFFFF;
-            y[j] = pos >> 16;
+            x[j] = (pos & 0xFFFF) * unit;
+            y[j] = (pos >> 16) * unit;
         }
 
-        s64 area = 0;
+        double area = 0;
         for (u32 j = 0; j < n; j++)
         {
             u32 k = (j + 1 == n) ? 0 : j + 1;
-            area += (s64)x[j] * y[k] - (s64)x[k] * y[j];
+            area += x[j] * y[k] - x[k] * y[j];
         }
 
         if (area != 0)
@@ -1741,6 +2006,31 @@ int GLRenderer::RenderPolygonBatch(int i) const
     }
 
     glDrawElements(primtype, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    return numpolys;
+}
+
+// GPU::GLSeams bit 1: the skirts of the polygons RenderPolygonBatch would draw together, which lie
+// one after the other in the index buffer the same way (BuildPolygons)
+int GLRenderer::RenderSkirtBatch(int i) const
+{
+    const RendererPolygon* rp = &PolygonList[i];
+    GLuint primtype = rp->PrimType;
+    u32 key = rp->RenderKey;
+    int numpolys = 0;
+    u32 numindices = 0;
+
+    for (int iend = i; iend < NumFinalPolys; iend++)
+    {
+        const RendererPolygon* cur_rp = &PolygonList[iend];
+        if (cur_rp->PrimType != primtype) break;
+        if (cur_rp->RenderKey != key) break;
+
+        numpolys++;
+        numindices += cur_rp->NumSkirtIndices;
+    }
+
+    if (numindices)
+        glDrawElements(GL_TRIANGLES, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->SkirtIndicesOffset * 2));
     return numpolys;
 }
 
@@ -2653,6 +2943,39 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         i += RenderPolygonBatch(i);
     }
 
+    // GPU::GLSeams bit 1: the opaque polygons' skirts (BuildSkirt), once every opaque polygon is in,
+    // and only over the clear plane: its stencil is 0xFF (0xBF with FetchClear0), where an opaque draw
+    // left its polygon ID, below 0x40. so they fill the cracks and the edges' pixels against the
+    // background, and nothing a polygon drew changes. the test is polyid's bit 7 (0) below the
+    // pixel's, and a skirt pixel then takes the polygon ID like its polygon's pixels
+    if (PosGrow)
+    {
+        for (int i = 0; i < NumFinalPolys; )
+        {
+            RendererPolygon* rp = &PolygonList[i];
+
+            if (rp->PolyData->IsShadowMask) { i++; continue; }
+            if (rp->PolyData->Translucent) { i++; continue; }
+
+            UseRenderShader(wbuffer, RenderMode_Opaque, false, (rp->RenderKey & RenderKey_NoDiscard) != 0, PolyFull(rp));
+
+            if (rp->PolyData->Attr & (1<<14))
+                glDepthFunc(GL_LEQUAL);
+            else
+                glDepthFunc(GL_LESS);
+
+            u32 polyattr = rp->PolyData->Attr;
+            u32 polyid = (polyattr >> 24) & 0x3F;
+
+            glStencilFunc(GL_LESS, polyid, 0x80);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            glStencilMask(0xFF);
+
+            SetPolygonDepthBias(polyattr);
+            i += RenderSkirtBatch(i);
+        }
+    }
+
     // edge flags (GPU::GLEdgeMark 1): the opaque draws above (and the need-opaque ones below) set
     // attr G with UseRenderShader's edge-marking programs, the translucent ones mask it off
     // (translucent pixels keep the flag and ID of the opaque pixel under them, like software)
@@ -3313,6 +3636,19 @@ void GLRenderer::RenderFrame(GPU& gpu)
     WideFrameY = TargetMargin != 0 || gpu.GPU3D.RenderViewMargin != 0;
     WideYAdjust = (TargetMargin - gpu.GPU3D.RenderViewMargin) << 4;
     FrameMargin = gpu.GPU3D.RenderViewMargin;
+    // GPU::GLSeams: the most fraction bits (up to the hi-res position's 4) that keep the largest
+    // position the frame can have within the vertex's 16 bits
+    PosSub = (gpu.GLSeams & 1) != 0;
+    PosGrow = (gpu.GLSeams & 2) != 0;
+    PosFrac = 0;
+    if (gpu.GLSeams & 3)
+    {
+        s64 maxHires = (WideFrame || WideFrameY)
+            ? 0x3FFF + std::max({WideXAdjust, WideYAdjust, 0}) : 0x1FFF;
+        while (PosFrac < 4 && ((maxHires * ScaleFactor) << (PosFrac + 1)) >> 4 <= 0xFFFF)
+            PosFrac++;
+    }
+    ShaderConfig.uPosScale = 1.0f / (1 << PosFrac);
     ShadowMaskLineClear = gpu.ShadowMaskLineClear;
     ShadowMaskDepthTest = gpu.ShadowMaskDepthTest;
     EqualDepthMargin = gpu.EqualDepthMargin;

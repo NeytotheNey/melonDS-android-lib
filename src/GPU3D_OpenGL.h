@@ -121,6 +121,9 @@ private:
 
         u32 NumIndices;
         u32 IndicesOffset;
+        // GPU::GLSeams bit 1: the polygon's skirt (BuildSkirt), drawn after the opaque pass
+        u32 NumSkirtIndices;
+        u32 SkirtIndicesOffset;
         GLuint PrimType;
 
         u32 RenderKey;
@@ -155,6 +158,7 @@ private:
     void UpdateRenderVariant(const GPU& gpu);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const;
+    u32 HiresToPos(s32 scaled) const;
     u32 WideVertexX(s32 hiresx) const;
     u32 WideVertexY(s32 hiresy) const;
     int TargetRow(int line) const noexcept;
@@ -170,6 +174,9 @@ private:
     void KeepColorBuffer() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
+    static bool GrowsSeams(const Polygon* poly);
+    void BuildSkirt(RendererPolygon* rp, u32 rim, u32& vidx, u32& sidx);
+    int RenderSkirtBatch(int i) const;
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
     void ClearShadowMaskLines(const Polygon* polygon, const bool* lastWasMask) const;
@@ -314,7 +321,8 @@ private:
         float uFogDensity[34][4];   // float[34]  168 / 136
         u32 uFogOffset;             // int        304 / 1
         u32 uFogShift;              // int        305 / 1
-        u32 _pad1[2];               // int        306 / 2
+        float uPosScale = 1.0f;     // float      306 / 1
+        u32 _pad1;                  // int        307 / 1
     } ShaderConfig {};
 
     GLuint ShaderConfigUBO {};
@@ -338,19 +346,24 @@ private:
 
     GLuint VertexBufferID {};
     // a bank's vertices and three more a polygon (upstream's 10240 could already overflow), for WideMelon's
-    // wide list. the indices stay below 65536
-    u32 VertexBuffer[(VertexRAMSize + 3 * PolygonRAMSize) * 7] {};
+    // wide list, and room for GPU::GLSeams bit 1's skirts, four outer corners a polygon (BuildSkirt
+    // leaves a polygon without one when they don't fit). the indices stay below 65536
+    static constexpr u32 MaxGLVertices = VertexRAMSize + 3 * PolygonRAMSize + 4 * PolygonRAMSize;
+    u32 VertexBuffer[MaxGLVertices * 7] {};
     u32 NumVertices {};
 
     GLuint VertexArrayID {};
     GLuint IndexBufferID {};
-    // the most a polygon takes is BetterPolygons' 10 triangles
-    u16 IndexBuffer[PolygonRAMSize * 30] {};
+    // the most a polygon takes is BetterPolygons' 10 triangles, then the skirts' (GPU::GLSeams bit 1)
+    static constexpr u32 MaxSkirtIndices = PolygonRAMSize * 24;
+    u16 IndexBuffer[PolygonRAMSize * 30 + MaxSkirtIndices] {};
     u32 NumIndices {};
+    // GPU::GLSeams bit 1: the skirts' triangles while BuildPolygons builds, then copied after the polygons'
+    u16 SkirtIndexBuffer[MaxSkirtIndices] {};
     // GPU::GLEdgeMark 1: a word per vertex of VertexBuffer, see EdgeTexID
-    u32 EdgeInfoBuffer[VertexRAMSize + 3 * PolygonRAMSize] {};
+    u32 EdgeInfoBuffer[MaxGLVertices] {};
     // GPU::GLEdgeFast bit 1: 12 floats a vertex (locations 5 to 7), up to 4 edges of its polygon
-    float EdgeLineBuffer[(VertexRAMSize + 3 * PolygonRAMSize) * 12] {};
+    float EdgeLineBuffer[MaxGLVertices * 12] {};
     GLuint EdgeLineBufferID {};
 
     GLuint TexMemID {};
@@ -412,6 +425,12 @@ private:
     bool WideFrame {};
     s32 WideXAdjust {};
     bool WideFrameY {};
+    // GPU::GLSeams, set per frame (RenderFrame): vertex positions are in 1/(1 << PosFrac) target
+    // pixels (0 without the switch; kRenderVS scales them back by uPosScale), PosSub keeps the hi-res
+    // fraction (bit 0), PosGrow gives the opaque polygons skirts (bit 1, BuildSkirt)
+    int PosFrac = 0;
+    bool PosSub = false;
+    bool PosGrow = false;
     s32 WideYAdjust {};
     // the margin the frame's polygons were built for (GPU3D::RenderViewMargin), for TargetRow
     int FrameMargin = 0;
