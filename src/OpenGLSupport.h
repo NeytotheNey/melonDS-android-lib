@@ -65,6 +65,9 @@ bool CompileVertexFragmentProgram(GLuint& result,
 // with a cache, a program compiled before from the same source on the same driver is loaded from
 // its binary instead, and a new one is kept for next time (counted in it)
 bool CompileComputeProgram(GLuint& result, const std::string& source, const std::string& name, ShaderCacheStats* cache = nullptr);
+// the driver's message for the last shader that didn't compile or program that didn't link, for the
+// caller's own log line (same thread as the compiles). empty when the last compute build had none
+const std::string& LastShaderError();
 
 }
 

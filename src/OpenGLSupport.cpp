@@ -370,6 +370,14 @@ void ReleaseShaderCache()
     ShaderCacheDirty = false;
 }
 
+// see LastShaderError
+static std::string LastShaderErrorText;
+
+const std::string& LastShaderError()
+{
+    return LastShaderErrorText;
+}
+
 bool CompilerShader(GLuint& id, const std::string& source, const std::string& name, const std::string& type)
 {
     int res;
@@ -394,6 +402,7 @@ bool CompilerShader(GLuint& id, const std::string& source, const std::string& na
         char* log = new char[res+1];
         glGetShaderInfoLog(id, res+1, NULL, log);
         Log(LogLevel::Error, "OpenGL: failed to compile %s shader %s: %s\n", type.c_str(), name.c_str(), log);
+        LastShaderErrorText = log;
         Log(LogLevel::Debug, "shader source:\n--\n%s\n--\n", source.c_str());
         delete[] log;
 
@@ -433,6 +442,7 @@ bool LinkProgram(GLuint& result, GLuint* ids, int numIds)
         char* log = new char[res+1];
         glGetProgramInfoLog(result, res+1, NULL, log);
         Log(LogLevel::Error, "OpenGL: failed to link shader program: %s\n", log);
+        LastShaderErrorText = log;
         delete[] log;
 
         return false;
@@ -443,6 +453,8 @@ bool LinkProgram(GLuint& result, GLuint* ids, int numIds)
 
 static bool BuildComputeProgram(GLuint& result, const std::string& source, const std::string& name, bool retrievable)
 {
+    // an older failure's message isn't this one's
+    LastShaderErrorText.clear();
     result = glCreateProgram();
     // without it glGetProgramBinary may have nothing to give back
     if (retrievable)

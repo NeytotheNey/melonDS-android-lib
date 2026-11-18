@@ -549,7 +549,13 @@ private:
     OpenGL::ShaderCacheStats ShaderBatch {};
     s64 ShaderBatchNs = 0;
 
-    void CompileShaderStep(int step);
+    bool CompileShaderStep(int step);
+    // programs of the batch in progress that didn't build (COMPFAIL, COMPSHADER's failed), and of
+    // the 33 after the last batch: while one is missing, RenderFrame draws nothing
+    int BatchFailures = 0;
+    int MissingPrograms = 0;
+    bool MissingLogged = false;
+    [[nodiscard]] int CountMissingPrograms() const noexcept;
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
@@ -576,6 +582,11 @@ private:
     void SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side, s32 positions[10][2]);
 
     bool CompileShader(GLuint& shader, const std::string& source, const std::initializer_list<const char*>& defines);
+#ifdef MELONADE_DEBUG_TOOLS
+    // MELONADE_SHADER_DUMP: a directory the source of every program compiled is written to, as it
+    // goes to the driver, for diffing two builds' sources (tools/shadercheck)
+    void DumpShaderSource(const std::string& name, const std::string& source);
+#endif
 };
 
 }
