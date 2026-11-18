@@ -1786,8 +1786,9 @@ uint ColorWord(uint color, uint flag)
 
 // the OBJ pass (GLCompositor::RunShadow2DObj): one quad per sprite instance (Shadow2D::Instance) into
 // ObjTex, at native resolution over the view's width (uWideOffset columns are left of X 0), rows
-// unit * 192 + sprite line. the depth is (priority, OAM index), lowest wins, which is
-// SoftRenderer::DrawSpritePixel's rule for opaque pixels
+// unit * 192 + sprite line, and 384 rows further down for the OBJ window (Shadow2D::ObjRows in all).
+// the depth is (priority, OAM index), lowest wins, which is SoftRenderer::DrawSpritePixel's rule for
+// opaque pixels
 const char* kShadow2DObjVS = R"(#version 320 es
 
 precision highp float;
@@ -1810,7 +1811,7 @@ void main()
     int y = iGeom.y + ((gl_VertexID & 2) != 0 ? iGeom.w : 0);
     uint key = ((iSprite.w >> 10) & 0x3u) * 128u + (iMisc.x & 0x7Fu);
     float depth = (float(key) + 0.5) / 512.0;
-    gl_Position = vec4(float(x) / float(uObjW) * 2.0 - 1.0, float(y) / 384.0 * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    gl_Position = vec4(float(x) / float(uObjW) * 2.0 - 1.0, float(y) / 768.0 * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vGeom = iGeom;
     vSprite = iSprite;
     vMisc = iMisc;
@@ -1833,7 +1834,8 @@ layout(location = 0) out uvec4 oObj;
 )";
 
 // SoftRenderer::DrawSprite_Normal for one pixel: R gets what it puts in OBJLine (color or palette
-// index, the flags, priority, opaque), an OBJ window sprite sets G (none are drawn until increment 4). transparent pixels draw nothing
+// index, the flags, priority, opaque), an OBJ window sprite sets G in its own rows (it's drawn as a
+// tiled sprite whatever its mode, as DrawSprite_Normal<true> does). transparent pixels draw nothing
 const char* kShadow2DObjFS_Main = R"(
 void main()
 {
@@ -1930,7 +1932,7 @@ void main()
 // over the drawn lines.
 // the planes pass (SHADOW2D_PLANES, GLCompositor::RunShadow2DPlanes) rebuilds each native pixel's
 // planes 0-2 the way SoftRenderer::DrawScanline_BGOBJ does (text BGs, normal sprites, BLDCNT blending
-// since increment 5; no windows, no mosaic yet) into PlanesTex, ViewWidth x 384 at 1x with no gap
+// since increment 5, windows since increment 4; no mosaic yet) into PlanesTex, ViewWidth x 384 at 1x with no gap
 // between the screens. the composite (GLCompositor::RunShadow2D), at the output's resolution after
 // the compositor's own pass, reads its native pixel's planes and runs the compositor's own maths on
 // them. the planes don't depend on the sub-pixel while every drawn layer is a text BG or a normal
@@ -2174,6 +2176,42 @@ uint ColorComposite(uint val1, uint val2, uint blend, uint evy, uint win)
     return val1;
 }
 
+// UnitState::CalculateWindowMask's scan of one window up to column x, in closed form. coords is the
+// block's W_Win0 or W_Win1 (x1 in byte 0, x2 in byte 1), winState Win0Active or Win1Active as the line
+// starts. the X state (bit 1) is the carry-in from the line before until an edge at or left of x, then
+// the later of the two edges decides: x1 opens, x2 closes. x2 is checked first, so x1 == x2 only
+// closes. inside takes the Y state (bit 0) too. the recorder keeps lines with other bits set on the CPU
+bool InsideWindow(int x, uint coords, uint winState)
+{
+    int x1 = int(coords & 0xFFu);
+    int x2 = int((coords >> 8) & 0xFFu);
+    bool open = (winState & 0x2u) != 0u;
+    bool opened = x1 <= x && x1 != x2;
+    bool closed = x2 <= x;
+    if (opened && closed)
+        open = x1 > x2;
+    else if (opened)
+        open = true;
+    else if (closed)
+        open = false;
+    return open && (winState & 0x1u) != 0u;
+}
+
+// CalculateWindowMask's WindowMask[x] for column x 0..255: WINOUT, over it the OBJ window where an
+// OBJ window sprite drew (objWin), then window 1, then window 0. winCnt is the block's W_WinCnt
+// (WinCnt[0-3]: WIN0 in, WIN1 in, WINOUT, the OBJ window)
+uint WindowMask(int x, uint dispcnt, uint win0, uint win1, uint winCnt, uint winState, bool objWin)
+{
+    uint mask = (winCnt >> 16) & 0xFFu;
+    if ((dispcnt & 0x8000u) != 0u && objWin)
+        mask = (winCnt >> 24) & 0xFFu;
+    if ((dispcnt & 0x4000u) != 0u && InsideWindow(x, win1, (winState >> 16) & 0xFFFFu))
+        mask = (winCnt >> 8) & 0xFFu;
+    if ((dispcnt & 0x2000u) != 0u && InsideWindow(x, win0, winState & 0xFFFFu))
+        mask = winCnt & 0xFFu;
+    return mask;
+}
+
 // DrawPixel_Accel's 3-entry stack, top first
 #define PUSH(v) { if (found == 0) top = (v); else if (found == 1) second = (v); else third = (v); found++; }
 
@@ -2194,7 +2232,7 @@ void main()
         discard;
     uvec4 s1 = texelFetch(LineStateTex, ivec2(1, row), 0);  // BGCNT 2-3, BG0-2 scroll
     uvec4 s2 = texelFetch(LineStateTex, ivec2(2, row), 0);  // BG3 scroll
-    uvec4 s5 = texelFetch(LineStateTex, ivec2(5, row), 0);  // window state, mosaic, BLDCNT with EVA and EVB
+    uvec4 s5 = texelFetch(LineStateTex, ivec2(5, row), 0);  // window X/Y state, mosaic, BLDCNT with EVA and EVB
     uvec4 s6 = texelFetch(LineStateTex, ivec2(6, row), 0);  // EVY and backdrop, lines, wide modes, left extents
     uvec4 s7 = texelFetch(LineStateTex, ivec2(7, row), 0);  // right extents
 
@@ -2218,10 +2256,22 @@ void main()
             obj = 0u;
     }
 
-    // the pixel's window mask, CalculateWindowMask's WindowMask[i]: bits 0-3 the BGs (BG0 also the 3D
-    // layer), 4 the sprites, 5 the BLDCNT effect. windows are off on every eligible line until
-    // increment 4, which is all set
+    // the pixel's window mask, DrawScanline_BGOBJ's WindowMask[i]: bits 0-3 the BGs (BG0 also the 3D
+    // layer), 4 the sprites, 5 the BLDCNT effect, all set with windows off. past the edges it's the
+    // edge column's, and with the edge patch (WideView or WideCheck, Shadow2D::F_WinEdge) columns 0
+    // and 255 have their neighbour's, the OBJ window included
     uint win = 0xFFu;
+    if ((dispcnt & 0xE000u) != 0u)
+    {
+        int wx = clamp(nx, 0, 255);
+        if ((flags & (1u << 17)) != 0u)
+            wx = clamp(wx, 1, 254);
+        uvec4 s4 = texelFetch(LineStateTex, ivec2(4, row), 0);  // BG3 rotation C-D, window 0-1 coords, WINCNT
+        bool objWin = false;
+        if ((dispcnt & 0x8000u) != 0u)
+            objWin = texelFetch(ObjTex, ivec2(wx + uObjOffset, 384 + (unitB ? 192 : 0) + line), 0).g != 0u;
+        win = WindowMask(wx, dispcnt, s4.y, s4.z, s4.w, s5.x, objWin);
+    }
 
     // DrawScanlineBGMode's order backwards (priority 0 first, and in a priority the sprites, then
     // BG0 to BG3): the first three opaque layers are DrawPixel_Accel's stack. the 3D layer is the

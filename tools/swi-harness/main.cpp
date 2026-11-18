@@ -1119,9 +1119,12 @@ int main(int argc, char** argv)
                 fprintf(shadowLog, "%s%s:%u", first ? "" : ",", Shadow2D::ReasonName(i), rec.ReasonCounts[i]);
                 first = false;
             }
-            fprintf(shadowLog, "%s replaylines=%llu replaymismatches=%llu stalemem=%llu\n", first ? "-" : "",
-                (unsigned long long)replay.Lines, (unsigned long long)replay.Mismatches, (unsigned long long)replay.MemMismatches);
-            replay.Lines = replay.Mismatches = replay.MemMismatches = 0;
+            fprintf(shadowLog, "%s replaylines=%llu replaymismatches=%llu stalemem=%llu winlines=%llu objwinon=%llu objwinlines=%llu\n",
+                first ? "-" : "", (unsigned long long)replay.Lines, (unsigned long long)replay.Mismatches,
+                (unsigned long long)replay.MemMismatches, (unsigned long long)replay.WindowLines,
+                (unsigned long long)replay.ObjWindowOnLines, (unsigned long long)replay.ObjWindowLines);
+            replay.Lines = replay.Mismatches = replay.MemMismatches = replay.WindowLines = 0;
+            replay.ObjWindowOnLines = replay.ObjWindowLines = 0;
             fflush(shadowLog);
             for (u32& count : rec.ReasonCounts) count = 0;
             rec.SelfCheckErrors = 0;

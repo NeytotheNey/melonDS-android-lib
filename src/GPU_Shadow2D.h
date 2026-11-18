@@ -95,6 +95,8 @@ enum : u32
     F_BG0Is3D     = 1u << 11,   // unit A shows the 3D layer on BG0 (enabled, DISPCNT bit 3)
     F_TextShift   = 12,         // the BGs drawn as text BGs on this line, 4 bits
     F_Wide        = 1u << 16,   // some layer is allowed past the edge (W_Wide)
+    F_WinEdge     = 1u << 17,   // the window mask's edge columns take their neighbour's (WideView or
+                                // WideCheck, see SoftRenderer::DrawScanline_BGOBJ)
     F_ReasonShift = 20,         // why the line isn't feature-eligible, 5 bits (R_*), 0 if it is
     F_Eligible    = 1u << 30,
     F_Drawn       = 1u << 31,   // only in the compositor's copy: the shadow draws this line
@@ -119,10 +121,10 @@ enum : u32
     R_VCount,       // a VCount write: the line isn't the line it's drawn as
     R_Capture,      // unit A, display capture armed
     R_BGType,       // an enabled BG that isn't a text BG
-    R_Window,
+    R_Window,       // windows on with window X/Y state the block's 16-bit fields don't hold (a savestate's)
     R_Blend,        // unit B, no EngineBNoHold: a backdrop alpha blend that would read engine A's leftover plane
     R_Mosaic,       // BG or sprite mosaic
-    R_RotSprite,    // an affine sprite on the line
+    R_RotSprite,    // an affine sprite on the line, or an affine OBJ window sprite with the OBJ window on
     R_FeatureCount,
     R_MemChanged = R_FeatureCount, // before the frame's last real mid-frame change of its unit's memory
     R_Frame,        // not this frame's block, or the frame's lines were noted out of order
@@ -136,7 +138,8 @@ enum : u32
 const char* ReasonName(u32 reason) noexcept;
 
 // a sprite instance as the compositor uploads it (three uvec4 attributes): one sprite over one run of
-// lines. Geom is signed: X, ObjTex row of the first line (unit * 192 + line), width, lines
+// lines. Geom is signed: X, ObjTex row of the first line (unit * 192 + line, plus 384 for an OBJ window
+// sprite, whose rows are below the sprites'), width, lines
 struct Instance
 {
     s32 X;
@@ -145,6 +148,10 @@ struct Instance
     u32 Index, DispCnt, Flags, Height;  // Flags: unit B (bit 0), OBJ window (bit 1)
 };
 static_assert(sizeof(Instance) == 48, "three uvec4");
+
+// ObjTex's rows: the OBJ line pixels of both units' 192 lines, then their OBJ window
+constexpr u32 ObjWindowRow = 384;
+constexpr u32 ObjRows = 768;
 
 // where the flats, extended palettes and palette are in MemTex (R32UI, 256 texels = two 512-byte
 // pages a row), in pages
@@ -189,6 +196,7 @@ struct Shadow2DRecorder
     {
         u64 BGNoted[3], SpriteNoted[3];     // the lines noted this frame, as BG and sprite lines
         u64 SpriteRot[3], SpriteMosaic[3];  // sprite lines with an affine or a mosaic sprite
+        u64 SpriteWinRot[3];                // and with an affine OBJ window sprite
         u64 Overflow[3];                    // sprite lines whose instances didn't fit
         // the last line > 0 of this frame where the unit's memory really changed: BG VRAM, the
         // extended palettes and the palette but the backdrop (BG lines), OBJ VRAM (sprite lines)
@@ -199,6 +207,7 @@ struct Shadow2DRecorder
         u32 RunKey;                         // the OBJ state that matters, 0 while no sprite is drawn
         u32 RunDispCnt;
         u64 RunRot[3], RunMosaic[3];        // the lines the run's affine and mosaic sprites cover
+        u64 RunWinRot[3];                   // and its affine OBJ window sprites
         alignas(u64) u8 OAM[0x400];
 
         // the last sprite snapshot, for the next BG line's block (sprite line L is snapshotted at
@@ -214,9 +223,10 @@ struct Shadow2DRecorder
     // MemTex pages changed since the compositor's last upload, Shadow2D::Page_* order
     u64 Dirty[(Shadow2D::Page_Count + 63) / 64] {};
 
-    // the frame's normal sprites. OBJ window sprites get none in increment 1: windows are off on every
-    // eligible line, so nothing reads them (increment 4 brings them back, into ObjTex's G channel)
+    // the frame's normal sprites, and its OBJ window sprites, which the OBJ pass draws into ObjTex's
+    // rows below the sprites' (Shadow2D::ObjWindowRow). both count towards MaxInstances
     std::vector<Shadow2D::Instance> Sprites;
+    std::vector<Shadow2D::Instance> WindowSprites;
 
     // for the GPU2D log, emulator thread time in the hooks (only measured while Logging)
     s64 RecorderNs = 0;
@@ -242,8 +252,9 @@ struct Shadow2DRecorder
     void NoteOBJDirty(const GPU& gpu, u32 line, const u64* const* bits, const u32* words) noexcept;
     void NoteOBJCopied(const GPU& gpu) noexcept;
 
-    // GPU::Snapshot2DScanline: the palette, then each unit's block. consumes PaletteDirty
-    void NoteLine(GPU2D::LineJob& job, u32& paletteDirty) noexcept;
+    // GPU::Snapshot2DScanline: the palette, then each unit's block. consumes PaletteDirty. winEdge:
+    // SoftRenderer gives the window mask's edge columns their neighbour's (job.WideView or WideCheck)
+    void NoteLine(GPU2D::LineJob& job, u32& paletteDirty, bool winEdge) noexcept;
     // GPU::Snapshot2DSprites: OAM and the OBJ state, then the sprite runs. consumes OAMDirty
     void NoteSprites(const GPU2D::LineJob& job, u32& oamDirty) noexcept;
     // closes the frame's sprite runs (GPU::StartScanline at line 192 and the compositor, either first)
@@ -313,7 +324,7 @@ private:
 
     void NoteDirty(const GPU& gpu, u32 line, bool obj, const u64* const* bits, const u32* words) noexcept;
     void NoteCopied(const GPU& gpu) noexcept;
-    void WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept;
+    void WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEdge) noexcept;
     void ScanRun(Engine& e) noexcept;
     void FlushRun(u32 num, u32 end) noexcept;
     void CheckBlock(const u32* block, const GPU2D::UnitState& u, const GPU2D::LineJob& job) noexcept;
