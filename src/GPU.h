@@ -1140,6 +1140,10 @@ public:
     // cut-out on polygon indices and shades only its winners. 0, the default, is the old path.
     // recompiles the programs
     int ComputeVis = 0;
+    // with ComputeVis: a frame takes the visibility path only when the opaque prefix has at least
+    // this share (percent) of the frame's work tiles, by the CPU's bound. other frames run the plain
+    // programs, as with ComputeVis 0. 0 takes it whenever there's a prefix
+    int ComputeVisGate = 25;
     // compute renderer, debug: the result buffer (winner words included) and the tile memory are
     // filled with 0xDEADBEEF where they're allocated and before every render, so a pass that reads
     // what no pass of the render wrote shows it on every GPU, not only where the driver leaves

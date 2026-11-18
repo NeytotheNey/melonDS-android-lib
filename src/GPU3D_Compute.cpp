@@ -220,8 +220,9 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
         if (ProbeMode & 2) shaderSource += "#define ProbeNoInterp\n";
         if (ProbeMode & 4) shaderSource += "#define ProbeNoDivide\n";
     }
-    // GPU::ComputeVis bit 1: Rasterise's shade mode for the opaque prefix, and DepthBlend as Resolve
-    if (VisMode & ComputeVis_Opaque)
+    // GPU::ComputeVis bit 1: Rasterise's shade mode for the opaque prefix, and DepthBlend as Resolve,
+    // in the programs compiled for it
+    if (CompilingVis)
     {
         if (&source == &ComputeRendererShaders::Rasterise)
             shaderSource += "#define VisShade\n";
@@ -457,6 +458,43 @@ bool ComputeRenderer::CompileShaderStep(int current)
     case 34:
         return CompileShader(ShaderOpaqueVis[1], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "WBuffer"});
     default:
+        break;
+    }
+
+    // and the Rasterise and DepthBlend programs for the frames that take the visibility path
+    if (current >= 35 && current < ShaderProgramCount())
+    {
+        CompilingVis = true;
+        bool built = CompileVisShaderStep(current - 35);
+        CompilingVis = false;
+        return built;
+    }
+    __builtin_unreachable();
+    return false;
+}
+
+bool ComputeRenderer::CompileVisShaderStep(int step)
+{
+    using namespace ComputeRendererShaders;
+    switch (step)
+    {
+    case 0: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTexture][0], Rasterise, {"Rasterise", "ZBuffer", "NoTexture"});
+    case 1: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTexture][1], Rasterise, {"Rasterise", "WBuffer", "NoTexture"});
+    case 2: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureToon][0], Rasterise, {"Rasterise", "ZBuffer", "NoTexture", "Toon"});
+    case 3: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureToon][1], Rasterise, {"Rasterise", "WBuffer", "NoTexture", "Toon"});
+    case 4: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureHighlight][0], Rasterise, {"Rasterise", "ZBuffer", "NoTexture", "Highlight"});
+    case 5: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureHighlight][1], Rasterise, {"Rasterise", "WBuffer", "NoTexture", "Highlight"});
+    case 6: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureDecal][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Decal"});
+    case 7: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureDecal][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Decal"});
+    case 8: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureModulate][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Modulate"});
+    case 9: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureModulate][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Modulate"});
+    case 10: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureToon][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Toon"});
+    case 11: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureToon][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Toon"});
+    case 12: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureHighlight][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Highlight"});
+    case 13: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureHighlight][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Highlight"});
+    case 14: return CompileShader(ShaderDepthBlendVis[0], DepthBlend, {"DepthBlend", "ZBuffer"});
+    case 15: return CompileShader(ShaderDepthBlendVis[1], DepthBlend, {"DepthBlend", "WBuffer"});
+    default:
         __builtin_unreachable();
         return false;
     }
@@ -682,6 +720,8 @@ void ComputeRenderer::DeleteShaders()
         &ShaderFinalPass[7],
         &ShaderOpaqueVis[0],
         &ShaderOpaqueVis[1],
+        &ShaderDepthBlendVis[0],
+        &ShaderDepthBlendVis[1],
     };
     // Program names are shared with the frontend's contexts, so clear them after deleting. Deleting a stale name again (in the destructor, or
     // when the settings change before the shaders are compiled again) could free a program that reused it
@@ -689,6 +729,14 @@ void ComputeRenderer::DeleteShaders()
     {
         glDeleteProgram(*program);
         *program = 0;
+    }
+    for (auto& programs : ShaderRasteriseVis)
+    {
+        for (GLuint& program : programs)
+        {
+            glDeleteProgram(program);
+            program = 0;
+        }
     }
 #ifdef MELONADE_DEBUG_TOOLS
     // the next programs' first dispatches count again (COMPSLOW)
@@ -1864,9 +1912,17 @@ void ComputeRenderer::UpdateDepthStats(const GPU& gpu)
         DepthStatsOn = want;
         bool cache = UseShaderCache;
         UseShaderCache = false;
-        GLuint programs[2] {};
+        // with GPU::ComputeVis, Resolve's two as well
+        GLuint programs[4] {};
         bool built = CompileShader(programs[0], ComputeRendererShaders::DepthBlend, {"DepthBlend", "ZBuffer"})
             && CompileShader(programs[1], ComputeRendererShaders::DepthBlend, {"DepthBlend", "WBuffer"});
+        if (built && VisMode)
+        {
+            CompilingVis = true;
+            built = CompileShader(programs[2], ComputeRendererShaders::DepthBlend, {"DepthBlend", "ZBuffer"})
+                && CompileShader(programs[3], ComputeRendererShaders::DepthBlend, {"DepthBlend", "WBuffer"});
+            CompilingVis = false;
+        }
         UseShaderCache = cache;
         // CompileShader turns DepthStatsOn off when the source didn't take the counters
         if (built && DepthStatsOn == want)
@@ -1875,13 +1931,18 @@ void ComputeRenderer::UpdateDepthStats(const GPU& gpu)
             {
                 glDeleteProgram(ShaderDepthBlend[i]);
                 ShaderDepthBlend[i] = programs[i];
+                if (VisMode)
+                {
+                    glDeleteProgram(ShaderDepthBlendVis[i]);
+                    ShaderDepthBlendVis[i] = programs[2 + i];
+                }
             }
         }
         else
         {
             // a failed build leaves 0, which glDeleteProgram ignores
-            glDeleteProgram(programs[0]);
-            glDeleteProgram(programs[1]);
+            for (GLuint program : programs)
+                glDeleteProgram(program);
             if (want)
             {
                 if (!built)
@@ -2033,6 +2094,7 @@ void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
     c.AlphaRefFrames += gpu3d.RenderAlphaRef != 0;
     c.AlphaRefMax = std::max(c.AlphaRefMax, (u32)gpu3d.RenderAlphaRef);
     c.WFrames += numPolygons > 0 && gpu3d.RenderPolygonRAM[0]->WBuffer;
+    c.VisFrames += VisFrame;
     VisCensus->Log(SteadyNowNs());
 }
 #endif
@@ -3156,9 +3218,24 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     meta.NumPolygons = numPolygons;
     meta.NumVariants = numVariants;
     meta.AlphaRef = gpu.GPU3D.RenderAlphaRef;
-    // GPU::ComputeVis: the opaque prefix OpaqueVis resolves. none without polygons, and then
-    // Resolve is DepthBlend as it was
-    const u32 visPrefixEnd = (VisMode & ComputeVis_Opaque) && numYSpans > 0 ? VisPrefixFor(gpu, numPolygons) : 0;
+    // GPU::ComputeVis: the opaque prefix OpaqueVis resolves. a frame takes the visibility path only
+    // with a prefix that has GPU::ComputeVisGate's share of the work tiles, by the CPU's bound
+    // (PolygonTileBound): with less, its fixed cost (a pass over every pixel, and Resolve reading
+    // the layers back) is more than it saves. the frames that don't run the plain programs, which
+    // draw the same
+    u32 visPrefixEnd = (VisMode & ComputeVis_Opaque) && numYSpans > 0 ? VisPrefixFor(gpu, numPolygons) : 0;
+    if (visPrefixEnd != 0)
+    {
+        u64 prefixTiles = 0;
+        for (u32 i = 0; i < visPrefixEnd; i++)
+            prefixTiles += PolygonTileBound(RenderPolygons[i]);
+        u64 gate = (u64)std::clamp(gpu.ComputeVisGate, 0, 100);
+        if (prefixTiles * 100 < gate * totalTileBound)
+            visPrefixEnd = 0;
+    }
+#ifdef MELONADE_DEBUG_TOOLS
+    VisFrame = visPrefixEnd != 0;
+#endif
     meta.VisPrefixEnd = visPrefixEnd;
     meta.Pad[0] = meta.Pad[1] = meta.Pad[2] = 0;
     {
@@ -3326,24 +3403,27 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         {
             bool highLightMode = gpu.GPU3D.RenderDispCnt & (1<<1);
 
+            // a frame on the visibility path (GPU::ComputeVis) takes the programs with the shade mode
+            const bool vis = visPrefixEnd != 0;
+            auto pick = [&](GLuint (&plain)[2], int kind) { return vis ? ShaderRasteriseVis[kind][wbuffer] : plain[wbuffer]; };
             GLuint shadersNoTexture[] =
             {
-                ShaderRasteriseNoTexture[wbuffer],
-                ShaderRasteriseNoTexture[wbuffer],
+                pick(ShaderRasteriseNoTexture, RasteriseKind_NoTexture),
+                pick(ShaderRasteriseNoTexture, RasteriseKind_NoTexture),
                 highLightMode
-                    ? ShaderRasteriseNoTextureHighlight[wbuffer]
-                    : ShaderRasteriseNoTextureToon[wbuffer],
-                ShaderRasteriseNoTexture[wbuffer],
+                    ? pick(ShaderRasteriseNoTextureHighlight, RasteriseKind_NoTextureHighlight)
+                    : pick(ShaderRasteriseNoTextureToon, RasteriseKind_NoTextureToon),
+                pick(ShaderRasteriseNoTexture, RasteriseKind_NoTexture),
                 ShaderRasteriseShadowMask[wbuffer]
             };
             GLuint shadersUseTexture[] =
             {
-                ShaderRasteriseUseTextureModulate[wbuffer],
-                ShaderRasteriseUseTextureDecal[wbuffer],
+                pick(ShaderRasteriseUseTextureModulate, RasteriseKind_UseTextureModulate),
+                pick(ShaderRasteriseUseTextureDecal, RasteriseKind_UseTextureDecal),
                 highLightMode
-                    ? ShaderRasteriseUseTextureHighlight[wbuffer]
-                    : ShaderRasteriseUseTextureToon[wbuffer],
-                ShaderRasteriseUseTextureDecal[wbuffer],
+                    ? pick(ShaderRasteriseUseTextureHighlight, RasteriseKind_UseTextureHighlight)
+                    : pick(ShaderRasteriseUseTextureToon, RasteriseKind_UseTextureToon),
+                pick(ShaderRasteriseUseTextureDecal, RasteriseKind_UseTextureDecal),
                 ShaderRasteriseShadowMask[wbuffer]
             };
 
@@ -3419,7 +3499,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     if (DepthCounter)
         DepthCounter->Ring.BeginFrame(ComputeDepthCounter::Binding, ScreenWidth * ScreenHeight);
 #endif
-    UseProgram(ShaderDepthBlend[wbuffer]);
+    // Resolve on the visibility path (GPU::ComputeVis)
+    UseProgram(visPrefixEnd != 0 ? ShaderDepthBlendVis[wbuffer] : ShaderDepthBlend[wbuffer]);
 #ifdef MELONADE_DEBUG_TOOLS
     // the counted DepthBlend's uniforms (AddDepthStats)
     if (DepthCounter)

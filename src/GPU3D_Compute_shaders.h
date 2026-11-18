@@ -1722,22 +1722,11 @@ void main()
 
 )";
 
-/*
-    with debug.melonade.computevis (VisResolve) this is Resolve: OpaqueVis already left the layers the
-    opaque prefix gives in the result, so a pixel starts from those and only the polygons after the
-    prefix are walked. a tile with none of those is done before it reads anything. with no prefix
-    (VisPrefixEnd 0) it's DepthBlend as it was
-*/
-const std::string DepthBlend =
-    PolygonBuffer +
-    Tilebuffers +
-    ResultBuffer +
-    BinningBuffer +
-    ClearLayersSource + R"(
 
-layout (local_size_x = TileSize, local_size_y = TileSize) in;
-
-#ifdef VisResolve
+// the tile tests of OpaqueVis and Resolve (debug.melonade.computevis), from the bin masks, which
+// both read the same. VisPrefixEnd isn't 0 where they're used
+const std::string VisTileTests{R"(
+#if defined(VisResolve) || defined(OpaqueVis)
 // of coarse mask word i, the groups of 32 polygons that aren't all in the prefix
 uint VisCoarseKeep(int i)
 {
@@ -1765,7 +1754,50 @@ bool VisTileHasRest(int linearTile)
     }
     return false;
 }
+
+// whether the tile has a polygon of the prefix. OpaqueVis leaves a tile without one alone, and
+// Resolve starts it from the clear as DepthBlend does: Rasterise has no prefix work there, so
+// nothing reads its winner words
+bool VisTileHasPrefix(int linearTile)
+{
+    uint lastGroup = (VisPrefixEnd - 1U) >> 5;
+    for (int i = 0; i <= int(lastGroup >> 5); i++)
+    {
+        uint coarseMask = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + i];
+        // the groups up to the one the prefix ends in
+        if (uint(i) == (lastGroup >> 5) && (lastGroup & 31U) != 31U)
+            coarseMask &= (1U << ((lastGroup & 31U) + 1U)) - 1U;
+        if (coarseMask == 0U)
+            continue;
+        uint group = uint(i) * 32U + uint(findLSB(coarseMask));
+        // a group all in the prefix (its coarse bit means it has a polygon)
+        if (group < lastGroup)
+            return true;
+        // the group the prefix ends in: its polygons before the end
+        uint inGroup = VisPrefixEnd - group * 32U;
+        uint fineMask = BinningMaskAndOffset[BinningMaskStart + linearTile * BinStride + int(group)];
+        return inGroup >= 32U || (fineMask & ((1U << inGroup) - 1U)) != 0U;
+    }
+    return false;
+}
 #endif
+)"};
+
+/*
+    with debug.melonade.computevis (VisResolve) this is Resolve: OpaqueVis already left the layers the
+    opaque prefix gives in the result, so a pixel starts from those and only the polygons after the
+    prefix are walked. a tile with none of those is done before it reads anything. with no prefix
+    (VisPrefixEnd 0) it's DepthBlend as it was
+*/
+const std::string DepthBlend =
+    PolygonBuffer +
+    Tilebuffers +
+    ResultBuffer +
+    BinningBuffer +
+    ClearLayersSource +
+    VisTileTests + R"(
+
+layout (local_size_x = TileSize, local_size_y = TileSize) in;
 
 void PlotTranslucent(inout uint color, inout uint depth, inout uint attr, bool isShadow, uint tileColor, uint srcA, uint tileDepth, uint srcAttr, bool writeDepth)
 {
@@ -1987,7 +2019,8 @@ void main()
 
     uvec2 color, depth, attr;
 #ifdef VisResolve
-    if (VisPrefixEnd != 0U)
+    // a tile without a prefix polygon is as DepthBlend has it (VisTileHasPrefix)
+    if (VisPrefixEnd != 0U && VisTileHasPrefix(linearTile))
     {
         // the whole work group leaves together, there are no barriers
         if (!VisTileHasRest(linearTile))
@@ -2067,7 +2100,8 @@ const std::string OpaqueVis =
     BinningBuffer +
     ResultBuffer +
     RasteriseShared +
-    ClearLayersSource + R"(
+    ClearLayersSource +
+    VisTileTests + R"(
 
 layout (local_size_x = TileSize, local_size_y = TileSize) in;
 
@@ -2088,6 +2122,11 @@ void main()
 {
     int linearTile = int(gl_WorkGroupID.x + (gl_WorkGroupID.y * uint(TilesPerLine)));
     ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+
+    // a tile without a prefix polygon is left to Resolve, which starts it from the clear. the whole
+    // work group leaves together
+    if (!VisTileHasPrefix(linearTile))
+        return;
 
     uvec2 color, depth, attr;
     ClearLayers(color, depth, attr);

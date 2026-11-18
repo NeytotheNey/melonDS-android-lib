@@ -726,12 +726,15 @@ private:
 //                    polygons. eq_f shadow_f mask_f wire_f: frames with any
 //   bitmap_f alpharef_f alpharef_max wbuf_f  frames with the clear bitmap, with an alpha test
 //                    reference over 0 (and the highest), and W-buffered
+//   vis_f            frames that took the visibility path (computevis and its gate)
 struct ComputeVisCensus
 {
     struct Counters
     {
         u32 Frames = 0, CutFrames = 0, EndTrans = 0, EndMode3 = 0, EndAll = 0;
         u32 EqFrames = 0, ShadowFrames = 0, MaskFrames = 0, WireFrames = 0, BitmapFrames = 0, AlphaRefFrames = 0, WFrames = 0;
+        // renders that took the visibility path (GPU::ComputeVis and its gate)
+        u32 VisFrames = 0;
         u32 AlphaRefMax = 0;
         u64 Polys = 0, Opaque = 0, Prefix = 0, PreCut = 0, Tiles = 0, PrefixTiles = 0, PreCutTiles = 0;
         u64 Cutout = 0, CutoutPrefix = 0, FirstCut = 0, Eq = 0, Shadow = 0, Mask = 0, Wire = 0;
@@ -752,12 +755,12 @@ struct ComputeVisCensus
         Platform::Log(Platform::LogLevel::Info, "COMPVIS frames=%u polys=%.1f opaque=%.1f prefix=%.1f prefix_pct=%.1f tiles=%.0f "
             "prefix_tiles_pct=%.1f precut=%.1f precut_tiles_pct=%.1f cutout=%.1f cutout_prefix=%.1f cut_frames=%u first_cut=%.1f "
             "end_trans=%u end_mode3=%u end_all=%u eq=%.1f shadow=%.1f mask=%.1f wire=%.1f eq_f=%u shadow_f=%u mask_f=%u wire_f=%u "
-            "bitmap_f=%u alpharef_f=%u alpharef_max=%u wbuf_f=%u\n",
+            "bitmap_f=%u alpharef_f=%u alpharef_max=%u wbuf_f=%u vis_f=%u\n",
             c.Frames, c.Polys * per, c.Opaque * per, c.Prefix * per, pct(c.Prefix, c.Polys), c.Tiles * per,
             pct(c.PrefixTiles, c.Tiles), c.PreCut * per, pct(c.PreCutTiles, c.Tiles), c.Cutout * per, c.CutoutPrefix * per,
             c.CutFrames, c.CutFrames ? (double)c.FirstCut / c.CutFrames : 0.0, c.EndTrans, c.EndMode3, c.EndAll,
             c.Eq * per, c.Shadow * per, c.Mask * per, c.Wire * per, c.EqFrames, c.ShadowFrames, c.MaskFrames, c.WireFrames,
-            c.BitmapFrames, c.AlphaRefFrames, c.AlphaRefMax, c.WFrames);
+            c.BitmapFrames, c.AlphaRefFrames, c.AlphaRefMax, c.WFrames, c.VisFrames);
         Sec = {};
         LogStartNs = now;
     }

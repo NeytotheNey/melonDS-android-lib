@@ -132,8 +132,21 @@ private:
     GLuint ShaderCalculateWorkListOffset {};
     GLuint ShaderSortWork {};
     GLuint ShaderFinalPass[8] {};
-    // GPU::ComputeVis bit 1 only: the visibility pass, Z and W
+    // GPU::ComputeVis bit 1 only: the visibility pass, Z and W, and Rasterise and DepthBlend as
+    // compiled for it (VisShade, VisResolve), beside the plain ones, which frames under the gate
+    // (GPU::ComputeVisGate) run. Rasterise in the order of RasteriseKind; a shadow mask has no shade
+    // mode, so it keeps the plain program
     GLuint ShaderOpaqueVis[2] {};
+    enum
+    {
+        RasteriseKind_NoTexture, RasteriseKind_NoTextureToon, RasteriseKind_NoTextureHighlight,
+        RasteriseKind_UseTextureDecal, RasteriseKind_UseTextureModulate, RasteriseKind_UseTextureToon,
+        RasteriseKind_UseTextureHighlight, RasteriseKind_Num,
+    };
+    GLuint ShaderRasteriseVis[RasteriseKind_Num][2] {};
+    GLuint ShaderDepthBlendVis[2] {};
+    // CompileShader adds VisShade and VisResolve while it's set
+    bool CompilingVis = false;
 
     GLuint YSpanIndicesTextureMemory {};
     GLuint YSpanIndicesTexture {};
@@ -524,12 +537,16 @@ private:
     bool VisBatchFailed = false;
     bool VisFailed = false;
     [[nodiscard]] int VisModeFor(const GPU& gpu) const noexcept;
-    [[nodiscard]] int ShaderProgramCount() const noexcept { return 33 + (VisMode ? 2 : 0); }
+    [[nodiscard]] int ShaderProgramCount() const noexcept { return 33 + (VisMode ? 2 + 2 * RasteriseKind_Num + 2 : 0); }
     // the opaque prefix stage 1a can resolve: the polygons from 0 up to the first that is
     // translucent, mode 3 (shadow or shadow mask) or a cut-out (VisCutout). all of their fragments
     // have alpha 31 in Rasterise
     [[nodiscard]] static bool VisCutout(const Polygon* polygon, bool textureMaps) noexcept;
     [[nodiscard]] static u32 VisPrefixFor(const GPU& gpu, int numPolygons) noexcept;
+#ifdef MELONADE_DEBUG_TOOLS
+    // whether the render being drawn took the visibility path, for COMPVIS
+    bool VisFrame = false;
+#endif
     GLint MaxTexBufferSize = 0;
     GLuint ShaderCheckSetup = 0;
     bool CheckSetupFailed = false;
@@ -599,6 +616,7 @@ private:
     s64 ShaderBatchNs = 0;
 
     bool CompileShaderStep(int step);
+    bool CompileVisShaderStep(int step);
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
