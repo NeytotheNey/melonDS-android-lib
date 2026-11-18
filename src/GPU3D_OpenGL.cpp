@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include "NDS.h"
 #include "GPU.h"
@@ -44,6 +45,12 @@ namespace melonDS
 #define FRAG_PASS(pass) do {} while (0)
 #define TRANS_SKIPPED(field) do {} while (0)
 #endif
+
+// GPU::GLPace's clock
+static s64 PaceNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 bool GLRenderer::BuildRenderShader(bool wbuffer, bool fragCount, bool fetch, bool nodiscard, bool full, int edge)
 {
@@ -972,6 +979,7 @@ GLRenderer::~GLRenderer()
     glDeleteProgram(FinalPassFogShader);
 
     if (ShadowLogQueries[0]) glDeleteQueries(64, ShadowLogQueries);
+    DropPaceFences();
 
 #ifdef MELONADE_DEBUG_TOOLS
     // their GL objects, while the context is still current
@@ -999,6 +1007,8 @@ void GLRenderer::Reset(GPU& gpu)
         TexHeap->Clear();
     TargetsChanged = true;
     EarlyCapture = false;
+    // pacing starts over with the new console
+    DropPaceFences();
 }
 
 void GLRenderer::SetBetterPolygons(bool betterpolygons) noexcept
@@ -3751,8 +3761,120 @@ void GLRenderer::FlushCommands()
     glFlush();
 }
 
+void GLRenderer::DropPaceFences() noexcept
+{
+    for (int i = 0; i < PaceFenceCount; i++)
+        glDeleteSync(PaceFences[i]);
+    PaceFenceCount = 0;
+}
+
+// the oldest count fences are done with
+void GLRenderer::PopPaceFences(int count) noexcept
+{
+    for (int i = 0; i < count; i++)
+        glDeleteSync(PaceFences[i]);
+    PaceFenceCount -= count;
+    std::copy(PaceFences + count, PaceFences + count + PaceFenceCount, PaceFences);
+    std::copy(PaceFenceNs + count, PaceFenceNs + count + PaceFenceCount, PaceFenceNs);
+}
+
+// a fence still unsignaled this long after it was made (by the clock: the emulator was paused, or
+// the GPU is stuck) holds nothing
+static constexpr s64 PaceStaleNs = 500000000;
+
+// GPU::GLPace, at the start of every Blit: drops the fences of the frames the GPU has finished,
+// which leaves one for each that's still unfinished, and logs once a second. the GPU runs them in
+// order, so it stops at the first that isn't done. a poll that fails counts as done, so it can't
+// get stuck. the polls don't flush: the frontend's frame-end flush has sent the fences (WaitForPace
+// flushes for the times it doesn't run)
+void GLRenderer::UpdatePace(const GPU& gpu) noexcept
+{
+    if (gpu.GLPace == 0)
+    {
+        DropPaceFences();
+        return;
+    }
+
+    s64 now = PaceNowNs();
+    int done = 0;
+    while (done < PaceFenceCount)
+    {
+        bool signaled = glClientWaitSync(PaceFences[done], 0, 0) != GL_TIMEOUT_EXPIRED;
+        if (!signaled && now - PaceFenceNs[done] < PaceStaleNs)
+            break;
+        PaceLog.Stale += !signaled;
+        done++;
+    }
+    PopPaceFences(done);
+    PaceLog.MaxPending = std::max(PaceLog.MaxPending, PaceFenceCount);
+
+    // debug only (debug.melonade.glpace), once a second: frames got a fence, waits counts the Blits
+    // that waited for an earlier frame, wait_ms and maxwait_ms are their time in all and the longest
+    // one. timeouts gave up after 100 ms, stale fences were dropped unsignaled for their age, and
+    // maxpending is the most frames left unfinished at a Blit
+    if (!gpu.GLPaceLog)
+        return;
+    if (PaceLog.StartNs == 0)
+        PaceLog.StartNs = now;
+    if (now - PaceLog.StartNs >= 1000000000)
+    {
+        Platform::Log(Platform::LogLevel::Info, "GLPACE mode=%d frames=%u waits=%u wait_ms=%.1f maxwait_ms=%.1f "
+            "timeouts=%u stale=%u maxpending=%d\n",
+            gpu.GLPace, PaceLog.Frames, PaceLog.Waits, PaceLog.WaitNs / 1e6, PaceLog.MaxWaitNs / 1e6,
+            PaceLog.Timeouts, PaceLog.Stale, PaceLog.MaxPending);
+        PaceLog = {};
+        PaceLog.StartNs = now;
+    }
+}
+
+// GPU::GLPace: holds the emulator thread until at most one earlier frame is unfinished, so the
+// driver's queue stays about a frame deep and a GPU that falls behind costs fps instead of piling
+// up delay. 100 ms at most, and a fence that turns stale meanwhile stops holding, so one that never
+// signals can't hang the thread. the first wait flushes, as the newest fences aren't sent yet when
+// the frontend's frame-end flush didn't run (it doesn't while the DS sleeps)
+void GLRenderer::WaitForPace() noexcept
+{
+    s64 start = PaceNowNs();
+    s64 deadline = start + 100000000;
+    GLbitfield flags = GL_SYNC_FLUSH_COMMANDS_BIT;
+    PaceLog.Waits++;
+    while (PaceFenceCount > 1)
+    {
+        s64 now = PaceNowNs();
+        s64 staleAt = PaceFenceNs[0] + PaceStaleNs;
+        if (now >= staleAt)
+        {
+            PopPaceFences(1);
+            PaceLog.Stale++;
+            continue;
+        }
+        if (now >= deadline)
+        {
+            PaceLog.Timeouts++;
+            break;
+        }
+
+        GLenum result = glClientWaitSync(PaceFences[0], flags, (GLuint64)(std::min(deadline, staleAt) - now));
+        flags = 0;
+        if (result != GL_TIMEOUT_EXPIRED)
+            PopPaceFences(1);
+    }
+    s64 waited = PaceNowNs() - start;
+    PaceLog.WaitNs += waited;
+    PaceLog.MaxWaitNs = std::max(PaceLog.MaxWaitNs, waited);
+}
+
 void GLRenderer::Blit(const GPU& gpu)
 {
+    // GPU::GLPace: before this frame's compositor goes in the queue, the frame before the last must
+    // be done. the Blit's the spot as its fence covers the whole frame. a frame that mapped a
+    // capture readback (at line 0, or at line 192 for held lines) already waited for the GPU to get
+    // past that fence, so the two never both wait
+    if (gpu.GLPace != 0 || PaceFenceCount != 0)
+        UpdatePace(gpu);
+    if (gpu.GLPace != 0 && PaceFenceCount >= 2)
+        WaitForPace();
+
 #ifdef MELONADE_DEBUG_TOOLS
     // the compositor's GPU timers, which it starts through BeginGPUTimer
     if (Timers)
@@ -3763,6 +3885,18 @@ void GLRenderer::Blit(const GPU& gpu)
     if (Timers)
         Timers->EndSet();
 #endif
+
+    // GPU::GLPace: signals when the GPU has finished this frame, the compositor and everything
+    // before it, the 3D render it shows too. not flushed here, which would send the compositor off
+    // earlier than it goes now: the frontend's frame-end flush (or the one after a late Blit) does
+    if (gpu.GLPace != 0)
+    {
+        if (PaceFenceCount == MaxPaceFences)
+            PopPaceFences(1);
+        PaceFences[PaceFenceCount] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        PaceFenceNs[PaceFenceCount++] = PaceNowNs();
+        PaceLog.Frames++;
+    }
 
     // the compositor and its hi-res capture pass were the last to read the kept frame, and GL
     // keeps their reads ahead of the render that next draws into it

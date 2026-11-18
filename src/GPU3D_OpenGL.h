@@ -522,6 +522,25 @@ private:
     GLuint MainFramebuffer {}, DownscaleFramebuffer {};
     u32 Framebuffer[256*192] {};
 
+    // GPU::GLPace: a fence for each Blit the GPU hasn't finished, oldest first, and when each was
+    // made. past the room for them the oldest is forgotten
+    static constexpr int MaxPaceFences = 8;
+    GLsync PaceFences[MaxPaceFences] {};
+    s64 PaceFenceNs[MaxPaceFences] {};
+    int PaceFenceCount = 0;
+    // the GLPACE log, zeroed with every line
+    struct
+    {
+        s64 StartNs = 0, WaitNs = 0, MaxWaitNs = 0;
+        u32 Frames = 0, Waits = 0, Timeouts = 0, Stale = 0;
+        int MaxPending = 0;
+    } PaceLog;
+
+    void DropPaceFences() noexcept;
+    void PopPaceFences(int count) noexcept;
+    void UpdatePace(const GPU& gpu) noexcept;
+    void WaitForPace() noexcept;
+
 #ifdef MELONADE_DEBUG_TOOLS
     // GPU discovery (docs/plan-gpu-discovery.md), all null while their switches are off, and then
     // nothing here makes a GL call for them. GLTIME (GPU::GLTimers)

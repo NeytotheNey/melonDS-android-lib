@@ -1062,6 +1062,15 @@ public:
     // isn't. only changed by a debug switch, which also turns the COMPPACE log line on
     int ComputePace = 2;
     bool ComputePaceLog = false;
+    // OpenGL renderer: the same for its frames, going by a fence after each Blit's compositor
+    // draws, which covers the 3D render they show too (GLRenderer::UpdatePace). without it a frame
+    // whose GPU work overran (the GPU 2D shadow in mode all on the OnePlus 7 Pro, before its fix)
+    // queued up behind the one before until presented fps fell to about 2. 0 off. 1 waits before
+    // a Blit until at most one earlier frame is unfinished, which never happens while the GPU keeps
+    // up. there is no skipping like ComputePace 2. only changed by a debug switch, which also turns
+    // the GLPACE log line on
+    int GLPace = 1;
+    bool GLPaceLog = false;
     // debug only, compute renderer: 8, 16 or 32 forces that tile size at any scale where it can
     // work, for A/B runs. 0 is the size the scale picks (TileSizeForScale)
     int ComputeTileSize = 0;
