@@ -111,7 +111,7 @@ public:
     [[nodiscard]] bool NeedsCaptureRedraw() const noexcept override { return PaceStale; }
     void RedrawSkippedFrame(GPU& gpu) override;
 
-    bool NeedsShaderCompile() override { return ShaderStepIdx != 33; }
+    bool NeedsShaderCompile() override { return ShaderStepIdx != ShaderProgramCount(); }
     void ShaderCompileStep(int& current, int& count) override;
 private:
     ComputeRenderer(GLCompositor&& compositor);
@@ -132,6 +132,8 @@ private:
     GLuint ShaderCalculateWorkListOffset {};
     GLuint ShaderSortWork {};
     GLuint ShaderFinalPass[8] {};
+    // GPU::ComputeVis bit 1 only: the visibility pass, Z and W
+    GLuint ShaderOpaqueVis[2] {};
 
     GLuint YSpanIndicesTextureMemory {};
     GLuint YSpanIndicesTexture {};
@@ -323,10 +325,15 @@ private:
         u32 FogOffset, FogShift, FogColor;
 
         s32 ClearBitmapOffset[2];
+
+        // GPU::ComputeVis: the opaque prefix's end (VisPrefixFor), 0 without the switch
+        u32 VisPrefixEnd;
+        // the block's size rounded up to a vec4, which some drivers take as its size
+        u32 Pad[3];
     };
     // std140: the ivec2 needs 8 byte alignment, which the 146 uints before it already give
-    static_assert(offsetof(MetaUniform, ClearBitmapOffset) == 584 && sizeof(MetaUniform) == 592,
-        "MetaUniform must match the std140 layout of the shader's MetaUniform block");
+    static_assert(offsetof(MetaUniform, ClearBitmapOffset) == 584 && offsetof(MetaUniform, VisPrefixEnd) == 592
+        && sizeof(MetaUniform) == 608, "MetaUniform must match the std140 layout of the shader's MetaUniform block");
     GLuint MetaUniformMemory {};
 
     GLuint Samplers[9] {};
@@ -499,6 +506,21 @@ private:
     // GPU::ComputeProbe as compiled, Rasterise's inexact cost probes (ProbeNoTexSample, ProbeNoInterp,
     // ProbeNoDivide in the shader)
     int ProbeMode = 0;
+    // GPU::ComputeVis as compiled (Phase 2 of docs/plan-compute-efficiency.md). bit 1, stage 1a: the
+    // visibility pass (OpaqueVis) resolves the opaque prefix on polygon indices, Rasterise shades
+    // only its winners (VisShade) and DepthBlend becomes Resolve (VisResolve), which starts from what
+    // OpaqueVis left. its two programs come after the 33, and the result buffer gets a word a pixel
+    // for the winners. a change recompiles at RenderFrame, like ComputeOpt; Reset takes it before
+    // the first compile
+    static constexpr int ComputeVis_Opaque = 1 << 0;
+    static constexpr int ComputeVis_All = ComputeVis_Opaque;
+    int VisMode = 0;
+    [[nodiscard]] int ShaderProgramCount() const noexcept { return 33 + (VisMode ? 2 : 0); }
+    // the opaque prefix stage 1a can resolve: the polygons from 0 up to the first that is
+    // translucent, mode 3 (shadow or shadow mask) or a cut-out (VisCutout). all of their fragments
+    // have alpha 31 in Rasterise
+    [[nodiscard]] static bool VisCutout(const Polygon* polygon, bool textureMaps) noexcept;
+    [[nodiscard]] static u32 VisPrefixFor(const GPU& gpu, int numPolygons) noexcept;
     GLint MaxTexBufferSize = 0;
     GLuint ShaderCheckSetup = 0;
     bool CheckSetupFailed = false;

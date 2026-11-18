@@ -212,12 +212,21 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     // GPU::ComputeCalc 1: CalcOffsets with the old atomic offsets
     if (&source == &ComputeRendererShaders::CalcOffsets && CalcMode != 0)
         shaderSource += "#define CalcAtomic\n";
-    // GPU::ComputeProbe: Rasterise's inexact cost probes
-    if (&source == &ComputeRendererShaders::Rasterise)
+    // GPU::ComputeProbe: Rasterise's inexact cost probes, and OpaqueVis's divide, so its depths
+    // stay Rasterise's
+    if (&source == &ComputeRendererShaders::Rasterise || &source == &ComputeRendererShaders::OpaqueVis)
     {
         if (ProbeMode & 1) shaderSource += "#define ProbeNoTexSample\n";
         if (ProbeMode & 2) shaderSource += "#define ProbeNoInterp\n";
         if (ProbeMode & 4) shaderSource += "#define ProbeNoDivide\n";
+    }
+    // GPU::ComputeVis bit 1: Rasterise's shade mode for the opaque prefix, and DepthBlend as Resolve
+    if (VisMode & ComputeVis_Opaque)
+    {
+        if (&source == &ComputeRendererShaders::Rasterise)
+            shaderSource += "#define VisShade\n";
+        if (&source == &ComputeRendererShaders::DepthBlend)
+            shaderSource += "#define VisResolve\n";
     }
     // GPU::ComputeFlat 0: VariantWorkCount as uvec4s again, in every program with the binning buffer
     if (FlatMode == 0 && source.find("BinResultBuffer") != std::string::npos)
@@ -316,10 +325,10 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
 {
     current = ShaderStepIdx;
     ShaderStepIdx++;
-    count = 33;
+    count = ShaderProgramCount();
 
-    // a batch is the 33 programs of one configuration. the Android frontend and RenderFrame compile
-    // them all at once, the Qt one a step per frame
+    // a batch is the 33 programs of one configuration (35 with GPU::ComputeVis). the Android frontend
+    // and RenderFrame compile them all at once, the Qt one a step per frame
     if (current == 0)
     {
         ShaderBatch = {};
@@ -343,10 +352,10 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
 #ifdef MELONADE_DEBUG_TOOLS
     if (current == count - 1)
     {
-        Platform::Log(Platform::LogLevel::Info, "COMPSHADER programs=%d hits=%u misses=%u rejected=%u uncached=%u ms=%.1f loaded=%llu saved=%llu cache=%d scale=%d width=%d tile=%d opt=%d\n",
+        Platform::Log(Platform::LogLevel::Info, "COMPSHADER programs=%d hits=%u misses=%u rejected=%u uncached=%u ms=%.1f loaded=%llu saved=%llu cache=%d scale=%d width=%d tile=%d opt=%d vis=%d\n",
             count, ShaderBatch.Hits, ShaderBatch.Misses, ShaderBatch.Rejected, ShaderBatch.Uncached,
             ShaderBatchNs / 1e6, (unsigned long long)ShaderBatch.BytesLoaded, (unsigned long long)ShaderBatch.BytesSaved,
-            UseShaderCache ? 1 : 0, ScaleFactor, TargetWidth, TileSize, OptMask);
+            UseShaderCache ? 1 : 0, ScaleFactor, TargetWidth, TileSize, OptMask, VisMode);
     }
 #endif
 }
@@ -453,6 +462,13 @@ void ComputeRenderer::CompileShaderStep(int current)
         return;
     case 32:
         CompileShader(ShaderFinalPass[7], ComputeRendererShaders::FinalPass, {"FinalPass", "AntiAliasing", "EdgeMarking", "Fog"});
+        return;
+    // GPU::ComputeVis only (ShaderProgramCount)
+    case 33:
+        CompileShader(ShaderOpaqueVis[0], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "ZBuffer"});
+        return;
+    case 34:
+        CompileShader(ShaderOpaqueVis[1], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "WBuffer"});
         return;
     default:
         __builtin_unreachable();
@@ -678,6 +694,8 @@ void ComputeRenderer::DeleteShaders()
         &ShaderFinalPass[5],
         &ShaderFinalPass[6],
         &ShaderFinalPass[7],
+        &ShaderOpaqueVis[0],
+        &ShaderOpaqueVis[1],
     };
     // Program names are shared with the frontend's contexts, so clear them after deleting. Deleting a stale name again (in the destructor, or
     // when the settings change before the shaders are compiled again) could free a program that reused it
@@ -696,6 +714,10 @@ void ComputeRenderer::Reset(GPU& gpu)
 {
     // set before the first compile, which comes before the first RenderFrame
     UseShaderCache = gpu.ShaderCache;
+    // so is GPU::ComputeVis while nothing is compiled yet, which saves a second compile at the first
+    // frame. later changes are RenderFrame's
+    if (ScaleFactor == -1)
+        VisMode = gpu.ComputeVis & ComputeVis_All;
     // and before the targets' first setup (SetRenderSettings), which starts the rooms. without
     // ComputeGrow the rooms are the most at the first frame, so there's nothing to remember.
     // a cart without a game code (homebrew) or no cart has no rooms. DSiWare is loaded as a cart
@@ -1087,8 +1109,10 @@ void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, i
     // storage is let go first, as the destructor does, so it isn't held through all of them
     ShrinkWorkBuffers();
 
+    // color, depth and attributes for two layers, and with GPU::ComputeVis a word for the winners
+    // (ResultWinnerStart in the shaders)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, FinalTileMemory);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, 4*3*2*ScreenWidth*ScreenHeight, nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (4*3*2 + (VisMode ? 4 : 0))*ScreenWidth*ScreenHeight, nullptr, GL_DYNAMIC_DRAW);
 
     int binResultSize = sizeof(BinResultHeader)
         + TilesPerLine*TileLines*CoarseBinStride*4 // BinnedMaskCoarse
@@ -1774,6 +1798,32 @@ s32 ComputeRenderer::WideVertexY(s32 hiresy) const
     return HiresCoordinates ? (y * ScaleFactor) >> 4 : (y >> 4) * ScaleFactor;
 }
 
+// a polygon that isn't translucent and isn't mode 3 whose texture can make a texel transparent:
+// palette formats with color 0 transparent, 4x4 and direct, not in decal mode, with texture maps
+// on. any other such polygon's fragments come out of Rasterise with alpha 31: no texture or decal
+// gives the polygon's alpha (31, or 31 for wireframe's 0), and modulate, toon and highlight give
+// the texel's at polygon alpha 31, which the other formats have at 31 (1 and 6 are translucent)
+bool ComputeRenderer::VisCutout(const Polygon* polygon, bool textureMaps) noexcept
+{
+    u32 mode = (polygon->Attr >> 4) & 0x3, fmt = (polygon->TexParam >> 26) & 0x7;
+    return !polygon->Translucent && mode != 3 && mode != 1 && textureMaps && fmt != 0
+        && (fmt == 5 || fmt == 7 || ((polygon->TexParam >> 29) & 1));
+}
+
+// GPU::ComputeVis bit 1: the opaque prefix cut at its first cut-out (COMPVIS's precut)
+u32 ComputeRenderer::VisPrefixFor(const GPU& gpu, int numPolygons) noexcept
+{
+    const GPU3D& gpu3d = gpu.GPU3D;
+    bool texMaps = gpu3d.RenderDispCnt & (1<<0);
+    for (int i = 0; i < numPolygons; i++)
+    {
+        const Polygon* p = gpu3d.RenderPolygonRAM[i];
+        if (p->Translucent || ((p->Attr >> 4) & 0x3) == 3 || VisCutout(p, texMaps))
+            return (u32)i;
+    }
+    return (u32)numPolygons;
+}
+
 #ifdef MELONADE_DEBUG_TOOLS
 // debug.melonade.computetimers, computepeaks and computesync, at the start of every RenderFrame:
 // makes the stats when a switch is on (again if one changed), drops them when all are off, and lets
@@ -1920,9 +1970,8 @@ void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
     for (int i = 0; i < numPolygons; i++)
     {
         const Polygon* p = gpu3d.RenderPolygonRAM[i];
-        u32 mode = (p->Attr >> 4) & 0x3, fmt = (p->TexParam >> 26) & 0x7;
-        bool cut = !p->Translucent && mode != 3 && mode != 1 && texMaps && fmt != 0
-            && (fmt == 5 || fmt == 7 || ((p->TexParam >> 29) & 1));
+        u32 mode = (p->Attr >> 4) & 0x3;
+        bool cut = VisCutout(p, texMaps);
         bool equal = (p->Attr >> 14) & 1;
         if (prefix < 0 && (p->Translucent || mode == 3))
         {
@@ -2556,14 +2605,17 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     int calcMode = std::clamp(gpu.ComputeCalc, 0, 1);
     int flatMode = std::clamp(gpu.ComputeFlat, 0, 1);
     int probeMode = gpu.ComputeProbe & 7;
+    // GPU::ComputeVis too, which also sizes the result buffer (ResizeTargets)
+    int visMode = gpu.ComputeVis & ComputeVis_All;
     if (binMode != BinMode || gpu.ComputeSSBO != SetupSSBO || calcMode != CalcMode || flatMode != FlatMode
-        || probeMode != ProbeMode)
+        || probeMode != ProbeMode || visMode != VisMode)
     {
         BinMode = binMode;
         SetupSSBO = gpu.ComputeSSBO;
         CalcMode = calcMode;
         FlatMode = flatMode;
         ProbeMode = probeMode;
+        VisMode = visMode;
         optChanged = true;
     }
     // ComputeOpt_SwapSkip: has GPU3D compare each swap's scene with the one before, from the next
@@ -3111,6 +3163,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     meta.NumPolygons = numPolygons;
     meta.NumVariants = numVariants;
     meta.AlphaRef = gpu.GPU3D.RenderAlphaRef;
+    // GPU::ComputeVis: the opaque prefix OpaqueVis resolves. none without polygons, and then
+    // Resolve is DepthBlend as it was
+    const u32 visPrefixEnd = (VisMode & ComputeVis_Opaque) && numYSpans > 0 ? VisPrefixFor(gpu, numPolygons) : 0;
+    meta.VisPrefixEnd = visPrefixEnd;
+    meta.Pad[0] = meta.Pad[1] = meta.Pad[2] = 0;
     {
         u32 r = (gpu.GPU3D.RenderClearAttr1 << 1) & 0x3E; if (r) r++;
         u32 g = (gpu.GPU3D.RenderClearAttr1 >> 4) & 0x3E; if (g) g++;
@@ -3241,6 +3298,20 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | commandBarrier);
 
         SLOW_LAP(Bin);
+        // GPU::ComputeVis: the visibility pass over the opaque prefix, from the bin masks and the X
+        // spans, which Rasterise reads the winners of. it starts from the clear bitmap as DepthBlend does
+        if (visPrefixEnd != 0)
+        {
+            BeginGPUTimer(ComputePass::Vis);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[0]);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[1]);
+            glActiveTexture(GL_TEXTURE0);
+            UseProgram(ShaderOpaqueVis[wbuffer]);
+            glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
         // one timer over every variant's dispatch
         BeginGPUTimer(ComputePass::Rast);
         glActiveTexture(GL_TEXTURE0);

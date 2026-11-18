@@ -32,6 +32,8 @@ namespace melonDS::ComputePass
 enum
 {
     Clear, Interp, Bin, Offs, Sort, Rast, Depth, Final,
+    // OpaqueVis (GPU::ComputeVis), between Sort and Rast in a render
+    Vis,
     Comp, CompExtra,
     CompHires, CompShadowObj, CompUpload, CompFilter, CompShadow, CompWings, CompHiCap,
     Count,
@@ -78,6 +80,7 @@ namespace melonDS
 //                   GPU 2D shadow's OBJ pass on (uploads, filtered 2D, the shadow's composite, the
 //                   held wings, hi-res capture)
 //   total           the sum of those
+//   vis             ms per timed render of OpaqueVis (GPU::ComputeVis), at the end of the line
 //   comp_hd cx_misc cx_sobj cx_up cx_filter cx_shadow cx_wings cx_hicap
 //                   the compositor's parts, at the end of the line, as GLTIME has them (see there):
 //                   ms per timed Blit, 0 for a Blit a part didn't run in, so comp_hd is part of comp
@@ -466,12 +469,12 @@ private:
             "sort=%.3f rast=%.3f depth=%.3f final=%.3f comp=%.3f compx=%.3f total=%.3f polys=%.0f variants=%.1f "
             "scale=%d tile=%d %s comp_hd=%.3f comp_hd_n=%u cx_misc=%.3f cx_sobj=%.3f cx_sobj_n=%u cx_up=%.3f cx_up_n=%u "
             "cx_filter=%.3f cx_filter_n=%u cx_shadow=%.3f cx_shadow_n=%u cx_wings=%.3f cx_wings_n=%u cx_hicap=%.3f "
-            "cx_hicap_n=%u\n",
+            "cx_hicap_n=%u vis=%.3f\n",
             Sync ? "COMPSYNC" : "COMPTIME", Sec.Frames, Sec.Skipped, ms[Clear], ms[Interp], ms[Bin], ms[Offs], ms[Sort],
             ms[Rast], ms[Depth], ms[Final], comp, compx, total, Sec.Polys * perFrame, Sec.Variants * perFrame,
             scale, tileSize, tail, ms[CompHires], n[CompHires], ms[CompExtra], ms[CompShadowObj], n[CompShadowObj],
             ms[CompUpload], n[CompUpload], ms[CompFilter], n[CompFilter], ms[CompShadow], n[CompShadow], ms[CompWings],
-            n[CompWings], ms[CompHiCap], n[CompHiCap]);
+            n[CompWings], ms[CompHiCap], n[CompHiCap], ms[Vis]);
     }
 };
 

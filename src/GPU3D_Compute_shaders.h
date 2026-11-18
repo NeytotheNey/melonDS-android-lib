@@ -97,7 +97,7 @@ struct XSpanSetup
     int CovLInitial, CovRInitial;
 };
 
-#if defined(Rasterise)
+#if defined(Rasterise) || defined(OpaqueVis)
 int CalcYFactorX(XSpanSetup span, int x)
 {
     x -= span.X0;
@@ -403,6 +403,151 @@ layout (std430, binding = 5) buffer ResultBuffer
 const uint ResultColorStart = 0u;
 const uint ResultDepthStart = ResultColorStart+uint(ScreenWidth)*uint(ScreenHeight)*2u;
 const uint ResultAttrStart = ResultDepthStart+uint(ScreenWidth)*uint(ScreenHeight)*2u;
+// debug.melonade.computevis: after the attributes, a word for each pixel with the polygon each layer
+// has from the opaque prefix (OpaqueVis), the first layer in the low half, the second in the high
+// one, or one of the two sentinels. the buffer only has room for it while the switch is on
+// (ResizeTargets)
+const uint ResultWinnerStart = ResultAttrStart+uint(ScreenWidth)*uint(ScreenHeight)*2u;
+// the clear color, depth and attributes (or the clear bitmap's)
+const uint VisClear = 0xFFFFu;
+// the second layer as it starts, all zeros
+const uint VisEmpty = 0xFFFEu;
+)"};
+
+// Rasterise with debug.melonade.computevis (VisShade): the result buffer, which the winners of the
+// opaque prefix are shaded into
+const std::string VisResultBuffer = "#ifdef VisShade\n" + ResultBuffer + "#endif\n";
+
+/*
+    shared by Rasterise and OpaqueVis (debug.melonade.computevis), so the visibility pass finds the
+    pixels, edge flags, coverage and depths that Rasterise shades
+*/
+const std::string RasteriseShared{R"(
+// whether a span covers pixel x, and which part of it the pixel is in
+bool SpanCovers(int x, int spanX0, int spanX1, int insideStart, int insideEnd, uint flags,
+    out bool insideLeftEdge, out bool insideRightEdge)
+{
+    insideLeftEdge = x < insideStart;
+    insideRightEdge = x >= insideEnd;
+    bool insidePolygonInside = !insideLeftEdge && !insideRightEdge;
+
+    return x >= spanX0 && x < spanX1
+        && ((insideLeftEdge && (flags & XSpanSetup_FillLeft) != 0U)
+            || (insideRightEdge && (flags & XSpanSetup_FillRight) != 0U)
+            || (insidePolygonInside && (flags & XSpanSetup_FillInside) != 0U));
+}
+
+// a covered pixel's attributes: the edge flags in bits 0-3 and the edge's coverage in bits 8-12.
+// reads EdgeCovL, EdgeCovR, CovLInitial, CovRInitial, X0 and InsideEnd of the span
+uint FragmentAttr(ivec2 position, int yTop, int yBot, bool insideLeftEdge, bool insideRightEdge, XSpanSetup xspan)
+{
+    uint attr = 0U;
+    if (position.y == yTop)
+        attr |= 0x4U;
+    else if (position.y == yBot - 1)
+        attr |= 0x8U;
+
+    if (insideLeftEdge)
+    {
+        attr |= 0x1U;
+
+        int cov = xspan.EdgeCovL;
+        if (cov < 0)
+        {
+            int xcov = xspan.CovLInitial + (xspan.EdgeCovL & 0x3FF) * (position.x - xspan.X0);
+            cov = min(xcov >> 5, 31);
+        }
+
+        attr |= uint(cov) << 8;
+    }
+    else if (insideRightEdge)
+    {
+        attr |= 0x2U;
+
+        int cov = xspan.EdgeCovR;
+        if (cov < 0)
+        {
+            int xcov = xspan.CovRInitial + (xspan.EdgeCovR & 0x3FF) * (position.x - xspan.InsideEnd);
+            cov = max(0x1F - (xcov >> 5), 0);
+        }
+
+        attr |= uint(cov) << 8;
+    }
+
+    return attr;
+}
+
+// the perspective factor of a covered pixel (X0 < X1), from X0, X1, W0, W1 and Flags
+int SpanFactor(XSpanSetup xspan, int x)
+{
+#if defined(ProbeNoDivide)
+    // debug.melonade.computeprobe 4, inexact on purpose: a linear factor with a float
+    // reciprocal instead of the perspective divide, to time what the divide costs. only
+    // where the divide runs: with OptLinearNoDivide, z-buffering skips it on linear spans
+#if defined(OptLinearNoDivide) && defined(ZBuffer)
+    int ifactor = 0;
+    if ((xspan.Flags & XSpanSetup_Linear) == 0U)
+#else
+    int ifactor;
+#endif
+        ifactor = int(float((x - xspan.X0) << YFactorShift) / float(xspan.X1 - xspan.X0));
+#elif defined(OptLinearNoDivide) && defined(ZBuffer)
+    // z-buffering only uses the factor for a perspective span's attributes, so a
+    // linear one skips the divide
+    int ifactor = 0;
+    if ((xspan.Flags & XSpanSetup_Linear) == 0U)
+        ifactor = CalcYFactorX(xspan, x);
+#else
+    int ifactor = CalcYFactorX(xspan, x);
+#endif
+    return ifactor;
+}
+
+// a covered pixel's depth, from Z0, Z1, X0, X1 and XRecip (z-buffer) or the factor (w-buffer)
+uint SpanDepth(XSpanSetup xspan, int x, int ifactor)
+{
+#ifdef ZBuffer
+    return InterpolateZZBuffer(xspan.Z0, xspan.Z1, x - xspan.X0, xspan.XRecip, xspan.X1 - xspan.X0);
+#endif
+#ifdef WBuffer
+    return InterpolateZWBuffer(xspan.Z0, xspan.Z1, ifactor);
+#endif
+}
+)"};
+
+// the layers a pixel starts with, shared by DepthBlend and OpaqueVis
+const std::string ClearLayersSource{R"(
+layout (binding = 0) uniform usampler2D ClearBitmapColor;
+layout (binding = 1) uniform usampler2D ClearBitmapDepth;
+
+// the clear color, depth and attributes (or the clear bitmap's) on top, nothing below
+void ClearLayers(out uvec2 color, out uvec2 depth, out uvec2 attr)
+{
+    attr = uvec2(ClearAttr, 0U);
+    if ((DispCnt & (1U<<14)) != 0U)
+    {
+        // clear bitmap: tiled at native resolution across the whole target, scrolled by
+        // ClearAttr2 (with a wide target's centre folded in, see RenderFrame) and wrapping at
+        // 256. ScreenWidth is the tile-rounded width, so the scale comes from the height, or
+        // with a margin (whose height is rounded too) from ScreenScale.
+        // the colour is already the packed 6-bit format, the depth texel is depth24 | fog<<24
+#ifdef ScreenScale
+        const int scale = ScreenScale;
+#else
+        const int scale = ScreenHeight/192;
+#endif
+        ivec2 pos = (ivec2(gl_GlobalInvocationID.xy) / scale + ClearBitmapOffset) & 0xFF;
+        color = uvec2(texelFetch(ClearBitmapColor, pos, 0).r, 0U);
+        depth = uvec2(texelFetch(ClearBitmapDepth, pos, 0).r, 0U);
+        attr.x = (attr.x & ~0x8000U) | ((depth.x >> 9) & 0x8000U);
+        depth.x &= 0xFFFFFFU;
+    }
+    else
+    {
+        color = uvec2(ClearColor, 0U);
+        depth = uvec2(ClearDepth, 0U);
+    }
+}
 )"};
 
 const char* Common = R"(
@@ -442,6 +587,10 @@ layout (std140, binding = 0) uniform MetaUniform
     uint FogOffset, FogShift, FogColor;
 
     ivec2 ClearBitmapOffset;
+
+    // debug.melonade.computevis (OpaqueVis): the polygons before this are the opaque prefix, which
+    // OpaqueVis resolves and Rasterise only shades the winners of. 0 without it
+    uint VisPrefixEnd;
 };
 
 #ifdef InterpSpans
@@ -450,7 +599,7 @@ const int YFactorShift = 9;
 const int YFactorShift = 8;
 #endif
 
-#if defined(InterpSpans) || defined(Rasterise)
+#if defined(InterpSpans) || defined(Rasterise) || defined(OpaqueVis)
 uint Umulh(uint a, uint b)
 {
     uint lo, hi;
@@ -670,7 +819,7 @@ uint InterpolateZWBuffer(int z0, int z1, int ifactor)
     if (z0 == z1)
         return uint(z0);
 
-#ifdef Rasterise
+#if defined(Rasterise) || defined(OpaqueVis)
     // since the precision along x spans is only 8 bit the result will always fit in 32-bit
     if (z0 < z1)
     {
@@ -1242,9 +1391,17 @@ const std::string Rasterise =
     WorkDescBuffer +
     XSpanSetupBuffer +
     BinningBuffer +
-    Tilebuffers + R"(
+    Tilebuffers +
+    VisResultBuffer +
+    RasteriseShared + R"(
 
 layout (local_size_x = TileSize, local_size_y = TileSize) in;
+
+// debug.melonade.computevis: the shade mode for the opaque prefix's polygons. a shadow mask is
+// never in the prefix
+#if defined(VisShade) && !defined(ShadowMask)
+#define VisShadeMode
+#endif
 
 layout (binding = 0) uniform usampler2DArray CurrentTexture;
 
@@ -1284,6 +1441,27 @@ void RasteriseTile(uint workIdx)
     ivec2 position = ivec2(int(bitfieldExtract(workDesc.x, 0, 16)), int(bitfieldExtract(workDesc.x, 16, 16))) + ivec2(gl_LocalInvocationID.xy);
     int tileOffset = int(bitfieldExtract(workDesc.y, PolyIdxBits, 32 - PolyIdxBits)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
 
+#ifdef VisShadeMode
+    // a polygon of the opaque prefix: OpaqueVis found which polygon each layer of the pixel has,
+    // so only those are shaded, straight into their layer of the result. the rest leave here.
+    // DepthBlend passes over the prefix's work tiles, so nothing goes into the tile memory
+    uint visResult = 0xFFFFFFFFU;
+    {
+        uint visPolygon = bitfieldExtract(workDesc.y, 0, PolyIdxBits);
+        if (visPolygon < VisPrefixEnd)
+        {
+            uint visPixel = uint(position.x) + uint(position.y) * uint(ScreenWidth);
+            uint winner = ResultValue[ResultWinnerStart + visPixel];
+            if ((winner & 0xFFFFU) == visPolygon)
+                visResult = ResultColorStart + visPixel;
+            else if ((winner >> 16) == visPolygon)
+                visResult = ResultColorStart + visPixel + uint(FramebufferStride);
+            else
+                return;
+        }
+    }
+#endif
+
     uint color = 0U;
 #ifdef OptFieldLoads
     if (position.y >= polyYTop && position.y < polyYBot)
@@ -1296,14 +1474,8 @@ void RasteriseTile(uint workIdx)
         int spanInsideEnd = XSpanSetups[xspanIdx].InsideEnd;
         uint spanFlags = XSpanSetups[xspanIdx].Flags;
 
-        bool insideLeftEdge = position.x < spanInsideStart;
-        bool insideRightEdge = position.x >= spanInsideEnd;
-        bool insidePolygonInside = !insideLeftEdge && !insideRightEdge;
-
-        if (position.x >= spanX0 && position.x < spanX1
-            && ((insideLeftEdge && (spanFlags & XSpanSetup_FillLeft) != 0U)
-                || (insideRightEdge && (spanFlags & XSpanSetup_FillRight) != 0U)
-                || (insidePolygonInside && (spanFlags & XSpanSetup_FillInside) != 0U)))
+        bool insideLeftEdge, insideRightEdge;
+        if (SpanCovers(position.x, spanX0, spanX1, spanInsideStart, spanInsideEnd, spanFlags, insideLeftEdge, insideRightEdge))
         {
             // XMin to Variant aren't used here
             Polygon polygon = Polygon(polyFirstXSpan, polyYTop, polyYBot, 0, 0, 0, 0, 0,
@@ -1339,48 +1511,11 @@ void RasteriseTile(uint workIdx)
     {
         XSpanSetup xspan = XSpanSetups[polygon.FirstXSpan + (position.y - polygon.YTop)];
 
-        bool insideLeftEdge = position.x < xspan.InsideStart;
-        bool insideRightEdge = position.x >= xspan.InsideEnd;
-        bool insidePolygonInside = !insideLeftEdge && !insideRightEdge;
-
-        if (position.x >= xspan.X0 && position.x < xspan.X1
-            && ((insideLeftEdge && (xspan.Flags & XSpanSetup_FillLeft) != 0U)
-                || (insideRightEdge && (xspan.Flags & XSpanSetup_FillRight) != 0U)
-                || (insidePolygonInside && (xspan.Flags & XSpanSetup_FillInside) != 0U)))
+        bool insideLeftEdge, insideRightEdge;
+        if (SpanCovers(position.x, xspan.X0, xspan.X1, xspan.InsideStart, xspan.InsideEnd, xspan.Flags, insideLeftEdge, insideRightEdge))
         {
 #endif
-            uint attr = 0U;
-            if (position.y == polygon.YTop)
-                attr |= 0x4U;
-            else if (position.y == polygon.YBot - 1)
-                attr |= 0x8U;
-
-            if (insideLeftEdge)
-            {
-                attr |= 0x1U;
-
-                int cov = xspan.EdgeCovL;
-                if (cov < 0)
-                {
-                    int xcov = xspan.CovLInitial + (xspan.EdgeCovL & 0x3FF) * (position.x - xspan.X0);
-                    cov = min(xcov >> 5, 31);
-                }
-
-                attr |= uint(cov) << 8;
-            }
-            else if (insideRightEdge)
-            {
-                attr |= 0x2U;
-
-                int cov = xspan.EdgeCovR;
-                if (cov < 0)
-                {
-                    int xcov = xspan.CovRInitial + (xspan.EdgeCovR & 0x3FF) * (position.x - xspan.InsideEnd);
-                    cov = max(0x1F - (xcov >> 5), 0);
-                }
-
-                attr |= uint(cov) << 8;
-            }
+            uint attr = FragmentAttr(position, polygon.YTop, polygon.YBot, insideLeftEdge, insideRightEdge, xspan);
 
             uint z;
             int u, v, vr, vg, vb;
@@ -1399,35 +1534,12 @@ void RasteriseTile(uint workIdx)
             else
 #endif
             {
-#if defined(ProbeNoDivide)
-                // debug.melonade.computeprobe 4, inexact on purpose: a linear factor with a float
-                // reciprocal instead of the perspective divide, to time what the divide costs. only
-                // where the divide runs: with OptLinearNoDivide, z-buffering skips it on linear spans
-#if defined(OptLinearNoDivide) && defined(ZBuffer)
-                int ifactor = 0;
-                if ((xspan.Flags & XSpanSetup_Linear) == 0U)
-#else
-                int ifactor;
-#endif
-                    ifactor = int(float((position.x - xspan.X0) << YFactorShift) / float(xspan.X1 - xspan.X0));
-#elif defined(OptLinearNoDivide) && defined(ZBuffer)
-                // z-buffering only uses the factor for a perspective span's attributes, so a
-                // linear one skips the divide
-                int ifactor = 0;
-                if ((xspan.Flags & XSpanSetup_Linear) == 0U)
-                    ifactor = CalcYFactorX(xspan, position.x);
-#else
-                int ifactor = CalcYFactorX(xspan, position.x);
-#endif
+                // the probes and OptLinearNoDivide are in SpanFactor
+                int ifactor = SpanFactor(xspan, position.x);
                 int idiff = xspan.X1 - xspan.X0;
                 int i = position.x - xspan.X0;
 
-#ifdef ZBuffer
-                z = InterpolateZZBuffer(xspan.Z0, xspan.Z1, i, xspan.XRecip, idiff);
-#endif
-#ifdef WBuffer
-                z = InterpolateZWBuffer(xspan.Z0, xspan.Z1, ifactor);
-#endif
+                z = SpanDepth(xspan, position.x, ifactor);
 #ifdef ProbeNoInterp
                 // computeprobe 2, inexact: the span's left end for color and texcoords. the factor
                 // stays in use (it's never negative), so the divide is still paid
@@ -1556,10 +1668,16 @@ void RasteriseTile(uint workIdx)
                 color = (color & TileColorMask) | PackTileAttr(attr);
 #endif
 
-                TileDepth(tileOffset) = z;
-#ifndef OptPackAttr
-                AttrTiles[tileOffset] = attr;
+#ifdef VisShadeMode
+                // a winner's depth and attributes are OpaqueVis's
+                if (visResult == 0xFFFFFFFFU)
 #endif
+                {
+                    TileDepth(tileOffset) = z;
+#ifndef OptPackAttr
+                    AttrTiles[tileOffset] = attr;
+#endif
+                }
             }
 #else
             color = 0xFFFFFFFFU; // doesn't really matter as long as it's not 0
@@ -1568,6 +1686,18 @@ void RasteriseTile(uint workIdx)
         }
     }
 
+#ifdef VisShadeMode
+    if (visResult != 0xFFFFFFFFU)
+    {
+        // what DepthBlend takes for an opaque pixel: the color without the attributes packed into it
+#ifdef OptPackAttr
+        ResultValue[visResult] = color & TileColorMask;
+#else
+        ResultValue[visResult] = color;
+#endif
+        return;
+    }
+#endif
     TileColor(tileOffset) = color;
 }
 
@@ -1586,16 +1716,50 @@ void main()
 
 )";
 
+/*
+    with debug.melonade.computevis (VisResolve) this is Resolve: OpaqueVis already left the layers the
+    opaque prefix gives in the result, so a pixel starts from those and only the polygons after the
+    prefix are walked. a tile with none of those is done before it reads anything. with no prefix
+    (VisPrefixEnd 0) it's DepthBlend as it was
+*/
 const std::string DepthBlend =
     PolygonBuffer +
     Tilebuffers +
     ResultBuffer +
-    BinningBuffer + R"(
-
-layout (binding = 0) uniform usampler2D ClearBitmapColor;
-layout (binding = 1) uniform usampler2D ClearBitmapDepth;
+    BinningBuffer +
+    ClearLayersSource + R"(
 
 layout (local_size_x = TileSize, local_size_y = TileSize) in;
+
+#ifdef VisResolve
+// of coarse mask word i, the groups of 32 polygons that aren't all in the prefix
+uint VisCoarseKeep(int i)
+{
+    int first = int(VisPrefixEnd >> 5) - i * 32;
+    return first <= 0 ? 0xFFFFFFFFU : first >= 32 ? 0U : ~((1U << uint(first)) - 1U);
+}
+
+// whether the tile has a polygon past the prefix
+bool VisTileHasRest(int linearTile)
+{
+    for (int i = int(VisPrefixEnd >> 10); i < CoarseBinStride; i++)
+    {
+        uint coarseMask = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + i] & VisCoarseKeep(i);
+        if (coarseMask == 0U)
+            continue;
+        uint coarseBit = uint(findLSB(coarseMask));
+        uint group = uint(i) * 32U + coarseBit;
+        // a group after the one the prefix ends in, or a later one in this word
+        if (group * 32U >= VisPrefixEnd || (coarseMask & ~(1U << coarseBit)) != 0U)
+            return true;
+        // the group the prefix ends in
+        uint fineMask = BinningMaskAndOffset[BinningMaskStart + linearTile * BinStride + int(group)];
+        if ((fineMask >> (VisPrefixEnd - group * 32U)) != 0U)
+            return true;
+    }
+    return false;
+}
+#endif
 
 void PlotTranslucent(inout uint color, inout uint depth, inout uint attr, bool isShadow, uint tileColor, uint srcA, uint tileDepth, uint srcAttr, bool writeDepth)
 {
@@ -1645,6 +1809,17 @@ void ProcessCoarseMask(int linearTile, uint coarseMask, uint coarseOffset,
 
         uint fineMask = BinningMaskAndOffset[BinningMaskStart + int(tileOffset)];
         uint workIdx = BinningMaskAndOffset[BinningWorkOffsetsStart + int(tileOffset)];
+#ifdef VisResolve
+        // the prefix's polygons in the group it ends in were OpaqueVis's: their work tiles are
+        // passed over (VisCoarseKeep left out the groups all in the prefix)
+        uint visGroupStart = (coarseBit + coarseOffset) * 32U;
+        if (visGroupStart < VisPrefixEnd)
+        {
+            uint visDone = VisPrefixEnd - visGroupStart >= 32U ? 0xFFFFFFFFU : (1U << (VisPrefixEnd - visGroupStart)) - 1U;
+            workIdx += uint(bitCount(fineMask & visDone));
+            fineMask &= ~visDone;
+        }
+#endif
 
         while (fineMask != 0U)
         {
@@ -1802,43 +1977,40 @@ void ProcessCoarseMask(int linearTile, uint coarseMask, uint coarseOffset,
 void main()
 {
     int linearTile = int(gl_WorkGroupID.x + (gl_WorkGroupID.y * uint(TilesPerLine)));
+    int resultOffset = int(gl_GlobalInvocationID.x) + int(gl_GlobalInvocationID.y) * ScreenWidth;
 
-    uvec2 color, depth;
-    uvec2 attr = uvec2(ClearAttr, 0U);
-    if ((DispCnt & (1U<<14)) != 0U)
+    uvec2 color, depth, attr;
+#ifdef VisResolve
+    if (VisPrefixEnd != 0U)
     {
-        // clear bitmap: tiled at native resolution across the whole target, scrolled by
-        // ClearAttr2 (with a wide target's centre folded in, see RenderFrame) and wrapping at
-        // 256. ScreenWidth is the tile-rounded width, so the scale comes from the height, or
-        // with a margin (whose height is rounded too) from ScreenScale.
-        // the colour is already the packed 6-bit format, the depth texel is depth24 | fog<<24
-#ifdef ScreenScale
-        const int scale = ScreenScale;
-#else
-        const int scale = ScreenHeight/192;
-#endif
-        ivec2 pos = (ivec2(gl_GlobalInvocationID.xy) / scale + ClearBitmapOffset) & 0xFF;
-        color = uvec2(texelFetch(ClearBitmapColor, pos, 0).r, 0U);
-        depth = uvec2(texelFetch(ClearBitmapDepth, pos, 0).r, 0U);
-        attr.x = (attr.x & ~0x8000U) | ((depth.x >> 9) & 0x8000U);
-        depth.x &= 0xFFFFFFU;
+        // the whole work group leaves together, there are no barriers
+        if (!VisTileHasRest(linearTile))
+            return;
+        // the prefix has no shadow masks, so the stencil and the shadow mask flag are as at the start
+        color = uvec2(ResultValue[ResultColorStart+uint(resultOffset)], ResultValue[ResultColorStart+uint(resultOffset)+uint(FramebufferStride)]);
+        depth = uvec2(ResultValue[ResultDepthStart+uint(resultOffset)], ResultValue[ResultDepthStart+uint(resultOffset)+uint(FramebufferStride)]);
+        attr = uvec2(ResultValue[ResultAttrStart+uint(resultOffset)], ResultValue[ResultAttrStart+uint(resultOffset)+uint(FramebufferStride)]);
     }
     else
-    {
-        color = uvec2(ClearColor, 0U);
-        depth = uvec2(ClearDepth, 0U);
-    }
+#endif
+    ClearLayers(color, depth, attr);
     uint stencil = 0U;
     bool prevIsShadowMask = false;
 
     // a coarse mask word for each 32 groups of 32 polygons, in order
+#ifdef VisResolve
+    for (int i = int(VisPrefixEnd >> 10); i < CoarseBinStride; i++)
+#else
     for (int i = 0; i < CoarseBinStride; i++)
+#endif
     {
         uint coarseMask = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + i];
+#ifdef VisResolve
+        coarseMask &= VisCoarseKeep(i);
+#endif
         ProcessCoarseMask(linearTile, coarseMask, uint(i) * 32u, color, depth, attr, stencil, prevIsShadowMask);
     }
 
-    int resultOffset = int(gl_GlobalInvocationID.x) + int(gl_GlobalInvocationID.y) * ScreenWidth;
 #ifdef OptSecondLayer
     // only the final pass reads this, and it's picked by the same DispCnt: the second layer's
     // color is only used with anti-aliasing (bit 4), its depth and attributes only when fog (bit 7)
@@ -1863,6 +2035,183 @@ void main()
     ResultValue[ResultAttrStart+uint(resultOffset)] = attr.x;
     ResultValue[ResultAttrStart+uint(resultOffset)+uint(FramebufferStride)] = attr.y;
 #endif
+}
+
+)";
+
+/*
+    debug.melonade.computevis, Phase 2 stage 1a (docs/plan-compute-efficiency.md): the visibility pass.
+    a pixel walks the opaque prefix's polygons binned to its tile in DS order, as DepthBlend does,
+    with Rasterise's own coverage, attributes and depth (RasteriseShared), and runs DepthBlend's rules
+    for an opaque fragment on polygon indices instead of colors: the depth test (the equal one
+    against the depth as it is at the polygon's turn), the second layer it falls back to when the
+    first has edge flags (attr & 0x3), and the push-down of the first layer under an edge pixel,
+    which isn't gated by anti-aliasing. it leaves the depth and attributes of both layers in the
+    result, which polygon each layer has (ResultWinnerStart, for Rasterise's shade mode), and the
+    color of a layer no polygon has (VisClear, VisEmpty).
+
+    the prefix (ComputeRenderer::VisPrefixFor) has no translucent, shadow or shadow mask polygons
+    and none with a texture that can make a texel transparent, so every fragment Rasterise makes for
+    it has alpha 31: it's opaque, and the alpha test drops all of them or none. the stencil and the
+    shadow mask flag DepthBlend keeps stay as they start
+*/
+const std::string OpaqueVis =
+    PolygonBuffer +
+    XSpanSetupBuffer +
+    BinningBuffer +
+    ResultBuffer +
+    RasteriseShared +
+    ClearLayersSource + R"(
+
+layout (local_size_x = TileSize, local_size_y = TileSize) in;
+
+// DepthBlend's depth test
+bool VisDepthPasses(bool equalDepthTest, uint dstDepth, uint tileDepth)
+{
+    return equalDepthTest
+#ifdef WBuffer
+        ? dstDepth - tileDepth + 0xFFU <= 0x1FEU
+#endif
+#ifdef ZBuffer
+        ? dstDepth - tileDepth + 0x200U <= 0x400U
+#endif
+        : tileDepth < dstDepth;
+}
+
+void main()
+{
+    int linearTile = int(gl_WorkGroupID.x + (gl_WorkGroupID.y * uint(TilesPerLine)));
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+
+    uvec2 color, depth, attr;
+    ClearLayers(color, depth, attr);
+    uvec2 winner = uvec2(VisClear, VisEmpty);
+
+    // Rasterise gives a fragment alpha 31 here, which only an alpha test reference of 31 drops
+    if (AlphaRef < 31)
+    {
+        for (int i = 0; i < CoarseBinStride && uint(i) * 1024U < VisPrefixEnd; i++)
+        {
+            uint coarseMask = BinningMaskAndOffset[BinningCoarseMaskStart + linearTile*CoarseBinStride + i];
+            while (coarseMask != 0U)
+            {
+                uint coarseBit = uint(findLSB(coarseMask));
+                coarseMask &= ~(1U << coarseBit);
+
+                // in order, so every group from here on is past the prefix
+                uint group = uint(i) * 32U + coarseBit;
+                if (group * 32U >= VisPrefixEnd)
+                    break;
+
+                uint fineMask = BinningMaskAndOffset[BinningMaskStart + linearTile * BinStride + int(group)];
+                if (VisPrefixEnd - group * 32U < 32U)
+                    fineMask &= (1U << (VisPrefixEnd - group * 32U)) - 1U;
+
+                while (fineMask != 0U)
+                {
+                    uint fineIdx = uint(findLSB(fineMask));
+                    fineMask &= ~(1U << fineIdx);
+                    uint polygonIdx = group * 32U + fineIdx;
+
+                    // Rasterise's coverage test, with the span words read only as far as needed
+                    int yTop = Polygons[polygonIdx].YTop;
+                    int yBot = Polygons[polygonIdx].YBot;
+                    if (position.y < yTop || position.y >= yBot)
+                        continue;
+
+                    int xspanIdx = Polygons[polygonIdx].FirstXSpan + (position.y - yTop);
+                    XSpanSetup xspan;
+                    xspan.X0 = XSpanSetups[xspanIdx].X0;
+                    xspan.X1 = XSpanSetups[xspanIdx].X1;
+                    xspan.InsideStart = XSpanSetups[xspanIdx].InsideStart;
+                    xspan.InsideEnd = XSpanSetups[xspanIdx].InsideEnd;
+                    xspan.Flags = XSpanSetups[xspanIdx].Flags;
+
+                    bool insideLeftEdge, insideRightEdge;
+                    if (!SpanCovers(position.x, xspan.X0, xspan.X1, xspan.InsideStart, xspan.InsideEnd, xspan.Flags, insideLeftEdge, insideRightEdge))
+                        continue;
+
+                    // what FragmentAttr, SpanFactor and SpanDepth read, the rest isn't used
+                    xspan.EdgeCovL = XSpanSetups[xspanIdx].EdgeCovL;
+                    xspan.EdgeCovR = XSpanSetups[xspanIdx].EdgeCovR;
+                    xspan.CovLInitial = XSpanSetups[xspanIdx].CovLInitial;
+                    xspan.CovRInitial = XSpanSetups[xspanIdx].CovRInitial;
+                    xspan.Z0 = XSpanSetups[xspanIdx].Z0;
+                    xspan.Z1 = XSpanSetups[xspanIdx].Z1;
+#ifdef WBuffer
+                    xspan.W0 = XSpanSetups[xspanIdx].W0;
+                    xspan.W1 = XSpanSetups[xspanIdx].W1;
+                    xspan.XRecip = 0;
+#else
+                    xspan.W0 = 0;
+                    xspan.W1 = 0;
+                    xspan.XRecip = XSpanSetups[xspanIdx].XRecip;
+#endif
+                    xspan.ColorR0 = 0; xspan.ColorG0 = 0; xspan.ColorB0 = 0;
+                    xspan.ColorR1 = 0; xspan.ColorG1 = 0; xspan.ColorB1 = 0;
+                    xspan.TexcoordU0 = 0; xspan.TexcoordV0 = 0;
+                    xspan.TexcoordU1 = 0; xspan.TexcoordV1 = 0;
+
+                    uint fragAttr = FragmentAttr(position, yTop, yBot, insideLeftEdge, insideRightEdge, xspan);
+                    // a covered pixel has X0 < X1, so Rasterise's X0 == X1 case never comes up. z-buffering's
+                    // depth doesn't need the factor, so it has no divide here
+#ifdef WBuffer
+                    uint tileDepth = SpanDepth(xspan, position.x, SpanFactor(xspan, position.x));
+#else
+                    uint tileDepth = SpanDepth(xspan, position.x, 0);
+#endif
+
+                    // DepthBlend's rules for an opaque fragment that isn't a shadow
+                    uint polygonAttr = Polygons[polygonIdx].Attr;
+                    bool equalDepthTest = (polygonAttr & (1U << 14)) != 0U;
+                    bool writeSecondLayer = false;
+                    if (!VisDepthPasses(equalDepthTest, depth.x, tileDepth))
+                    {
+                        if ((attr.x & 0x3U) == 0U)
+                            continue;
+
+                        writeSecondLayer = true;
+                        if (!VisDepthPasses(equalDepthTest, depth.y, tileDepth))
+                            continue;
+                    }
+
+                    uint srcAttr = (polygonAttr & 0x3F008000U) | fragAttr;
+                    if (!writeSecondLayer)
+                    {
+                        if ((srcAttr & 0x3U) != 0U)
+                        {
+                            depth.y = depth.x;
+                            attr.y = attr.x;
+                            winner.y = winner.x;
+                        }
+
+                        depth.x = tileDepth;
+                        attr.x = srcAttr;
+                        winner.x = polygonIdx;
+                    }
+                    else
+                    {
+                        depth.y = tileDepth;
+                        attr.y = srcAttr;
+                        winner.y = polygonIdx;
+                    }
+                }
+            }
+        }
+    }
+
+    // all of both layers, whatever DISPCNT says: Resolve starts from them
+    uint resultOffset = uint(position.x) + uint(position.y) * uint(ScreenWidth);
+    ResultValue[ResultDepthStart+resultOffset] = depth.x;
+    ResultValue[ResultDepthStart+resultOffset+uint(FramebufferStride)] = depth.y;
+    ResultValue[ResultAttrStart+resultOffset] = attr.x;
+    ResultValue[ResultAttrStart+resultOffset+uint(FramebufferStride)] = attr.y;
+    ResultValue[ResultWinnerStart+resultOffset] = winner.x | (winner.y << 16);
+    // a layer a polygon has gets its color from Rasterise. the first layer is never VisEmpty
+    if (winner.x == VisClear)
+        ResultValue[ResultColorStart+resultOffset] = color.x;
+    if (winner.y >= VisEmpty)
+        ResultValue[ResultColorStart+resultOffset+uint(FramebufferStride)] = winner.y == VisClear ? color.x : 0U;
 }
 
 )";
