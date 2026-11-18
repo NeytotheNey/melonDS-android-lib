@@ -1470,7 +1470,7 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
     job.BG[0] = GPU2D_A.State();
     job.BG[1] = GPU2D_B.State();
 
-    // debug only for now, see GPU_Shadow2D.h
+    // the GPU 2D shadow (Sharper rotated 2D setting or debug.melonade.gpu2d), see GPU_Shadow2D.h
     if (Shadow2D)
         Shadow2D->NoteLine(job, PaletteDirty, job.WideView || GPU3D.WideCheck);
 
@@ -1530,7 +1530,7 @@ void GPU::Snapshot2DSprites(GPU2D::LineJob& job, u32 line) noexcept
     job.OBJ[0] = GPU2D_A.State();
     job.OBJ[1] = GPU2D_B.State();
 
-    // debug only for now, see GPU_Shadow2D.h
+    // the GPU 2D shadow (Sharper rotated 2D setting or debug.melonade.gpu2d), see GPU_Shadow2D.h
     if (Shadow2D)
         Shadow2D->NoteSprites(job, OAMDirty);
 
@@ -1577,7 +1577,7 @@ void GPU::MakeVRAMFlat_2DBGCoherent(u32 line) noexcept
         Stats2D->NoteBGDirty(1, bgDirtyB.Data, bgDirtyB.DataLength, bgExtPalDirtyB.Data, bgExtPalDirtyB.DataLength, objExtPalDirtyB.Data, objExtPalDirtyB.DataLength);
     }
 
-    // debug only for now, see GPU_Shadow2D.h: which pages the compositor has to upload again, and
+    // the GPU 2D shadow (Sharper rotated 2D setting or debug.melonade.gpu2d), see GPU_Shadow2D.h: which pages the compositor has to upload again, and
     // what they hold before the copies, to tell which ones really change
     if (Shadow2D)
     {
@@ -1643,7 +1643,7 @@ void GPU::MakeVRAMFlat_2DOBJCoherent(u32 line) noexcept
         Stats2D->NoteOBJDirty(1, objDirtyB.Data, objDirtyB.DataLength);
     }
 
-    // debug only for now, see GPU_Shadow2D.h
+    // the GPU 2D shadow (Sharper rotated 2D setting or debug.melonade.gpu2d), see GPU_Shadow2D.h
     if (Shadow2D)
     {
         const u64* const bits[2] = {objDirtyA.Data, objDirtyB.Data};
@@ -2468,7 +2468,7 @@ void GPU::StartScanline(u32 line) noexcept
             if (CapReads)
                 CapReads->NoteBarrier();
 
-            // debug only for now, see GPU_Shadow2D.h: the frame's sprite runs are complete, whenever
+            // the GPU 2D shadow (Sharper rotated 2D setting or debug.melonade.gpu2d), see GPU_Shadow2D.h: the frame's sprite runs are complete, whenever
             // the Blit comes. the swi-harness counts the frame's lines here, as it has no Blit
             if (Shadow2D)
             {

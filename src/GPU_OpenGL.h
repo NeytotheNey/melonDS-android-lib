@@ -76,8 +76,8 @@ public:
     // GPU::OutputCap: the need the renderers cap the output by (see Renderer's SetOutputNeed), from
     // the frontend's need, or GPU::OutputCapNeed over it, or 0 for no cap: with OutputCap off, and while
     // anything that reads the 3D at the output's scale and isn't ported to the DOWN3D programs is on
-    // (the GPU 2D shadow, filtered 2D's identity mode)
-    [[nodiscard]] static int OutputNeed(const GPU& gpu, int frontendNeed) noexcept;
+    // (the GPU 2D shadow, unless its programs failed, and filtered 2D's identity mode)
+    [[nodiscard]] int OutputNeed(const GPU& gpu, int frontendNeed) const noexcept;
     // GPU::OutputCap3D: the mode the capped draw and the capped hi-res capture pass use from now on
     // (0-3), whether hi-res capture is on (GPU::HiresCapture) and whether filtered 2D is
     // (GPU::Filter2D, but for its identity mode, which isn't capped). called with every SetOutputNeed,

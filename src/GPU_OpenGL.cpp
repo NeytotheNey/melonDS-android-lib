@@ -670,7 +670,7 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
         line.Reason = "switch off";
     else if (gpu.Filter2D == 3)
         line.Reason = "filtered 2D identity mode";
-    else if (gpu.Shadow2D)
+    else if (gpu.Shadow2D && !Shadow.Failed)
         line.Reason = "GPU 2D shadow";
     else if (line.Need <= 0)
         line.Reason = "need 0";
@@ -760,9 +760,10 @@ bool GLCompositor::OutputAnyRatio(const GPU& gpu, const char** why) noexcept
 // calls the renderer's SetOutputNeed, so the output is back at the 3D's scale in the first frame that
 // runs them. hi-res capture has a capped pass (HiresCaptureDown3DFS), with its copies at the output's
 // scale, and filtered 2D capped programs (FILTER2D with DOWN3D), with the map at the 3D's scale
-int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) noexcept
+int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) const noexcept
 {
-    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || gpu.Shadow2D)
+    // a shadow whose programs didn't build (Shadow2DState::Failed) draws nothing, so it doesn't hold the cap off
+    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || (gpu.Shadow2D && !Shadow.Failed))
         return 0;
     return gpu.OutputCapNeed > 0 ? gpu.OutputCapNeed : frontendNeed;
 }
