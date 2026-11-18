@@ -2836,10 +2836,10 @@ bool GLCompositor::PrepareShadow2DResources() noexcept
         glDeleteRenderbuffers(1, &Shadow.ObjDepth);
         glDeleteTextures(1, &Shadow.ObjTex);
 
-        Shadow.ObjTex = MakeHiresTexture(GL_RG32UI, ViewWidth, 384);
+        Shadow.ObjTex = MakeHiresTexture(GL_RG32UI, ViewWidth, ObjRows);
         glGenRenderbuffers(1, &Shadow.ObjDepth);
         glBindRenderbuffer(GL_RENDERBUFFER, Shadow.ObjDepth);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, ViewWidth, 384);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, ViewWidth, ObjRows);
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
 
         GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
@@ -2974,11 +2974,17 @@ void GLCompositor::UploadShadow2D(const GPU& gpu, Shadow2DRecorder& rec) noexcep
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GPU2D::ShadowStateWords / 4, 384, GL_RGBA_INTEGER, GL_UNSIGNED_INT, Shadow.State.data());
     bytes += Shadow.State.size() * sizeof(u32);
 
-    size_t sprites = rec.Sprites.size();
+    // the sprites, then the OBJ window sprites: the OBJ pass draws them all in one go
+    size_t normal = rec.Sprites.size();
+    size_t sprites = normal + rec.WindowSprites.size();
     if (sprites)
     {
         glBindBuffer(GL_ARRAY_BUFFER, Shadow.InstanceBuffer);
-        glBufferData(GL_ARRAY_BUFFER, sprites * sizeof(Instance), rec.Sprites.data(), GL_STREAM_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, sprites * sizeof(Instance), nullptr, GL_STREAM_DRAW);
+        if (normal)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, normal * sizeof(Instance), rec.Sprites.data());
+        if (sprites > normal)
+            glBufferSubData(GL_ARRAY_BUFFER, normal * sizeof(Instance), (sprites - normal) * sizeof(Instance), rec.WindowSprites.data());
         glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
         bytes += sprites * sizeof(Instance);
     }
@@ -2988,8 +2994,12 @@ void GLCompositor::UploadShadow2D(const GPU& gpu, Shadow2DRecorder& rec) noexcep
     Shadow.LogInstances += sprites;
 }
 
-// the OBJ pass: the frame's sprite instances into ObjTex (R; G, the OBJ window, stays 0 until
-// increment 4). it leaves the state RenderFrame sets up afterwards as it found it, or sets it again
+// the OBJ pass: the frame's sprite instances into ObjTex, the sprites' OBJ line pixels into R of rows
+// 0-383 and the OBJ window into G of rows 384-767 (Shadow2D::ObjWindowRow). the OBJ window is an OR of
+// every OBJ window sprite's opaque pixels, so any of them may write the texel, and its rows of its own
+// keep the sprites' pixels as they are without a per-channel colour mask (a driver risk on RG32UI)
+// or a second target. it leaves the state RenderFrame sets up afterwards as it found it, or sets it
+// again
 void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
 {
     using namespace Shadow2D;
@@ -3003,7 +3013,7 @@ void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
     // three back-to-back queries, so a tiler running the two independent passes out of order can't
     // put one query's start after its end (GLTIME's bad=)
     BeginGPUTimer(ComputePass::CompShadowObj);
-    glViewport(0, 0, Shadow.ObjW, 384);
+    glViewport(0, 0, Shadow.ObjW, ObjRows);
     glDisable(GL_BLEND);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_SCISSOR_TEST);
@@ -3014,7 +3024,7 @@ void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
     glClearBufferuiv(GL_COLOR, 0, zero);
     glClearBufferfv(GL_DEPTH, 0, &farDepth);
 
-    size_t sprites = rec.Sprites.size();
+    size_t sprites = rec.Sprites.size() + rec.WindowSprites.size();
     if (sprites)
     {
         glUseProgram(Shadow.ObjProgram);
@@ -3026,7 +3036,8 @@ void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
         glVertexAttribIPointer(1, 4, GL_UNSIGNED_INT, sizeof(Instance), (void*)offsetof(Instance, FirstRow));
         glVertexAttribIPointer(2, 4, GL_UNSIGNED_INT, sizeof(Instance), (void*)offsetof(Instance, Index));
 
-        // lowest (priority, OAM index) wins, as SoftRenderer::DrawSpritePixel decides it
+        // lowest (priority, OAM index) wins, as SoftRenderer::DrawSpritePixel decides it. in the OBJ
+        // window's rows a fragment the depth test drops is over a texel a window sprite drew already
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
         glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)sprites);

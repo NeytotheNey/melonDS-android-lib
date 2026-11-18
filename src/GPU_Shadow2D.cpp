@@ -116,6 +116,7 @@ void Shadow2DRecorder::Reset() noexcept
     OAMSynced = false;
     PaletteSynced = false;
     Sprites.clear();
+    WindowSprites.clear();
     OldPages.clear();
 }
 
@@ -202,7 +203,7 @@ void Shadow2DRecorder::NoteOBJCopied(const GPU& gpu) noexcept
     NoteCopied(gpu);
 }
 
-void Shadow2DRecorder::NoteLine(GPU2D::LineJob& job, u32& paletteDirty) noexcept
+void Shadow2DRecorder::NoteLine(GPU2D::LineJob& job, u32& paletteDirty, bool winEdge) noexcept
 {
     HookTimer timer(Logging ? &RecorderNs : nullptr);
     const u32 line = job.Line;
@@ -252,11 +253,11 @@ void Shadow2DRecorder::NoteLine(GPU2D::LineJob& job, u32& paletteDirty) noexcept
 
         // only the accelerated line format has room for the block
         if (job.Accelerated)
-            WriteBlock(job, num);
+            WriteBlock(job, num, winEdge);
     }
 }
 
-void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept
+void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEdge) noexcept
 {
     const GPU2D::UnitState& u = job.BG[num];
     const Engine& e = Engines[num];
@@ -313,6 +314,14 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept
     // doesn't have. those lines stay on the CPU
     bool blendLeftover = num && !job.EngineBNoHold && ((u.BlendCnt >> 6) & 0x3) == 1
         && (u.BlendCnt & 0x0020) && (u.BlendCnt & 0x3F00);
+    // windows (increment 4) are worked out by the planes pass from the block, but for two cases.
+    // CalculateWindowMask tests the whole Win0Active/Win1Active word against 3, and the block keeps
+    // 16 bits of each, which only bits 0-1 should ever use: a savestate can load anything there.
+    // and an affine OBJ window sprite needs increment 3, so with the OBJ window on its lines stay
+    // on the CPU as an affine sprite's do
+    bool windows = (u.DispCnt & 0xE000) != 0;
+    bool winState = ((u.DispCnt & 0x2000) && (u.Win0Active & ~0x3u)) || ((u.DispCnt & 0x4000) && (u.Win1Active & ~0x3u));
+    bool winRot = (u.DispCnt & 0x8000) && LineBit(e.SpriteWinRot, line);
     u32 dispMode = (u.DispCnt >> 16) & (num ? 0x1 : 0x3);
     u32 reason = R_None;
     if (!job.ScreensEnabled) reason = R_ScreensOff;
@@ -322,10 +331,10 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept
     else if (job.VCount != job.Line) reason = R_VCount;
     else if (!num && u.CaptureLatch) reason = R_Capture;
     else if (other) reason = R_BGType;
-    else if (u.DispCnt & 0xE000) reason = R_Window;
+    else if (winState) reason = R_Window;
     else if (blendLeftover) reason = R_Blend;
     else if (mosaicBG || LineBit(e.SpriteMosaic, line)) reason = R_Mosaic;
-    else if (LineBit(e.SpriteRot, line)) reason = R_RotSprite;
+    else if (LineBit(e.SpriteRot, line) || winRot) reason = R_RotSprite;
 
     // the sprite pass of this line, snapshotted one HBlank earlier
     bool spritesOn = (e.PendingLine == line) && (e.PendingOBJState & 0x3) == 0x3;
@@ -344,7 +353,8 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num) noexcept
     block[W_Flags] = (num ? F_UnitB : 0) | (u.Enabled ? F_Enabled : 0) | (u.ForcedBlank ? F_ForcedBlank : 0)
         | ((u32)(u.LayerEnable & 0x1F) << F_LayerShift) | (spritesOn ? F_OBJEnable : 0)
         | (job.VCount == job.Line ? F_VCountLine : 0) | (has3D ? F_BG0Is3D : 0) | (text << F_TextShift)
-        | (wide ? F_Wide : 0) | (reason << F_ReasonShift) | (reason == R_None ? F_Eligible : 0);
+        | (wide ? F_Wide : 0) | (windows && winEdge ? F_WinEdge : 0) | (reason << F_ReasonShift)
+        | (reason == R_None ? F_Eligible : 0);
     block[W_Frame] = Frame;
     block[W_DispCnt] = u.DispCnt;
     block[W_BGCnt01] = u.BGCnt[0] | ((u32)u.BGCnt[1] << 16);
@@ -448,12 +458,14 @@ void Shadow2DRecorder::NoteSprites(const GPU2D::LineJob& job, u32& oamDirty) noe
             Frame = 1;
         Broken = false;
         Sprites.clear();
+        WindowSprites.clear();
         for (Engine& e : Engines)
         {
             memset(e.BGNoted, 0, sizeof(e.BGNoted));
             memset(e.SpriteNoted, 0, sizeof(e.SpriteNoted));
             memset(e.SpriteRot, 0, sizeof(e.SpriteRot));
             memset(e.SpriteMosaic, 0, sizeof(e.SpriteMosaic));
+            memset(e.SpriteWinRot, 0, sizeof(e.SpriteWinRot));
             memset(e.Overflow, 0, sizeof(e.Overflow));
             e.LastChangeBG = 0;
             e.LastChangeOBJ = 0;
@@ -495,6 +507,8 @@ void Shadow2DRecorder::NoteSprites(const GPU2D::LineJob& job, u32& oamDirty) noe
             SetLineBit(e.SpriteRot, line);
         if (LineBit(e.RunMosaic, line))
             SetLineBit(e.SpriteMosaic, line);
+        if (LineBit(e.RunWinRot, line))
+            SetLineBit(e.SpriteWinRot, line);
 
         e.PendingLine = line;
         e.PendingOBJDispCnt = u.DispCnt;
@@ -505,12 +519,14 @@ void Shadow2DRecorder::NoteSprites(const GPU2D::LineJob& job, u32& oamDirty) noe
     oamDirty &= ~0x3u;
 }
 
-// the lines the run's affine sprites and mosaic sprites cover, which stay on the CPU in increment 1.
-// OBJ window sprites only matter with windows on, and those lines stay on the CPU anyway
+// the lines the run's affine sprites and mosaic sprites cover, which stay on the CPU in increment 1,
+// and those its affine OBJ window sprites cover, which do where the OBJ window is on. OBJ window
+// sprites ignore the mosaic bit (SoftRenderer::DrawSprites)
 void Shadow2DRecorder::ScanRun(Engine& e) noexcept
 {
     memset(e.RunRot, 0, sizeof(e.RunRot));
     memset(e.RunMosaic, 0, sizeof(e.RunMosaic));
+    memset(e.RunWinRot, 0, sizeof(e.RunWinRot));
     if (!e.RunKey)
         return;
 
@@ -519,7 +535,8 @@ void Shadow2DRecorder::ScanRun(Engine& e) noexcept
     {
         u16 attr0 = oam[i * 4];
         u16 attr1 = oam[i * 4 + 1];
-        if (((attr0 >> 10) & 0x3) == 2)
+        bool window = ((attr0 >> 10) & 0x3) == 2;
+        if (window && !(attr0 & 0x0100))
             continue;
 
         u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
@@ -537,7 +554,7 @@ void Shadow2DRecorder::ScanRun(Engine& e) noexcept
             }
             if (xpos <= -width)
                 continue;
-            MarkLines(e.RunRot, y, height);
+            MarkLines(window ? e.RunWinRot : e.RunRot, y, height);
         }
         else if (!(attr0 & 0x0200) && (attr0 & 0x1000))
         {
@@ -548,7 +565,8 @@ void Shadow2DRecorder::ScanRun(Engine& e) noexcept
     }
 }
 
-// the run's normal sprites become instances, one per sprite and stretch of lines it covers
+// the run's normal sprites, and its OBJ window sprites, become instances, one per sprite and stretch
+// of lines it covers
 void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
 {
     Engine& e = Engines[num];
@@ -568,11 +586,11 @@ void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
         if (attr0 & 0x0300)
             continue;
         u32 mode = (attr0 >> 10) & 0x3;
-        // OBJ window sprites only matter with windows on, and those lines stay on the CPU until
-        // increment 4, which brings them back as instances into ObjTex's G channel
-        if (mode == 2)
-            continue;
-        if (attr0 & 0x1000)
+        // an OBJ window sprite is drawn as a tiled one whatever its mode, and without mosaic, into
+        // the OBJ window (SoftRenderer::DrawSprites and DrawSprite_Normal<true>). it only matters
+        // where the BG pass turns the OBJ window on, which isn't known yet, so it's always drawn
+        bool window = mode == 2;
+        if ((attr0 & 0x1000) && !window)
             continue;
         // bitmap sprites with alpha 0, or the reserved bitmap mapping, draw nothing
         if (mode == 3 && (!(attr2 >> 12) || (e.RunDispCnt & 0x60) == 0x60))
@@ -595,7 +613,7 @@ void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
             if (first >= last)
                 continue;
 
-            if (Sprites.size() >= MaxInstances)
+            if (Sprites.size() + WindowSprites.size() >= MaxInstances)
             {
                 for (u32 l = start; l < end; l++)
                     SetLineBit(e.Overflow, l);
@@ -604,7 +622,7 @@ void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
 
             Instance inst;
             inst.X = xpos;
-            inst.Row = num * 192 + first;
+            inst.Row = (window ? ObjWindowRow : 0) + num * 192 + first;
             inst.Width = width;
             inst.Lines = last - first;
             inst.FirstRow = (first - y) & 0xFF;
@@ -613,9 +631,9 @@ void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
             inst.Attr2 = attr2;
             inst.Index = i;
             inst.DispCnt = e.RunDispCnt;
-            inst.Flags = num;
+            inst.Flags = num | (window ? 2 : 0);
             inst.Height = height;
-            Sprites.push_back(inst);
+            (window ? WindowSprites : Sprites).push_back(inst);
         }
     }
 }
@@ -654,7 +672,7 @@ u32 Shadow2DRecorder::LineReason(const u32* block) const noexcept
 
 void Shadow2DRecorder::CountFrame(const GPU& gpu, int backbuf) noexcept
 {
-    CountedInstances += Sprites.size();
+    CountedInstances += Sprites.size() + WindowSprites.size();
     if (FrameHook)
         FrameHook(gpu, backbuf, FrameHookUser);
     for (int half = 0; half < 2; half++)

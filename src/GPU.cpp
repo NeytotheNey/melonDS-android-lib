@@ -1472,7 +1472,7 @@ void GPU::Snapshot2DScanline(GPU2D::LineJob& job, u32 line) noexcept
 
     // debug only for now, see GPU_Shadow2D.h
     if (Shadow2D)
-        Shadow2D->NoteLine(job, PaletteDirty);
+        Shadow2D->NoteLine(job, PaletteDirty, job.WideView || GPU3D.WideCheck);
 
     // debug only, see GPU_2DStats.h
     if (Stats2D)

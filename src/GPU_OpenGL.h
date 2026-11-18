@@ -543,7 +543,8 @@ private:
         GLuint MemTex = 0;                  // GL_R32UI 256 x Shadow2D::MemRows: flats, extended palettes, palette
         u32 MemGeneration = 0;              // the recorder's Generation MemTex holds, 0 for none
         GLuint StateTex = 0;                // GL_RGBA32UI 8x384: the frame's state blocks, F_Drawn set
-        GLuint ObjTex = 0, ObjDepth = 0, ObjFB = 0;  // GL_RG32UI ViewWidth x 384, and its 16-bit depth
+        // GL_RG32UI ViewWidth x 768 (Shadow2D::ObjRows: the OBJ line, then the OBJ window), and its 16-bit depth
+        GLuint ObjTex = 0, ObjDepth = 0, ObjFB = 0;
         int ObjW = 0;
         GLuint InstanceBuffer = 0, InstanceVAO = 0;
         GLuint QuadBuffer = 0, QuadVAO = 0;

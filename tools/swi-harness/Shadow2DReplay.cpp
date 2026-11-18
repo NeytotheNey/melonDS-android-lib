@@ -71,7 +71,8 @@ u32 ColorWord(u32 color, u32 flag)
     return r | (g << 8) | (b << 16) | flag;
 }
 
-// kShadow2DObjFS_Main for the pixel at native X nx of the instance's line ObjTex row: false if discarded
+// kShadow2DObjFS_Main for the pixel at native X nx of the instance's line ObjTex row: false if discarded.
+// out is what goes into R, or for an OBJ window sprite into G (1)
 bool ObjPixel(const Instance& inst, int nx, int row, u32& out)
 {
     int width = (int)inst.Width;
@@ -155,8 +156,8 @@ bool ObjPixel(const Instance& inst, int nx, int row, u32& out)
         pixel = color | pixelattr;
     }
 
-    out = window ? 0u : pixel;
-    return !window;
+    out = window ? 1u : pixel;
+    return true;
 }
 
 u32 TextBGPixel(int bg, int nx, int vcount, bool unitB, u32 dispcnt, u32 bgcnt, u32 pos)
@@ -343,6 +344,35 @@ u32 ColorComposite(u32 val1, u32 val2, u32 blend, u32 evy, u32 win)
     return val1;
 }
 
+// kShadow2DFS_Main's InsideWindow and WindowMask (the closed form of CalculateWindowMask's scan)
+bool InsideWindow(int x, u32 coords, u32 active)
+{
+    int x1 = (int)(coords & 0xFFu);
+    int x2 = (int)((coords >> 8) & 0xFFu);
+    bool open = (active & 0x2u) != 0u;
+    bool opened = x1 <= x && x1 != x2;
+    bool closed = x2 <= x;
+    if (opened && closed)
+        open = x1 > x2;
+    else if (opened)
+        open = true;
+    else if (closed)
+        open = false;
+    return open && (active & 0x1u) != 0u;
+}
+
+u32 WindowMask(int x, u32 dispcnt, u32 win0, u32 win1, u32 winCnt, u32 active, bool objWin)
+{
+    u32 mask = (winCnt >> 16) & 0xFFu;
+    if ((dispcnt & 0x8000u) != 0u && objWin)
+        mask = (winCnt >> 24) & 0xFFu;
+    if ((dispcnt & 0x4000u) != 0u && InsideWindow(x, win1, (active >> 16) & 0xFFFFu))
+        mask = (winCnt >> 8) & 0xFFu;
+    if ((dispcnt & 0x2000u) != 0u && InsideWindow(x, win0, active & 0xFFFFu))
+        mask = winCnt & 0xFFu;
+    return mask;
+}
+
 }
 
 void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
@@ -377,26 +407,30 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
     }
 
     // the OBJ pass at 1x: per ObjTex row (unit * 192 + line) and native X 0..255, the lowest
-    // (priority, OAM index) of the opaque pixels, as the depth test keeps it. window sprites only set
-    // G, which nothing reads in increment 1
-    static u32 objTex[384][256];
-    static u32 objDepth[384][256];
+    // (priority, OAM index) of the opaque pixels, as the depth test keeps it, in R. the OBJ window
+    // sprites come after the sprites in the instance buffer and draw G in rows 384 on
+    static u32 objTex[ObjRows][256][2];
+    static u32 objDepth[ObjRows][256];
     memset(objTex, 0, sizeof(objTex));
     for (auto& row : objDepth)
         for (u32& d : row)
             d = ~0u;
-    for (const Instance& inst : rec.Sprites)
+    for (const std::vector<Instance>* list : {&rec.Sprites, &rec.WindowSprites})
     {
-        u32 key = ((inst.Attr2 >> 10) & 0x3u) * 128u + (inst.Index & 0x7Fu);
-        for (u32 r = inst.Row; r < inst.Row + inst.Lines && r < 384; r++)
+        for (const Instance& inst : *list)
         {
-            for (int nx = std::max(inst.X, 0); nx < std::min(inst.X + (int)inst.Width, 256); nx++)
+            u32 key = ((inst.Attr2 >> 10) & 0x3u) * 128u + (inst.Index & 0x7Fu);
+            u32 channel = (inst.Flags & 2u) ? 1 : 0;
+            for (u32 r = inst.Row; r < inst.Row + inst.Lines && r < ObjRows; r++)
             {
-                u32 pixel;
-                if (key >= objDepth[r][nx] || !ObjPixel(inst, nx, (int)r, pixel))
-                    continue;
-                objDepth[r][nx] = key;
-                objTex[r][nx] = pixel;
+                for (int nx = std::max(inst.X, 0); nx < std::min(inst.X + (int)inst.Width, 256); nx++)
+                {
+                    u32 pixel;
+                    if (key >= objDepth[r][nx] || !ObjPixel(inst, nx, (int)r, pixel))
+                        continue;
+                    objDepth[r][nx] = key;
+                    objTex[r][nx][channel] = pixel;
+                }
             }
         }
     }
@@ -419,18 +453,32 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
             int vcount = (int)(s[W_Lines] & 0xFFFFu);
             u32 textMask = (flags >> 12) & 0xFu;
             bool bg0Is3D = (flags & 0x800u) != 0u;
+            bool objWinLine = false;
 
             for (int nx = 0; nx < 256; nx++)
             {
                 u32 obj = 0u;
                 if ((flags & (0x10u << 3)) != 0u)
                 {
-                    obj = objTex[(unitB ? 192 : 0) + line][nx];
+                    obj = objTex[(unitB ? 192 : 0) + line][nx][0];
                     if ((obj & 0x40000u) == 0u)
                         obj = 0u;
                 }
 
                 u32 win = 0xFFu;
+                if ((dispcnt & 0xE000u) != 0u)
+                {
+                    int wx = std::clamp(nx, 0, 255);
+                    if ((flags & F_WinEdge) != 0u)
+                        wx = std::clamp(wx, 1, 254);
+                    bool objWin = false;
+                    if ((dispcnt & 0x8000u) != 0u)
+                        objWin = objTex[ObjWindowRow + (unitB ? 192 : 0) + line][wx][1] != 0u;
+                    win = WindowMask(wx, dispcnt, s[W_Win0], s[W_Win1], s[W_WinCnt], s[W_WinActive], objWin);
+                    replay.WindowLines += nx == 0;
+                    replay.ObjWindowOnLines += nx == 0 && (dispcnt & 0x8000u) != 0u;
+                    objWinLine |= objWin;
+                }
 
                 u32 top = 0u, second = 0u, third = 0u;
                 int found = 0;
@@ -516,6 +564,7 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
                             screen, line, nx, plane, expected, p[plane], unitB ? 'B' : 'A');
                 }
             }
+            replay.ObjWindowLines += objWinLine;
         }
     }
 }

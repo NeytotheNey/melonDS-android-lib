@@ -28,6 +28,9 @@ namespace melonDS { class GPU; }
 struct Shadow2DReplay
 {
     melonDS::u64 Lines = 0;         // lines compared
+    melonDS::u64 WindowLines = 0;   // of them, lines with windows on
+    melonDS::u64 ObjWindowOnLines = 0; // of them, lines with the OBJ window on
+    melonDS::u64 ObjWindowLines = 0; // and lines where an OBJ window sprite drew into it
     melonDS::u64 Mismatches = 0;    // plane words that differed
     melonDS::u64 MemMismatches = 0; // MemTex words the incremental uploads left stale
     FILE* Log = nullptr;            // the first mismatches go here
