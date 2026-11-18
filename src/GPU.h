@@ -1140,6 +1140,11 @@ public:
     // cut-out on polygon indices and shades only its winners. 0, the default, is the old path.
     // recompiles the programs
     int ComputeVis = 0;
+    // compute renderer, debug: the result buffer (winner words included) and the tile memory are
+    // filled with 0xDEADBEEF where they're allocated and before every render, so a pass that reads
+    // what no pass of the render wrote shows it on every GPU, not only where the driver leaves
+    // garbage. slow (a fill of the whole buffers each render)
+    bool ComputePoison = false;
     // WideMelon (docs/plan-widemelon-polylist.md): with the view wider than 256, the polygon and vertex
     // RAM counts the game sees, and DISP3DCNT bit 13, are the native view's, and the scene is kept in a
     // list twice the DS's size, half of it for the polygons only the wings show, so the wide view no

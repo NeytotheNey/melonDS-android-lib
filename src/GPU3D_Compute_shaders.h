@@ -423,23 +423,29 @@ const std::string VisResultBuffer = "#ifdef VisShade\n" + ResultBuffer + "#endif
     pixels, edge flags, coverage and depths that Rasterise shades
 */
 const std::string RasteriseShared{R"(
-// whether a span covers pixel x, and which part of it the pixel is in
-bool SpanCovers(int x, int spanX0, int spanX1, int insideStart, int insideEnd, uint flags,
-    out bool insideLeftEdge, out bool insideRightEdge)
-{
-    insideLeftEdge = x < insideStart;
-    insideRightEdge = x >= insideEnd;
-    bool insidePolygonInside = !insideLeftEdge && !insideRightEdge;
+// SpanCoverage's bits. no bool goes in or out of these functions: Mali-G715's driver (r54p3, Pixel 8)
+// drew nothing at all with the coverage test as a function with out bool parameters
+const uint SpanCovered = 1U;
+const uint SpanLeftEdge = 2U;
+const uint SpanRightEdge = 4U;
 
-    return x >= spanX0 && x < spanX1
-        && ((insideLeftEdge && (flags & XSpanSetup_FillLeft) != 0U)
-            || (insideRightEdge && (flags & XSpanSetup_FillRight) != 0U)
-            || (insidePolygonInside && (flags & XSpanSetup_FillInside) != 0U));
+// whether a span covers pixel x (SpanCovered), and which parts of it the pixel is in: SpanLeftEdge,
+// SpanRightEdge (both where the edges overlap), or neither for the inside
+uint SpanCoverage(int x, int spanX0, int spanX1, int insideStart, int insideEnd, uint flags)
+{
+    uint parts = (x < insideStart ? SpanLeftEdge : 0U) | (x >= insideEnd ? SpanRightEdge : 0U);
+    // the fill flags each part takes: either edge's, or the inside's
+    uint fill = ((parts & SpanLeftEdge) != 0U ? XSpanSetup_FillLeft : 0U)
+        | ((parts & SpanRightEdge) != 0U ? XSpanSetup_FillRight : 0U)
+        | (parts == 0U ? XSpanSetup_FillInside : 0U);
+    uint covered = (x >= spanX0 && x < spanX1 && (flags & fill) != 0U) ? SpanCovered : 0U;
+    return covered | parts;
 }
 
-// a covered pixel's attributes: the edge flags in bits 0-3 and the edge's coverage in bits 8-12.
-// reads EdgeCovL, EdgeCovR, CovLInitial, CovRInitial, X0 and InsideEnd of the span
-uint FragmentAttr(ivec2 position, int yTop, int yBot, bool insideLeftEdge, bool insideRightEdge, XSpanSetup xspan)
+// a covered pixel's attributes: the edge flags in bits 0-3 and the edge's coverage in bits 8-12,
+// from SpanCoverage's bits. reads EdgeCovL, EdgeCovR, CovLInitial, CovRInitial, X0 and InsideEnd
+// of the span
+uint FragmentAttr(ivec2 position, int yTop, int yBot, uint coverage, XSpanSetup xspan)
 {
     uint attr = 0U;
     if (position.y == yTop)
@@ -447,7 +453,7 @@ uint FragmentAttr(ivec2 position, int yTop, int yBot, bool insideLeftEdge, bool 
     else if (position.y == yBot - 1)
         attr |= 0x8U;
 
-    if (insideLeftEdge)
+    if ((coverage & SpanLeftEdge) != 0U)
     {
         attr |= 0x1U;
 
@@ -460,7 +466,7 @@ uint FragmentAttr(ivec2 position, int yTop, int yBot, bool insideLeftEdge, bool 
 
         attr |= uint(cov) << 8;
     }
-    else if (insideRightEdge)
+    else if ((coverage & SpanRightEdge) != 0U)
     {
         attr |= 0x2U;
 
@@ -1474,8 +1480,8 @@ void RasteriseTile(uint workIdx)
         int spanInsideEnd = XSpanSetups[xspanIdx].InsideEnd;
         uint spanFlags = XSpanSetups[xspanIdx].Flags;
 
-        bool insideLeftEdge, insideRightEdge;
-        if (SpanCovers(position.x, spanX0, spanX1, spanInsideStart, spanInsideEnd, spanFlags, insideLeftEdge, insideRightEdge))
+        uint coverage = SpanCoverage(position.x, spanX0, spanX1, spanInsideStart, spanInsideEnd, spanFlags);
+        if ((coverage & SpanCovered) != 0U)
         {
             // XMin to Variant aren't used here
             Polygon polygon = Polygon(polyFirstXSpan, polyYTop, polyYBot, 0, 0, 0, 0, 0,
@@ -1511,11 +1517,11 @@ void RasteriseTile(uint workIdx)
     {
         XSpanSetup xspan = XSpanSetups[polygon.FirstXSpan + (position.y - polygon.YTop)];
 
-        bool insideLeftEdge, insideRightEdge;
-        if (SpanCovers(position.x, xspan.X0, xspan.X1, xspan.InsideStart, xspan.InsideEnd, xspan.Flags, insideLeftEdge, insideRightEdge))
+        uint coverage = SpanCoverage(position.x, xspan.X0, xspan.X1, xspan.InsideStart, xspan.InsideEnd, xspan.Flags);
+        if ((coverage & SpanCovered) != 0U)
         {
 #endif
-            uint attr = FragmentAttr(position, polygon.YTop, polygon.YBot, insideLeftEdge, insideRightEdge, xspan);
+            uint attr = FragmentAttr(position, polygon.YTop, polygon.YBot, coverage, xspan);
 
             uint z;
             int u, v, vr, vg, vb;
@@ -2127,8 +2133,8 @@ void main()
                     xspan.InsideEnd = XSpanSetups[xspanIdx].InsideEnd;
                     xspan.Flags = XSpanSetups[xspanIdx].Flags;
 
-                    bool insideLeftEdge, insideRightEdge;
-                    if (!SpanCovers(position.x, xspan.X0, xspan.X1, xspan.InsideStart, xspan.InsideEnd, xspan.Flags, insideLeftEdge, insideRightEdge))
+                    uint coverage = SpanCoverage(position.x, xspan.X0, xspan.X1, xspan.InsideStart, xspan.InsideEnd, xspan.Flags);
+                    if ((coverage & SpanCovered) == 0U)
                         continue;
 
                     // what FragmentAttr, SpanFactor and SpanDepth read, the rest isn't used
@@ -2152,7 +2158,7 @@ void main()
                     xspan.TexcoordU0 = 0; xspan.TexcoordV0 = 0;
                     xspan.TexcoordU1 = 0; xspan.TexcoordV1 = 0;
 
-                    uint fragAttr = FragmentAttr(position, yTop, yBot, insideLeftEdge, insideRightEdge, xspan);
+                    uint fragAttr = FragmentAttr(position, yTop, yBot, coverage, xspan);
                     // a covered pixel has X0 < X1, so Rasterise's X0 == X1 case never comes up. z-buffering's
                     // depth doesn't need the factor, so it has no divide here
 #ifdef WBuffer

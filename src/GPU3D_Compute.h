@@ -111,7 +111,7 @@ public:
     [[nodiscard]] bool NeedsCaptureRedraw() const noexcept override { return PaceStale; }
     void RedrawSkippedFrame(GPU& gpu) override;
 
-    bool NeedsShaderCompile() override { return ShaderStepIdx != ShaderProgramCount(); }
+    bool NeedsShaderCompile() override { return ShaderStepIdx < ShaderProgramCount(); }
     void ShaderCompileStep(int& current, int& count) override;
 private:
     ComputeRenderer(GLCompositor&& compositor);
@@ -424,6 +424,10 @@ private:
     bool WarmZeroFailed = false;
     bool WarmZeroReady(OpenGL::ShaderCacheStats* cache);
     u64 ZeroBuffer(GLuint buffer) noexcept;
+    // what ZeroBuffer writes: 0, or GPU::ComputePoison's pattern while it's on
+    u32 FillValue = 0;
+    bool PoisonOn = false;
+    static constexpr u32 PoisonValue = 0xDEADBEEF;
     double TouchBuffers(std::initializer_list<GLuint> buffers, u64& bytes) noexcept;
     void Warm();
     // glUseProgram, which debug builds also count for COMPSLOW
@@ -515,6 +519,11 @@ private:
     static constexpr int ComputeVis_Opaque = 1 << 0;
     static constexpr int ComputeVis_All = ComputeVis_Opaque;
     int VisMode = 0;
+    // a program of a batch compiled with GPU::ComputeVis didn't build: the batch is compiled again
+    // without it, which stays off for the renderer's life (VisFailed)
+    bool VisBatchFailed = false;
+    bool VisFailed = false;
+    [[nodiscard]] int VisModeFor(const GPU& gpu) const noexcept;
     [[nodiscard]] int ShaderProgramCount() const noexcept { return 33 + (VisMode ? 2 : 0); }
     // the opaque prefix stage 1a can resolve: the polygons from 0 up to the first that is
     // translucent, mode 3 (shadow or shadow mask) or a cut-out (VisCutout). all of their fragments
@@ -589,7 +598,7 @@ private:
     OpenGL::ShaderCacheStats ShaderBatch {};
     s64 ShaderBatchNs = 0;
 
-    void CompileShaderStep(int step);
+    bool CompileShaderStep(int step);
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
