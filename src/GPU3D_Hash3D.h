@@ -92,22 +92,33 @@ namespace melonDS
 // frame that finds the ring full is logged as dropped. emulator thread only, GL context current
 struct Hash3DReadback
 {
-    static constexpr int Slots = 6;
+    // HASH3DF's slots are whole full-resolution images (12 MB each at 8x), so its ring is shorter
+    static constexpr int MaxSlots = 6;
+    static constexpr int FullSlots = 3;
 
     // GL_RGBA / GL_UNSIGNED_BYTE from the OpenGL renderer's downscale target (converted with
     // Hash3DFromGLColor), or GL_RGBA_INTEGER / GL_UNSIGNED_BYTE from the compute renderer's low res
     // image, which is GetLine's format already. with a width, HASH3DF's: width x height of GL_RGBA /
     // GL_UNSIGNED_BYTE (the compute renderer's full-resolution image), hashed as they are
     explicit Hash3DReadback(bool glColor, int width = 0, int height = 0)
-        : GLColor(glColor), Full(width > 0), Width(Full ? width : 256), Height(Full ? height : 192)
+        : GLColor(glColor), Full(width > 0), Width(Full ? width : 256), Height(Full ? height : 192),
+          Slots(Full ? FullSlots : MaxSlots)
     {
         glGenBuffers(Slots, Buffers);
         GLint previous = 0;
         glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previous);
-        for (GLuint buffer : Buffers)
+        // HASH3DF's are checked. errors from before aren't the allocations'
+        for (int i = 0; Full && i < 16 && glGetError() != GL_NO_ERROR; i++) {}
+        GLsizeiptr size = (GLsizeiptr)Width * Height * 4;
+        for (int i = 0; i < Slots; i++)
         {
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
-            glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)Width * Height * 4, nullptr, GL_STREAM_READ);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, Buffers[i]);
+            glBufferData(GL_PIXEL_PACK_BUFFER, size, nullptr, GL_STREAM_READ);
+            if (!Full)
+                continue;
+            GLint64 real = -1;
+            glGetBufferParameteri64v(GL_PIXEL_PACK_BUFFER, GL_BUFFER_SIZE, &real);
+            Allocated = Allocated && glGetError() == GL_NO_ERROR && real == (GLint64)size;
         }
         glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)previous);
     }
@@ -118,14 +129,19 @@ struct Hash3DReadback
     // the readbacks still pending (a renderer change, a game stop) are logged as dropped
     ~Hash3DReadback()
     {
-        for (int i = 0; i < Count; i++)
-            LogHash3DDropped(Frames[(Head + i) % Slots], "rendererclosed", Full);
-        for (GLsync& fence : Fences)
-        {
-            if (fence)
-                glDeleteSync(fence);
-        }
+        DropPending("rendererclosed");
         glDeleteBuffers(Slots, Buffers);
+    }
+
+    // logs the readbacks still pending as dropped, with why, and forgets them
+    void DropPending(const char* why)
+    {
+        for (; Count > 0; Count--, Head = (Head + 1) % Slots)
+        {
+            LogHash3DDropped(Frames[Head], why, Full);
+            glDeleteSync(Fences[Head]);
+            Fences[Head] = nullptr;
+        }
     }
 
     // with the image to hash bound to GL_READ_FRAMEBUFFER and its read buffer set. leaves every
@@ -200,12 +216,14 @@ struct Hash3DReadback
     }
 
     const bool GLColor, Full;
-    const int Width, Height;
+    const int Width, Height, Slots;
+    // every slot got its storage (checked at construction)
+    bool Allocated = true;
 
 private:
-    GLuint Buffers[Slots] {};
-    GLsync Fences[Slots] {};
-    u32 Frames[Slots] {};
+    GLuint Buffers[MaxSlots] {};
+    GLsync Fences[MaxSlots] {};
+    u32 Frames[MaxSlots] {};
     int Head = 0, Count = 0;
     u32 Converted[256 * 192] {};
 };

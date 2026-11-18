@@ -376,13 +376,19 @@ private:
     bool DepthStatsFailed = false;
     std::unique_ptr<ComputeDepthCounter> DepthCounter;
     void UpdateDepthStats(const GPU& gpu);
-    // HASH3DF (GPU::Hash3DFullLogging), made again when the image's size changes
+    // HASH3DF (GPU::Hash3DFullLogging), made again when the image's size changes, and dropped by
+    // ResizeTargets while the switch is off (Hash3DFullOn, from RenderFrame). a ring whose storage
+    // couldn't be had turns it off for the renderer's life
     std::unique_ptr<Hash3DReadback> Hash3DFull;
+    bool Hash3DFullOn = false;
+    bool Hash3DFullFailed = false;
     // COMPVIS (GPU::ComputeVisStats), and the opaque prefix's end and the first equal-test polygon
     // after it, which the COMPDEPTH counters take as uniforms. NoteVisPrefix sets them every render
     // while either is on
     std::unique_ptr<ComputeVisCensus> VisCensus;
     u32 DepthPrefixEnd = 0, DepthTransStop = 0;
+    // the same for the prefix cut at its first cut-out (stage 1a's)
+    u32 DepthCutEnd = 0, DepthCutTransStop = 0;
     void NoteVisPrefix(const GPU& gpu, int numPolygons);
 
     // the COMPSLOW line: RenderFrame's CPU time by phase, logged for a frame over 30 ms, with how

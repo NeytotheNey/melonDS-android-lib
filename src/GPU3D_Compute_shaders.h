@@ -1401,8 +1401,15 @@ void RasteriseTile(uint workIdx)
             {
 #if defined(ProbeNoDivide)
                 // debug.melonade.computeprobe 4, inexact on purpose: a linear factor with a float
-                // reciprocal instead of the perspective divide, to time what the divide costs
-                int ifactor = int(float((position.x - xspan.X0) << YFactorShift) / float(xspan.X1 - xspan.X0));
+                // reciprocal instead of the perspective divide, to time what the divide costs. only
+                // where the divide runs: with OptLinearNoDivide, z-buffering skips it on linear spans
+#if defined(OptLinearNoDivide) && defined(ZBuffer)
+                int ifactor = 0;
+                if ((xspan.Flags & XSpanSetup_Linear) == 0U)
+#else
+                int ifactor;
+#endif
+                    ifactor = int(float((position.x - xspan.X0) << YFactorShift) / float(xspan.X1 - xspan.X0));
 #elif defined(OptLinearNoDivide) && defined(ZBuffer)
                 // z-buffering only uses the factor for a perspective span's attributes, so a
                 // linear one skips the divide

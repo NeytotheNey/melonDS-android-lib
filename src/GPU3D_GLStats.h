@@ -637,7 +637,7 @@ private:
 };
 
 // debug builds only, compute renderer, GPU::ComputeDepthStats: the COMPDEPTH log. DepthBlend is
-// rebuilt with nine counters (see AddDepthStats in GPU3D_Compute.cpp), summed per work group in
+// rebuilt with 14 counters (see AddDepthStats in GPU3D_Compute.cpp), summed per work group in
 // shared memory and added to an SSBO (a flat uint array) once per group.
 //
 // COMPDEPTH, once a second, every value per screen pixel (the dispatch's tile-rounded width x height)
@@ -657,10 +657,13 @@ private:
 //                    prefix left them (behind the first only, when it's no edge): stage 3's yield.
 //                    behind_pct is its share of the colored ones after the prefix
 //   palpha           a count, not per pixel: prefix fragments with an alpha of 1 to 30. must be 0
+//   cvisited ccolored cfailed cwinners cbehind cbehind_pct
+//                    the same as the p fields and behind, for the prefix cut at its first cut-out
+//                    (COMPVIS's precut, stage 1a's), cbehind against the layers as that one left them
 struct ComputeDepthCounter
 {
     enum { Depth_Visited, Depth_Colored, Depth_Failed, Depth_PVisited, Depth_PColored, Depth_PFailed, Depth_Winners,
-        Depth_Behind, Depth_PAlpha, Depth_Count };
+        Depth_Behind, Depth_PAlpha, Depth_CVisited, Depth_CColored, Depth_CFailed, Depth_CWinners, Depth_CBehind, Depth_Count };
     static constexpr GLuint Binding = 8;
 
     GLCounterRing<Depth_Count> Ring;
@@ -679,15 +682,19 @@ struct ComputeDepthCounter
             const double* sums = Ring.Sums;
             double visited = sums[Depth_Visited];
             double restColored = sums[Depth_Colored] - sums[Depth_PColored];
+            double cutRestColored = sums[Depth_Colored] - sums[Depth_CColored];
             Platform::Log(Platform::LogLevel::Info, "COMPDEPTH counted=%u dropped=%u visited=%.3f colored=%.3f failed=%.3f "
                 "colored_pct=%.1f failed_pct=%.1f scale=%d pvisited=%.3f pcolored=%.3f pfailed=%.3f winners=%.3f "
-                "behind=%.3f behind_pct=%.1f palpha=%llu\n",
+                "behind=%.3f behind_pct=%.1f palpha=%llu cvisited=%.3f ccolored=%.3f cfailed=%.3f cwinners=%.3f "
+                "cbehind=%.3f cbehind_pct=%.1f\n",
                 Ring.Counted, Ring.Dropped, visited * per, sums[Depth_Colored] * per, sums[Depth_Failed] * per,
                 visited > 0.0 ? sums[Depth_Colored] * 100.0 / visited : 0.0,
                 visited > 0.0 ? sums[Depth_Failed] * 100.0 / visited : 0.0, scale,
                 sums[Depth_PVisited] * per, sums[Depth_PColored] * per, sums[Depth_PFailed] * per, sums[Depth_Winners] * per,
                 sums[Depth_Behind] * per, restColored > 0.0 ? sums[Depth_Behind] * 100.0 / restColored : 0.0,
-                (unsigned long long)Ring.Totals[Depth_PAlpha]);
+                (unsigned long long)Ring.Totals[Depth_PAlpha], sums[Depth_CVisited] * per, sums[Depth_CColored] * per,
+                sums[Depth_CFailed] * per, sums[Depth_CWinners] * per, sums[Depth_CBehind] * per,
+                cutRestColored > 0.0 ? sums[Depth_CBehind] * 100.0 / cutRestColored : 0.0);
         }
         Ring.ResetSums();
         LogStartNs = now;

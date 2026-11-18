@@ -79,20 +79,26 @@ static bool AddDepthStats(std::string& src)
     if (!insertAt("workIdx++;", " DepthStatsVisited++;", true)) return false;
     // the opaque prefix's polygons (polygon order is walk order), and the layers as the walk leaves it
     if (!insertAt("uint polygonIdx = fineIdx + (coarseBit + coarseOffset) * 32U;",
-        " bool DepthStatsPre = polygonIdx < DepthStatsPrefixEnd;"
-        " if (DepthStatsPre) DepthStatsPVisited++; else if (!DepthStatsSnap) DepthStatsSnapshot(depth, attr.x);", true)) return false;
+        " bool DepthStatsPre = polygonIdx < DepthStatsPrefixEnd, DepthStatsCPre = polygonIdx < DepthStatsCutEnd;"
+        " if (DepthStatsPre) DepthStatsPVisited++; else if (!DepthStatsSnap) DepthStatsSnapshot(depth, attr.x);"
+        " if (DepthStatsCPre) DepthStatsCVisited++; else if (!DepthStatsCSnap) DepthStatsCSnapshot(depth, attr.x);", true)) return false;
     {
         size_t pos = src.find("if (tileColor != 0U)", start);
         size_t brace = pos == std::string::npos ? std::string::npos : src.find('{', pos);
         if (brace == std::string::npos) return false;
         src.insert(brace + 1, " DepthStatsColored++;"
-            " if (DepthStatsPre) { DepthStatsPColored++; if ((tileColor & 0x1F000000U) != 0x1F000000U) DepthStatsPAlpha++; }");
+            " if (DepthStatsPre) { DepthStatsPColored++; if ((tileColor & 0x1F000000U) != 0x1F000000U) DepthStatsPAlpha++; }"
+            " if (DepthStatsCPre) DepthStatsCColored++;");
     }
     if (!insertAt("uint tileDepth = TileDepth(pixelindex);",
         " if (!DepthStatsPre && !isShadowMask && !equalDepthTest && polygonIdx < DepthStatsTransStop"
         " && tileDepth >= DepthStatsOpDepth.x && ((DepthStatsOpAttr & 0x3U) == 0U || tileDepth >= DepthStatsOpDepth.y))"
-        " DepthStatsBehind++;", true)) return false;
-    if (!insertAt("if ((dstattr & 0x3U) == 0U || writeSecondLayer)", "DepthStatsFailed++; if (DepthStatsPre) DepthStatsPFailed++; ", false)) return false;
+        " DepthStatsBehind++;"
+        " if (!DepthStatsCPre && !isShadowMask && !equalDepthTest && polygonIdx < DepthStatsCutTransStop"
+        " && tileDepth >= DepthStatsCOpDepth.x && ((DepthStatsCOpAttr & 0x3U) == 0U || tileDepth >= DepthStatsCOpDepth.y))"
+        " DepthStatsCBehind++;", true)) return false;
+    if (!insertAt("if ((dstattr & 0x3U) == 0U || writeSecondLayer)",
+        "DepthStatsFailed++; if (DepthStatsPre) DepthStatsPFailed++; if (DepthStatsCPre) DepthStatsCFailed++; ", false)) return false;
     // which layers a prefix polygon wrote: the push-down, the first layer, the second
     if (!insertAt("color.y = color.x;", " DepthStatsWin.y = DepthStatsWin.x;", true)) return false;
     if (!insertAt("color.x = tileColor;", " DepthStatsWin.x = true;", true)) return false;
@@ -119,37 +125,50 @@ static bool AddDepthStats(std::string& src)
         "layout (std430, binding = 8) buffer DepthStatsBuffer { uint DepthStatsCount[]; };\n"
         "layout (location = 0) uniform uint DepthStatsPrefixEnd;\n"
         "layout (location = 1) uniform uint DepthStatsTransStop;\n"
-        "shared uint DepthStatsShared[9];\n"
+        "layout (location = 2) uniform uint DepthStatsCutEnd;\n"
+        "layout (location = 3) uniform uint DepthStatsCutTransStop;\n"
+        "shared uint DepthStatsShared[14];\n"
         "uint DepthStatsVisited = 0U, DepthStatsColored = 0U, DepthStatsFailed = 0U, DepthStatsPVisited = 0U, DepthStatsPColored = 0U;\n"
         "uint DepthStatsPFailed = 0U, DepthStatsWinners = 0U, DepthStatsBehind = 0U, DepthStatsPAlpha = 0U;\n"
-        "bool DepthStatsSnap = false;\n"
+        "uint DepthStatsCVisited = 0U, DepthStatsCColored = 0U, DepthStatsCFailed = 0U, DepthStatsCWinners = 0U, DepthStatsCBehind = 0U;\n"
+        "bool DepthStatsSnap = false, DepthStatsCSnap = false;\n"
         "bvec2 DepthStatsWin = bvec2(false);\n"
-        "uvec2 DepthStatsOpDepth = uvec2(0U);\n"
-        "uint DepthStatsOpAttr = 0U;\n"
+        "uvec2 DepthStatsOpDepth = uvec2(0U), DepthStatsCOpDepth = uvec2(0U);\n"
+        "uint DepthStatsOpAttr = 0U, DepthStatsCOpAttr = 0U;\n"
         "void DepthStatsSnapshot(uvec2 depth, uint attr)\n"
         "{\n"
         "    DepthStatsSnap = true;\n"
         "    DepthStatsWinners = uint(DepthStatsWin.x) + uint(DepthStatsWin.y);\n"
         "    DepthStatsOpDepth = depth;\n"
         "    DepthStatsOpAttr = attr;\n"
+        "}\n"
+        "void DepthStatsCSnapshot(uvec2 depth, uint attr)\n"
+        "{\n"
+        "    DepthStatsCSnap = true;\n"
+        "    DepthStatsCWinners = uint(DepthStatsWin.x) + uint(DepthStatsWin.y);\n"
+        "    DepthStatsCOpDepth = depth;\n"
+        "    DepthStatsCOpAttr = attr;\n"
         "}\n\n");
     src +=
         "\nvoid main()\n"
         "{\n"
-        "    if (gl_LocalInvocationIndex < 9U)\n"
+        "    if (gl_LocalInvocationIndex < 14U)\n"
         "        DepthStatsShared[gl_LocalInvocationIndex] = 0U;\n"
         "    memoryBarrierShared();\n"
         "    barrier();\n"
         "    DepthBlendMain();\n"
         "    if (!DepthStatsSnap)\n"
         "        DepthStatsWinners = uint(DepthStatsWin.x) + uint(DepthStatsWin.y);\n"
-        "    uint counts[9] = uint[9](DepthStatsVisited, DepthStatsColored, DepthStatsFailed, DepthStatsPVisited,\n"
-        "        DepthStatsPColored, DepthStatsPFailed, DepthStatsWinners, DepthStatsBehind, DepthStatsPAlpha);\n"
-        "    for (int i = 0; i < 9; i++)\n"
+        "    if (!DepthStatsCSnap)\n"
+        "        DepthStatsCWinners = uint(DepthStatsWin.x) + uint(DepthStatsWin.y);\n"
+        "    uint counts[14] = uint[14](DepthStatsVisited, DepthStatsColored, DepthStatsFailed, DepthStatsPVisited,\n"
+        "        DepthStatsPColored, DepthStatsPFailed, DepthStatsWinners, DepthStatsBehind, DepthStatsPAlpha,\n"
+        "        DepthStatsCVisited, DepthStatsCColored, DepthStatsCFailed, DepthStatsCWinners, DepthStatsCBehind);\n"
+        "    for (int i = 0; i < 14; i++)\n"
         "        atomicAdd(DepthStatsShared[i], counts[i]);\n"
         "    memoryBarrierShared();\n"
         "    barrier();\n"
-        "    if (gl_LocalInvocationIndex < 9U)\n"
+        "    if (gl_LocalInvocationIndex < 14U)\n"
         "        atomicAdd(DepthStatsCount[gl_LocalInvocationIndex], DepthStatsShared[gl_LocalInvocationIndex]);\n"
         "}\n";
     return true;
@@ -967,6 +986,14 @@ void ComputeRenderer::SetColorDither(bool dither) noexcept
 
 void ComputeRenderer::ResizeTargets(int scale, bool highResolutionCoordinates, int targetWidth, int targetMargin)
 {
+#ifdef MELONADE_DEBUG_TOOLS
+    // HASH3DF's ring is a few full images, so it doesn't stay once the switch is off
+    if (!Hash3DFullOn && Hash3DFull)
+    {
+        Hash3DFull->DropPending("off");
+        Hash3DFull.reset();
+    }
+#endif
     CurGLCompositor.SetRenderSettings(GLCompositor::CappedScale(scale, OutputNeed, OutputAnyRatio), scale, targetWidth, targetMargin);
 
     if (ScaleFactor != -1)
@@ -1852,10 +1879,24 @@ void ComputeRenderer::QueueHash3D(GPU& gpu, u32 frame)
 void ComputeRenderer::QueueHash3DFull(GPU& gpu, u32 frame)
 {
     int width = TargetWidth * ScaleFactor, height = OutputHeight;
-    if (width <= 0 || height <= 0 || !Framebuffer)
+    if (width <= 0 || height <= 0 || !Framebuffer || Hash3DFullFailed)
         return;
     if (!Hash3DFull || Hash3DFull->Width != width || Hash3DFull->Height != height)
+    {
+        if (Hash3DFull)
+            Hash3DFull->DropPending("resize");
         Hash3DFull = std::make_unique<Hash3DReadback>(false, width, height);
+        if (!Hash3DFull->Allocated)
+        {
+            // off for the session: a ring that doesn't fit now wouldn't later either
+            Platform::Log(Platform::LogLevel::Warn, "HASH3DF alloc_failed size=%dx%d slots=%d, off until the renderer is made again\n",
+                width, height, Hash3DFull->Slots);
+            Hash3DFull->DropPending("allocfailed");
+            Hash3DFull.reset();
+            Hash3DFullFailed = true;
+            return;
+        }
+    }
 
     GLint readFB = 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFB);
@@ -1873,7 +1914,7 @@ void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
 {
     const GPU3D& gpu3d = gpu.GPU3D;
     bool texMaps = gpu3d.RenderDispCnt & (1<<0);
-    int prefix = -1, firstCut = -1, transStop = numPolygons, endWhy = 0;
+    int prefix = -1, firstCut = -1, transStop = numPolygons, cutTransStop = numPolygons, endWhy = 0;
     u64 tiles = 0, prefixTiles = 0, preCutTiles = 0;
     u32 opaque = 0, cutout = 0, cutPrefix = 0, eq = 0, shadow = 0, mask = 0, wire = 0;
     for (int i = 0; i < numPolygons; i++)
@@ -1894,9 +1935,12 @@ void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
         u32 t = PolygonTileBound(RenderPolygons[i]);
         tiles += t;
         prefixTiles += inPrefix ? t : 0;
-        preCutTiles += (inPrefix && firstCut < 0) ? t : 0;
+        bool inPreCut = inPrefix && firstCut < 0;
+        preCutTiles += inPreCut ? t : 0;
         if (!inPrefix && equal && transStop == numPolygons)
             transStop = i;
+        if (!inPreCut && equal && cutTransStop == numPolygons)
+            cutTransStop = i;
         opaque += !p->Translucent;
         cutout += cut;
         cutPrefix += cut && inPrefix;
@@ -1909,6 +1953,8 @@ void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
         prefix = numPolygons;
     DepthPrefixEnd = (u32)prefix;
     DepthTransStop = (u32)transStop;
+    DepthCutEnd = (u32)(firstCut < 0 ? prefix : firstCut);
+    DepthCutTransStop = (u32)cutTransStop;
 
     if (!gpu.ComputeVisStats)
     {
@@ -1922,7 +1968,7 @@ void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
     c.Polys += numPolygons;
     c.Opaque += opaque;
     c.Prefix += prefix;
-    c.PreCut += firstCut < 0 ? prefix : firstCut;
+    c.PreCut += DepthCutEnd;
     c.Tiles += tiles;
     c.PrefixTiles += prefixTiles;
     c.PreCutTiles += preCutTiles;
@@ -2470,6 +2516,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     SlowFirsts = 0;
     if (gpu.ComputeTimers || gpu.ComputePeaks || gpu.ComputeSync || Stats)
         UpdateStats(gpu);
+    Hash3DFullOn = gpu.Hash3DFullLogging;
 #endif
     CaptureSpinUs = gpu.CaptureSpinUs;
     // the COMPWHY log tells a swap with the same scene from one with a new scene
@@ -3305,6 +3352,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     {
         glUniform1ui(0, DepthPrefixEnd);
         glUniform1ui(1, DepthTransStop);
+        glUniform1ui(2, DepthCutEnd);
+        glUniform1ui(3, DepthCutTransStop);
     }
 #endif
     glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
