@@ -3213,6 +3213,14 @@ void GLCompositor::RunShadow2DPlanes(bool checked) noexcept
         glDrawBuffers(2, buffers);
         Shadow.PlanesTargets = targets;
     }
+    // both targets' write masks, before the clears (glClearBuffer obeys them) and the draw: the
+    // OpenGL 3D renderer leaves draw buffer 1 masked (its translucent, edge and fog passes) until its
+    // next frame starts, and nothing else here sets it, so StackTex went unwritten and the affine
+    // composite read stale stacks (Mario Kart's bottom screen at 2x and up: frozen racer icons, a
+    // garbage band in rank swaps). the compute renderer never sets it either, so after a switch from
+    // OpenGL it stays as OpenGL left it
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     const GLenum colors[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
     if (checked)
     {
