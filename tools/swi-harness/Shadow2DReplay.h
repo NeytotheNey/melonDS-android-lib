@@ -33,6 +33,22 @@ struct Shadow2DReplay
     melonDS::u64 ObjWindowLines = 0; // and lines where an OBJ window sprite drew into it
     melonDS::u64 Mismatches = 0;    // plane words that differed
     melonDS::u64 MemMismatches = 0; // MemTex words the incremental uploads left stale
+    melonDS::u64 AffineLines = 0;   // of the lines compared, those with an affine BG
+    melonDS::u64 ExtLines = 0;      // and with a tiled extended BG
+    // the affine composite (lines with a rotated or scaled BG, Shadow2D::HiresBGs, as at 2x and up):
+    // its planes at each native pixel's first sub-pixel, which have to be the planes pass's, and over
+    // every sub-pixel at SubScale on every 8th frame, how many differ from the native pixel's (the
+    // sharpness hi-res adds, only counted)
+    melonDS::u64 HiresLines = 0;
+    melonDS::u64 AffineRuns = 0;    // the affine composite's draws (runs of lines sharing constants)
+    melonDS::u64 PerLineRuns = 0;   // of them, runs whose fragments read each line's constants
+    melonDS::u64 StackMismatches = 0;
+    melonDS::u64 SubPixels = 0, SubDiffers = 0;
+    int SubScale = 4;
+    melonDS::u32 Frames = 0;
+    // the rotated or scaled BGs seen (unit, BG, kind, A-D), each logged once, the first 64
+    melonDS::u64 SeenRot[64] {};
+    int SeenRotCount = 0;
     FILE* Log = nullptr;            // the first mismatches go here
 
     // Shadow2DRecorder::FrameHook

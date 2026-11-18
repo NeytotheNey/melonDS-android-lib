@@ -531,12 +531,24 @@ private:
     static constexpr int Shadow2DObjUnit = 13;
     static constexpr int Shadow2DPlanesUnit = 15;
     // the programs (Shadow2DFS): the composite in the middle only and wide, the planes pass in the 256
-    // view and wide
-    enum { Shadow2DComp, Shadow2DCompWide, Shadow2DPlanes, Shadow2DPlanesWide, Shadow2DPrograms };
+    // view and wide, and the affine composite, for the lines with BGs sampled at sub-pixels
+    // (Shadow2D::F_HiresShift), in the middle only and wide
+    enum { Shadow2DComp, Shadow2DCompWide, Shadow2DPlanes, Shadow2DPlanesWide, Shadow2DAffine, Shadow2DAffineWide,
+           Shadow2DPrograms };
     struct Shadow2DProgram
     {
         GLuint Program = 0;
         GLint ScaleLoc = -1, WideOffsetLoc = -1, ObjOffsetLoc = -1, WideMarginLoc = -1;
+        // the affine composite's run constants (Shadow2D::PackAffineLine)
+        GLint AffineRefLoc = -1, AffineRot2Loc = -1, AffineRot3Loc = -1, AffineLineLoc = -1, AffineRowLoc = -1;
+        GLint AffinePerLineLoc = -1;
+    };
+    // a run of lines the affine composite draws with its first line's constants
+    struct AffineRun
+    {
+        u32 Constants[12];                  // Shadow2D::AffineWords
+        int Row = 0;                        // the first line's PlanesTex row
+        bool PerLine = false;               // the shader reads each line's constants from its block
     };
     struct Shadow2DState
     {
@@ -548,9 +560,12 @@ private:
         int ObjW = 0;
         GLuint InstanceBuffer = 0, InstanceVAO = 0;
         GLuint QuadBuffer = 0, QuadVAO = 0;
-        // GL_RGBA32UI ViewWidth x 384: each drawn native pixel's planes 0-2, and whether a 2D layer drew it
-        GLuint PlanesTex = 0, PlanesFB = 0;
+        // GL_RGBA32UI ViewWidth x 384: each drawn native pixel's planes 0-2, and whether a 2D layer drew it.
+        // StackTex, the same size, is PlanesFB's second target: the stack without the BGs sampled at
+        // sub-pixels, for the affine composite (drawn into every frame)
+        GLuint PlanesTex = 0, StackTex = 0, PlanesFB = 0;
         int PlanesW = 0;
+        int PlanesTargets = 0;              // PlanesFB's draw buffers: 2, or 1 with gpu2daffine 2
         GLuint ObjProgram = 0;
         GLint ObjWLoc = -1, ObjWideOffsetLoc = -1;
         std::array<Shadow2DProgram, Shadow2DPrograms> Comp {};
@@ -558,7 +573,11 @@ private:
 
         std::vector<u32> State;             // the blocks as uploaded, 384 lines
         std::vector<float> Quads;           // the row runs' triangles
+        std::vector<float> AffineQuads;     // the affine composite's, a quad per AffineRuns entry
+        std::vector<AffineRun> AffineRuns;
         int DrawnLines = 0;
+        int HiresLines = 0;                 // of them, the lines with BGs sampled at sub-pixels
+        int AffineDebug = 0;                // the recorder's, for the frame
 
         // the GPU2D log, Shadow2DRecorder::Logging only
         s64 LogStartNs = 0;
@@ -566,6 +585,7 @@ private:
         std::array<u32, 32> LogReasons {};
         u64 LogUploadBytes = 0;
         u64 LogInstances = 0;
+        u64 LogHiresLines = 0;
         u32 CheckFrames = 0, Checks = 0, CheckLines = 0, Mismatches = 0;
     };
     Shadow2DState Shadow {};
