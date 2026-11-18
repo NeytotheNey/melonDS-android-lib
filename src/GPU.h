@@ -1229,12 +1229,14 @@ public:
     std::unique_ptr<GPU2DStats> Stats2D;
     void Set2DStatsLogging(bool enable) noexcept;
 
-    // debug only for now: the GPU 2D shadow renderer (GPU_Shadow2D.h, docs/plan-gpu-2d-shadow.md).
-    // the recorder notes each line's state while the jobs are built, and the GL compositor redraws
+    // the GPU 2D shadow renderer (GPU_Shadow2D.h, docs/plan-gpu-2d-shadow.md): the app's "Sharper
+    // rotated 2D" setting turns on mode 1, and debug.melonade.gpu2d sets any mode over it. the
+    // recorder notes each line's state while the jobs are built, and the GL compositor redraws
     // the lines it can at output resolution, for display only. null while it's off, the default, so
     // that's all it costs. mode 1 draws the lines that gain something, 2 every eligible line; log
     // adds the GPU2D log line, check (with mode 2) the 1x readback; wide 1 lets every layer draw past
-    // the edge (debug.melonade.gpu2dwide). set between games, before the reset
+    // the edge (debug.melonade.gpu2dwide). set between frames (it waits for the 2D thread and starts
+    // the recorder over), or between games before the reset
     std::unique_ptr<Shadow2DRecorder> Shadow2D;
     void SetShadow2D(int mode, bool log, bool check, int wide) noexcept;
 

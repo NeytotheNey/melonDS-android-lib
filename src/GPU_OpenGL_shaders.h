@@ -196,6 +196,8 @@ smooth in vec2 fTexcoord;
 
 #ifdef SHADOW2D_PLANES
 layout(location = 0) out uvec4 oPlanes;
+// the stack without the BGs the composite samples at sub-pixels (GLCompositor::RunShadow2DPlanes)
+layout(location = 1) out uvec4 oStack;
 #else
 layout(location = 0) out vec4 oColor;
 #endif
@@ -1927,17 +1929,28 @@ void main()
 }
 )";
 
-// the shadow's two passes, kCompositorFS_Nearest_Head with SHADOW2D (and WIDE for a wide view) +
-// kCompositePixelFS + kCompositorFS_Nearest_Main + kShadow2DMemFS + this. both draw row-run quads
-// over the drawn lines.
+// the shadow's passes, kCompositorFS_Nearest_Head with SHADOW2D (and WIDE for a wide view) +
+// kCompositePixelFS + kCompositorFS_Nearest_Main + kShadow2DMemFS + this. all draw quads over the
+// drawn lines.
 // the planes pass (SHADOW2D_PLANES, GLCompositor::RunShadow2DPlanes) rebuilds each native pixel's
 // planes 0-2 the way SoftRenderer::DrawScanline_BGOBJ does (text BGs, normal sprites, BLDCNT blending
-// since increment 5, windows since increment 4; no mosaic yet) into PlanesTex, ViewWidth x 384 at 1x with no gap
-// between the screens. the composite (GLCompositor::RunShadow2D), at the output's resolution after
-// the compositor's own pass, reads its native pixel's planes and runs the compositor's own maths on
-// them. the planes don't depend on the sub-pixel while every drawn layer is a text BG or a normal
-// sprite, so this is what working them out per sub-pixel gives, for 1/Scale^2 of the layer work
-// (working them out per output pixel cost the Adreno 640 14 ms a frame at 4x)
+// since increment 5, windows since increment 4, affine and tiled extended BGs since increment 2; no
+// mosaic yet) into PlanesTex, ViewWidth x 384 at 1x with no gap between the screens. the composite
+// (GLCompositor::RunShadow2D), at the output's resolution after the compositor's own pass, reads its
+// native pixel's planes and runs the compositor's own maths on them. the planes don't depend on the
+// sub-pixel while every drawn layer is a text BG, a normal sprite or a 1:1 affine BG, so this is what
+// working them out per sub-pixel gives, for 1/Scale^2 of the layer work (working them out per output
+// pixel cost the Adreno 640 14 ms a frame at 4x).
+// a rotated or scaled BG (Shadow2D::HiresBGs, at 2x and up) is what hi-res is for, so it's sampled at
+// each output pixel's own position instead. the planes pass also writes, into StackTex, the pixel's
+// stack without those BGs and where each of them would go in it, and the affine composite
+// (SHADOW2D_AFFINE, over the runs of such lines) samples just those BGs at the sub-pixel, puts them
+// in and works the planes out from there. so only the rotated layers cost per output pixel, and at
+// the native pixel's first sub-pixel this gives exactly the planes the planes pass wrote. its line
+// constants are uniforms, one draw per run of lines that share them (Shadow2D::AffineRunContinues),
+// so a fragment's BG fetches don't wait on fetching them: an earlier version passed them on as flat
+// varyings from a vertex shader, one quad per line, and the Adreno 640 drew whole groups of those
+// lines black at 8x; fetching them per fragment fixed that but cost the Adreno 640 about twice as much
 const char* kShadow2DVS = R"(#version 320 es
 
 in vec2 vPosition;
@@ -2032,6 +2045,69 @@ uint TextBGPixel(int bg, int nx, int vcount, bool unitB, uint dispcnt, uint bgcn
     return ColorWord(color, 0x01000000u << uint(bg));
 }
 
+// SoftRenderer::DrawBG_Affine (ext false) or DrawBG_Extended's tiled mode (ext true) for BG2 or BG3
+// at x, y: the BG's coordinates in 1/256 pixels, what the CPU's rotX and rotY are at the pixel (any
+// int: past the edges they carry on as x*A does). 0 is transparent
+uint RotBGPixel(int bg, int x, int y, bool ext, bool unitB, uint dispcnt, uint bgcnt)
+{
+    // the tile bits of a 128 to 1024 pixel BG. without wrap (BGCNT bit 13), anything past its
+    // edges is transparent
+    int size = int((bgcnt >> 14) & 0x3u);
+    int coordmask = (0x8000 << size) - 0x800;
+    if ((bgcnt & 0x2000u) == 0u && ((x | y) & ~(coordmask | 0x7FF)) != 0)
+        return 0u;
+
+    int tileset, tilemap, mask, base;
+    if (unitB)
+    {
+        tileset = int((bgcnt & 0x003Cu) << 12);
+        tilemap = int((bgcnt & 0x1F00u) << 3);
+        mask = 0x1FFFF;
+        base = MemBBG;
+    }
+    else
+    {
+        tileset = int(((dispcnt & 0x07000000u) >> 8) + ((bgcnt & 0x003Cu) << 12));
+        tilemap = int(((dispcnt & 0x38000000u) >> 11) + ((bgcnt & 0x1F00u) << 3));
+        mask = 0x7FFFF;
+        base = MemABG;
+    }
+
+    int map = (((y & coordmask) >> 11) << (4 + size)) + ((x & coordmask) >> 11);
+    int tx = (x >> 8) & 0x7;
+    int ty = (y >> 8) & 0x7;
+    int palBase = unitB ? 0x400 : 0;
+
+    uint color;
+    if (ext)
+    {
+        // a 16-bit tilemap: flips, and the extended palette slot is the BG's own
+        int tile = int(MemHalf(base, (tilemap + (map << 1)) & mask));
+        if ((tile & 0x0400) != 0)
+            tx = 7 - tx;
+        if ((tile & 0x0800) != 0)
+            ty = 7 - ty;
+        int c = int(MemByte(base, (tileset + ((tile & 0x03FF) << 6) + (ty << 3) + tx) & mask));
+        if (c == 0)
+            return 0u;
+        if ((dispcnt & 0x40000000u) != 0u)
+            color = MemHalf(unitB ? MemBBGExt : MemABGExt, bg * 8192 + ((tile >> 12) & 0xF) * 512 + c * 2);
+        else
+            color = MemHalf(MemPal, palBase + c * 2);
+    }
+    else
+    {
+        // an 8-bit tilemap of 256-color tiles
+        int tile = int(MemByte(base, (tilemap + map) & mask));
+        int c = int(MemByte(base, (tileset + (tile << 6) + (ty << 3) + tx) & mask));
+        if (c == 0)
+            return 0u;
+        color = MemHalf(MemPal, palBase + c * 2);
+    }
+
+    return ColorWord(color, 0x01000000u << uint(bg));
+}
+
 // SoftRenderer::InterleaveSprites's color for an opaque OBJ line pixel, with the BG pass's DISPCNT
 uint SpritePixel(uint obj, bool unitB, uint dispcnt)
 {
@@ -2053,6 +2129,12 @@ bool WideBG(int bg, int nx, uint modes, uint left, uint right)
     if (nx < 0)
         return -nx <= int((left >> uint(bg * 8)) & 0xFFu);
     return nx - 255 <= int((right >> uint(bg * 8)) & 0xFFu);
+}
+
+// a stack entry from a 2D layer (a BG or a sprite), not the backdrop, the 3D layer or nothing
+bool Is2D(uint word)
+{
+    return ((word >> 24) & 0x9Fu) != 0u;
 }
 
 ivec4 PlaneBytes(uint word)
@@ -2176,6 +2258,46 @@ uint ColorComposite(uint val1, uint val2, uint blend, uint evy, uint win)
     return val1;
 }
 
+// DrawScanline_BGOBJ's accelerated planes from a pixel's stack (top, second, third). unit A takes one
+// of its four branches: 3D on top blending, 3D on top normal or fade, 3D on bottom blending, or no
+// 3D involved. unit B is ColorComposite with planes 1 and 2 cleared
+uvec3 StackPlanes(uint top, uint second, uint third, bool unitB, uint blend, uint blendEVY, uint win)
+{
+    uint blendCnt = blend & 0xFFFFu;
+    uint eva = (blend >> 16) & 0xFFu;
+    uint evb = (blend >> 24) & 0xFFu;
+    uint flag1 = top >> 24;
+    uint flag2 = second >> 24;
+    if (!unitB && (flag1 & 0xC0u) == 0x40u && (blendCnt & BlendTarget2(flag2)) != 0u)
+    {
+        // 3D on top, blending
+        return uvec3(second, ColorComposite(second, third, blend, blendEVY, win), 0x04000000u);
+    }
+    if (!unitB && (flag1 & 0xC0u) == 0x40u)
+    {
+        // 3D on top, normal or fade
+        uint effect = (blendCnt >> 6) & 0x3u;
+        if (effect == 1u || (blendCnt & 0x0001u) == 0u || (win & 0x20u) == 0u)
+            effect = 0u;
+        return uvec3(second, ColorComposite(second, third, blend, blendEVY, win), (effect << 24) | (blendEVY << 8));
+    }
+    if (!unitB && (flag2 & 0xC0u) == 0x40u && (blendCnt & 0x01C0u) == 0x0140u)
+    {
+        // 3D on bottom, blending. the CPU works out the sprite's EVA and EVB here but only keeps
+        // the effect: the compositor blends with the unit's
+        uint effect = 1u;
+        uint target1;
+        if      ((flag1 & 0x80u) != 0u) target1 = 0x0010u;
+        else if ((flag1 & 0x40u) != 0u) target1 = 0x0001u;
+        else                            target1 = flag1;
+        if ((flag1 & 0xC0u) != 0xC0u && !(((blendCnt & target1) != 0u && (win & 0x20u) != 0u) || (flag1 & 0xC0u) == 0x80u))
+            effect = 7u;
+        return uvec3(top, ColorComposite(top, third, blend, blendEVY, win), (effect << 24) | (evb << 16) | (eva << 8));
+    }
+    // no potential 3D pixel involved (unit B always)
+    return uvec3(ColorComposite(top, second, blend, blendEVY, win), 0u, 0x07000000u);
+}
+
 // UnitState::CalculateWindowMask's scan of one window up to column x, in closed form. coords is the
 // block's W_Win0 or W_Win1 (x1 in byte 0, x2 in byte 1), winState Win0Active or Win1Active as the line
 // starts. the X state (bit 1) is the carry-in from the line before until an edge at or left of x, then
@@ -2212,10 +2334,25 @@ uint WindowMask(int x, uint dispcnt, uint win0, uint win1, uint winCnt, uint win
     return mask;
 }
 
-// DrawPixel_Accel's 3-entry stack, top first
-#define PUSH(v) { if (found == 0) top = (v); else if (found == 1) second = (v); else third = (v); found++; }
+// a word's bits as a signed int, and a halfword's sign-extended, by arithmetic (no conversion that
+// would have to keep the bit pattern)
+int AsInt(uint w)
+{
+    return (w & 0x80000000u) != 0u ? -int(~w) - 1 : int(w);
+}
+
+int S16(uint w)
+{
+    int v = int(w & 0xFFFFu);
+    return v >= 0x8000 ? v - 0x10000 : v;
+}
 
 #ifdef SHADOW2D_PLANES
+// DrawPixel_Accel's 3-entry stack, top first (pushes past the third only count), and the same stack
+// without the BGs the composite samples at sub-pixels
+#define PUSH(v) { if (found == 0) top = (v); else if (found == 1) second = (v); else if (found == 2) third = (v); found++; }
+#define PUSH_NA(v) { if (foundNA == 0) na0 = (v); else if (foundNA == 1) na1 = (v); else if (foundNA == 2) na2 = (v); foundNA++; }
+
 void main()
 {
     // one native pixel: PlanesTex's rows are the lines with no gap between the screens, and its
@@ -2231,7 +2368,7 @@ void main()
     if ((flags & 0x80000000u) == 0u)
         discard;
     uvec4 s1 = texelFetch(LineStateTex, ivec2(1, row), 0);  // BGCNT 2-3, BG0-2 scroll
-    uvec4 s2 = texelFetch(LineStateTex, ivec2(2, row), 0);  // BG3 scroll
+    uvec4 s2 = texelFetch(LineStateTex, ivec2(2, row), 0);  // BG3 scroll, BG2 reference point, BG3's X
     uvec4 s5 = texelFetch(LineStateTex, ivec2(5, row), 0);  // window X/Y state, mosaic, BLDCNT with EVA and EVB
     uvec4 s6 = texelFetch(LineStateTex, ivec2(6, row), 0);  // EVY and backdrop, lines, wide modes, left extents
     uvec4 s7 = texelFetch(LineStateTex, ivec2(7, row), 0);  // right extents
@@ -2244,6 +2381,18 @@ void main()
     uint textMask = (flags >> 12) & 0xFu;
     bool bg0Is3D = (flags & 0x800u) != 0u;
     bool wing = nx < 0 || nx > 255;
+
+    // BG2 and BG3 as rotation/scaling BGs (Shadow2D::F_AffineShift and F_ExtShift), and the ones of
+    // them the composite samples at sub-pixels (F_HiresShift), as BG bits
+    uint affineMask = ((flags >> 25) & 0x3u) << 2;
+    uint rotMask = affineMask | (((flags >> 27) & 0x3u) << 2);
+    uint hiresMask = ((flags >> 18) & 0x3u) << 2;
+    uvec4 s3 = uvec4(0u), s4 = uvec4(0u);
+    if (rotMask != 0u || (dispcnt & 0xE000u) != 0u)
+    {
+        s3 = texelFetch(LineStateTex, ivec2(3, row), 0);    // BG3's Y, BG2 rotation A-B, C-D, BG3 A-B
+        s4 = texelFetch(LineStateTex, ivec2(4, row), 0);    // BG3 rotation C-D, window 0-1 coords, WINCNT
+    }
 
     // the line's OBJ pixel, if the BG pass shows sprites (LayerEnable bit 4)
     uint obj = 0u;
@@ -2266,7 +2415,6 @@ void main()
         int wx = clamp(nx, 0, 255);
         if ((flags & (1u << 17)) != 0u)
             wx = clamp(wx, 1, 254);
-        uvec4 s4 = texelFetch(LineStateTex, ivec2(4, row), 0);  // BG3 rotation C-D, window 0-1 coords, WINCNT
         bool objWin = false;
         if ((dispcnt & 0x8000u) != 0u)
             objWin = texelFetch(ObjTex, ivec2(wx + uObjOffset, 384 + (unitB ? 192 : 0) + line), 0).g != 0u;
@@ -2275,35 +2423,64 @@ void main()
 
     // DrawScanlineBGMode's order backwards (priority 0 first, and in a priority the sprites, then
     // BG0 to BG3): the first three opaque layers are DrawPixel_Accel's stack. the 3D layer is the
-    // placeholder, opaque everywhere its window bit is set
+    // placeholder, opaque everywhere its window bit is set. a rotation/scaling BG is at the CPU's
+    // rotX and rotY for the pixel, the line's latched reference point plus nx steps of A and C.
+    // the composite's stack leaves out the BGs it samples at sub-pixels, so it goes on to the first
+    // three opaque layers of the rest, and keeps where those BGs come in it (3 for nowhere: below
+    // its third entry, or not drawn at this pixel)
     uint top = 0u, second = 0u, third = 0u;
     int found = 0;
-    bool any2D = false;
-    for (int prio = 0; prio < 4 && found < 3; prio++)
+    uint na0 = 0u, na1 = 0u, na2 = 0u;
+    int foundNA = 0;
+    int at2 = 3, at3 = 3;
+    for (int prio = 0; prio < 4 && (found < 3 || foundNA < 3); prio++)
     {
         if (obj != 0u && int((obj >> 16) & 0x3u) == prio && (win & 0x10u) != 0u)
         {
-            PUSH(SpritePixel(obj, unitB, dispcnt))
-            any2D = true;
+            uint pixel = SpritePixel(obj, unitB, dispcnt);
+            PUSH(pixel)
+            PUSH_NA(pixel)
         }
-        for (int bg = 0; bg < 4 && found < 3; bg++)
+        for (int bg = 0; bg < 4 && (found < 3 || foundNA < 3); bg++)
         {
             if (int(bgcnt[bg] & 0x3u) != prio || ((win >> uint(bg)) & 0x1u) == 0u)
                 continue;
             if (bg == 0 && bg0Is3D)
             {
                 PUSH(0x40000000u)
+                PUSH_NA(0x40000000u)
                 continue;
             }
-            if (((textMask >> uint(bg)) & 0x1u) == 0u)
+            uint bit = 1u << uint(bg);
+            if ((textMask & bit) == 0u && (rotMask & bit) == 0u)
                 continue;
             if (wing && !WideBG(bg, nx, s6.z, s6.w, s7.x))
                 continue;
-            uint pixel = TextBGPixel(bg, nx, vcount, unitB, dispcnt, bgcnt[bg], pos[bg]);
+            bool hires = (hiresMask & bit) != 0u;
+            if (hires)
+            {
+                if (bg == 2)
+                    at2 = min(foundNA, 3);
+                else
+                    at3 = min(foundNA, 3);
+                if (found >= 3)
+                    continue;
+            }
+
+            uint pixel;
+            if ((textMask & bit) != 0u)
+                pixel = TextBGPixel(bg, nx, vcount, unitB, dispcnt, bgcnt[bg], pos[bg]);
+            else if (bg == 2)
+                pixel = RotBGPixel(2, AsInt(s2.y) + nx * S16(s3.y), AsInt(s2.z) + nx * S16(s3.z),
+                                   (affineMask & bit) == 0u, unitB, dispcnt, bgcnt[2]);
+            else
+                pixel = RotBGPixel(3, AsInt(s2.w) + nx * S16(s3.w), AsInt(s3.x) + nx * S16(s4.x),
+                                   (affineMask & bit) == 0u, unitB, dispcnt, bgcnt[3]);
             if (pixel != 0u)
             {
                 PUSH(pixel)
-                any2D = true;
+                if (!hires)
+                    PUSH_NA(pixel)
             }
         }
     }
@@ -2313,66 +2490,22 @@ void main()
     // from the same line: the recorder keeps the unit B lines that could read it (a backdrop alpha
     // blend) on the CPU. the third plane's leftover under that is never read: with nothing over
     // the backdrop, the planes only take ColorComposite(backdrop, plane 2)
-    if (found < 3)
-        PUSH(ColorWord((s6.x >> 16) & 0xFFFFu, 0x20000000u))
-    if (found < 3)
-        PUSH(0u)
+    uint backdrop = ColorWord((s6.x >> 16) & 0xFFFFu, 0x20000000u);
+    PUSH(backdrop)
+    PUSH_NA(backdrop)
+    PUSH(0u)
+    PUSH_NA(0u)
 
-    // DrawScanline_BGOBJ's accelerated planes. unit A takes one of its four branches: 3D on top
-    // blending, 3D on top normal or fade, 3D on bottom blending, or no 3D involved. unit B is
-    // ColorComposite with planes 1 and 2 cleared
-    uint blend = s5.w;
-    uint blendCnt = blend & 0xFFFFu;
-    uint blendEVY = s6.x & 0xFFu;
-    uint eva = (blend >> 16) & 0xFFu;
-    uint evb = (blend >> 24) & 0xFFu;
-    uint flag1 = top >> 24;
-    uint flag2 = second >> 24;
-    uint p0, p1, p2;
-    if (!unitB && (flag1 & 0xC0u) == 0x40u && (blendCnt & BlendTarget2(flag2)) != 0u)
-    {
-        // 3D on top, blending
-        p0 = second;
-        p1 = ColorComposite(second, third, blend, blendEVY, win);
-        p2 = 0x04000000u;
-    }
-    else if (!unitB && (flag1 & 0xC0u) == 0x40u)
-    {
-        // 3D on top, normal or fade
-        uint effect = (blendCnt >> 6) & 0x3u;
-        if (effect == 1u || (blendCnt & 0x0001u) == 0u || (win & 0x20u) == 0u)
-            effect = 0u;
-        p0 = second;
-        p1 = ColorComposite(second, third, blend, blendEVY, win);
-        p2 = (effect << 24) | (blendEVY << 8);
-    }
-    else if (!unitB && (flag2 & 0xC0u) == 0x40u && (blendCnt & 0x01C0u) == 0x0140u)
-    {
-        // 3D on bottom, blending. the CPU works out the sprite's EVA and EVB here but only keeps
-        // the effect: the compositor blends with the unit's
-        uint effect = 1u;
-        uint target1;
-        if      ((flag1 & 0x80u) != 0u) target1 = 0x0010u;
-        else if ((flag1 & 0x40u) != 0u) target1 = 0x0001u;
-        else                            target1 = flag1;
-        if ((flag1 & 0xC0u) != 0xC0u && !(((blendCnt & target1) != 0u && (win & 0x20u) != 0u) || (flag1 & 0xC0u) == 0x80u))
-            effect = 7u;
-        p0 = top;
-        p1 = ColorComposite(top, third, blend, blendEVY, win);
-        p2 = (effect << 24) | (evb << 16) | (eva << 8);
-    }
-    else
-    {
-        // no potential 3D pixel involved (unit B always)
-        p0 = ColorComposite(top, second, blend, blendEVY, win);
-        p1 = 0u;
-        p2 = 0x07000000u;
-    }
-
-    oPlanes = uvec4(p0, p1, p2, any2D ? 1u : 0u);
+    uvec3 planes = StackPlanes(top, second, third, unitB, s5.w, s6.x & 0xFFu, win);
+    oPlanes = uvec4(planes, (Is2D(top) || Is2D(second) || Is2D(third)) ? 1u : 0u);
+    oStack = uvec4(na0, na1, na2, win | (uint(at2) << 8) | (uint(at3) << 10));
 }
 #else
-void main()
+// the composite's output pixel: its PlanesTex row (the lines with no gap between the screens), its
+// native X, floor(sub-pixel / scale), signed (the wings are negative or past 255), and where it is in
+// that native pixel (0..scale-1 each way). fTexcoord gets the pixel's center as the compositor's
+// vertex shader would give it
+void OutputPixel(out int row, out int nx, out ivec2 sub)
 {
     highp ivec2 frag = ivec2(gl_FragCoord.xy);
     int scale = int(u3DScale);
@@ -2380,31 +2513,29 @@ void main()
     // rows down (the margins are never drawn here, see GLCompositor::BuildShadow2DQuads)
     int screen = frag.y >= (194 + 2 * WIDE_MARGIN) * scale ? 1 : 0;
     int subY = frag.y - (screen != 0 ? 194 + 2 * WIDE_MARGIN : WIDE_MARGIN) * scale;
-    int row = screen * 192 + subY / scale;
+    row = screen * 192 + subY / scale;
 
-    // the native X, floor(sub-pixel / scale), signed: the wings are negative or past 255
     int subX = frag.x - SHADOW_OFFSET * scale;
-    int nx = subX >= 0 ? subX / scale : -((scale - 1 - subX) / scale);
+    nx = subX >= 0 ? subX / scale : -((scale - 1 - subX) / scale);
+    sub = ivec2(subX - nx * scale, subY - (subY / scale) * scale);
     fTexcoord = vec2((float(frag.x) + 0.5) / float(scale) - float(SHADOW_OFFSET),
                      float(screen * 192) + (float(subY) + 0.5) / float(scale));
-
-    // the quads only cover drawn lines, whose pixels the planes pass wrote
-    uvec4 planes = texelFetch(PlanesTex, ivec2(nx + SHADOW_OFFSET, row), 0);
-    uint p0 = planes.x, p1 = planes.y, p2 = planes.z;
+}
 
 #ifdef WIDE
-    // a wing pixel with no 2D layer of its own is the compositor's, edge checks and all
-    if ((nx < 0 || nx > 255) && planes.w == 0u)
-    {
-        ivec4 wingPixel = WingPixel(int(fTexcoord.y), WingSide(-1));
-        wingPixel.rgb <<= 2;
-        wingPixel.rgb |= (wingPixel.rgb >> 6);
-        oColor = vec4(vec3(wingPixel.bgr) / 255.0, 1.0);
-        return;
-    }
+// a wing pixel with no 2D layer of its own is the compositor's, edge checks and all
+vec4 ShadowWingColor()
+{
+    ivec4 wingPixel = WingPixel(int(fTexcoord.y), WingSide(-1));
+    wingPixel.rgb <<= 2;
+    wingPixel.rgb |= (wingPixel.rgb >> 6);
+    return vec4(vec3(wingPixel.bgr) / 255.0, 1.0);
+}
 #endif
 
-    // the rest is the compositor's main(), for a display mode 1 line
+// the rest is the compositor's main(), for a display mode 1 line, on the pixel's planes
+vec4 ShadowColor(uint p0, uint p1, uint p2, int row)
+{
     ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, row), 0));
     float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
     ivec4 val1 = PlaneBytes(p0);
@@ -2427,8 +2558,146 @@ void main()
 
     pixel.rgb <<= 2;
     pixel.rgb |= (pixel.rgb >> 6);
-    oColor = vec4(vec3(pixel.bgr) / 255.0, 1.0);
+    return vec4(vec3(pixel.bgr) / 255.0, 1.0);
 }
+
+#ifdef SHADOW2D_AFFINE
+// the run's constants (Shadow2D::PackAffineLine, GLCompositor::RunShadow2D): its first line's (uAffineRow)
+// reference points (X2, Y2, X3, Y3), BG2's and BG3's A, B, C and D, then the flags, DISPCNT's BG
+// bases and extended palette bit with EVY in the low byte, BGCNT 2-3, and BLDCNT with EVA and EVB
+uniform ivec4 uAffineRef;
+uniform ivec4 uAffineRot2;
+uniform ivec4 uAffineRot3;
+uniform uvec4 uAffineLine;
+uniform int uAffineRow;
+// set for a run of lines whose constants change: each fragment reads its line's from the block
+uniform bool uAffinePerLine;
+// the planes pass's stack without the BGs sampled here (GLCompositor::RunShadow2D binds it on
+// PlanesTex's unit, which this doesn't read)
+uniform highp usampler2D StackTex;
+
+int FloorDiv(int a, int b)
+{
+    return a >= 0 ? a / b : -((b - 1 - a) / b);
+}
+
+// DrawPixel_Accel's stack with v pushed in at position at (0 = on top): what was there and below
+// moves down, and the third falls out
+void StackInsert(inout uint t0, inout uint t1, inout uint t2, uint v, int at)
+{
+    if (at == 0)
+    {
+        t2 = t1;
+        t1 = t0;
+        t0 = v;
+    }
+    else if (at == 1)
+    {
+        t2 = t1;
+        t1 = v;
+    }
+    else if (at == 2)
+        t2 = v;
+}
+
+void main()
+{
+    int row, nx;
+    ivec2 sub;
+    OutputPixel(row, nx, sub);
+    int scale = int(u3DScale);
+
+    uvec4 stack = texelFetch(StackTex, ivec2(nx + SHADOW_OFFSET, row), 0);
+    uint t0 = stack.x, t1 = stack.y, t2 = stack.z;
+    uint win = stack.w & 0xFFu;
+    int at2 = int((stack.w >> 8) & 0x3u);
+    int at3 = int((stack.w >> 10) & 0x3u);
+
+    // the line's latched reference points: the run's first line's plus a line's B and D a line
+    ivec4 rot2 = uAffineRot2;
+    ivec4 rot3 = uAffineRot3;
+    ivec4 ref = uAffineRef + (row - uAffineRow) * ivec4(rot2.y, rot2.w, rot3.y, rot3.w);
+    uvec4 line = uAffineLine;
+    if (uAffinePerLine)
+    {
+        // or the line's own, from its block (Shadow2D::W_*), as PackAffineLine has them
+        uvec4 s0 = texelFetch(LineStateTex, ivec2(0, row), 0);  // flags, frame, DISPCNT, BGCNT 0-1
+        uvec4 s1 = texelFetch(LineStateTex, ivec2(1, row), 0);  // BGCNT 2-3
+        uvec4 s2 = texelFetch(LineStateTex, ivec2(2, row), 0);  // BG3 scroll, BG2 reference point, BG3's X
+        uvec4 s3 = texelFetch(LineStateTex, ivec2(3, row), 0);  // BG3's Y, BG2 rotation A-B, C-D, BG3 A-B
+        uvec4 s4 = texelFetch(LineStateTex, ivec2(4, row), 0);  // BG3 rotation C-D
+        uvec4 s5 = texelFetch(LineStateTex, ivec2(5, row), 0);  // BLDCNT with EVA and EVB
+        uvec4 s6 = texelFetch(LineStateTex, ivec2(6, row), 0);  // EVY and backdrop
+        ref = ivec4(AsInt(s2.y), AsInt(s2.z), AsInt(s2.w), AsInt(s3.x));
+        rot2 = ivec4(S16(s3.y), S16(s3.y >> 16), S16(s3.z), S16(s3.z >> 16));
+        rot3 = ivec4(S16(s3.w), S16(s3.w >> 16), S16(s4.x), S16(s4.x >> 16));
+        line = uvec4(s0.x, (s0.z & 0x7F000000u) | (s6.x & 0xFFu), s1.x, s5.w);
+    }
+    uint flags = line.x;
+    uint dispcnt = line.y & 0xFF000000u;
+    uint evy = line.y & 0xFFu;
+    uint bgcnt2 = line.z & 0xFFFFu;
+    uint bgcnt3 = (line.z >> 16) & 0xFFFFu;
+    bool unitB = (flags & 0x1u) != 0u;
+    uint affineMask = (flags >> 25) & 0x3u;
+
+    // each BG at the sub-pixel's own position: the CPU's rotX and rotY at the native pixel (the
+    // reference point plus nx steps of A and C), plus sub.x/scale of a step along the line and
+    // sub.y/scale of a line's (B and D), all in integers, floored. the native pixel's first
+    // sub-pixel is the CPU's pixel exactly
+    uint a2 = 0u, a3 = 0u;
+    if (at2 < 3)
+        a2 = RotBGPixel(2, ref.x + nx * rot2.x + FloorDiv(sub.x * rot2.x + sub.y * rot2.y, scale),
+                           ref.y + nx * rot2.z + FloorDiv(sub.x * rot2.z + sub.y * rot2.w, scale),
+                        (affineMask & 0x1u) == 0u, unitB, dispcnt, bgcnt2);
+    if (at3 < 3)
+        a3 = RotBGPixel(3, ref.z + nx * rot3.x + FloorDiv(sub.x * rot3.x + sub.y * rot3.y, scale),
+                           ref.w + nx * rot3.z + FloorDiv(sub.x * rot3.z + sub.y * rot3.w, scale),
+                        (affineMask & 0x2u) == 0u, unitB, dispcnt, bgcnt3);
+
+    // the deeper one goes in first, so the other's position still holds. in the same priority
+    // BG3 is drawn first, under BG2
+    if ((bgcnt3 & 0x3u) >= (bgcnt2 & 0x3u))
+    {
+        if (a3 != 0u) StackInsert(t0, t1, t2, a3, at3);
+        if (a2 != 0u) StackInsert(t0, t1, t2, a2, at2);
+    }
+    else
+    {
+        if (a2 != 0u) StackInsert(t0, t1, t2, a2, at2);
+        if (a3 != 0u) StackInsert(t0, t1, t2, a3, at3);
+    }
+
+#ifdef WIDE
+    if ((nx < 0 || nx > 255) && !(Is2D(t0) || Is2D(t1) || Is2D(t2)))
+    {
+        oColor = ShadowWingColor();
+        return;
+    }
+#endif
+
+    uvec3 planes = StackPlanes(t0, t1, t2, unitB, line.w, evy, win);
+    oColor = ShadowColor(planes.x, planes.y, planes.z, row);
+}
+#else
+void main()
+{
+    int row, nx;
+    ivec2 sub;
+    OutputPixel(row, nx, sub);
+
+    // the quads only cover drawn lines, whose pixels the planes pass wrote
+    uvec4 planes = texelFetch(PlanesTex, ivec2(nx + SHADOW_OFFSET, row), 0);
+#ifdef WIDE
+    if ((nx < 0 || nx > 255) && planes.w == 0u)
+    {
+        oColor = ShadowWingColor();
+        return;
+    }
+#endif
+    oColor = ShadowColor(planes.x, planes.y, planes.z, row);
+}
+#endif
 #endif
 )";
 

@@ -17,12 +17,14 @@
 */
 
 // The GPU 2D shadow renderer's shaders, replayed on the CPU (swi-harness --shadow2d): a line for line
-// C++ copy of kShadow2DObjFS_Main and of kShadow2DFS_Main's SHADOW2D_PLANES path (GPU_OpenGL_shaders.h),
-// run on what GLCompositor::UploadShadow2D would upload at the Blit (the flats, the recorder's palette
-// copy, the blocks and the sprite instances), at 1x. Each line the recorder lets through gets its
-// planes 0-2 compared word for word with what SoftRenderer drew, as the check mode does on the phone.
-// It proves the shaders' maths and the recorder's rules, not the GL driver: keep it in step with the
-// shaders when they change.
+// C++ copy of kShadow2DObjFS_Main and of kShadow2DFS_Main's SHADOW2D_PLANES and SHADOW2D_AFFINE paths
+// (GPU_OpenGL_shaders.h), run on what GLCompositor::UploadShadow2D would upload at the Blit (the
+// flats, the recorder's palette copy, the blocks and the sprite instances), at 1x. Each line the
+// recorder lets through gets its planes 0-2 compared word for word with what SoftRenderer drew, as
+// the check mode does on the phone. On lines with a rotated or scaled BG, the affine composite's
+// planes at each native pixel's first sub-pixel are compared with them too (they have to match at
+// any scale), and its other sub-pixels are only counted. It proves the shaders' maths and the
+// recorder's rules, not the GL driver: keep it in step with the shaders when they change.
 
 #include "Shadow2DReplay.h"
 
@@ -224,6 +226,74 @@ u32 TextBGPixel(int bg, int nx, int vcount, bool unitB, u32 dispcnt, u32 bgcnt, 
     return ColorWord(color, 0x01000000u << (u32)bg);
 }
 
+// kShadow2DFS_Main's AsInt and S16
+int AsInt(u32 w)
+{
+    return (w & 0x80000000u) != 0u ? -(int)(~w) - 1 : (int)w;
+}
+
+int S16(u32 w)
+{
+    int v = (int)(w & 0xFFFFu);
+    return v >= 0x8000 ? v - 0x10000 : v;
+}
+
+u32 RotBGPixel(int bg, int x, int y, bool ext, bool unitB, u32 dispcnt, u32 bgcnt)
+{
+    int size = (int)((bgcnt >> 14) & 0x3u);
+    int coordmask = (0x8000 << size) - 0x800;
+    if ((bgcnt & 0x2000u) == 0u && ((x | y) & ~(coordmask | 0x7FF)) != 0)
+        return 0u;
+
+    int tileset, tilemap, mask, base;
+    if (unitB)
+    {
+        tileset = (int)((bgcnt & 0x003Cu) << 12);
+        tilemap = (int)((bgcnt & 0x1F00u) << 3);
+        mask = 0x1FFFF;
+        base = MemBBG;
+    }
+    else
+    {
+        tileset = (int)(((dispcnt & 0x07000000u) >> 8) + ((bgcnt & 0x003Cu) << 12));
+        tilemap = (int)(((dispcnt & 0x38000000u) >> 11) + ((bgcnt & 0x1F00u) << 3));
+        mask = 0x7FFFF;
+        base = MemABG;
+    }
+
+    int map = (((y & coordmask) >> 11) << (4 + size)) + ((x & coordmask) >> 11);
+    int tx = (x >> 8) & 0x7;
+    int ty = (y >> 8) & 0x7;
+    int palBase = unitB ? 0x400 : 0;
+
+    u32 color;
+    if (ext)
+    {
+        int tile = (int)MemHalf(base, (tilemap + (map << 1)) & mask);
+        if ((tile & 0x0400) != 0)
+            tx = 7 - tx;
+        if ((tile & 0x0800) != 0)
+            ty = 7 - ty;
+        int c = (int)MemByte(base, (tileset + ((tile & 0x03FF) << 6) + (ty << 3) + tx) & mask);
+        if (c == 0)
+            return 0u;
+        if ((dispcnt & 0x40000000u) != 0u)
+            color = MemHalf(unitB ? MemBBGExt : MemABGExt, bg * 8192 + ((tile >> 12) & 0xF) * 512 + c * 2);
+        else
+            color = MemHalf(MemPal, palBase + c * 2);
+    }
+    else
+    {
+        int tile = (int)MemByte(base, (tilemap + map) & mask);
+        int c = (int)MemByte(base, (tileset + (tile << 6) + (ty << 3) + tx) & mask);
+        if (c == 0)
+            return 0u;
+        color = MemHalf(MemPal, palBase + c * 2);
+    }
+
+    return ColorWord(color, 0x01000000u << (u32)bg);
+}
+
 u32 SpritePixel(u32 obj, bool unitB, u32 dispcnt)
 {
     u32 color;
@@ -373,6 +443,144 @@ u32 WindowMask(int x, u32 dispcnt, u32 win0, u32 win1, u32 winCnt, u32 active, b
     return mask;
 }
 
+bool Is2D(u32 word)
+{
+    return ((word >> 24) & 0x9Fu) != 0u;
+}
+
+// kShadow2DFS_Main's StackPlanes
+void StackPlanes(u32 top, u32 second, u32 third, bool unitB, u32 blend, u32 evy, u32 win, u32* p)
+{
+    u32 blendCnt = blend & 0xFFFFu;
+    u32 eva = (blend >> 16) & 0xFFu;
+    u32 evb = (blend >> 24) & 0xFFu;
+    u32 flag1 = top >> 24;
+    u32 flag2 = second >> 24;
+    if (!unitB && (flag1 & 0xC0u) == 0x40u && (blendCnt & BlendTarget2(flag2)) != 0u)
+    {
+        p[0] = second;
+        p[1] = ColorComposite(second, third, blend, evy, win);
+        p[2] = 0x04000000u;
+    }
+    else if (!unitB && (flag1 & 0xC0u) == 0x40u)
+    {
+        u32 effect = (blendCnt >> 6) & 0x3u;
+        if (effect == 1u || (blendCnt & 0x0001u) == 0u || (win & 0x20u) == 0u)
+            effect = 0u;
+        p[0] = second;
+        p[1] = ColorComposite(second, third, blend, evy, win);
+        p[2] = (effect << 24) | (evy << 8);
+    }
+    else if (!unitB && (flag2 & 0xC0u) == 0x40u && (blendCnt & 0x01C0u) == 0x0140u)
+    {
+        u32 effect = 1u;
+        u32 target1;
+        if      ((flag1 & 0x80u) != 0u) target1 = 0x0010u;
+        else if ((flag1 & 0x40u) != 0u) target1 = 0x0001u;
+        else                            target1 = flag1;
+        if ((flag1 & 0xC0u) != 0xC0u && !(((blendCnt & target1) != 0u && (win & 0x20u) != 0u) || (flag1 & 0xC0u) == 0x80u))
+            effect = 7u;
+        p[0] = top;
+        p[1] = ColorComposite(top, third, blend, evy, win);
+        p[2] = (effect << 24) | (evb << 16) | (eva << 8);
+    }
+    else
+    {
+        p[0] = ColorComposite(top, second, blend, evy, win);
+        p[1] = 0u;
+        p[2] = 0x07000000u;
+    }
+}
+
+// the affine composite's FloorDiv, StackInsert and what its main() makes of a sub-pixel's stack
+int FloorDiv(int a, int b)
+{
+    return a >= 0 ? a / b : -((b - 1 - a) / b);
+}
+
+void StackInsert(u32& t0, u32& t1, u32& t2, u32 v, int at)
+{
+    if (at == 0)
+    {
+        t2 = t1;
+        t1 = t0;
+        t0 = v;
+    }
+    else if (at == 1)
+    {
+        t2 = t1;
+        t1 = v;
+    }
+    else if (at == 2)
+        t2 = v;
+}
+
+// a line's constants as the affine composite has them: its run's (the uniforms GLCompositor::RunShadow2D
+// sets from the run's first line, Shadow2D::PackAffineLine), with the reference points moved on by
+// lines B and D, as the shader does
+struct AffineLine
+{
+    u32 Flags, DispCnt, BGCnt23, Blend, EVY;
+    int Ref[4];         // BG2 X, Y, BG3 X, Y
+    int Rot[2][4];      // A, B, C, D of BG2 and BG3
+};
+
+AffineLine ReadAffineLine(const u32* c, int lines)
+{
+    AffineLine l;
+    for (int i = 0; i < 2; i++)
+    {
+        l.Rot[i][0] = S16(c[4 + i * 2]);
+        l.Rot[i][1] = S16(c[4 + i * 2] >> 16);
+        l.Rot[i][2] = S16(c[5 + i * 2]);
+        l.Rot[i][3] = S16(c[5 + i * 2] >> 16);
+        l.Ref[i * 2] = AsInt(c[i * 2]) + lines * l.Rot[i][1];
+        l.Ref[i * 2 + 1] = AsInt(c[i * 2 + 1]) + lines * l.Rot[i][3];
+    }
+    l.Flags = c[8];
+    l.DispCnt = c[9] & 0xFF000000u;
+    l.EVY = c[9] & 0xFFu;
+    l.BGCnt23 = c[10];
+    l.Blend = c[11];
+    return l;
+}
+
+// the affine composite's planes for the sub-pixel (subX, subY) of native pixel nx at this scale, from
+// the planes pass's stack texel (stack[0-3])
+void AffinePlanes(const AffineLine& l, const u32* stack, int nx, int subX, int subY, int scale, u32* p)
+{
+    u32 t0 = stack[0], t1 = stack[1], t2 = stack[2];
+    u32 win = stack[3] & 0xFFu;
+    int at2 = (int)((stack[3] >> 8) & 0x3u);
+    int at3 = (int)((stack[3] >> 10) & 0x3u);
+    u32 bgcnt2 = l.BGCnt23 & 0xFFFFu;
+    u32 bgcnt3 = (l.BGCnt23 >> 16) & 0xFFFFu;
+    bool unitB = (l.Flags & 0x1u) != 0u;
+    u32 affineMask = (l.Flags >> 25) & 0x3u;
+
+    u32 a2 = 0u, a3 = 0u;
+    if (at2 < 3)
+        a2 = RotBGPixel(2, l.Ref[0] + nx * l.Rot[0][0] + FloorDiv(subX * l.Rot[0][0] + subY * l.Rot[0][1], scale),
+                           l.Ref[1] + nx * l.Rot[0][2] + FloorDiv(subX * l.Rot[0][2] + subY * l.Rot[0][3], scale),
+                        (affineMask & 0x1u) == 0u, unitB, l.DispCnt, bgcnt2);
+    if (at3 < 3)
+        a3 = RotBGPixel(3, l.Ref[2] + nx * l.Rot[1][0] + FloorDiv(subX * l.Rot[1][0] + subY * l.Rot[1][1], scale),
+                           l.Ref[3] + nx * l.Rot[1][2] + FloorDiv(subX * l.Rot[1][2] + subY * l.Rot[1][3], scale),
+                        (affineMask & 0x2u) == 0u, unitB, l.DispCnt, bgcnt3);
+
+    if ((bgcnt3 & 0x3u) >= (bgcnt2 & 0x3u))
+    {
+        if (a3 != 0u) StackInsert(t0, t1, t2, a3, at3);
+        if (a2 != 0u) StackInsert(t0, t1, t2, a2, at2);
+    }
+    else
+    {
+        if (a2 != 0u) StackInsert(t0, t1, t2, a2, at2);
+        if (a3 != 0u) StackInsert(t0, t1, t2, a3, at3);
+    }
+    StackPlanes(t0, t1, t2, unitB, l.Blend, l.EVY, win, p);
+}
+
 }
 
 void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
@@ -435,9 +643,64 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
         }
     }
 
+    // every 8th frame, the affine composite over all sub-pixels at SubScale too
+    const bool subFrame = (replay.Frames++ % 8) == 0;
+
     for (int screen = 0; screen < 2; screen++)
     {
         const u32* fb = gpu.Framebuffer[backbuf][screen].get();
+        // the affine composite's runs, as GLCompositor::BuildShadow2DQuads makes them: by the lines'
+        // constants (Shadow2D::AffineRunContinues), or past 8 runs by the lines alone, the shader
+        // reading each line's own constants (per line)
+        auto lineConstants = [&](int line, u32* c)
+        {
+            const u32* b = &fb[GPU2D::AccelShadowStateStart + line * GPU2D::ShadowStateWords];
+            PackAffineLine(b, b[W_Flags] | F_Drawn | (HiresBGs(b) << F_HiresShift), c);
+        };
+        auto affineLine = [&](int line)
+        {
+            const u32* b = &fb[GPU2D::AccelShadowStateStart + line * GPU2D::ShadowStateWords];
+            return rec.LineReason(b) == R_None && HiresBGs(b) != 0;
+        };
+        int runStart[192];
+        bool perLine = false;
+        for (int pass = 0; pass < 2; pass++)
+        {
+            perLine = pass != 0;
+            int runs = 0;
+            for (int line = 0; line < 192; )
+            {
+                if (!affineLine(line))
+                {
+                    runStart[line++] = -1;
+                    continue;
+                }
+                u32 last[AffineWords];
+                lineConstants(line, last);
+                int start = line;
+                runStart[line++] = start;
+                runs++;
+                while (line < 192 && affineLine(line))
+                {
+                    if (!perLine)
+                    {
+                        u32 c[AffineWords];
+                        lineConstants(line, c);
+                        if (!AffineRunContinues(last, c))
+                            break;
+                        memcpy(last, c, sizeof(last));
+                    }
+                    runStart[line++] = start;
+                }
+            }
+            if (perLine || runs <= 8)
+            {
+                replay.AffineRuns += runs;
+                replay.PerLineRuns += perLine ? runs : 0;
+                break;
+            }
+        }
+
         for (int line = 0; line < 192; line++)
         {
             const u32* s = &fb[GPU2D::AccelShadowStateStart + line * GPU2D::ShadowStateWords];
@@ -454,6 +717,45 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
             u32 textMask = (flags >> 12) & 0xFu;
             bool bg0Is3D = (flags & 0x800u) != 0u;
             bool objWinLine = false;
+
+            // as the compositor flags the line at 2x and up (Shadow2D::HiresBGs into F_HiresShift)
+            u32 affineMask = ((flags >> F_AffineShift) & 0x3u) << 2;
+            u32 rotMask = affineMask | (((flags >> F_ExtShift) & 0x3u) << 2);
+            u32 hiresMask = HiresBGs(s) << 2;
+            replay.AffineLines += affineMask != 0u;
+            replay.ExtLines += (rotMask & ~affineMask) != 0u;
+            replay.HiresLines += hiresMask != 0u;
+            // the line's own constants, which the planes pass reads from the block; and its run's,
+            // which the affine composite gets
+            u32 constants[AffineWords];
+            PackAffineLine(s, flags | F_Drawn | ((hiresMask >> 2) << F_HiresShift), constants);
+            AffineLine affine = ReadAffineLine(constants, 0);
+            AffineLine affineRun = affine;
+            if (hiresMask && !perLine)
+            {
+                u32 runConstants[AffineWords];
+                lineConstants(runStart[line], runConstants);
+                affineRun = ReadAffineLine(runConstants, line - runStart[line]);
+            }
+            for (int i = 0; i < 2 && replay.Log; i++)
+            {
+                if (!(hiresMask & (4u << i)))
+                    continue;
+                bool ext = !(affineMask & (4u << i));
+                u64 key = (u64)(s[W_RotAB2 + i * 2]) | ((u64)(s[W_RotCD2 + i * 2]) << 32);
+                key ^= ((u64)((unitB ? 4 : 0) | (i << 1) | (ext ? 1 : 0))) << 61;
+                bool seen = false;
+                for (int k = 0; k < replay.SeenRotCount; k++)
+                    seen |= replay.SeenRot[k] == key;
+                if (seen || replay.SeenRotCount >= 64)
+                    continue;
+                replay.SeenRot[replay.SeenRotCount++] = key;
+                u32 cnt = bgcnt[2 + i];
+                fprintf(replay.Log, "REPLAY rotbg frame=%u unit=%c bg=%d kind=%s A=%d B=%d C=%d D=%d size=%u wrap=%u extpal=%u screen=%d line=%d\n",
+                    replay.Frames, unitB ? 'B' : 'A', 2 + i, ext ? "ext" : "affine", affine.Rot[i][0], affine.Rot[i][1],
+                    affine.Rot[i][2], affine.Rot[i][3], (cnt >> 14) & 0x3u, (cnt >> 13) & 0x1u,
+                    (dispcnt >> 30) & 0x1u, screen, line);
+            }
 
             for (int nx = 0; nx < 256; nx++)
             {
@@ -480,78 +782,71 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
                     objWinLine |= objWin;
                 }
 
+                // the planes pass's two stacks: DrawPixel_Accel's, and the one without the BGs
+                // sampled at sub-pixels with where they come in it (3 for nowhere)
                 u32 top = 0u, second = 0u, third = 0u;
                 int found = 0;
-                auto push = [&](u32 v) { if (found == 0) top = v; else if (found == 1) second = v; else third = v; found++; };
-                for (int prio = 0; prio < 4 && found < 3; prio++)
+                u32 na[3] = {0u, 0u, 0u};
+                int foundNA = 0;
+                int at[2] = {3, 3};
+                auto push = [&](u32 v) { if (found == 0) top = v; else if (found == 1) second = v; else if (found == 2) third = v; found++; };
+                auto pushNA = [&](u32 v) { if (foundNA < 3) na[foundNA] = v; foundNA++; };
+                for (int prio = 0; prio < 4 && (found < 3 || foundNA < 3); prio++)
                 {
                     if (obj != 0u && (int)((obj >> 16) & 0x3u) == prio && (win & 0x10u) != 0u)
-                        push(SpritePixel(obj, unitB, dispcnt));
-                    for (int bg = 0; bg < 4 && found < 3; bg++)
+                    {
+                        u32 pixel = SpritePixel(obj, unitB, dispcnt);
+                        push(pixel);
+                        pushNA(pixel);
+                    }
+                    for (int bg = 0; bg < 4 && (found < 3 || foundNA < 3); bg++)
                     {
                         if ((int)(bgcnt[bg] & 0x3u) != prio || ((win >> (u32)bg) & 0x1u) == 0u)
                             continue;
                         if (bg == 0 && bg0Is3D)
                         {
                             push(0x40000000u);
+                            pushNA(0x40000000u);
                             continue;
                         }
-                        if (((textMask >> (u32)bg) & 0x1u) == 0u)
+                        u32 bit = 1u << (u32)bg;
+                        if ((textMask & bit) == 0u && (rotMask & bit) == 0u)
                             continue;
-                        u32 pixel = TextBGPixel(bg, nx, vcount, unitB, dispcnt, bgcnt[bg], pos[bg]);
+                        bool hires = (hiresMask & bit) != 0u;
+                        if (hires)
+                        {
+                            at[bg - 2] = std::min(foundNA, 3);
+                            if (found >= 3)
+                                continue;
+                        }
+
+                        u32 pixel;
+                        if ((textMask & bit) != 0u)
+                            pixel = TextBGPixel(bg, nx, vcount, unitB, dispcnt, bgcnt[bg], pos[bg]);
+                        else
+                        {
+                            int i = bg - 2;
+                            pixel = RotBGPixel(bg, affine.Ref[i * 2] + nx * affine.Rot[i][0], affine.Ref[i * 2 + 1] + nx * affine.Rot[i][2],
+                                               (affineMask & bit) == 0u, unitB, dispcnt, bgcnt[bg]);
+                        }
                         if (pixel != 0u)
+                        {
                             push(pixel);
+                            if (!hires)
+                                pushNA(pixel);
+                        }
                     }
                 }
-                if (found < 3)
-                    push(ColorWord((s[W_EVYBackdrop] >> 16) & 0xFFFFu, 0x20000000u));
+                u32 backdrop = ColorWord((s[W_EVYBackdrop] >> 16) & 0xFFFFu, 0x20000000u);
+                push(backdrop);
+                pushNA(backdrop);
                 // plane 2 as the pass starts is 0, except unit B's without EngineBNoHold (unit A's
                 // leftover), whose lines that could read it the recorder keeps on the CPU
-                if (found < 3)
-                    push(0u);
+                push(0u);
+                pushNA(0u);
 
-                u32 blend = s[W_Blend];
-                u32 blendCnt = blend & 0xFFFFu;
-                u32 evy = s[W_EVYBackdrop] & 0xFFu;
-                u32 eva = (blend >> 16) & 0xFFu;
-                u32 evb = (blend >> 24) & 0xFFu;
-                u32 flag1 = top >> 24;
-                u32 flag2 = second >> 24;
                 u32 p[3];
-                if (!unitB && (flag1 & 0xC0u) == 0x40u && (blendCnt & BlendTarget2(flag2)) != 0u)
-                {
-                    p[0] = second;
-                    p[1] = ColorComposite(second, third, blend, evy, win);
-                    p[2] = 0x04000000u;
-                }
-                else if (!unitB && (flag1 & 0xC0u) == 0x40u)
-                {
-                    u32 effect = (blendCnt >> 6) & 0x3u;
-                    if (effect == 1u || (blendCnt & 0x0001u) == 0u || (win & 0x20u) == 0u)
-                        effect = 0u;
-                    p[0] = second;
-                    p[1] = ColorComposite(second, third, blend, evy, win);
-                    p[2] = (effect << 24) | (evy << 8);
-                }
-                else if (!unitB && (flag2 & 0xC0u) == 0x40u && (blendCnt & 0x01C0u) == 0x0140u)
-                {
-                    u32 effect = 1u;
-                    u32 target1;
-                    if      ((flag1 & 0x80u) != 0u) target1 = 0x0010u;
-                    else if ((flag1 & 0x40u) != 0u) target1 = 0x0001u;
-                    else                            target1 = flag1;
-                    if ((flag1 & 0xC0u) != 0xC0u && !(((blendCnt & target1) != 0u && (win & 0x20u) != 0u) || (flag1 & 0xC0u) == 0x80u))
-                        effect = 7u;
-                    p[0] = top;
-                    p[1] = ColorComposite(top, third, blend, evy, win);
-                    p[2] = (effect << 24) | (evb << 16) | (eva << 8);
-                }
-                else
-                {
-                    p[0] = ColorComposite(top, second, blend, evy, win);
-                    p[1] = 0u;
-                    p[2] = 0x07000000u;
-                }
+                StackPlanes(top, second, third, unitB, s[W_Blend], s[W_EVYBackdrop] & 0xFFu, win, p);
 
                 const u32* planes = &fb[line * (256*3 + 1)];
                 for (int plane = 0; plane < 3; plane++)
@@ -562,6 +857,34 @@ void Shadow2DReplay::Frame(const GPU& gpu, int backbuf, void* user)
                     if (replay.Mismatches++ < 20 && replay.Log)
                         fprintf(replay.Log, "REPLAY mismatch screen=%d line=%d x=%d plane=%d expected=%08X got=%08X unit=%c\n",
                             screen, line, nx, plane, expected, p[plane], unitB ? 'B' : 'A');
+                }
+
+                if (!hiresMask)
+                    continue;
+
+                // the affine composite from this texel of StackTex: at the native pixel's first
+                // sub-pixel it has to give the planes just written, at any scale
+                const u32 stack[4] = {na[0], na[1], na[2], win | ((u32)at[0] << 8) | ((u32)at[1] << 10)};
+                u32 q[3];
+                AffinePlanes(affineRun, stack, nx, 0, 0, replay.SubScale, q);
+                for (int plane = 0; plane < 3; plane++)
+                {
+                    if (q[plane] == p[plane])
+                        continue;
+                    if (replay.StackMismatches++ < 20 && replay.Log)
+                        fprintf(replay.Log, "REPLAY stack mismatch screen=%d line=%d x=%d plane=%d planes=%08X composite=%08X unit=%c\n",
+                            screen, line, nx, plane, p[plane], q[plane], unitB ? 'B' : 'A');
+                }
+                if (!subFrame)
+                    continue;
+                for (int subY = 0; subY < replay.SubScale; subY++)
+                {
+                    for (int subX = 0; subX < replay.SubScale; subX++)
+                    {
+                        AffinePlanes(affineRun, stack, nx, subX, subY, replay.SubScale, q);
+                        replay.SubPixels++;
+                        replay.SubDiffers += q[0] != p[0] || q[1] != p[1] || q[2] != p[2];
+                    }
                 }
             }
             replay.ObjWindowLines += objWinLine;

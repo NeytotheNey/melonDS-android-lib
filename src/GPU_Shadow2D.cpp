@@ -264,10 +264,12 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
     const u32 line = job.Line;
     u32* block = &job.Framebuffer[num][GPU2D::AccelShadowStateStart + line * GPU2D::ShadowStateWords];
 
-    // the BGs drawn as text BGs, and BG0 as the 3D layer, as DrawScanlineBGMode<N>, 6 and 7 pick them
+    // the BGs drawn as text BGs, affine BGs (DrawBG_Affine) and tiled extended BGs (DrawBG_Extended
+    // with a 16-bit tilemap), and BG0 as the 3D layer, as DrawScanlineBGMode<N>, 6 and 7 pick them.
+    // bitmap extended BGs and mode 6's large BG are other (increment 7)
     u32 mode = u.DispCnt & 0x7;
     bool bg0Is3D = !num && (u.DispCnt & 0x8);
-    u32 text = 0, other = 0;
+    u32 text = 0, affine = 0, ext = 0, other = 0;
     bool has3D = false;
     for (u32 layer = 0; layer < 4; layer++)
     {
@@ -287,12 +289,14 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
         }
         else if (layer == 3)
         {
-            if (mode >= 1) other |= 1 << layer;
+            if (mode >= 3) ((u.BGCnt[layer] & 0x0080) ? other : ext) |= 1 << layer;
+            else if (mode >= 1) affine |= 1 << layer;
             else text |= 1 << layer;
         }
         else if (layer == 2)
         {
-            if (mode == 5 || mode == 4 || mode == 2) other |= 1 << layer;
+            if (mode == 5) ((u.BGCnt[layer] & 0x0080) ? other : ext) |= 1 << layer;
+            else if (mode == 4 || mode == 2) affine |= 1 << layer;
             else text |= 1 << layer;
         }
         else
@@ -302,12 +306,14 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
     bool mosaicBG = false;
     for (u32 layer = 0; layer < 4; layer++)
     {
-        if ((text & (1 << layer)) && (u.BGCnt[layer] & 0x0040))
+        if (((text | affine | ext) & (1 << layer)) && (u.BGCnt[layer] & 0x0040))
             mosaicBG = true;
     }
 
     // feature-eligible: the base rules, then the increments' (text BGs and normal sprites, increment
-    // 1). BLDCNT blending (increment 5) is all done by the composite, but for one case: without
+    // 1; affine and tiled extended BGs, increment 2, from the line's latched reference points in the
+    // block, so a game rewriting them mid-frame is drawn as the CPU draws it). BLDCNT blending
+    // (increment 5) is all done by the composite, but for one case: without
     // EngineBNoHold, unit B's pass starts with the second plane unit A's pass of the line left
     // (SoftRenderer only clears it with EngineBNoHold), so where B draws nothing over the backdrop,
     // an alpha blend with the backdrop as 1st target blends with that leftover, which the shadow
@@ -346,7 +352,7 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
         wideLeft = 0xFFFFFFFF;
         wideRight = 0xFFFFFFFF;
     }
-    bool wide = wideModes && (text || (u.LayerEnable & 0x10));
+    bool wide = wideModes && ((text | affine | ext) || (u.LayerEnable & 0x10));
 
     u16 backdrop = *(const u16*)&job.Palette[num ? 0x400 : 0];
 
@@ -354,7 +360,7 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
         | ((u32)(u.LayerEnable & 0x1F) << F_LayerShift) | (spritesOn ? F_OBJEnable : 0)
         | (job.VCount == job.Line ? F_VCountLine : 0) | (has3D ? F_BG0Is3D : 0) | (text << F_TextShift)
         | (wide ? F_Wide : 0) | (windows && winEdge ? F_WinEdge : 0) | (reason << F_ReasonShift)
-        | (reason == R_None ? F_Eligible : 0);
+        | ((affine >> 2) << F_AffineShift) | ((ext >> 2) << F_ExtShift) | (reason == R_None ? F_Eligible : 0);
     block[W_Frame] = Frame;
     block[W_DispCnt] = u.DispCnt;
     block[W_BGCnt01] = u.BGCnt[0] | ((u32)u.BGCnt[1] << 16);
@@ -399,6 +405,11 @@ void Shadow2DRecorder::CheckBlock(const u32* block, const GPU2D::UnitState& u, c
     errors += ((flags & F_ForcedBlank) != 0) != (u.ForcedBlank != 0);
     errors += ((flags >> F_LayerShift) & 0x1F) != (u32)(u.LayerEnable & 0x1F);
     errors += ((flags & F_Eligible) != 0) != (((flags >> F_ReasonShift) & 0x1F) == R_None);
+    // a BG is drawn as one kind at most, and only if it's enabled
+    u32 text = (flags >> F_TextShift) & 0xF;
+    u32 affine = (flags >> F_AffineShift) & 0x3, ext = (flags >> F_ExtShift) & 0x3;
+    errors += (affine & ext) != 0 || (text & ((affine | ext) << 2)) != 0;
+    errors += ((text | ((affine | ext) << 2)) & ~(u32)u.LayerEnable) != 0;
     errors += block[W_Frame] != Frame;
     errors += block[W_DispCnt] != u.DispCnt;
     for (u32 layer = 0; layer < 4; layer++)

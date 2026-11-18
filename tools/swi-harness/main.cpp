@@ -1119,12 +1119,18 @@ int main(int argc, char** argv)
                 fprintf(shadowLog, "%s%s:%u", first ? "" : ",", Shadow2D::ReasonName(i), rec.ReasonCounts[i]);
                 first = false;
             }
-            fprintf(shadowLog, "%s replaylines=%llu replaymismatches=%llu stalemem=%llu winlines=%llu objwinon=%llu objwinlines=%llu\n",
+            fprintf(shadowLog, "%s replaylines=%llu replaymismatches=%llu stalemem=%llu winlines=%llu objwinon=%llu objwinlines=%llu"
+                " affinelines=%llu extlines=%llu hireslines=%llu affineruns=%llu perlineruns=%llu stackmismatches=%llu subpixels=%llu subdiffers=%llu\n",
                 first ? "-" : "", (unsigned long long)replay.Lines, (unsigned long long)replay.Mismatches,
                 (unsigned long long)replay.MemMismatches, (unsigned long long)replay.WindowLines,
-                (unsigned long long)replay.ObjWindowOnLines, (unsigned long long)replay.ObjWindowLines);
+                (unsigned long long)replay.ObjWindowOnLines, (unsigned long long)replay.ObjWindowLines,
+                (unsigned long long)replay.AffineLines, (unsigned long long)replay.ExtLines,
+                (unsigned long long)replay.HiresLines, (unsigned long long)replay.AffineRuns, (unsigned long long)replay.PerLineRuns, (unsigned long long)replay.StackMismatches,
+                (unsigned long long)replay.SubPixels, (unsigned long long)replay.SubDiffers);
             replay.Lines = replay.Mismatches = replay.MemMismatches = replay.WindowLines = 0;
             replay.ObjWindowOnLines = replay.ObjWindowLines = 0;
+            replay.AffineLines = replay.ExtLines = replay.HiresLines = replay.AffineRuns = replay.PerLineRuns = replay.StackMismatches = 0;
+            replay.SubPixels = replay.SubDiffers = 0;
             fflush(shadowLog);
             for (u32& count : rec.ReasonCounts) count = 0;
             rec.SelfCheckErrors = 0;
