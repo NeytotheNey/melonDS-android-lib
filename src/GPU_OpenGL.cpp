@@ -2752,9 +2752,9 @@ void GLCompositor::CheckHiresCapture(const u8* bankNative, int bank, int rowStar
 // frame's, not before a real mid-frame change of its unit's memory, its sprites fit), it doesn't show
 // a hi-res capture image, its wings aren't held, and the mode wants it: mode 1 only where it gains
 // something, a line with a rotated or scaled BG at 2x and up (Shadow2D::HiresBGs) or whose 2D the
-// wide config sends into a wide view's wings. those BGs are sampled at the output's sub-pixels
-// (F_HiresShift). the decisions go into the uploaded copy of the block (F_Drawn), never a uniform
-// mask (the Adreno gotcha in MODS.md). then the drawn lines' memory and sprites are uploaded and the
+// wide config sends into a wide view's wings. up to MaxSharpAffineScale, those BGs are sampled at
+// the output's sub-pixels (F_HiresShift). the decisions go into the uploaded copy of the block
+// (F_Drawn), never a uniform mask (the Adreno gotcha in MODS.md). then the drawn lines' memory and sprites are uploaded and the
 // OBJ pass and the planes pass run. returns how many lines are drawn
 int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuffers, bool hiresDisplay, bool ctrlCopied) noexcept
 {
@@ -2777,6 +2777,12 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
     const bool wideView = ViewWidth != 256;
     Shadow.State.resize(384 * GPU2D::ShadowStateWords);
     Shadow.AffineDebug = rec->AffineDebug;
+    // the affine composite only up to MaxSharpAffineScale (debug.melonade.gpu2daffine -1 lifts it):
+    // above it, the lines it would draw are drawn as gpu2daffine 2 draws them, their hires bits
+    // cleared so the planes pass works those BGs out at the native pixel and the plain composite
+    // shows them, which is what every frame at 1x does. StackTex stays a target and is still drawn
+    // (as at 1x), so a resize back under the cap finds it as fresh as any frame's
+    const bool sharp = rec->AffineDebug < 2 && (Scale <= MaxSharpAffineScale || rec->AffineDebug < 0);
     int drawn = 0, hiresLines = 0;
     for (int half = 0; half < 2; half++)
     {
@@ -2797,7 +2803,7 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
             u32 hires = Scale >= 2 ? HiresBGs(block) : 0;
             if (reason == R_None && rec->Mode == 1 && !hires && !(wideView && (block[W_Flags] & F_Wide)))
                 reason = R_Policy;
-            if (reason != R_None || rec->AffineDebug >= 2)
+            if (reason != R_None || !sharp)
                 hires = 0;
 
             copy[W_Flags] = (copy[W_Flags] & ~(F_Drawn | (0x3u << F_HiresShift)))
@@ -3109,7 +3115,7 @@ void GLCompositor::BuildShadow2DQuads(bool planes) noexcept
     const int scale = planes ? 1 : Scale;
     const float w = planes ? (float)ViewWidth : (float)ScreenW;
     const float h = planes ? 384.0f : (float)ScreenH;
-    const u32 hiresMask = planes || Shadow.AffineDebug ? 0 : 0x3u << F_HiresShift;
+    const u32 hiresMask = planes || Shadow.AffineDebug > 0 ? 0 : 0x3u << F_HiresShift;
 
     for (int half = 0; half < 2; half++)
     {

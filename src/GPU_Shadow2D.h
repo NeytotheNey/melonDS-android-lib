@@ -141,11 +141,18 @@ enum : u32
 };
 const char* ReasonName(u32 reason) noexcept;
 
+// the highest output scale (the compositor's whole-number Scale, the same at either view width) the
+// affine composite samples rotated BGs at sub-pixels at. above it, those lines take the plain
+// composite with native BG pixels, as debug.melonade.gpu2daffine 2 draws them: at 8x the sharp
+// composite cost the OnePlus ~8.3 ms a frame (the app's docs/plan-gpu-2d-shadow.md, increment 2).
+// debug.melonade.gpu2daffine -1 lifts the cap
+constexpr int MaxSharpAffineScale = 6;
+
 // which of BG2 and BG3 (bits 0-1) a line's block draws as rotation/scaling BGs (affine or tiled
 // extended) with a real rotation or scale: B or C nonzero, or A or D other than 256. at an output
-// scale of 2 or more these are sampled at the output's sub-pixels (F_HiresShift), and they're what
-// mode 1 counts as gaining something. 1:1 layers (Golden Sun's streamed pictures) stay at the
-// native pixel, where the planes pass works them out as the CPU does
+// scale of 2 or more they're what mode 1 counts as gaining something, and up to MaxSharpAffineScale
+// they're sampled at the output's sub-pixels (F_HiresShift). 1:1 layers (Golden Sun's streamed
+// pictures) stay at the native pixel, where the planes pass works them out as the CPU does
 inline u32 HiresBGs(const u32* block) noexcept
 {
     u32 flags = block[W_Flags];
@@ -255,7 +262,8 @@ struct Shadow2DRecorder
     int Wide = 0;               // debug.melonade.gpu2dwide: 1 = every layer draws past the edge
     // debug.melonade.gpu2daffine, to tell the affine composite apart from what it needs on a phone:
     // 1 draws the lines with rotated BGs with the plain composite (native BG pixels, as at 1x) while
-    // the planes pass still writes StackTex, 2 the same without StackTex
+    // the planes pass still writes StackTex, 2 the same without StackTex. -1 lifts the cap on the
+    // sharp composite (MaxSharpAffineScale), for testing it above 6x
     int AffineDebug = 0;
     bool SelfCheck = false;     // the swi-harness: decode every block written and compare it
 
