@@ -96,7 +96,8 @@ enum
 //                  from Blits that showed hi-res captures (the draw reads the copies then), and the
 //                  cx_ ones add up to compx: cx_misc the state setup and CPU work between the parts
 //                  (and before the first one), cx_sobj the GPU 2D shadow's uploads, OBJ pass
-//                  and planes pass, cx_up the screen texture uploads (planes, control words, wing planes), cx_filter
+//                  and planes pass (three queries summed, one after each framebuffer bind, so a
+//                  tiler reordering the two passes can't give a query a negative time), cx_up the screen texture uploads (planes, control words, wing planes), cx_filter
 //                  filtered 2D's key and MMPX passes (not on a frame that reuses the map), cx_shadow
 //                  the shadow's composite, cx_wings the held wings' copy, cx_hicap the hi-res
 //                  capture pass with its uploads. each but cx_misc has an _n, the timed Blits it ran
@@ -109,8 +110,8 @@ struct GLTimerStats
     enum SetKind { Set_Render, Set_Capture, Set_Blit, Set_Kinds };
 
     static constexpr int SetCount = 24;
-    // a render uses up to 7, a capture readback 1, a Blit up to 9 (CompExtra twice and each other
-    // compositor part once)
+    // a render uses up to 7, a capture readback 1, a Blit up to 11 (CompExtra twice, CompShadowObj
+    // three times and each other compositor part once). past this a Begin only ends the pass before
     static constexpr int SetQueries = 12;
     static_assert(GLPass::Count <= 32, "the passes a set ran are a u32 mask");
 

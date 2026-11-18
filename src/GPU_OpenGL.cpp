@@ -2999,6 +2999,10 @@ void GLCompositor::RunShadow2DObj(const Shadow2DRecorder& rec) noexcept
     glBindTexture(GL_TEXTURE_2D, 0);
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Shadow.ObjFB);
+    // a new query for the OBJ pass, still cx_sobj: the uploads, this pass and the planes pass are
+    // three back-to-back queries, so a tiler running the two independent passes out of order can't
+    // put one query's start after its end (GLTIME's bad=)
+    BeginGPUTimer(ComputePass::CompShadowObj);
     glViewport(0, 0, Shadow.ObjW, 384);
     glDisable(GL_BLEND);
     glDisable(GL_STENCIL_TEST);
@@ -3107,6 +3111,8 @@ void GLCompositor::RunShadow2DPlanes(bool checked) noexcept
     glActiveTexture(GL_TEXTURE0 + Shadow2DPlanesUnit);
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, Shadow.PlanesFB);
+    // the planes pass's own query, still cx_sobj (see RunShadow2DObj)
+    BeginGPUTimer(ComputePass::CompShadowObj);
     if (checked)
     {
         const GLuint sentinel[4] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF};
