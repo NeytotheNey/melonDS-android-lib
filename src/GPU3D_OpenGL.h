@@ -431,6 +431,8 @@ private:
     int PosFrac = 0;
     bool PosSub = false;
     bool PosGrow = false;
+    // GPU::GLSeams as the last frame drawn had it, so a change draws an identical frame again
+    int SeamsDrawn = 0;
     s32 WideYAdjust {};
     // the margin the frame's polygons were built for (GPU3D::RenderViewMargin), for TargetRow
     int FrameMargin = 0;

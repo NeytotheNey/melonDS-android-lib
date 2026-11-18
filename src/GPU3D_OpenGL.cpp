@@ -3595,9 +3595,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
     if (ResizeTargets(BetterPolygons, ScaleFactor, frameTargetWidth, FrameTargetMargin(gpu, frameTargetWidth)))
         keep = false;
 
+    // GPU::GLSeams changed since the last frame drawn (the app's toggle flips it mid-game): the
+    // frame is drawn again even when the scene is the same, so a still scene shows the change
+    bool seamsChanged = gpu.GLSeams != SeamsDrawn;
+    SeamsDrawn = gpu.GLSeams;
+
     // nothing changed since the last frame: MainFramebuffer still holds it, so Blit and the
     // capture readback keep working from it (upstream's GL renderer skips the same way)
-    if (!textureChanged && !texPalChanged && !TargetsChanged && gpu.GPU3D.RenderFrameIdentical)
+    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && gpu.GPU3D.RenderFrameIdentical)
     {
 #ifdef MELONADE_DEBUG_TOOLS
         if (Timers)
