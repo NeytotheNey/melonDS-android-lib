@@ -263,25 +263,39 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
 #ifdef MELONADE_DEBUG_TOOLS
     DumpShaderSource(shaderFileName, shaderSource);
     // MELONADE_SHADER_BREAK=<a dump's name without its config, e.g. shader_FinalPass>: that program
-    // doesn't compile, to test COMPFAIL and the missing-program skip
+    // doesn't compile, to test COMPFAIL and the missing-program skip. or with the start of its config
+    // (shader_FinalPass_s8): only in configurations whose dump names start so, to break a later batch
     static const char* breakName = getenv("MELONADE_SHADER_BREAK");
-    if (breakName && shaderFileName == breakName)
-        shaderSource.insert(shaderSource.find('\n') + 1, "#error MELONADE_SHADER_BREAK\n");
+    if (breakName)
+    {
+        std::string full = shaderFileName + ShaderConfigSuffix();
+        std::string name = breakName;
+        bool qualified = name.size() > shaderFileName.size() + 2 && name.compare(0, shaderFileName.size() + 2, shaderFileName + "_s") == 0;
+        if (name == shaderFileName || (qualified && full.compare(0, name.size(), name) == 0))
+            shaderSource.insert(shaderSource.find('\n') + 1, "#error MELONADE_SHADER_BREAK\n");
+    }
 #endif
 
     return OpenGL::CompileComputeProgram(shader, shaderSource.c_str(), shaderName.c_str(), UseShaderCache ? &ShaderBatch : nullptr);
 }
 
 #ifdef MELONADE_DEBUG_TOOLS
+std::string ComputeRenderer::ShaderConfigSuffix() const
+{
+    return "_s" + std::to_string(ScaleFactor) + "_t" + std::to_string(TileSize) + "_o" + std::to_string(OptMask)
+        + "_w" + std::to_string(TargetWidth) + "_m" + std::to_string(TargetMargin) + "_b" + std::to_string(BinMode)
+        + "_c" + std::to_string(CalcMode) + "_f" + std::to_string(FlatMode) + "_x" + std::to_string(SetupSSBO ? 1 : 0);
+}
+
 // the environment variable MELONADE_SHADER_DUMP names a directory, read once. the files are named
-// by the defines and the scale, tile size and opt mask, and written as they're compiled
+// by the defines and what else the source depends on (scale, tile size, opt mask, WideMelon width
+// and margin, and the Mali diagnostics' modes), and written as they're compiled
 void ComputeRenderer::DumpShaderSource(const std::string& name, const std::string& source)
 {
     static const char* dir = getenv("MELONADE_SHADER_DUMP");
     if (!dir || !*dir)
         return;
-    std::string path = std::string(dir) + "/" + name + "_s" + std::to_string(ScaleFactor) + "_t" + std::to_string(TileSize)
-        + "_o" + std::to_string(OptMask) + ".glsl";
+    std::string path = std::string(dir) + "/" + name + ShaderConfigSuffix() + ".glsl";
     if (FILE* f = fopen(path.c_str(), "wb"))
     {
         fwrite(source.data(), 1, source.size(), f);
@@ -345,6 +359,38 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
         MissingPrograms = CountMissingPrograms();
         MissingLogged = false;
     }
+}
+
+void ComputeRenderer::ClearImages() noexcept
+{
+    // glClearBuffer goes by the scissor test and the color mask, which the compositor sets
+    GLint drawFB = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFB);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean colorMask[4] = {};
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureFrameBuffer);
+    if (Framebuffer != 0)
+    {
+        // RGBA8
+        const GLfloat zero[4] = {0.f, 0.f, 0.f, 0.f};
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Framebuffer, 0);
+        glClearBufferfv(GL_COLOR, 0, zero);
+    }
+    // RGBA8UI, and the attachment the capture readback and HASH3D read through
+    const GLuint zeroUI[4] = {0, 0, 0, 0};
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, LowResFramebuffer, 0);
+    glClearBufferuiv(GL_COLOR, 0, zeroUI);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)drawFB);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+    // the capture readback and the compositor read them next
+    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
 }
 
 // the 33 programs that are 0 (didn't build, or aren't compiled yet)
@@ -1825,6 +1871,15 @@ void ComputeRenderer::UpdateDepthStats(const GPU& gpu)
             // the programs there are stay, built the way DepthStatsOn was before
             DepthStatsOn = !want;
         }
+
+        // outside a batch, so the missing count is this one's to keep up to date (a program that
+        // goes missing here is reported and the images cleared at the check in RenderFrame)
+        int missing = CountMissingPrograms();
+        if (missing != MissingPrograms)
+        {
+            MissingPrograms = missing;
+            MissingLogged = false;
+        }
     }
 
     if (DepthStatsOn && !DepthCounter)
@@ -2441,13 +2496,16 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     }
     SLOW_LAP(Warm);
 
-    // a program that didn't build (COMPFAIL): nothing is drawn rather than drawn wrong, the image
-    // stays as it was (a kept frame was never taken, see KeepFramebuffer)
+    // a program that didn't build (COMPFAIL): nothing is drawn rather than drawn wrong, and the 3D
+    // is blank. a batch follows ResizeTargets, whose new image nothing has written, and the low res
+    // one would still have the last config's frame for a capture, so both are cleared once (a kept
+    // frame was never taken, see KeepFramebuffer)
     if (MissingPrograms != 0)
     {
         if (!MissingLogged)
         {
             MissingLogged = true;
+            ClearImages();
             Platform::Log(Platform::LogLevel::Error, "COMPFAIL %d of the 33 programs didn't build, the 3D isn't drawn\n", MissingPrograms);
         }
         return;

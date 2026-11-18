@@ -556,6 +556,9 @@ private:
     int MissingPrograms = 0;
     bool MissingLogged = false;
     [[nodiscard]] int CountMissingPrograms() const noexcept;
+    // the 3D image and the low res one a capture reads, cleared to transparent black: what's shown
+    // while a program is missing, rather than a new image nothing wrote or an older config's frame
+    void ClearImages() noexcept;
     void DeleteShaders();
 
     bool TargetFits(int width, int scale) const noexcept;
@@ -586,6 +589,8 @@ private:
     // MELONADE_SHADER_DUMP: a directory the source of every program compiled is written to, as it
     // goes to the driver, for diffing two builds' sources (tools/shadercheck)
     void DumpShaderSource(const std::string& name, const std::string& source);
+    // what a dump's name adds to the defines: the configuration the source depends on
+    std::string ShaderConfigSuffix() const;
 #endif
 };
 
