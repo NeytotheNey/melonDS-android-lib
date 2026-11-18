@@ -20,6 +20,8 @@
 
 #include <assert.h>
 #include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -212,22 +214,14 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     // GPU::ComputeCalc 1: CalcOffsets with the old atomic offsets
     if (&source == &ComputeRendererShaders::CalcOffsets && CalcMode != 0)
         shaderSource += "#define CalcAtomic\n";
-    // GPU::ComputeProbe: Rasterise's inexact cost probes, and OpaqueVis's divide, so its depths
-    // stay Rasterise's
-    if (&source == &ComputeRendererShaders::Rasterise || &source == &ComputeRendererShaders::OpaqueVis)
+    // GPU::ComputeProbe: Rasterise's inexact cost probes (RasteriseVis's too), and OpaqueVis's
+    // divide, so its depths stay Rasterise's
+    if (&source == &ComputeRendererShaders::Rasterise || &source == &ComputeRendererShaders::RasteriseVis
+        || &source == &ComputeRendererShaders::OpaqueVis)
     {
         if (ProbeMode & 1) shaderSource += "#define ProbeNoTexSample\n";
         if (ProbeMode & 2) shaderSource += "#define ProbeNoInterp\n";
         if (ProbeMode & 4) shaderSource += "#define ProbeNoDivide\n";
-    }
-    // GPU::ComputeVis bit 1: Rasterise's shade mode for the opaque prefix, and DepthBlend as Resolve,
-    // in the programs compiled for it
-    if (CompilingVis)
-    {
-        if (&source == &ComputeRendererShaders::Rasterise)
-            shaderSource += "#define VisShade\n";
-        if (&source == &ComputeRendererShaders::DepthBlend)
-            shaderSource += "#define VisResolve\n";
     }
     // GPU::ComputeFlat 0: VariantWorkCount as uvec4s again, in every program with the binning buffer
     if (FlatMode == 0 && source.find("BinResultBuffer") != std::string::npos)
@@ -291,7 +285,7 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     shaderSource += ComputeRendererShaders::Common;
 #ifdef MELONADE_DEBUG_TOOLS
     // debug only: DepthBlend with the COMPDEPTH counters (GPU::ComputeDepthStats)
-    if (DepthStatsOn && &source == &ComputeRendererShaders::DepthBlend)
+    if (DepthStatsOn && (&source == &ComputeRendererShaders::DepthBlend || &source == &ComputeRendererShaders::DepthBlendVis))
     {
         std::string counted = source;
         if (AddDepthStats(counted))
@@ -319,8 +313,38 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     //    fclose(f);
     //}
 
+#ifdef MELONADE_DEBUG_TOOLS
+    // the vis programs' define lists can be the plain ones', so the file says which source it was
+    bool visSource = &source == &ComputeRendererShaders::RasteriseVis || &source == &ComputeRendererShaders::DepthBlendVis
+        || &source == &ComputeRendererShaders::OpaqueVis;
+    DumpShaderSource(shaderFileName + (visSource ? "_vissrc" : ""), shaderSource);
+    // MELONADE_SHADER_BREAK=<a dump's name without its config, e.g. shader_DepthBlend_ZBuffer_vissrc>:
+    // that program doesn't compile, to test COMPFAIL, COMPVISFAIL and the missing-program skip
+    static const char* breakName = getenv("MELONADE_SHADER_BREAK");
+    if (breakName && shaderFileName + (visSource ? "_vissrc" : "") == breakName)
+        shaderSource.insert(shaderSource.find('\n') + 1, "#error MELONADE_SHADER_BREAK\n");
+#endif
+
     return OpenGL::CompileComputeProgram(shader, shaderSource.c_str(), shaderName.c_str(), UseShaderCache ? &ShaderBatch : nullptr);
 }
+
+#ifdef MELONADE_DEBUG_TOOLS
+// the environment variable MELONADE_SHADER_DUMP names a directory, read once. the files are
+// named by the defines and the scale, tile size and opt mask, and written as they are compiled
+void ComputeRenderer::DumpShaderSource(const std::string& name, const std::string& source)
+{
+    static const char* dir = getenv("MELONADE_SHADER_DUMP");
+    if (!dir || !*dir)
+        return;
+    std::string path = std::string(dir) + "/" + name + "_s" + std::to_string(ScaleFactor) + "_t" + std::to_string(TileSize)
+        + "_o" + std::to_string(OptMask) + "_p" + std::to_string(ProbeMode) + ".glsl";
+    if (FILE* f = fopen(path.c_str(), "wb"))
+    {
+        fwrite(source.data(), 1, source.size(), f);
+        fclose(f);
+    }
+}
+#endif
 
 void ComputeRenderer::ShaderCompileStep(int& current, int& count)
 {
@@ -328,17 +352,30 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
     ShaderStepIdx++;
     count = ShaderProgramCount();
 
-    // a batch is the 33 programs of one configuration (35 with GPU::ComputeVis). the Android frontend
-    // and RenderFrame compile them all at once, the Qt one a step per frame
+    // a batch is the 33 programs of one configuration (51 with GPU::ComputeVis, ShaderProgramCount).
+    // the Android frontend and RenderFrame compile them all at once, the Qt one a step per frame
     if (current == 0)
     {
         ShaderBatch = {};
         ShaderBatchNs = 0;
         VisBatchFailed = false;
+        BatchFailures = 0;
     }
     s64 start = SteadyNowNs();
-    if (!CompileShaderStep(current) && VisMode != 0)
-        VisBatchFailed = true;
+    if (!CompileShaderStep(current))
+    {
+        // in every build: a program that didn't build mustn't go unnoticed
+        BatchFailures++;
+        std::string error = OpenGL::LastShaderError();
+        for (char& ch : error)
+            if (ch == '\n' || ch == '\r')
+                ch = ' ';
+        Platform::Log(Platform::LogLevel::Error, "COMPFAIL step=%d of %d vis=%d scale=%d tile=%d opt=%d: %s\n",
+            current, count, VisMode, ScaleFactor, TileSize, OptMask, error.c_str());
+        // only GPU::ComputeVis's own programs (33 on) turn it off: a plain one failing isn't its fault
+        if (VisMode != 0 && current >= 33)
+            VisBatchFailed = true;
+    }
     // the zero program for Warm, which doesn't depend on the targets, goes through the program
     // cache with the batch while its file is read anyway
     if (current == count - 1 && WarmEnabled)
@@ -355,30 +392,72 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
 #ifdef MELONADE_DEBUG_TOOLS
     if (current == count - 1)
     {
-        Platform::Log(Platform::LogLevel::Info, "COMPSHADER programs=%d hits=%u misses=%u rejected=%u uncached=%u ms=%.1f loaded=%llu saved=%llu cache=%d scale=%d width=%d tile=%d opt=%d vis=%d\n",
+        Platform::Log(Platform::LogLevel::Info, "COMPSHADER programs=%d hits=%u misses=%u rejected=%u uncached=%u ms=%.1f loaded=%llu saved=%llu cache=%d scale=%d width=%d tile=%d opt=%d vis=%d failed=%d\n",
             count, ShaderBatch.Hits, ShaderBatch.Misses, ShaderBatch.Rejected, ShaderBatch.Uncached,
             ShaderBatchNs / 1e6, (unsigned long long)ShaderBatch.BytesLoaded, (unsigned long long)ShaderBatch.BytesSaved,
-            UseShaderCache ? 1 : 0, ScaleFactor, TargetWidth, TileSize, OptMask, VisMode);
+            UseShaderCache ? 1 : 0, ScaleFactor, TargetWidth, TileSize, OptMask, VisMode, BatchFailures);
     }
 #endif
 
     // GPU::ComputeVis: a program that didn't build would draw wrong (or not at all), so the batch
     // starts again without the switch, as it is with 0. the result buffer keeps its winner words,
     // which nothing reads then
+    // the plain programs every frame needs. RenderFrame doesn't draw while one is missing
+    if (current == count - 1)
+    {
+        MissingPrograms = CountMissingPrograms();
+        MissingLogged = false;
+    }
+
     if (current == count - 1 && VisBatchFailed)
     {
-        Platform::Log(Platform::LogLevel::Warn, "COMPVISFAIL: a program with computevis %d didn't build, compiling again without it\n", VisMode);
+        Platform::Log(Platform::LogLevel::Warn, "COMPVISFAIL: a program of computevis %d didn't build, compiling again without it\n", VisMode);
         VisBatchFailed = false;
         VisFailed = true;
+        VisFailedConfig = VisConfig();
         VisMode = 0;
         DeleteShaders();
         ShaderStepIdx = 0;
     }
 }
 
-// GPU::ComputeVis as the renderer takes it: off for good once a batch with it failed to build
-int ComputeRenderer::VisModeFor(const GPU& gpu) const noexcept
+// the plain 33 programs that are 0 (didn't build, or aren't compiled yet)
+int ComputeRenderer::CountMissingPrograms() const noexcept
 {
+    const GLuint programs[] =
+    {
+        ShaderInterpXSpans[0], ShaderInterpXSpans[1], ShaderBinCombined, ShaderDepthBlend[0], ShaderDepthBlend[1],
+        ShaderRasteriseNoTexture[0], ShaderRasteriseNoTexture[1], ShaderRasteriseNoTextureToon[0], ShaderRasteriseNoTextureToon[1],
+        ShaderRasteriseNoTextureHighlight[0], ShaderRasteriseNoTextureHighlight[1], ShaderRasteriseUseTextureDecal[0],
+        ShaderRasteriseUseTextureDecal[1], ShaderRasteriseUseTextureModulate[0], ShaderRasteriseUseTextureModulate[1],
+        ShaderRasteriseUseTextureToon[0], ShaderRasteriseUseTextureToon[1], ShaderRasteriseUseTextureHighlight[0],
+        ShaderRasteriseUseTextureHighlight[1], ShaderRasteriseShadowMask[0], ShaderRasteriseShadowMask[1],
+        ShaderClearCoarseBinMask, ShaderClearIndirectWorkCount, ShaderCalculateWorkListOffset, ShaderSortWork,
+        ShaderFinalPass[0], ShaderFinalPass[1], ShaderFinalPass[2], ShaderFinalPass[3],
+        ShaderFinalPass[4], ShaderFinalPass[5], ShaderFinalPass[6], ShaderFinalPass[7],
+    };
+    static_assert(std::size(programs) == 33);
+    int missing = 0;
+    for (GLuint program : programs)
+        missing += program == 0;
+    return missing;
+}
+
+// what a batch of programs is compiled for, besides GPU::ComputeVis: a vis program that failed to
+// build may build for another
+u64 ComputeRenderer::VisConfig() const noexcept
+{
+    return (u64)ScaleFactor | ((u64)TargetWidth << 8) | ((u64)TargetMargin << 20) | ((u64)TileSize << 28)
+        | ((u64)OptMask << 34) | ((u64)ProbeMode << 44) | ((u64)BinMode << 47) | ((u64)CalcMode << 49)
+        | ((u64)FlatMode << 50) | ((u64)SetupSSBO << 51) | ((u64)MaxPolygons << 52);
+}
+
+// GPU::ComputeVis as the renderer takes it: off after a vis program failed to build, until the
+// switch goes to 0 or the configuration changes
+int ComputeRenderer::VisModeFor(const GPU& gpu) noexcept
+{
+    if (VisFailed && (gpu.ComputeVis == 0 || VisConfig() != VisFailedConfig))
+        VisFailed = false;
     return VisFailed ? 0 : (gpu.ComputeVis & ComputeVis_All);
 }
 
@@ -453,22 +532,18 @@ bool ComputeRenderer::CompileShaderStep(int current)
     case 32:
         return CompileShader(ShaderFinalPass[7], ComputeRendererShaders::FinalPass, {"FinalPass", "AntiAliasing", "EdgeMarking", "Fog"});
     // GPU::ComputeVis only (ShaderProgramCount)
+    // Rasterise too, for Common's math, which OpaqueVis shares with it
     case 33:
-        return CompileShader(ShaderOpaqueVis[0], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "ZBuffer"});
+        return CompileShader(ShaderOpaqueVis[0], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "Rasterise", "ZBuffer"});
     case 34:
-        return CompileShader(ShaderOpaqueVis[1], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "WBuffer"});
+        return CompileShader(ShaderOpaqueVis[1], ComputeRendererShaders::OpaqueVis, {"OpaqueVis", "Rasterise", "WBuffer"});
     default:
         break;
     }
 
     // and the Rasterise and DepthBlend programs for the frames that take the visibility path
     if (current >= 35 && current < ShaderProgramCount())
-    {
-        CompilingVis = true;
-        bool built = CompileVisShaderStep(current - 35);
-        CompilingVis = false;
-        return built;
-    }
+        return CompileVisShaderStep(current - 35);
     __builtin_unreachable();
     return false;
 }
@@ -478,22 +553,22 @@ bool ComputeRenderer::CompileVisShaderStep(int step)
     using namespace ComputeRendererShaders;
     switch (step)
     {
-    case 0: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTexture][0], Rasterise, {"Rasterise", "ZBuffer", "NoTexture"});
-    case 1: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTexture][1], Rasterise, {"Rasterise", "WBuffer", "NoTexture"});
-    case 2: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureToon][0], Rasterise, {"Rasterise", "ZBuffer", "NoTexture", "Toon"});
-    case 3: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureToon][1], Rasterise, {"Rasterise", "WBuffer", "NoTexture", "Toon"});
-    case 4: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureHighlight][0], Rasterise, {"Rasterise", "ZBuffer", "NoTexture", "Highlight"});
-    case 5: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureHighlight][1], Rasterise, {"Rasterise", "WBuffer", "NoTexture", "Highlight"});
-    case 6: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureDecal][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Decal"});
-    case 7: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureDecal][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Decal"});
-    case 8: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureModulate][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Modulate"});
-    case 9: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureModulate][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Modulate"});
-    case 10: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureToon][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Toon"});
-    case 11: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureToon][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Toon"});
-    case 12: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureHighlight][0], Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Highlight"});
-    case 13: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureHighlight][1], Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Highlight"});
-    case 14: return CompileShader(ShaderDepthBlendVis[0], DepthBlend, {"DepthBlend", "ZBuffer"});
-    case 15: return CompileShader(ShaderDepthBlendVis[1], DepthBlend, {"DepthBlend", "WBuffer"});
+    case 0: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTexture][0], RasteriseVis, {"Rasterise", "ZBuffer", "NoTexture"});
+    case 1: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTexture][1], RasteriseVis, {"Rasterise", "WBuffer", "NoTexture"});
+    case 2: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureToon][0], RasteriseVis, {"Rasterise", "ZBuffer", "NoTexture", "Toon"});
+    case 3: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureToon][1], RasteriseVis, {"Rasterise", "WBuffer", "NoTexture", "Toon"});
+    case 4: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureHighlight][0], RasteriseVis, {"Rasterise", "ZBuffer", "NoTexture", "Highlight"});
+    case 5: return CompileShader(ShaderRasteriseVis[RasteriseKind_NoTextureHighlight][1], RasteriseVis, {"Rasterise", "WBuffer", "NoTexture", "Highlight"});
+    case 6: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureDecal][0], RasteriseVis, {"Rasterise", "ZBuffer", "UseTexture", "Decal"});
+    case 7: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureDecal][1], RasteriseVis, {"Rasterise", "WBuffer", "UseTexture", "Decal"});
+    case 8: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureModulate][0], RasteriseVis, {"Rasterise", "ZBuffer", "UseTexture", "Modulate"});
+    case 9: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureModulate][1], RasteriseVis, {"Rasterise", "WBuffer", "UseTexture", "Modulate"});
+    case 10: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureToon][0], RasteriseVis, {"Rasterise", "ZBuffer", "UseTexture", "Toon"});
+    case 11: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureToon][1], RasteriseVis, {"Rasterise", "WBuffer", "UseTexture", "Toon"});
+    case 12: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureHighlight][0], RasteriseVis, {"Rasterise", "ZBuffer", "UseTexture", "Highlight"});
+    case 13: return CompileShader(ShaderRasteriseVis[RasteriseKind_UseTextureHighlight][1], RasteriseVis, {"Rasterise", "WBuffer", "UseTexture", "Highlight"});
+    case 14: return CompileShader(ShaderDepthBlendVis[0], DepthBlendVis, {"DepthBlend", "ZBuffer"});
+    case 15: return CompileShader(ShaderDepthBlendVis[1], DepthBlendVis, {"DepthBlend", "WBuffer"});
     default:
         __builtin_unreachable();
         return false;
@@ -1397,8 +1472,13 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         [[maybe_unused]] double allocMs = (SteadyNowNs() - start) / 1e6;
         [[maybe_unused]] double touchMs = -1;
         u64 touchBytes = 0;
-        if (WarmEnabled && WorkTileRoom > oldRoom)
+        // GPU::ComputePoison fills grown storage with its pattern, warm-up or not
+        if ((WarmEnabled || PoisonOn) && WorkTileRoom > oldRoom)
+        {
+            FillValue = PoisonOn ? PoisonValue : 0;
             touchMs = TouchBuffers({ TileMemory[0], TileMemory[1], TileMemory[2] }, touchBytes);
+            FillValue = 0;
+        }
 #ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "COMPGROW worktiles %d->%d of %d bound=%u scale=%d tile=%d ms=%.1f touch=%.1f bytes=%llu\n",
             oldRoom, room, MaxWorkTiles, workTiles, ScaleFactor, TileSize, allocMs, touchMs, (unsigned long long)touchBytes);
@@ -1419,8 +1499,12 @@ void ComputeRenderer::GrowWorkBuffers(u32 workTiles, u32 spans)
         [[maybe_unused]] double allocMs = (SteadyNowNs() - start) / 1e6;
         [[maybe_unused]] double touchMs = -1;
         u64 touchBytes = 0;
-        if (WarmEnabled && XSpanRoom > oldRoom)
+        if ((WarmEnabled || PoisonOn) && XSpanRoom > oldRoom)
+        {
+            FillValue = PoisonOn ? PoisonValue : 0;
             touchMs = TouchBuffers({ XSpanSetupMemory, YSpanIndicesTextureMemory }, touchBytes);
+            FillValue = 0;
+        }
 #ifdef MELONADE_DEBUG_TOOLS
         Platform::Log(Platform::LogLevel::Info, "COMPGROW xspans %d->%d of %d need=%u scale=%d ms=%.1f touch=%.1f bytes=%llu\n",
             oldRoom, room, maxSpans, spans, ScaleFactor, allocMs, touchMs, (unsigned long long)touchBytes);
@@ -1917,12 +2001,8 @@ void ComputeRenderer::UpdateDepthStats(const GPU& gpu)
         bool built = CompileShader(programs[0], ComputeRendererShaders::DepthBlend, {"DepthBlend", "ZBuffer"})
             && CompileShader(programs[1], ComputeRendererShaders::DepthBlend, {"DepthBlend", "WBuffer"});
         if (built && VisMode)
-        {
-            CompilingVis = true;
-            built = CompileShader(programs[2], ComputeRendererShaders::DepthBlend, {"DepthBlend", "ZBuffer"})
-                && CompileShader(programs[3], ComputeRendererShaders::DepthBlend, {"DepthBlend", "WBuffer"});
-            CompilingVis = false;
-        }
+            built = CompileShader(programs[2], ComputeRendererShaders::DepthBlendVis, {"DepthBlend", "ZBuffer"})
+                && CompileShader(programs[3], ComputeRendererShaders::DepthBlendVis, {"DepthBlend", "WBuffer"});
         UseShaderCache = cache;
         // CompileShader turns DepthStatsOn off when the source didn't take the counters
         if (built && DepthStatsOn == want)
@@ -2704,10 +2784,23 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     if (WarmPending)
     {
         WarmPending = false;
-        if (WarmEnabled)
+        // GPU::ComputePoison's first fill is Warm's, with or without the warm-up
+        if (WarmEnabled || PoisonOn)
             Warm();
     }
     SLOW_LAP(Warm);
+
+    // a plain program that didn't build (COMPFAIL): nothing is drawn rather than drawn wrong, the
+    // image stays as it was (a kept frame was never taken, see KeepFramebuffer)
+    if (MissingPrograms != 0)
+    {
+        if (!MissingLogged)
+        {
+            MissingLogged = true;
+            Platform::Log(Platform::LogLevel::Error, "COMPFAIL %d of the 33 programs didn't build, the 3D isn't drawn\n", MissingPrograms);
+        }
+        return;
+    }
 
     WideFrame = TargetWidth != WideMelon::NativeWidth || gpu.GPU3D.RenderViewWidth != WideMelon::NativeWidth;
     WideXAdjust = (TargetWidth - gpu.GPU3D.RenderViewWidth) << 3;
@@ -3236,8 +3329,6 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 #ifdef MELONADE_DEBUG_TOOLS
     VisFrame = visPrefixEnd != 0;
 #endif
-    meta.VisPrefixEnd = visPrefixEnd;
-    meta.Pad[0] = meta.Pad[1] = meta.Pad[2] = 0;
     {
         u32 r = (gpu.GPU3D.RenderClearAttr1 << 1) & 0x3E; if (r) r++;
         u32 g = (gpu.GPU3D.RenderClearAttr1 >> 4) & 0x3E; if (g) g++;
@@ -3389,6 +3480,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[1]);
             glActiveTexture(GL_TEXTURE0);
             UseProgram(ShaderOpaqueVis[wbuffer]);
+            glUniform1ui(UniformIdxVisPrefixEnd, visPrefixEnd);
             glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }
@@ -3459,6 +3551,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
                 glUniform1ui(UniformIdxCurVariant, i);
                 glUniform1ui(UniformIdxColorDither, ColorDither ? 1 : 0);
+                // RasteriseVis's (a shadow mask's plain program has no such uniform, which GL ignores)
+                if (vis)
+                    glUniform1ui(UniformIdxVisPrefixEnd, visPrefixEnd);
                 // OptSmall: the texcoords' 4 fraction bits come off here instead of in the shader.
                 // the sizes are powers of two, so nothing is rounded
                 float texcoordScale = (OptMask & ComputeOpt_Small) ? 1.f / 16.f : 1.f;
@@ -3501,6 +3596,8 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 #endif
     // Resolve on the visibility path (GPU::ComputeVis)
     UseProgram(visPrefixEnd != 0 ? ShaderDepthBlendVis[wbuffer] : ShaderDepthBlend[wbuffer]);
+    if (visPrefixEnd != 0)
+        glUniform1ui(UniformIdxVisPrefixEnd, visPrefixEnd);
 #ifdef MELONADE_DEBUG_TOOLS
     // the counted DepthBlend's uniforms (AddDepthStats)
     if (DepthCounter)

@@ -132,10 +132,10 @@ private:
     GLuint ShaderCalculateWorkListOffset {};
     GLuint ShaderSortWork {};
     GLuint ShaderFinalPass[8] {};
-    // GPU::ComputeVis bit 1 only: the visibility pass, Z and W, and Rasterise and DepthBlend as
-    // compiled for it (VisShade, VisResolve), beside the plain ones, which frames under the gate
-    // (GPU::ComputeVisGate) run. Rasterise in the order of RasteriseKind; a shadow mask has no shade
-    // mode, so it keeps the plain program
+    // GPU::ComputeVis bit 1 only: the visibility pass, Z and W, and Rasterise and DepthBlend for it
+    // (RasteriseVis, DepthBlendVis, sources of their own), beside the plain ones, which frames under
+    // the gate (GPU::ComputeVisGate) run. Rasterise in the order of RasteriseKind; a shadow mask has
+    // no shade mode, so it keeps the plain program
     GLuint ShaderOpaqueVis[2] {};
     enum
     {
@@ -145,8 +145,6 @@ private:
     };
     GLuint ShaderRasteriseVis[RasteriseKind_Num][2] {};
     GLuint ShaderDepthBlendVis[2] {};
-    // CompileShader adds VisShade and VisResolve while it's set
-    bool CompilingVis = false;
 
     GLuint YSpanIndicesTextureMemory {};
     GLuint YSpanIndicesTexture {};
@@ -297,6 +295,9 @@ private:
     static constexpr int UniformIdxCurVariant = 0;
     static constexpr int UniformIdxTextureSize = 1;
     static constexpr int UniformIdxColorDither = 2;
+    // GPU::ComputeVis's programs only (VisCommon): where the opaque prefix ends. past the COMPDEPTH
+    // counters' 0 to 3
+    static constexpr int UniformIdxVisPrefixEnd = 7;
 
     static constexpr int MaxFullscreenLayers = 16;
 
@@ -338,15 +339,10 @@ private:
         u32 FogOffset, FogShift, FogColor;
 
         s32 ClearBitmapOffset[2];
-
-        // GPU::ComputeVis: the opaque prefix's end (VisPrefixFor), 0 without the switch
-        u32 VisPrefixEnd;
-        // the block's size rounded up to a vec4, which some drivers take as its size
-        u32 Pad[3];
     };
     // std140: the ivec2 needs 8 byte alignment, which the 146 uints before it already give
-    static_assert(offsetof(MetaUniform, ClearBitmapOffset) == 584 && offsetof(MetaUniform, VisPrefixEnd) == 592
-        && sizeof(MetaUniform) == 608, "MetaUniform must match the std140 layout of the shader's MetaUniform block");
+    static_assert(offsetof(MetaUniform, ClearBitmapOffset) == 584 && sizeof(MetaUniform) == 592,
+        "MetaUniform must match the std140 layout of the shader's MetaUniform block");
     GLuint MetaUniformMemory {};
 
     GLuint Samplers[9] {};
@@ -525,18 +521,27 @@ private:
     int ProbeMode = 0;
     // GPU::ComputeVis as compiled (Phase 2 of docs/plan-compute-efficiency.md). bit 1, stage 1a: the
     // visibility pass (OpaqueVis) resolves the opaque prefix on polygon indices, Rasterise shades
-    // only its winners (VisShade) and DepthBlend becomes Resolve (VisResolve), which starts from what
-    // OpaqueVis left. its two programs come after the 33, and the result buffer gets a word a pixel
-    // for the winners. a change recompiles at RenderFrame, like ComputeOpt; Reset takes it before
-    // the first compile
+    // only its winners (RasteriseVis) and DepthBlend becomes Resolve (DepthBlendVis), which starts
+    // from what OpaqueVis left. their 18 programs come after the 33 (51), which stay as they were,
+    // and the result buffer gets a word a pixel for the winners. a change recompiles at
+    // RenderFrame, like ComputeOpt; Reset takes it before the first compile
     static constexpr int ComputeVis_Opaque = 1 << 0;
     static constexpr int ComputeVis_All = ComputeVis_Opaque;
     int VisMode = 0;
-    // a program of a batch compiled with GPU::ComputeVis didn't build: the batch is compiled again
-    // without it, which stays off for the renderer's life (VisFailed)
+    // a program of GPU::ComputeVis's (33 on) didn't build: the batch is compiled again without it,
+    // which stays off (VisFailed) until the switch goes to 0 or the configuration the batch was for
+    // changes (VisFailedConfig)
     bool VisBatchFailed = false;
+    // programs of the batch in progress that didn't build (COMPFAIL, COMPSHADER's failed), and of
+    // the plain 33 after the last batch: while one is missing, RenderFrame draws nothing
+    int BatchFailures = 0;
+    int MissingPrograms = 0;
+    bool MissingLogged = false;
+    [[nodiscard]] int CountMissingPrograms() const noexcept;
     bool VisFailed = false;
-    [[nodiscard]] int VisModeFor(const GPU& gpu) const noexcept;
+    u64 VisFailedConfig = 0;
+    [[nodiscard]] u64 VisConfig() const noexcept;
+    [[nodiscard]] int VisModeFor(const GPU& gpu) noexcept;
     [[nodiscard]] int ShaderProgramCount() const noexcept { return 33 + (VisMode ? 2 + 2 * RasteriseKind_Num + 2 : 0); }
     // the opaque prefix stage 1a can resolve: the polygons from 0 up to the first that is
     // translucent, mode 3 (shadow or shadow mask) or a cut-out (VisCutout). all of their fragments
@@ -646,6 +651,11 @@ private:
     void SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side, s32 positions[10][2]);
 
     bool CompileShader(GLuint& shader, const std::string& source, const std::initializer_list<const char*>& defines);
+#ifdef MELONADE_DEBUG_TOOLS
+    // MELONADE_SHADER_DUMP: a directory the source of every program compiled is written to, as it
+    // goes to the driver, for diffing two builds' sources
+    void DumpShaderSource(const std::string& name, const std::string& source);
+#endif
 };
 
 }
