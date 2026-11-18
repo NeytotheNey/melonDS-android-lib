@@ -2878,9 +2878,16 @@ void main()
         if (VisTileHasRest(linearTile) == 0U)
             return;
         // the prefix has no shadow masks, so the stencil and the shadow mask flag are as at the start
+#ifdef VisProbeNoSecond
+        // debug.melonade.computevisprobe 1, inexact: the second layer isn't read back
+        color = uvec2(ResultValue[ResultColorStart+uint(resultOffset)], 0U);
+        depth = uvec2(ResultValue[ResultDepthStart+uint(resultOffset)], 0U);
+        attr = uvec2(ResultValue[ResultAttrStart+uint(resultOffset)], 0U);
+#else
         color = uvec2(ResultValue[ResultColorStart+uint(resultOffset)], ResultValue[ResultColorStart+uint(resultOffset)+uint(FramebufferStride)]);
         depth = uvec2(ResultValue[ResultDepthStart+uint(resultOffset)], ResultValue[ResultDepthStart+uint(resultOffset)+uint(FramebufferStride)]);
         attr = uvec2(ResultValue[ResultAttrStart+uint(resultOffset)], ResultValue[ResultAttrStart+uint(resultOffset)+uint(FramebufferStride)]);
+#endif
     }
     else
 #endif
@@ -3101,15 +3108,18 @@ void main()
     // all of both layers, whatever DISPCNT says: Resolve starts from them
     uint resultOffset = uint(position.x) + uint(position.y) * uint(ScreenWidth);
     ResultValue[ResultDepthStart+resultOffset] = depth.x;
-    ResultValue[ResultDepthStart+resultOffset+uint(FramebufferStride)] = depth.y;
     ResultValue[ResultAttrStart+resultOffset] = attr.x;
-    ResultValue[ResultAttrStart+resultOffset+uint(FramebufferStride)] = attr.y;
     ResultValue[ResultWinnerStart+resultOffset] = winner.x | (winner.y << 16);
     // a layer a polygon has gets its color from Rasterise. the first layer is never VisEmpty
     if (winner.x == VisClear)
         ResultValue[ResultColorStart+resultOffset] = color.x;
+#ifndef VisProbeNoSecond
+    // (debug.melonade.computevisprobe 1, inexact: none of the second layer)
+    ResultValue[ResultDepthStart+resultOffset+uint(FramebufferStride)] = depth.y;
+    ResultValue[ResultAttrStart+resultOffset+uint(FramebufferStride)] = attr.y;
     if (winner.y >= VisEmpty)
         ResultValue[ResultColorStart+resultOffset+uint(FramebufferStride)] = winner.y == VisClear ? color.x : 0U;
+#endif
 }
 
 )";

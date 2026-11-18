@@ -1144,6 +1144,12 @@ public:
     // this share (percent) of the frame's work tiles, by the CPU's bound. other frames run the plain
     // programs, as with ComputeVis 0. 0 takes it whenever there's a prefix
     int ComputeVisGate = 25;
+    // debug builds only, timing probes for the visibility path that RENDER WRONG on purpose, a sum
+    // of bits: 1 OpaqueVis doesn't write the second layer (depth, attributes, a sentinel's color)
+    // and Resolve doesn't read it back (VisProbeNoSecond, recompiles the vis programs); 2 a frame
+    // that doesn't take the visibility path gets an empty dispatch and a storage barrier between
+    // SortWork and Rasterise, what OpaqueVis's dispatch adds (exact, it only costs time)
+    int ComputeVisProbe = 0;
     // compute renderer, debug: the result buffer (winner words included) and the tile memory are
     // filled with 0xDEADBEEF where they're allocated and before every render, so a pass that reads
     // what no pass of the render wrote shows it on every GPU, not only where the driver leaves

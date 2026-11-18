@@ -528,6 +528,8 @@ private:
     static constexpr int ComputeVis_Opaque = 1 << 0;
     static constexpr int ComputeVis_All = ComputeVis_Opaque;
     int VisMode = 0;
+    // GPU::ComputeVisProbe's bit 1 as the vis programs are compiled (debug builds)
+    int VisProbeMode = 0;
     // a program of GPU::ComputeVis's (33 on) didn't build: the batch is compiled again without it,
     // which stays off (VisFailed) until the switch goes to 0 or the configuration the batch was for
     // changes (VisFailedConfig)
@@ -540,8 +542,10 @@ private:
     [[nodiscard]] int CountMissingPrograms() const noexcept;
     bool VisFailed = false;
     u64 VisFailedConfig = 0;
+    [[nodiscard]] static u64 VisConfigFor(int scale, int width, int margin, int tileSize, int optMask, int probeMode,
+        int binMode, int calcMode, int flatMode, bool setupSSBO, int maxPolygons) noexcept;
     [[nodiscard]] u64 VisConfig() const noexcept;
-    [[nodiscard]] int VisModeFor(const GPU& gpu) noexcept;
+    [[nodiscard]] int VisModeFor(const GPU& gpu, u64 config) noexcept;
     [[nodiscard]] int ShaderProgramCount() const noexcept { return 33 + (VisMode ? 2 + 2 * RasteriseKind_Num + 2 : 0); }
     // the opaque prefix stage 1a can resolve: the polygons from 0 up to the first that is
     // translucent, mode 3 (shadow or shadow mask) or a cut-out (VisCutout). all of their fragments

@@ -223,6 +223,11 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
         if (ProbeMode & 2) shaderSource += "#define ProbeNoInterp\n";
         if (ProbeMode & 4) shaderSource += "#define ProbeNoDivide\n";
     }
+#ifdef MELONADE_DEBUG_TOOLS
+    // GPU::ComputeVisProbe bit 1, inexact: the second layer's hand-off left out, in the vis sources only
+    if ((VisProbeMode & 1) && (&source == &ComputeRendererShaders::OpaqueVis || &source == &ComputeRendererShaders::DepthBlendVis))
+        shaderSource += "#define VisProbeNoSecond\n";
+#endif
     // GPU::ComputeFlat 0: VariantWorkCount as uvec4s again, in every program with the binning buffer
     if (FlatMode == 0 && source.find("BinResultBuffer") != std::string::npos)
         shaderSource += "#define VariantCountVec4\n";
@@ -445,18 +450,25 @@ int ComputeRenderer::CountMissingPrograms() const noexcept
 
 // what a batch of programs is compiled for, besides GPU::ComputeVis: a vis program that failed to
 // build may build for another
+u64 ComputeRenderer::VisConfigFor(int scale, int width, int margin, int tileSize, int optMask, int probeMode,
+    int binMode, int calcMode, int flatMode, bool setupSSBO, int maxPolygons) noexcept
+{
+    return (u64)scale | ((u64)width << 8) | ((u64)margin << 20) | ((u64)tileSize << 28)
+        | ((u64)optMask << 34) | ((u64)probeMode << 44) | ((u64)binMode << 47) | ((u64)calcMode << 49)
+        | ((u64)flatMode << 50) | ((u64)setupSSBO << 51) | ((u64)maxPolygons << 52);
+}
+
 u64 ComputeRenderer::VisConfig() const noexcept
 {
-    return (u64)ScaleFactor | ((u64)TargetWidth << 8) | ((u64)TargetMargin << 20) | ((u64)TileSize << 28)
-        | ((u64)OptMask << 34) | ((u64)ProbeMode << 44) | ((u64)BinMode << 47) | ((u64)CalcMode << 49)
-        | ((u64)FlatMode << 50) | ((u64)SetupSSBO << 51) | ((u64)MaxPolygons << 52);
+    return VisConfigFor(ScaleFactor, TargetWidth, TargetMargin, TileSize, OptMask, ProbeMode, BinMode, CalcMode,
+        FlatMode, SetupSSBO, MaxPolygons);
 }
 
 // GPU::ComputeVis as the renderer takes it: off after a vis program failed to build, until the
-// switch goes to 0 or the configuration changes
-int ComputeRenderer::VisModeFor(const GPU& gpu) noexcept
+// switch goes to 0 or the configuration the next batch is for (config, VisConfigFor) is another
+int ComputeRenderer::VisModeFor(const GPU& gpu, u64 config) noexcept
 {
-    if (VisFailed && (gpu.ComputeVis == 0 || VisConfig() != VisFailedConfig))
+    if (VisFailed && (gpu.ComputeVis == 0 || config != VisFailedConfig))
         VisFailed = false;
     return VisFailed ? 0 : (gpu.ComputeVis & ComputeVis_All);
 }
@@ -826,7 +838,7 @@ void ComputeRenderer::Reset(GPU& gpu)
     // so is GPU::ComputeVis while nothing is compiled yet, which saves a second compile at the first
     // frame. later changes are RenderFrame's
     if (ScaleFactor == -1)
-        VisMode = VisModeFor(gpu);
+        VisMode = VisFailed ? 0 : (gpu.ComputeVis & ComputeVis_All);
     // and before the targets' first setup (SetRenderSettings), which starts the rooms. without
     // ComputeGrow the rooms are the most at the first frame, so there's nothing to remember.
     // a cart without a game code (homebrew) or no cart has no rooms. DSiWare is loaded as a cart
@@ -2740,11 +2752,26 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     int calcMode = std::clamp(gpu.ComputeCalc, 0, 1);
     int flatMode = std::clamp(gpu.ComputeFlat, 0, 1);
     int probeMode = gpu.ComputeProbe & 7;
-    // GPU::ComputeVis too, which also sizes the result buffer (ResizeTargets)
-    int visMode = VisModeFor(gpu);
+    // the polygon list's size goes by the target and the latched scene's wide list (MaxPolygonsFor),
+    // not GPU::WidePolys itself, which only reaches a scene at its swap
+    WideList = gpu.GPU3D.RenderWideList;
+    int targetWidth = FrameTargetWidth(gpu);
+    int targetMargin = FrameTargetMargin(gpu, targetWidth);
+    // GPU::ComputeVis too, which also sizes the result buffer (ResizeTargets). after a vis program
+    // failed, by the configuration this frame's programs are for, so one changing compiles once
+    int visMode = VisModeFor(gpu, VisConfigFor(ScaleFactor, targetWidth, targetMargin,
+        TileSizeFor(targetWidth, targetMargin, ScaleFactor, ForcedTileSize), optMask, probeMode, binMode, calcMode,
+        flatMode, gpu.ComputeSSBO, MaxPolygonsFor(targetWidth, WideList)));
+    // GPU::ComputeVisProbe's bit 1 changes the vis programs (debug builds)
+#ifdef MELONADE_DEBUG_TOOLS
+    int visProbeMode = visMode ? (gpu.ComputeVisProbe & 1) : 0;
+#else
+    int visProbeMode = 0;
+#endif
     if (binMode != BinMode || gpu.ComputeSSBO != SetupSSBO || calcMode != CalcMode || flatMode != FlatMode
-        || probeMode != ProbeMode || visMode != VisMode)
+        || probeMode != ProbeMode || visMode != VisMode || visProbeMode != VisProbeMode)
     {
+        VisProbeMode = visProbeMode;
         BinMode = binMode;
         SetupSSBO = gpu.ComputeSSBO;
         CalcMode = calcMode;
@@ -2758,11 +2785,6 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     gpu.GPU3D.SceneRepeatCheck = (OptMask & ComputeOpt_SwapSkip) != 0;
     bool identical = gpu.GPU3D.RenderFrameIdentical
         || ((OptMask & ComputeOpt_SwapSkip) && gpu.GPU3D.RenderSceneRepeated);
-    // the polygon list's size goes by the target and the latched scene's wide list (MaxPolygonsFor),
-    // not GPU::WidePolys itself, which only reaches a scene at its swap
-    WideList = gpu.GPU3D.RenderWideList;
-    int targetWidth = FrameTargetWidth(gpu);
-    int targetMargin = FrameTargetMargin(gpu, targetWidth);
     if (targetWidth != TargetWidth || targetMargin != TargetMargin
         || TileSizeFor(targetWidth, targetMargin, ScaleFactor, ForcedTileSize) != TileSize || optChanged
         || MaxPolygonsFor(targetWidth, WideList) != MaxPolygons)
@@ -3484,6 +3506,22 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
             glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }
+#ifdef MELONADE_DEBUG_TOOLS
+        // GPU::ComputeVisProbe bit 2: what OpaqueVis's dispatch adds to a frame besides its work, for
+        // a frame that doesn't run it: a dispatch with as many threads (the zero program with nothing
+        // to write) and the storage barrier after it
+        else if ((gpu.ComputeVisProbe & 2) && WarmZeroReady(nullptr))
+        {
+            BeginGPUTimer(ComputePass::Vis);
+            UseProgram(ShaderWarmZero);
+            glUniform1ui(0, 0);
+            glUniform1ui(1, 0);
+            u32 groups = (u32)(ScreenWidth * ScreenHeight / 64);
+            u32 x = std::min(groups, 65535u);
+            glDispatchCompute(x, (groups + x - 1) / x, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+#endif
         // one timer over every variant's dispatch
         BeginGPUTimer(ComputePass::Rast);
         glActiveTexture(GL_TEXTURE0);
@@ -3551,8 +3589,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
                 glUniform1ui(UniformIdxCurVariant, i);
                 glUniform1ui(UniformIdxColorDither, ColorDither ? 1 : 0);
-                // RasteriseVis's (a shadow mask's plain program has no such uniform, which GL ignores)
-                if (vis)
+                // RasteriseVis's. a shadow mask keeps the plain program, which has no location 7: setting
+                // it there would be GL_INVALID_OPERATION
+                if (vis && shader != ShaderRasteriseShadowMask[wbuffer])
                     glUniform1ui(UniformIdxVisPrefixEnd, visPrefixEnd);
                 // OptSmall: the texcoords' 4 fraction bits come off here instead of in the shader.
                 // the sizes are powers of two, so nothing is rounded

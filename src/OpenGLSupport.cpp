@@ -453,6 +453,8 @@ bool LinkProgram(GLuint& result, GLuint* ids, int numIds)
 
 static bool BuildComputeProgram(GLuint& result, const std::string& source, const std::string& name, bool retrievable)
 {
+    // an older failure's message isn't this one's
+    LastShaderErrorText.clear();
     result = glCreateProgram();
     // without it glGetProgramBinary may have nothing to give back
     if (retrievable)
