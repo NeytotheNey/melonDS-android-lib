@@ -1399,7 +1399,11 @@ void RasteriseTile(uint workIdx)
             else
 #endif
             {
-#if defined(OptLinearNoDivide) && defined(ZBuffer)
+#if defined(ProbeNoDivide)
+                // debug.melonade.computeprobe 4, inexact on purpose: a linear factor with a float
+                // reciprocal instead of the perspective divide, to time what the divide costs
+                int ifactor = int(float((position.x - xspan.X0) << YFactorShift) / float(xspan.X1 - xspan.X0));
+#elif defined(OptLinearNoDivide) && defined(ZBuffer)
                 // z-buffering only uses the factor for a perspective span's attributes, so a
                 // linear one skips the divide
                 int ifactor = 0;
@@ -1417,6 +1421,15 @@ void RasteriseTile(uint workIdx)
 #ifdef WBuffer
                 z = InterpolateZWBuffer(xspan.Z0, xspan.Z1, ifactor);
 #endif
+#ifdef ProbeNoInterp
+                // computeprobe 2, inexact: the span's left end for color and texcoords. the factor
+                // stays in use (it's never negative), so the divide is still paid
+                u = xspan.TexcoordU0 ^ (ifactor >> 31);
+                v = xspan.TexcoordV0;
+                vr = xspan.ColorR0;
+                vg = xspan.ColorG0;
+                vb = xspan.ColorB0;
+#else
                 if ((xspan.Flags & XSpanSetup_Linear) == 0U)
                 {
                     u = InterpolateAttrPersp(xspan.TexcoordU0, xspan.TexcoordU1, ifactor);
@@ -1435,6 +1448,7 @@ void RasteriseTile(uint workIdx)
                     vg = InterpolateAttrLinear(xspan.ColorG0, xspan.ColorG1, i, xspan.XRecip, idiff);
                     vb = InterpolateAttrLinear(xspan.ColorB0, xspan.ColorB1, i, xspan.XRecip, idiff);
                 }
+#endif
             }
 
 #ifndef ShadowMask
@@ -1486,7 +1500,12 @@ void RasteriseTile(uint workIdx)
             vec2 uvf = vec2(ivec2(u, v)) * vec2(1.0 / 16.0) * InvTextureSize;
 #endif
 
+#ifdef ProbeNoTexSample
+            // computeprobe 1, inexact: an opaque texel made from the texcoords instead of the sample
+            uvec4 texcolor = uvec4(uint(u) & 63U, uint(v) & 63U, 0U, 31U);
+#else
             uvec4 texcolor = texture(CurrentTexture, vec3(uvf, polygon.TextureLayer));
+#endif
 #ifdef Decal
             if (texcolor.a == 31U)
             {

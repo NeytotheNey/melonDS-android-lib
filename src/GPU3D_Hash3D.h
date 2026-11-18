@@ -28,14 +28,15 @@ namespace melonDS
 // debug only (GPU::Hash3DLogging, Renderer3D::QueueHash3D): the HASH3D line's checksum, a 64-bit
 // FNV-1a over the 256x192 words of a 3D image in GetLine's format (r, g and b in 6 bits in bytes 0
 // to 2, alpha in 5 bits in byte 3), the same as HASH2D's. every renderer hashes that format, so
-// their lines can be compared with each other as well as with another build's
-inline u64 Hash3DImage(const u32* pixels, int stride) noexcept
+// their lines can be compared with each other as well as with another build's. HASH3DF's is the
+// same over the compute renderer's full-resolution RGBA8 words
+inline u64 Hash3DImage(const u32* pixels, int stride, int width = 256, int height = 192) noexcept
 {
     u64 h = 0xCBF29CE484222325ULL;
-    for (int y = 0; y < 192; y++)
+    for (int y = 0; y < height; y++)
     {
         const u32* row = &pixels[y * stride];
-        for (int x = 0; x < 256; x++)
+        for (int x = 0; x < width; x++)
             h = (h ^ row[x]) * 0x100000001B3ULL;
     }
     return h;
@@ -61,10 +62,19 @@ inline void LogHash3D(u32 frame, u64 hash) noexcept
         Platform::Log(Platform::LogLevel::Info, "HASH3D frame=%u hash=%016llX\n", frame, (unsigned long long)hash);
 }
 
-// a frame whose image couldn't be read back without waiting for the GPU
-inline void LogHash3DDropped(u32 frame, const char* why) noexcept
+// and HASH3DF's, with the image's size
+inline void LogHash3DFull(u32 frame, u64 hash, int width, int height) noexcept
 {
-    Platform::Log(Platform::LogLevel::Info, "HASH3D frame=%u dropped=%s\n", frame, why);
+    if (frame & 1)
+        Platform::Log(Platform::LogLevel::Info, "HASH3DF frame=%u hash=%016llX size=%dx%d%.0s\n", frame, (unsigned long long)hash, width, height, "");
+    else
+        Platform::Log(Platform::LogLevel::Info, "HASH3DF frame=%u hash=%016llX size=%dx%d\n", frame, (unsigned long long)hash, width, height);
+}
+
+// a frame whose image couldn't be read back without waiting for the GPU
+inline void LogHash3DDropped(u32 frame, const char* why, bool full = false) noexcept
+{
+    Platform::Log(Platform::LogLevel::Info, "%s frame=%u dropped=%s\n", full ? "HASH3DF" : "HASH3D", frame, why);
 }
 
 }
@@ -86,8 +96,10 @@ struct Hash3DReadback
 
     // GL_RGBA / GL_UNSIGNED_BYTE from the OpenGL renderer's downscale target (converted with
     // Hash3DFromGLColor), or GL_RGBA_INTEGER / GL_UNSIGNED_BYTE from the compute renderer's low res
-    // image, which is GetLine's format already
-    explicit Hash3DReadback(bool glColor) : GLColor(glColor)
+    // image, which is GetLine's format already. with a width, HASH3DF's: width x height of GL_RGBA /
+    // GL_UNSIGNED_BYTE (the compute renderer's full-resolution image), hashed as they are
+    explicit Hash3DReadback(bool glColor, int width = 0, int height = 0)
+        : GLColor(glColor), Full(width > 0), Width(Full ? width : 256), Height(Full ? height : 192)
     {
         glGenBuffers(Slots, Buffers);
         GLint previous = 0;
@@ -95,7 +107,7 @@ struct Hash3DReadback
         for (GLuint buffer : Buffers)
         {
             glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
-            glBufferData(GL_PIXEL_PACK_BUFFER, 256 * 192 * 4, nullptr, GL_STREAM_READ);
+            glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)Width * Height * 4, nullptr, GL_STREAM_READ);
         }
         glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)previous);
     }
@@ -107,7 +119,7 @@ struct Hash3DReadback
     ~Hash3DReadback()
     {
         for (int i = 0; i < Count; i++)
-            LogHash3DDropped(Frames[(Head + i) % Slots], "rendererclosed");
+            LogHash3DDropped(Frames[(Head + i) % Slots], "rendererclosed", Full);
         for (GLsync& fence : Fences)
         {
             if (fence)
@@ -123,7 +135,7 @@ struct Hash3DReadback
         Collect();
         if (Count == Slots)
         {
-            LogHash3DDropped(frame, "ringfull");
+            LogHash3DDropped(frame, "ringfull", Full);
             return;
         }
 
@@ -131,7 +143,7 @@ struct Hash3DReadback
         GLint previous = 0;
         glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previous);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, Buffers[slot]);
-        glReadPixels(0, 0, 256, 192, GLColor ? GL_RGBA : GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
+        glReadPixels(0, 0, Width, Height, GLColor || Full ? GL_RGBA : GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)previous);
         Fences[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         Frames[slot] = frame;
@@ -151,14 +163,19 @@ struct Hash3DReadback
             Fences[slot] = nullptr;
 
             if (state == GL_WAIT_FAILED)
-                LogHash3DDropped(Frames[slot], "waitfailed");
+                LogHash3DDropped(Frames[slot], "waitfailed", Full);
             else
             {
                 GLint previous = 0;
                 glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previous);
                 glBindBuffer(GL_PIXEL_PACK_BUFFER, Buffers[slot]);
-                const u32* data = (const u32*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 256 * 192 * 4, GL_MAP_READ_BIT);
-                if (data)
+                const u32* data = (const u32*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)Width * Height * 4, GL_MAP_READ_BIT);
+                if (data && Full)
+                {
+                    LogHash3DFull(Frames[slot], Hash3DImage(data, Width, Width, Height), Width, Height);
+                    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                }
+                else if (data)
                 {
                     u64 hash;
                     if (GLColor)
@@ -173,7 +190,7 @@ struct Hash3DReadback
                     LogHash3D(Frames[slot], hash);
                 }
                 else
-                    LogHash3DDropped(Frames[slot], "mapfailed");
+                    LogHash3DDropped(Frames[slot], "mapfailed", Full);
                 glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)previous);
             }
 
@@ -182,8 +199,10 @@ struct Hash3DReadback
         }
     }
 
+    const bool GLColor, Full;
+    const int Width, Height;
+
 private:
-    const bool GLColor;
     GLuint Buffers[Slots] {};
     GLsync Fences[Slots] {};
     u32 Frames[Slots] {};

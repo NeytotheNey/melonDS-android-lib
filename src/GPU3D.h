@@ -642,6 +642,8 @@ public:
     // pixel format, at native resolution), as frame, the HASH2D frame that shows it. nothing may wait
     // on the GPU for it. without an override no line is logged
     virtual void QueueHash3D(GPU& gpu, u32 frame) {}
+    // and GPU::Hash3DFullLogging's HASH3DF line, of the image at full resolution (compute only)
+    virtual void QueueHash3DFull(GPU& gpu, u32 frame) {}
 
     // GPU::ComputePace 2: the last render was left out to let the GPU catch up, so the 3D image
     // is older than the scene. GPU then has it drawn after all (RedrawSkippedFrame) at line 0

@@ -465,13 +465,14 @@ private:
 // a ring of small SSBOs of N counters that shaders add to, read back some frames later without
 // waiting: BeginFrame zeroes one and binds it (or a scratch buffer that's never read while the ring
 // is full), EndFrame puts a fence after the frame's dispatches or draws, and Collect adds the
-// finished ones' counts, each over its frame's pixel count, to Sums
+// finished ones' counts, each over its frame's pixel count, to Sums, and as they are to Totals
 template <int N>
 struct GLCounterRing
 {
     static constexpr int Slots = 6;
 
     double Sums[N] {};
+    u64 Totals[N] {};
     u32 Counted = 0, Dropped = 0;
 
     GLCounterRing()
@@ -549,7 +550,10 @@ struct GLCounterRing
             {
                 double per = Pixels[slot] > 0 ? 1.0 / Pixels[slot] : 0.0;
                 for (int i = 0; i < N; i++)
+                {
                     Sums[i] += counts[i] * per;
+                    Totals[i] += counts[i];
+                }
                 Counted++;
                 glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
             }
@@ -567,6 +571,8 @@ struct GLCounterRing
     {
         for (double& sum : Sums)
             sum = 0.0;
+        for (u64& total : Totals)
+            total = 0;
         Counted = Dropped = 0;
     }
 
@@ -631,8 +637,8 @@ private:
 };
 
 // debug builds only, compute renderer, GPU::ComputeDepthStats: the COMPDEPTH log. DepthBlend is
-// rebuilt with three counters (see AddDepthStats in GPU3D_Compute.cpp), summed per work group in
-// shared memory and added to an SSBO once per group.
+// rebuilt with nine counters (see AddDepthStats in GPU3D_Compute.cpp), summed per work group in
+// shared memory and added to an SSBO (a flat uint array) once per group.
 //
 // COMPDEPTH, once a second, every value per screen pixel (the dispatch's tile-rounded width x height)
 // and per counted frame:
@@ -641,9 +647,20 @@ private:
 //   colored          of those, the ones with a non-zero color, for which it then reads depth
 //   failed           of those, the ones that failed the first depth test (shadow masks included)
 //   colored_pct failed_pct  the same as shares of visited
+// split by group (Phase 2 stage 0, docs/plan-compute-efficiency.md), where the prefix is the
+// opaque prefix COMPVIS describes (polygons before the first translucent or mode 3 one):
+//   pvisited pcolored pfailed  the same three for the prefix's polygons; the rest is the difference
+//   winners          of the pixel's two layers, how many a prefix polygon holds when the walk leaves
+//                    the prefix (0 to 2): what a visibility pass would shade
+//   behind           colored fragments after the prefix, not of a shadow mask or an equal-test
+//                    polygon and before the first equal-test one, that lie behind both layers as the
+//                    prefix left them (behind the first only, when it's no edge): stage 3's yield.
+//                    behind_pct is its share of the colored ones after the prefix
+//   palpha           a count, not per pixel: prefix fragments with an alpha of 1 to 30. must be 0
 struct ComputeDepthCounter
 {
-    enum { Depth_Visited, Depth_Colored, Depth_Failed, Depth_Count };
+    enum { Depth_Visited, Depth_Colored, Depth_Failed, Depth_PVisited, Depth_PColored, Depth_PFailed, Depth_Winners,
+        Depth_Behind, Depth_PAlpha, Depth_Count };
     static constexpr GLuint Binding = 8;
 
     GLCounterRing<Depth_Count> Ring;
@@ -661,13 +678,80 @@ struct ComputeDepthCounter
             double per = Ring.Counted ? 1.0 / Ring.Counted : 0.0;
             const double* sums = Ring.Sums;
             double visited = sums[Depth_Visited];
+            double restColored = sums[Depth_Colored] - sums[Depth_PColored];
             Platform::Log(Platform::LogLevel::Info, "COMPDEPTH counted=%u dropped=%u visited=%.3f colored=%.3f failed=%.3f "
-                "colored_pct=%.1f failed_pct=%.1f scale=%d\n",
+                "colored_pct=%.1f failed_pct=%.1f scale=%d pvisited=%.3f pcolored=%.3f pfailed=%.3f winners=%.3f "
+                "behind=%.3f behind_pct=%.1f palpha=%llu\n",
                 Ring.Counted, Ring.Dropped, visited * per, sums[Depth_Colored] * per, sums[Depth_Failed] * per,
                 visited > 0.0 ? sums[Depth_Colored] * 100.0 / visited : 0.0,
-                visited > 0.0 ? sums[Depth_Failed] * 100.0 / visited : 0.0, scale);
+                visited > 0.0 ? sums[Depth_Failed] * 100.0 / visited : 0.0, scale,
+                sums[Depth_PVisited] * per, sums[Depth_PColored] * per, sums[Depth_PFailed] * per, sums[Depth_Winners] * per,
+                sums[Depth_Behind] * per, restColored > 0.0 ? sums[Depth_Behind] * 100.0 / restColored : 0.0,
+                (unsigned long long)Ring.Totals[Depth_PAlpha]);
         }
         Ring.ResetSums();
+        LogStartNs = now;
+    }
+
+private:
+    s64 LogStartNs = 0;
+};
+
+// debug builds only, compute renderer, GPU::ComputeVisStats: the COMPVIS log, Phase 2 stage 0's census
+// of the opaque prefix (docs/plan-compute-efficiency.md), from the CPU's polygons of every render
+// ComputeRenderer::NoteVisPrefix sees. the prefix is the longest run from polygon 0 that isn't
+// translucent (GPU3D's Translucent) or mode 3 (shadows and shadow masks); a cut-out is a polygon
+// that isn't, whose texture can make a texel transparent (palette formats with color 0 transparent,
+// 4x4 and direct, not in decal mode, with texture maps on).
+//
+// COMPVIS, once a second, every value per render unless it says frames (a count of renders):
+//   frames           renders
+//   polys opaque     polygons, and the ones that aren't translucent
+//   prefix prefix_pct  the prefix's length, and its share of the polygons
+//   tiles            work tiles from the polygons' boxes (the CPU's bound binning stays under)
+//   prefix_tiles_pct the prefix's share of those
+//   precut precut_tiles_pct  the same for the prefix cut at its first cut-out (stage 1a's prefix)
+//   cutout cutout_prefix     cut-outs, and the ones in the prefix
+//   cut_frames first_cut     renders with a cut-out in the prefix, and the first one's index there
+//   end_trans end_mode3 end_all  frames whose prefix ended at a translucent polygon, a mode 3 one,
+//                    or was the whole list
+//   eq shadow mask wire  equal-test (attr bit 14), shadow, shadow mask and wireframe (alpha 0)
+//                    polygons. eq_f shadow_f mask_f wire_f: frames with any
+//   bitmap_f alpharef_f alpharef_max wbuf_f  frames with the clear bitmap, with an alpha test
+//                    reference over 0 (and the highest), and W-buffered
+struct ComputeVisCensus
+{
+    struct Counters
+    {
+        u32 Frames = 0, CutFrames = 0, EndTrans = 0, EndMode3 = 0, EndAll = 0;
+        u32 EqFrames = 0, ShadowFrames = 0, MaskFrames = 0, WireFrames = 0, BitmapFrames = 0, AlphaRefFrames = 0, WFrames = 0;
+        u32 AlphaRefMax = 0;
+        u64 Polys = 0, Opaque = 0, Prefix = 0, PreCut = 0, Tiles = 0, PrefixTiles = 0, PreCutTiles = 0;
+        u64 Cutout = 0, CutoutPrefix = 0, FirstCut = 0, Eq = 0, Shadow = 0, Mask = 0, Wire = 0;
+    };
+    Counters Sec;
+
+    // after a render's counts are in
+    void Log(s64 now)
+    {
+        if (LogStartNs == 0)
+            LogStartNs = now;
+        if (now - LogStartNs < 1000000000 || Sec.Frames == 0)
+            return;
+
+        const Counters& c = Sec;
+        double per = 1.0 / c.Frames;
+        auto pct = [](u64 part, u64 whole) { return whole ? part * 100.0 / whole : 0.0; };
+        Platform::Log(Platform::LogLevel::Info, "COMPVIS frames=%u polys=%.1f opaque=%.1f prefix=%.1f prefix_pct=%.1f tiles=%.0f "
+            "prefix_tiles_pct=%.1f precut=%.1f precut_tiles_pct=%.1f cutout=%.1f cutout_prefix=%.1f cut_frames=%u first_cut=%.1f "
+            "end_trans=%u end_mode3=%u end_all=%u eq=%.1f shadow=%.1f mask=%.1f wire=%.1f eq_f=%u shadow_f=%u mask_f=%u wire_f=%u "
+            "bitmap_f=%u alpharef_f=%u alpharef_max=%u wbuf_f=%u\n",
+            c.Frames, c.Polys * per, c.Opaque * per, c.Prefix * per, pct(c.Prefix, c.Polys), c.Tiles * per,
+            pct(c.PrefixTiles, c.Tiles), c.PreCut * per, pct(c.PreCutTiles, c.Tiles), c.Cutout * per, c.CutoutPrefix * per,
+            c.CutFrames, c.CutFrames ? (double)c.FirstCut / c.CutFrames : 0.0, c.EndTrans, c.EndMode3, c.EndAll,
+            c.Eq * per, c.Shadow * per, c.Mask * per, c.Wire * per, c.EqFrames, c.ShadowFrames, c.MaskFrames, c.WireFrames,
+            c.BitmapFrames, c.AlphaRefFrames, c.AlphaRefMax, c.WFrames);
+        Sec = {};
         LogStartNs = now;
     }
 

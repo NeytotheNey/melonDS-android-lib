@@ -1129,6 +1129,12 @@ public:
     int SceneStats = 0;
     // compute renderer: logs a COMPDEPTH line once a second on what DepthBlend does per pixel
     bool ComputeDepthStats = false;
+    // compute renderer, Phase 2 stage 0 (docs/plan-compute-efficiency.md): a COMPVIS line once a
+    // second, a census of the opaque prefix from the CPU's polygons (ComputeVisCensus)
+    bool ComputeVisStats = false;
+    // compute renderer: Rasterise cost probes, a sum of bits that RENDER WRONG on purpose (1 no
+    // texture sample, 2 no color or texcoord interpolation, 4 no perspective divide). recompiles
+    int ComputeProbe = 0;
     // WideMelon (docs/plan-widemelon-polylist.md): with the view wider than 256, the polygon and vertex
     // RAM counts the game sees, and DISP3DCNT bit 13, are the native view's, and the scene is kept in a
     // list twice the DS's size, half of it for the polygons only the wings show, so the wide view no
@@ -1141,7 +1147,10 @@ public:
     // logs a HASH3D line per frame with a checksum of the 3D image at native resolution, numbered like
     // HASH2D (Renderer3D::QueueHash3D)
     bool Hash3DLogging = false;
-    // the frame HASH2D numbers (counted while Hash2DLogging or Hash3DLogging is on): the one running
+    // the same as a HASH3DF line, of the compute renderer's 3D image at full resolution
+    // (Renderer3D::QueueHash3DFull)
+    bool Hash3DFullLogging = false;
+    // the frame HASH2D numbers (counted while Hash2DLogging, Hash3DLogging or Hash3DFullLogging is on): the one running
     // now, from its line 0 to the end of line 262
     [[nodiscard]] u32 GetHashFrame() const noexcept { return Hash2DFrame; }
     // compute renderer (Renderer3D::FlushAfterCaptureBlit): in frames that hold capture lines,

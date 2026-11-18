@@ -2273,7 +2273,7 @@ void GPU::FinishFrame(u32 lines) noexcept
 
     if (Hash2DLogging)
         LogHash2D();
-    else if (Hash3DLogging)
+    else if (Hash3DLogging || Hash3DFullLogging)
         Hash2DFrame++; // what LogHash2D counts, so HASH3D lines are numbered the same without it
 
     FrontBuffer = FrontBuffer ? 0 : 1;

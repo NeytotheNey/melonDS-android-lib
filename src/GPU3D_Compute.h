@@ -106,6 +106,7 @@ public:
     void BeginGPUTimer(int pass) final { if (Stats) Stats->Begin(pass); }
     void EndGPUTimer() final { if (Stats) Stats->End(); }
     void QueueHash3D(GPU& gpu, u32 frame) final;
+    void QueueHash3DFull(GPU& gpu, u32 frame) final;
 #endif
     [[nodiscard]] bool NeedsCaptureRedraw() const noexcept override { return PaceStale; }
     void RedrawSkippedFrame(GPU& gpu) override;
@@ -375,6 +376,14 @@ private:
     bool DepthStatsFailed = false;
     std::unique_ptr<ComputeDepthCounter> DepthCounter;
     void UpdateDepthStats(const GPU& gpu);
+    // HASH3DF (GPU::Hash3DFullLogging), made again when the image's size changes
+    std::unique_ptr<Hash3DReadback> Hash3DFull;
+    // COMPVIS (GPU::ComputeVisStats), and the opaque prefix's end and the first equal-test polygon
+    // after it, which the COMPDEPTH counters take as uniforms. NoteVisPrefix sets them every render
+    // while either is on
+    std::unique_ptr<ComputeVisCensus> VisCensus;
+    u32 DepthPrefixEnd = 0, DepthTransStop = 0;
+    void NoteVisPrefix(const GPU& gpu, int numPolygons);
 
     // the COMPSLOW line: RenderFrame's CPU time by phase, logged for a frame over 30 ms, with how
     // many programs it was the first to dispatch since they were compiled (DispatchedPrograms)
@@ -481,6 +490,9 @@ private:
     int CalcMode = 0;
     // GPU::ComputeFlat as compiled: starts at GPU's default, so only the switch compiles twice
     int FlatMode = 1;
+    // GPU::ComputeProbe as compiled, Rasterise's inexact cost probes (ProbeNoTexSample, ProbeNoInterp,
+    // ProbeNoDivide in the shader)
+    int ProbeMode = 0;
     GLint MaxTexBufferSize = 0;
     GLuint ShaderCheckSetup = 0;
     bool CheckSetupFailed = false;
@@ -571,6 +583,9 @@ private:
     s32 WideVertexX(s32 hiresx) const;
     s32 WideVertexY(s32 hiresy) const;
 
+    // the work tiles a polygon's box touches, a pixel wider on each side for the edge rounding
+    // (binning goes by the x-spans), which binning makes no more of
+    u32 PolygonTileBound(const RenderPolygon& rp) const noexcept;
     void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to);
     void SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2]);
     void SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side, s32 positions[10][2]);

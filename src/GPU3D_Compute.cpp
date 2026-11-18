@@ -75,15 +75,28 @@ static bool AddDepthStats(std::string& src)
     };
 
     // walking a polygon's work tile, finding a colored pixel there, failing the first depth test (a
-    // shadow mask's sets the stencil)
+    // shadow mask's sets the stencil). each anchor's first match after the function's start
     if (!insertAt("workIdx++;", " DepthStatsVisited++;", true)) return false;
+    // the opaque prefix's polygons (polygon order is walk order), and the layers as the walk leaves it
+    if (!insertAt("uint polygonIdx = fineIdx + (coarseBit + coarseOffset) * 32U;",
+        " bool DepthStatsPre = polygonIdx < DepthStatsPrefixEnd;"
+        " if (DepthStatsPre) DepthStatsPVisited++; else if (!DepthStatsSnap) DepthStatsSnapshot(depth, attr.x);", true)) return false;
     {
         size_t pos = src.find("if (tileColor != 0U)", start);
         size_t brace = pos == std::string::npos ? std::string::npos : src.find('{', pos);
         if (brace == std::string::npos) return false;
-        src.insert(brace + 1, " DepthStatsColored++;");
+        src.insert(brace + 1, " DepthStatsColored++;"
+            " if (DepthStatsPre) { DepthStatsPColored++; if ((tileColor & 0x1F000000U) != 0x1F000000U) DepthStatsPAlpha++; }");
     }
-    if (!insertAt("if ((dstattr & 0x3U) == 0U || writeSecondLayer)", "DepthStatsFailed++; ", false)) return false;
+    if (!insertAt("uint tileDepth = TileDepth(pixelindex);",
+        " if (!DepthStatsPre && !isShadowMask && !equalDepthTest && polygonIdx < DepthStatsTransStop"
+        " && tileDepth >= DepthStatsOpDepth.x && ((DepthStatsOpAttr & 0x3U) == 0U || tileDepth >= DepthStatsOpDepth.y))"
+        " DepthStatsBehind++;", true)) return false;
+    if (!insertAt("if ((dstattr & 0x3U) == 0U || writeSecondLayer)", "DepthStatsFailed++; if (DepthStatsPre) DepthStatsPFailed++; ", false)) return false;
+    // which layers a prefix polygon wrote: the push-down, the first layer, the second
+    if (!insertAt("color.y = color.x;", " DepthStatsWin.y = DepthStatsWin.x;", true)) return false;
+    if (!insertAt("color.x = tileColor;", " DepthStatsWin.x = true;", true)) return false;
+    if (!insertAt("color.y = tileColor;", " DepthStatsWin.y = true;", true)) return false;
     {
         const char* anchor = "stencil = 0x1U;";
         size_t pos = src.find(anchor, start);
@@ -97,35 +110,47 @@ static bool AddDepthStats(std::string& src)
         src.replace(pos, strlen(anchor), "void DepthBlendMain()");
     }
 
-    // the counters, declared before the functions that count, and a main that sums them per work group
+    // the counters, declared before the functions that count, and a main that sums them per work group.
+    // all of them flat uints (never a uvec4's component, see BinningBuffer), in ComputeDepthCounter's order
     size_t decl = src.find("void PlotTranslucent(");
     if (decl == std::string::npos || decl > start)
         return false;
     src.insert(decl,
         "layout (std430, binding = 8) buffer DepthStatsBuffer { uint DepthStatsCount[]; };\n"
-        "shared uint DepthStatsShared[3];\n"
-        "uint DepthStatsVisited = 0U, DepthStatsColored = 0U, DepthStatsFailed = 0U;\n\n");
+        "layout (location = 0) uniform uint DepthStatsPrefixEnd;\n"
+        "layout (location = 1) uniform uint DepthStatsTransStop;\n"
+        "shared uint DepthStatsShared[9];\n"
+        "uint DepthStatsVisited = 0U, DepthStatsColored = 0U, DepthStatsFailed = 0U, DepthStatsPVisited = 0U, DepthStatsPColored = 0U;\n"
+        "uint DepthStatsPFailed = 0U, DepthStatsWinners = 0U, DepthStatsBehind = 0U, DepthStatsPAlpha = 0U;\n"
+        "bool DepthStatsSnap = false;\n"
+        "bvec2 DepthStatsWin = bvec2(false);\n"
+        "uvec2 DepthStatsOpDepth = uvec2(0U);\n"
+        "uint DepthStatsOpAttr = 0U;\n"
+        "void DepthStatsSnapshot(uvec2 depth, uint attr)\n"
+        "{\n"
+        "    DepthStatsSnap = true;\n"
+        "    DepthStatsWinners = uint(DepthStatsWin.x) + uint(DepthStatsWin.y);\n"
+        "    DepthStatsOpDepth = depth;\n"
+        "    DepthStatsOpAttr = attr;\n"
+        "}\n\n");
     src +=
         "\nvoid main()\n"
         "{\n"
-        "    if (gl_LocalInvocationIndex == 0U)\n"
-        "    {\n"
-        "        DepthStatsShared[0] = 0U; DepthStatsShared[1] = 0U; DepthStatsShared[2] = 0U;\n"
-        "    }\n"
+        "    if (gl_LocalInvocationIndex < 9U)\n"
+        "        DepthStatsShared[gl_LocalInvocationIndex] = 0U;\n"
         "    memoryBarrierShared();\n"
         "    barrier();\n"
         "    DepthBlendMain();\n"
-        "    atomicAdd(DepthStatsShared[0], DepthStatsVisited);\n"
-        "    atomicAdd(DepthStatsShared[1], DepthStatsColored);\n"
-        "    atomicAdd(DepthStatsShared[2], DepthStatsFailed);\n"
+        "    if (!DepthStatsSnap)\n"
+        "        DepthStatsWinners = uint(DepthStatsWin.x) + uint(DepthStatsWin.y);\n"
+        "    uint counts[9] = uint[9](DepthStatsVisited, DepthStatsColored, DepthStatsFailed, DepthStatsPVisited,\n"
+        "        DepthStatsPColored, DepthStatsPFailed, DepthStatsWinners, DepthStatsBehind, DepthStatsPAlpha);\n"
+        "    for (int i = 0; i < 9; i++)\n"
+        "        atomicAdd(DepthStatsShared[i], counts[i]);\n"
         "    memoryBarrierShared();\n"
         "    barrier();\n"
-        "    if (gl_LocalInvocationIndex == 0U)\n"
-        "    {\n"
-        "        atomicAdd(DepthStatsCount[0], DepthStatsShared[0]);\n"
-        "        atomicAdd(DepthStatsCount[1], DepthStatsShared[1]);\n"
-        "        atomicAdd(DepthStatsCount[2], DepthStatsShared[2]);\n"
-        "    }\n"
+        "    if (gl_LocalInvocationIndex < 9U)\n"
+        "        atomicAdd(DepthStatsCount[gl_LocalInvocationIndex], DepthStatsShared[gl_LocalInvocationIndex]);\n"
         "}\n";
     return true;
 }
@@ -168,6 +193,13 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     // GPU::ComputeCalc 1: CalcOffsets with the old atomic offsets
     if (&source == &ComputeRendererShaders::CalcOffsets && CalcMode != 0)
         shaderSource += "#define CalcAtomic\n";
+    // GPU::ComputeProbe: Rasterise's inexact cost probes
+    if (&source == &ComputeRendererShaders::Rasterise)
+    {
+        if (ProbeMode & 1) shaderSource += "#define ProbeNoTexSample\n";
+        if (ProbeMode & 2) shaderSource += "#define ProbeNoInterp\n";
+        if (ProbeMode & 4) shaderSource += "#define ProbeNoDivide\n";
+    }
     // GPU::ComputeFlat 0: VariantWorkCount as uvec4s again, in every program with the binning buffer
     if (FlatMode == 0 && source.find("BinResultBuffer") != std::string::npos)
         shaderSource += "#define VariantCountVec4\n";
@@ -518,6 +550,7 @@ ComputeRenderer::~ComputeRenderer()
     // its queries, while the context is still current
     Stats.reset();
     Hash3D.reset();
+    Hash3DFull.reset();
     DepthCounter.reset();
 #endif
     DropPaceFences();
@@ -1813,7 +1846,121 @@ void ComputeRenderer::QueueHash3D(GPU& gpu, u32 frame)
     Hash3D->Queue(frame);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readFB);
 }
+
+// GPU::Hash3DFullLogging: the final pass's RGBA8 image at full resolution, the columns and rows
+// past the output (tile rounding) left out, likewise as the last render left it
+void ComputeRenderer::QueueHash3DFull(GPU& gpu, u32 frame)
+{
+    int width = TargetWidth * ScaleFactor, height = OutputHeight;
+    if (width <= 0 || height <= 0 || !Framebuffer)
+        return;
+    if (!Hash3DFull || Hash3DFull->Width != width || Hash3DFull->Height != height)
+        Hash3DFull = std::make_unique<Hash3DReadback>(false, width, height);
+
+    GLint readFB = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFB);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureFrameBuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Framebuffer, 0);
+    Hash3DFull->Queue(frame);
+    // the capture readback and HASH3D read the low res image through it
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, LowResFramebuffer, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readFB);
+}
+
+// GPU::ComputeVisStats and ComputeDepthStats, for a render that's drawn: the opaque prefix
+// (ComputeVisCensus has the rules) and the census of its polygons
+void ComputeRenderer::NoteVisPrefix(const GPU& gpu, int numPolygons)
+{
+    const GPU3D& gpu3d = gpu.GPU3D;
+    bool texMaps = gpu3d.RenderDispCnt & (1<<0);
+    int prefix = -1, firstCut = -1, transStop = numPolygons, endWhy = 0;
+    u64 tiles = 0, prefixTiles = 0, preCutTiles = 0;
+    u32 opaque = 0, cutout = 0, cutPrefix = 0, eq = 0, shadow = 0, mask = 0, wire = 0;
+    for (int i = 0; i < numPolygons; i++)
+    {
+        const Polygon* p = gpu3d.RenderPolygonRAM[i];
+        u32 mode = (p->Attr >> 4) & 0x3, fmt = (p->TexParam >> 26) & 0x7;
+        bool cut = !p->Translucent && mode != 3 && mode != 1 && texMaps && fmt != 0
+            && (fmt == 5 || fmt == 7 || ((p->TexParam >> 29) & 1));
+        bool equal = (p->Attr >> 14) & 1;
+        if (prefix < 0 && (p->Translucent || mode == 3))
+        {
+            prefix = i;
+            endWhy = p->Translucent ? 1 : 2;
+        }
+        bool inPrefix = prefix < 0;
+        if (inPrefix && cut && firstCut < 0)
+            firstCut = i;
+        u32 t = PolygonTileBound(RenderPolygons[i]);
+        tiles += t;
+        prefixTiles += inPrefix ? t : 0;
+        preCutTiles += (inPrefix && firstCut < 0) ? t : 0;
+        if (!inPrefix && equal && transStop == numPolygons)
+            transStop = i;
+        opaque += !p->Translucent;
+        cutout += cut;
+        cutPrefix += cut && inPrefix;
+        eq += equal;
+        shadow += p->IsShadow;
+        mask += p->IsShadowMask;
+        wire += ((p->Attr >> 16) & 0x1F) == 0;
+    }
+    if (prefix < 0)
+        prefix = numPolygons;
+    DepthPrefixEnd = (u32)prefix;
+    DepthTransStop = (u32)transStop;
+
+    if (!gpu.ComputeVisStats)
+    {
+        VisCensus.reset();
+        return;
+    }
+    if (!VisCensus)
+        VisCensus = std::make_unique<ComputeVisCensus>();
+    ComputeVisCensus::Counters& c = VisCensus->Sec;
+    c.Frames++;
+    c.Polys += numPolygons;
+    c.Opaque += opaque;
+    c.Prefix += prefix;
+    c.PreCut += firstCut < 0 ? prefix : firstCut;
+    c.Tiles += tiles;
+    c.PrefixTiles += prefixTiles;
+    c.PreCutTiles += preCutTiles;
+    c.Cutout += cutout;
+    c.CutoutPrefix += cutPrefix;
+    if (firstCut >= 0)
+    {
+        c.CutFrames++;
+        c.FirstCut += firstCut;
+    }
+    (endWhy == 1 ? c.EndTrans : endWhy == 2 ? c.EndMode3 : c.EndAll)++;
+    c.Eq += eq;
+    c.Shadow += shadow;
+    c.Mask += mask;
+    c.Wire += wire;
+    c.EqFrames += eq != 0;
+    c.ShadowFrames += shadow != 0;
+    c.MaskFrames += mask != 0;
+    c.WireFrames += wire != 0;
+    c.BitmapFrames += (gpu3d.RenderDispCnt >> 14) & 1;
+    c.AlphaRefFrames += gpu3d.RenderAlphaRef != 0;
+    c.AlphaRefMax = std::max(c.AlphaRefMax, (u32)gpu3d.RenderAlphaRef);
+    c.WFrames += numPolygons > 0 && gpu3d.RenderPolygonRAM[0]->WBuffer;
+    VisCensus->Log(SteadyNowNs());
+}
 #endif
+
+u32 ComputeRenderer::PolygonTileBound(const RenderPolygon& rp) const noexcept
+{
+    // bottom Y is exclusive
+    s32 tileX0 = std::max(rp.XMin - 1, 0) / TileSize;
+    s32 tileX1 = std::min(rp.XMax + 1, ScreenWidth - 1) / TileSize;
+    s32 tileY0 = std::max(rp.YTop, 0) / TileSize;
+    s32 tileY1 = (std::min(rp.YBot, ScreenHeight) - 1) / TileSize;
+    if (tileX1 < tileX0 || tileY1 < tileY0 || rp.YBot <= 0)
+        return 0;
+    return (u32)((tileX1 - tileX0 + 1) * (tileY1 - tileY0 + 1));
+}
 
 void ComputeRenderer::DropPaceFences() noexcept
 {
@@ -2361,12 +2508,15 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     int binMode = std::clamp(gpu.ComputeBin, 0, 3);
     int calcMode = std::clamp(gpu.ComputeCalc, 0, 1);
     int flatMode = std::clamp(gpu.ComputeFlat, 0, 1);
-    if (binMode != BinMode || gpu.ComputeSSBO != SetupSSBO || calcMode != CalcMode || flatMode != FlatMode)
+    int probeMode = gpu.ComputeProbe & 7;
+    if (binMode != BinMode || gpu.ComputeSSBO != SetupSSBO || calcMode != CalcMode || flatMode != FlatMode
+        || probeMode != ProbeMode)
     {
         BinMode = binMode;
         SetupSSBO = gpu.ComputeSSBO;
         CalcMode = calcMode;
         FlatMode = flatMode;
+        ProbeMode = probeMode;
         optChanged = true;
     }
     // ComputeOpt_SwapSkip: has GPU3D compare each swap's scene with the one before, from the next
@@ -2837,19 +2987,9 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         }
 
         {
-            // the tiles the bounding box touches, a pixel wider on each side for the edge rounding
-            // (binning goes by the x-spans). bottom Y is exclusive
-            const RenderPolygon& rp = RenderPolygons[i];
-            s32 tileX0 = std::max(rp.XMin - 1, 0) / TileSize;
-            s32 tileX1 = std::min(rp.XMax + 1, ScreenWidth - 1) / TileSize;
-            s32 tileY0 = std::max(rp.YTop, 0) / TileSize;
-            s32 tileY1 = (std::min(rp.YBot, ScreenHeight) - 1) / TileSize;
-            if (tileX1 >= tileX0 && tileY1 >= tileY0 && rp.YBot > 0)
-            {
-                u32 tiles = (u32)((tileX1 - tileX0 + 1) * (tileY1 - tileY0 + 1));
-                variantTileBound[prevVariant] += tiles;
-                totalTileBound += tiles;
-            }
+            u32 tiles = PolygonTileBound(RenderPolygons[i]);
+            variantTileBound[prevVariant] += tiles;
+            totalTileBound += tiles;
         }
 
         //printf("polygon min max %d %d | %d %d\n", RenderPolygons[i].XMin, RenderPolygons[i].XMinY, RenderPolygons[i].XMax, RenderPolygons[i].XMaxY);
@@ -3141,6 +3281,11 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     SLOW_LAP(Rast);
 
+#ifdef MELONADE_DEBUG_TOOLS
+    // the opaque prefix, for COMPVIS and the COMPDEPTH counters. a render that gets this far is drawn
+    if (gpu.ComputeVisStats || VisCensus || DepthCounter)
+        NoteVisPrefix(gpu, numYSpans > 0 ? numPolygons : 0);
+#endif
     BeginGPUTimer(ComputePass::Depth);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ClearBitmapTex[0]);
@@ -3154,6 +3299,14 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         DepthCounter->Ring.BeginFrame(ComputeDepthCounter::Binding, ScreenWidth * ScreenHeight);
 #endif
     UseProgram(ShaderDepthBlend[wbuffer]);
+#ifdef MELONADE_DEBUG_TOOLS
+    // the counted DepthBlend's uniforms (AddDepthStats)
+    if (DepthCounter)
+    {
+        glUniform1ui(0, DepthPrefixEnd);
+        glUniform1ui(1, DepthTransStop);
+    }
+#endif
     glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 #ifdef MELONADE_DEBUG_TOOLS

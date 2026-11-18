@@ -3586,6 +3586,8 @@ void GPU3D::VCount215(GPU& gpu) noexcept
     // frame shows this render
     if (gpu.Hash3DLogging)
         CurrentRenderer->QueueHash3D(gpu, gpu.GetHashFrame() + 1);
+    if (gpu.Hash3DFullLogging)
+        CurrentRenderer->QueueHash3DFull(gpu, gpu.GetHashFrame() + 1);
 }
 
 // debug only (GPU::SceneStats), see GPU3D_SceneStats.h for the fields
