@@ -2730,10 +2730,26 @@ void main()
     // a Wide_Repeat wing pixel: its planes are its edge column's, and so is its 3D
     if ((planes.w & 2u) != 0u)
         fTexcoord.x += float(RepeatColumn(nx) - nx);
-    else if ((nx < 0 || nx > 255) && planes.w == 0u)
+    else if (nx < 0 || nx > 255)
     {
-        oColor = ShadowWingColor();
-        return;
+        // a box carried past the edge (Shadow2D::W_CarryLeft and W_CarryRight, Carry_*): the edge
+        // column of the row the line takes its color from, its 3D and brightness included
+        uint carry = nx < 0 ? texelFetch(LineStateTex, ivec2(0, row), 0).y : texelFetch(LineStateTex, ivec2(7, row), 0).w;
+        int d = nx < 0 ? -nx : nx - 255;
+        if ((carry & 0x80000000u) != 0u && d <= int((carry >> 20) & 0xFu))
+        {
+            int src = int(d <= int((carry >> 16) & 0xFu) ? carry & 0xFFu : (carry >> 8) & 0xFFu);
+            int ex = nx < 0 ? 0 : 255;
+            int line = row >= 192 ? row - 192 : row;
+            fTexcoord += vec2(float(ex - nx), float(src - line));
+            row += src - line;
+            planes = texelFetch(PlanesTex, ivec2(ex + SHADOW_OFFSET, row), 0);
+        }
+        else if (planes.w == 0u)
+        {
+            oColor = ShadowWingColor();
+            return;
+        }
     }
 #endif
     oColor = ShadowColor(planes.x, planes.y, planes.z, row);

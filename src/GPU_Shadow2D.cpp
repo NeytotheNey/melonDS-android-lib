@@ -118,6 +118,10 @@ void Shadow2DRecorder::Reset() noexcept
     Sprites.clear();
     WindowSprites.clear();
     OldPages.clear();
+    CarryFrame = 0;
+    memset(EdgeSeen, 0, sizeof(EdgeSeen));
+    memset(EdgeHeld, 0, sizeof(EdgeHeld));
+    ObjHeld.clear();
 }
 
 const u8* Shadow2DRecorder::PageSource(const GPU& gpu, u32 page) const noexcept
@@ -750,6 +754,168 @@ void Shadow2DRecorder::AddOffscreenNeighbors(u32 start, u32 end) noexcept
                     break;
                 }
             }
+        }
+    }
+}
+
+// from PokeDaisy's EXPAND (pk_nds_wide.cpp, pk_nds_wide_frame, GPL-3.0, https://github.com/lidor30/pokedaisy):
+// a box at the screen's side (a Gen 4 battle's HP box, flush with it) is carried a few pixels past it
+// and closed there with its outline and stepped corners, instead of stopping in mid-air or running
+// across the whole wing. a row is carried when a sprite that has held its place for a while (not one
+// sliding in) shows at the edge column, and the band of pixels in from the edge is one color that has
+// held too; a row of the same box with a letter or a bar at the edge takes the nearest such row's
+// color, so the letter isn't streaked across the wing. PokeDaisy works on the screen's final colors,
+// this on plane 0 (the top layer's color and flags), and the composite draws the edge column of the
+// row it picks, so the colors come out the same
+void Shadow2DRecorder::WorkOutCarry(const u32* fb, u32* copy) noexcept
+{
+    constexpr int EdgeBand = 5;         // pixels in from the edge that have to be one color
+    constexpr u8 EdgeSteady = 8;        // game frames a sprite and the edge pixel have to hold
+    constexpr int BoxRun = 3;           // how far a box goes past the edge before its end
+    constexpr int BoxCorner[2] = {2, 1};// how much shorter its first and last two rows are
+
+    u32 step = Frame - CarryFrame;
+    step = CarryFrame == 0 || step == 0 ? 1 : std::min<u32>(step, 255);
+    CarryFrame = Frame;
+
+    auto plane0 = [&](int y, int x) { return fb[y * GPU2D::AccelLineWords + x]; };
+    auto carrying = [&](int y)
+    {
+        const u32* b = &copy[y * GPU2D::ShadowStateWords];
+        return (b[W_Flags] & F_Drawn) && !(b[W_Flags] & F_UnitB) && !(b[W_Flags] & (0x3u << F_HiresShift))
+            && (b[W_Wide] & Wide_CarryBoxes);
+    };
+
+    // the battle's 3D over its background (BG0 the 3D layer, shown, not under BG3), from the middle
+    // line: a sprite behind it is scenery, drawn past the edge and never carried
+    const u32* mid = &copy[96 * GPU2D::ShadowStateWords];
+    u32 dispcnt = mid[W_DispCnt];
+    u32 bg0Prio = mid[W_BGCnt01] & 0x3, bg3Prio = (mid[W_BGCnt23] >> 16) & 0x3;
+    bool battle3D = (dispcnt & 0x8) && (dispcnt & 0x100) && bg0Prio <= bg3Prio;
+
+    // the rows a held sprite crosses the edge on. sprites are known by what they are (tiles, palette,
+    // shape, size, X, not their Y, which bobs while the game waits for a command, nor their OAM slot,
+    // which the game reshuffles)
+    static constexpr int sizes[3][4][2] = {
+        {{8, 8}, {16, 16}, {32, 32}, {64, 64}}, {{16, 8}, {32, 8}, {32, 16}, {64, 32}}, {{8, 16}, {8, 32}, {16, 32}, {32, 64}},
+    };
+    bool edgeObj[2][192] {};
+    ObjHeldNext.clear();
+    const u16* oam = (const u16*)Engines[0].OAM;
+    for (int i = 0; i < 128; i++)
+    {
+        u16 a0 = oam[i * 4], a1 = oam[i * 4 + 1], a2 = oam[i * 4 + 2];
+        u64 key = (u64)(a0 & 0xC300) | (u64)(a1 & 0xF1FF) << 16 | (u64)a2 << 32;
+        u8 held = 0;
+        for (auto& [k, n] : ObjHeld)
+            if (k == key)
+            {
+                held = (u8)std::min<u32>(255, n + step);
+                break;
+            }
+        ObjHeldNext.emplace_back(key, held);
+        if (!(a0 & 0x100) && (a0 & 0x200))
+            continue;
+        int shape = (a0 >> 14) & 3;
+        if (shape == 3)
+            continue;
+        int w = sizes[shape][(a1 >> 14) & 3][0], h = sizes[shape][(a1 >> 14) & 3][1];
+        if ((a0 & 0x300) == 0x300)
+        {
+            w *= 2;
+            h *= 2;
+        }
+        int x = a1 & 0x1FF, y = a0 & 0xFF;
+        if (x >= 256) x -= 512;
+        if (y >= 192) y -= 256;
+        int prio = (a2 >> 10) & 3;
+        if ((battle3D && prio > (int)bg0Prio) || held < EdgeSteady)
+            continue;
+        bool left = x <= 0 && x + w > 0, right = x < 256 && x + w >= 256;
+        for (int r = std::max(0, y); r < std::min(192, y + h); r++)
+        {
+            edgeObj[0][r] |= left;
+            edgeObj[1][r] |= right;
+        }
+    }
+    ObjHeld.swap(ObjHeldNext);
+
+    for (int side = 0; side < 2; side++)
+    {
+        int ex = side ? 255 : 0;
+        // each row's edge pixel, held give or take a row (a box bobbing a pixel still holds)
+        u32 now[192];
+        for (int y = 0; y < 192; y++)
+            now[y] = plane0(y, ex);
+        for (int y = 0; y < 192; y++)
+        {
+            const u32* was = EdgeSeen[side];
+            bool held = now[y] == was[y] || (y > 0 && now[y] == was[y - 1]) || (y + 1 < 192 && now[y] == was[y + 1]);
+            EdgeHeld[side][y] = held ? (u8)std::min<u32>(255, EdgeHeld[side][y] + step) : 0;
+        }
+        memcpy(EdgeSeen[side], now, sizeof(now));
+
+        // the rows a held sprite shows at the edge on, and the ones of them sure of their color
+        bool covered[192] {}, sure[192] {};
+        for (int y = 0; y < 192; y++)
+        {
+            if (!edgeObj[side][y] || !carrying(y) || !((now[y] >> 24) & 0x90))
+                continue;
+            covered[y] = true;
+            bool band = true;
+            for (int k = 1; k < EdgeBand && band; k++)
+                band = plane0(y, side ? 255 - k : k) == now[y];
+            sure[y] = band && EdgeHeld[side][y] >= EdgeSteady;
+        }
+        // each covered row takes the nearest sure row of its run of covered rows
+        int carryRow[192];
+        for (int y = 0; y < 192; y++)
+        {
+            carryRow[y] = -1;
+            if (!covered[y])
+                continue;
+            for (int d = 0; d < 192 && carryRow[y] < 0; d++)
+            {
+                int up = y - d, down = y + d;
+                bool upIn = up >= 0, downIn = down < 192;
+                for (int k = y; upIn && k > up; k--)
+                    if (!covered[k - 1]) upIn = false;
+                for (int k = y; downIn && k < down; k++)
+                    if (!covered[k + 1]) downIn = false;
+                if (!upIn && !downIn)
+                    break;
+                if (upIn && sure[up]) carryRow[y] = up;
+                else if (downIn && sure[down]) carryRow[y] = down;
+            }
+        }
+        // each run of carried rows (a box, or boxes touching) ends past BoxRun in its outline: its first
+        // row's color, as thick as that line is (up to 3 rows), the corners stepped
+        u32* out = &copy[0];
+        for (int y = 0; y < 192; y++)
+            out[y * GPU2D::ShadowStateWords + (side ? W_CarryRight : W_CarryLeft)] = 0;
+        for (int y = 0; y < 192;)
+        {
+            if (carryRow[y] < 0)
+            {
+                y++;
+                continue;
+            }
+            int r1 = y;
+            while (r1 + 1 < 192 && carryRow[r1 + 1] >= 0)
+                r1++;
+            auto color = [&](int r) { return plane0(carryRow[r], ex); };
+            int t = 1;
+            while (y + t <= r1 && t < 3 && color(y + t) == color(y))
+                t++;
+            for (int r = y; r <= r1; r++)
+            {
+                int k = std::min(r - y, r1 - r);
+                int end = BoxRun + t - (k < 2 ? BoxCorner[k] : 0);
+                out[r * GPU2D::ShadowStateWords + (side ? W_CarryRight : W_CarryLeft)] = Carry_On
+                    | ((u32)carryRow[r] << Carry_RowShift) | ((u32)carryRow[y] << Carry_CapRowShift)
+                    | ((u32)(end - t) << Carry_FillEndShift) | ((u32)end << Carry_CapEndShift);
+            }
+            y = r1 + 1;
         }
     }
 }

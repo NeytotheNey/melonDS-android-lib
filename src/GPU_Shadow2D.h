@@ -79,7 +79,11 @@ enum : u32
     W_OBJDispCnt,   // the sprite pass's DispCnt
     W_OBJState,     // the sprite pass's Enabled, OBJEnable (bits 0-1), OBJMosaicSize (8-15, 16-23)
     W_Version,      // band and page log version indices, for increment 1b. 0 for now
-    W_Count
+    W_Count,
+    // only in the compositor's copy, over words the GL side doesn't read: the HP box carry of the
+    // line's left and right wings (Shadow2DRecorder::WorkOutCarry, Carry_*)
+    W_CarryLeft = W_Frame,
+    W_CarryRight = W_Version,
 };
 static_assert(W_Count == GPU2D::ShadowStateWords, "the state block's words");
 
@@ -102,6 +106,8 @@ enum : u32
     F_ReasonShift = 20,         // why the line isn't feature-eligible, 5 bits (R_*), 0 if it is
     F_AffineShift = 25,         // BG2 and BG3 (2 bits) drawn as affine BGs (DrawBG_Affine) on this line
     F_ExtShift    = 27,         // and as tiled extended BGs (DrawBG_Extended's 16-bit tilemap mode)
+    F_WingsOnly   = 1u << 29,   // only in the compositor's copy: the shadow draws only this line's
+                                // wings (a wide line before a mid-frame memory change)
     F_Eligible    = 1u << 30,
     F_Drawn       = 1u << 31,   // only in the compositor's copy: the shadow draws this line
 };
@@ -117,6 +123,22 @@ enum : u32
     // the sprites only: past the edge, just the ones behind the 3D layer (a priority number above
     // BG0's while BG0 shows the 3D): a Gen 4 battle's platforms and trainers, not its HP boxes
     Wide_Behind3D = 3,
+};
+
+// next to the sprites' mode in W_Wide: the boxes at the screen's sides (a Gen 4 battle's HP boxes)
+// carried a few pixels past it and closed there (Shadow2DRecorder::WorkOutCarry)
+constexpr u32 Wide_CarryBoxes = 1u << 10;
+
+// a wing's carry word in the compositor's copy (W_CarryLeft, W_CarryRight): set, the wing's columns
+// 1..FillEnd past the edge show the edge column of row Row, then up to CapEnd that of row CapRow
+// (the box's outline), and the scene after that
+enum : u32
+{
+    Carry_On = 1u << 31,
+    Carry_RowShift = 0,         // 8 bits each
+    Carry_CapRowShift = 8,
+    Carry_FillEndShift = 16,    // 4 bits each
+    Carry_CapEndShift = 20,
 };
 
 // the modes for unit A's BG0-3 and sprites as W_Wide packs them
@@ -415,7 +437,21 @@ struct Shadow2DRecorder
     // the frame was drawn into (call it at line 192, before the Blit)
     void CountFrame(const GPU& gpu, int backbuf) noexcept;
 
+    // the compositor, once its copy of a screen's blocks has their F_Drawn: on the lines of unit A
+    // with Wide_CarryBoxes, which rows' boxes go on past the edge, from the screen's planes (fb, the
+    // accelerated line format) and what has held still over the last frames. writes W_CarryLeft and
+    // W_CarryRight into the copy (copy: that screen's 192 blocks)
+    void WorkOutCarry(const u32* fb, u32* copy) noexcept;
+
 private:
+    // WorkOutCarry's memory of the last frames: the frame it last ran, each row's edge pixel (plane
+    // 0) on each side and the frames it has held, and the sprites by what they are with the frames
+    // each has held
+    u32 CarryFrame = 0;
+    u32 EdgeSeen[2][192] {};
+    u8 EdgeHeld[2][192] {};
+    std::vector<std::pair<u64, u8>> ObjHeld, ObjHeldNext;
+
     struct OldPage
     {
         u32 Page;
