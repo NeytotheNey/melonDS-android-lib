@@ -670,7 +670,7 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
         line.Reason = "switch off";
     else if (gpu.Filter2D == 3)
         line.Reason = "filtered 2D identity mode";
-    else if (gpu.Shadow2D && !Shadow.Failed)
+    else if (gpu.Shadow2D && !Shadow.Failed && gpu.Shadow2D->MayDraw())
         line.Reason = "GPU 2D shadow";
     else if (line.Need <= 0)
         line.Reason = "need 0";
@@ -762,8 +762,11 @@ bool GLCompositor::OutputAnyRatio(const GPU& gpu, const char** why) noexcept
 // scale, and filtered 2D capped programs (FILTER2D with DOWN3D), with the map at the 3D's scale
 int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) const noexcept
 {
-    // a shadow whose programs didn't build (Shadow2DState::Failed) draws nothing, so it doesn't hold the cap off
-    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || (gpu.Shadow2D && !Shadow.Failed))
+    // a shadow whose programs didn't build (Shadow2DState::Failed) draws nothing, so it doesn't hold the
+    // cap off, nor does one in mode 3 with no layer past the edge (Shadow2DRecorder::MayDraw: the app
+    // keeps it on a little past a Gen 4 battle, where the frames are the CPU's as with it off). the
+    // frontend sets the wide modes before it calls SetOutputNeed, so the cap follows the same frame's
+    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || (gpu.Shadow2D && !Shadow.Failed && gpu.Shadow2D->MayDraw()))
         return 0;
     return gpu.OutputCapNeed > 0 ? gpu.OutputCapNeed : frontendNeed;
 }
@@ -2797,18 +2800,40 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
 
             u32 ctrl = ctrlCopied ? CtrlWords[outLine] : fb[line * (256*3 + 1) + 256*3];
             u32 reason = Shadow.Failed ? (u32)R_Failed : rec->LineReason(block);
-            if (reason == R_None && hiresDisplay && (ctrl & HiresDisplayFlag))
+            bool hiresShown = hiresDisplay && (ctrl & HiresDisplayFlag);
+            bool held = ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1) != 0;
+            if (reason == R_None && hiresShown)
                 reason = R_Hires;
-            if (reason == R_None && ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1))
+            if (reason == R_None && held)
                 reason = R_Held;
-            u32 hires = Scale >= 2 ? HiresBGs(block) : 0;
+            // a wide line before the frame's last mid-frame change of the unit's memory: the middle
+            // stays the CPU's, but the wings are drawn from the memory the compositor has, so a Gen 4
+            // battle's background doesn't blink out past the edge for a frame (the game changes BG
+            // memory mid-frame now and then while it prints and animates). only when that change is
+            // all that keeps the line on the CPU: its sprites fit (R_InstanceCap, which LineReason
+            // checks after the memory change), it shows no hi-res capture image and isn't held. the
+            // same for a wide line with an affine sprite (R_RotSprite, a Gen 4 battle's thrown ball and
+            // the trainer throwing it): the CPU draws the sprite in the middle, the wings go on without
+            // it, as PokeDaisy's margins do (they leave affine sprites out), instead of blacking out
+            bool wingsOnly = (reason == R_MemChanged || reason == R_RotSprite) && wideView && (block[W_Flags] & F_Wide)
+                && !held && !hiresShown && !Shadow.Failed && rec->LineReason(block, true, true) == R_None;
+            if (wingsOnly)
+                reason = R_None;
+            u32 hires = Scale >= 2 && !wingsOnly ? HiresBGs(block) : 0;
             if (reason == R_None && rec->Mode == 1 && !hires && !(wideView && (block[W_Flags] & F_Wide)))
                 reason = R_Policy;
-            if (reason != R_None || !sharp)
+            // mode 3 draws just the lines with a layer past the edge, rotated BGs at native pixels as
+            // the CPU has them
+            if (reason == R_None && rec->Mode == 3 && !(wideView && (block[W_Flags] & F_Wide)))
+                reason = R_Policy;
+            if (reason != R_None || !sharp || rec->Mode == 3)
                 hires = 0;
 
-            copy[W_Flags] = (copy[W_Flags] & ~(F_Drawn | (0x3u << F_HiresShift)))
-                | (reason == R_None ? F_Drawn : 0) | (hires << F_HiresShift);
+            copy[W_Flags] = (copy[W_Flags] & ~(F_Drawn | F_WingsOnly | (0x3u << F_HiresShift)))
+                | (reason == R_None ? F_Drawn : 0) | (wingsOnly ? F_WingsOnly : 0) | (hires << F_HiresShift);
+            // the compositor's own words over ones it doesn't read (WorkOutCarry fills them in)
+            copy[W_CarryLeft] = 0;
+            copy[W_CarryRight] = 0;
             if (rec->Logging)
                 Shadow.LogReasons[reason]++;
             drawn += reason == R_None;
@@ -2819,6 +2844,18 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
     // nothing to draw: the dirty pages wait for a frame that draws something
     if (!drawn)
         return 0;
+
+    // the boxes carried past the edge, on unit A's screen when its lines ask for it (Wide_CarryBoxes)
+    if (wideView)
+    {
+        for (int half = 0; half < 2; half++)
+        {
+            u32* copy = &Shadow.State[half * 192 * GPU2D::ShadowStateWords];
+            const u32* mid = &copy[96 * GPU2D::ShadowStateWords];
+            if (!(mid[W_Flags] & F_UnitB) && (mid[W_Wide] & Wide_CarryBoxes))
+                rec->WorkOutCarry(gpu.Framebuffer[backbuf][half].get(), copy);
+        }
+    }
     if (!PrepareShadow2DResources() || !PrepareShadow2DProgram(wideView ? Shadow2DCompWide : Shadow2DComp)
         || !PrepareShadow2DProgram(wideView ? Shadow2DPlanesWide : Shadow2DPlanes)
         || (hiresLines && !PrepareShadow2DProgram(wideView ? Shadow2DAffineWide : Shadow2DAffine)))
@@ -3152,7 +3189,8 @@ void GLCompositor::BuildShadow2DQuads(bool planes) noexcept
                 {
                     const u32* nextBlock = &Shadow.State[(half * 192 + end) * GPU2D::ShadowStateWords];
                     u32 next = nextBlock[W_Flags];
-                    if (!(next & F_Drawn) || (wideView && (next & F_Wide)) != wide || ((next & hiresMask) != 0) != hires)
+                    if (!(next & F_Drawn) || (wideView && (next & F_Wide)) != wide || ((next & hiresMask) != 0) != hires
+                        || (next & F_WingsOnly) != (flags & F_WingsOnly))
                         break;
                     if (hires && !perLine)
                     {
@@ -3173,9 +3211,22 @@ void GLCompositor::BuildShadow2DQuads(bool planes) noexcept
                 x1 = x1 / w * 2.0f - 1.0f;
                 y0 = y0 / h * 2.0f - 1.0f;
                 y1 = y1 / h * 2.0f - 1.0f;
-                const float quad[12] = {x0, y0, x1, y0, x0, y1, x1, y0, x1, y1, x0, y1};
                 std::vector<float>& quads = hires ? Shadow.AffineQuads : Shadow.Quads;
-                quads.insert(quads.end(), quad, quad + 12);
+                if ((flags & F_WingsOnly) && !planes)
+                {
+                    // the composite leaves the middle to the CPU: a quad for each wing (the planes
+                    // pass still does the whole line, as the wings repeat and carry its edges)
+                    float m0 = (float)(offset * scale) / w * 2.0f - 1.0f;
+                    float m1 = (float)((offset + 256) * scale) / w * 2.0f - 1.0f;
+                    const float wings[24] = {x0, y0, m0, y0, x0, y1, m0, y0, m0, y1, x0, y1,
+                                             m1, y0, x1, y0, m1, y1, x1, y0, x1, y1, m1, y1};
+                    quads.insert(quads.end(), wings, wings + 24);
+                }
+                else
+                {
+                    const float quad[12] = {x0, y0, x1, y0, x0, y1, x1, y0, x1, y1, x0, y1};
+                    quads.insert(quads.end(), quad, quad + 12);
+                }
                 if (hires)
                     Shadow.AffineRuns.push_back(run);
 
@@ -3353,7 +3404,9 @@ void GLCompositor::CheckShadow2D(const GPU& gpu, int backbuf) noexcept
         for (int line = 0; line < 192; line++)
         {
             int row = half * 192 + line;
-            if (!(Shadow.State[row * GPU2D::ShadowStateWords + W_Flags] & F_Drawn))
+            // a wings-only line's middle is the CPU's, and its planes come from later memory
+            u32 checkFlags = Shadow.State[row * GPU2D::ShadowStateWords + W_Flags];
+            if (!(checkFlags & F_Drawn) || (checkFlags & F_WingsOnly))
                 continue;
             lines++;
             const u32* planes = &fb[line * (256*3 + 1)];
@@ -3407,7 +3460,7 @@ void GLCompositor::LogShadow2D(const GPU& gpu) noexcept
 
     Log(LogLevel::Info, "GPU2D mode=%s scale=%d width=%d frames=%u drawn=%u/%u cpu=%s upkb=%.1f inst=%.1f logpages=0 "
         "recus=%.1f checks=%u checklines=%u mismatches=%u failed=%d hires=%llu\n",
-        rec->Check ? "check" : rec->Mode == 2 ? "all" : "1", Scale, ViewWidth, Shadow.LogFrames,
+        rec->Check ? "check" : rec->Mode == 2 ? "all" : rec->Mode == 3 ? "wide" : "1", Scale, ViewWidth, Shadow.LogFrames,
         Shadow.LogReasons[R_None], Shadow.LogFrames * 384, length ? reasons : "-",
         Shadow.LogUploadBytes * perFrame / 1024.0, Shadow.LogInstances * perFrame,
         rec->RecorderNs * perFrame / 1000.0, Shadow.Checks, Shadow.CheckLines, Shadow.Mismatches, Shadow.Failed ? 1 : 0,

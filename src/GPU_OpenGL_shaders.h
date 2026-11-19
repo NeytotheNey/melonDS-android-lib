@@ -2131,6 +2131,13 @@ bool WideBG(int bg, int nx, uint modes, uint left, uint right)
     return nx - 255 <= int((right >> uint(bg * 8)) & 0xFFu);
 }
 
+// the screen column a Wide_Repeat wing pixel repeats: the last two columns on that side, every
+// other one, so a dithered row keeps its pattern (PokeDaisy's EXPAND does the same)
+int RepeatColumn(int nx)
+{
+    return nx < 0 ? (nx & 1) : 254 + (nx & 1);
+}
+
 // a stack entry from a 2D layer (a BG or a sprite), not the backdrop, the 3D layer or nothing
 bool Is2D(uint word)
 {
@@ -2382,6 +2389,26 @@ void main()
     bool bg0Is3D = (flags & 0x800u) != 0u;
     bool wing = nx < 0 || nx > 255;
 
+    // Shadow2D::Wide_Repeat: on a line where a BG in that mode shows a pixel at the screen's edge
+    // column, the wing on that side is the screen's last two columns again, everything in them, so
+    // this pixel is worked out as theirs (the composite takes the 3D from there too)
+    bool repeat = false;
+    if (wing && (s6.z & 0xAAu) != 0u)
+    {
+        int ex = nx < 0 ? 0 : 255;
+        for (int bg = 1; bg < 4; bg++)
+        {
+            if (((s6.z >> uint(bg * 2)) & 0x3u) == 2u && (textMask & (1u << uint(bg))) != 0u
+                && TextBGPixel(bg, ex, vcount, unitB, dispcnt, bgcnt[bg], pos[bg]) != 0u)
+                repeat = true;
+        }
+        if (repeat)
+        {
+            nx = RepeatColumn(nx);
+            wing = false;
+        }
+    }
+
     // BG2 and BG3 as rotation/scaling BGs (Shadow2D::F_AffineShift and F_ExtShift), and the ones of
     // them the composite samples at sub-pixels (F_HiresShift), as BG bits
     uint affineMask = ((flags >> 25) & 0x3u) << 2;
@@ -2394,14 +2421,18 @@ void main()
         s4 = texelFetch(LineStateTex, ivec2(4, row), 0);    // BG3 rotation C-D, window 0-1 coords, WINCNT
     }
 
-    // the line's OBJ pixel, if the BG pass shows sprites (LayerEnable bit 4)
+    // the line's OBJ pixel, if the BG pass shows sprites (LayerEnable bit 4). past the edge only in
+    // the sprites' wide mode 1, or 3 (Shadow2D::Wide_Behind3D) for a sprite behind the 3D layer
     uint obj = 0u;
-    if ((flags & (0x10u << 3)) != 0u && (!wing || ((s6.z >> 8) & 0x3u) == 1u))
+    uint objWide = (s6.z >> 8) & 0x3u;
+    if ((flags & (0x10u << 3)) != 0u && (!wing || objWide == 1u || objWide == 3u))
     {
         int ox = nx + uObjOffset;
         if (ox >= 0 && ox < textureSize(ObjTex, 0).x)
             obj = texelFetch(ObjTex, ivec2(ox, (unitB ? 192 : 0) + line), 0).r;
         if ((obj & 0x40000u) == 0u)
+            obj = 0u;
+        if (wing && objWide == 3u && (!bg0Is3D || ((obj >> 16) & 0x3u) <= (bgcnt[0] & 0x3u)))
             obj = 0u;
     }
 
@@ -2497,8 +2528,8 @@ void main()
     PUSH_NA(0u)
 
     uvec3 planes = StackPlanes(top, second, third, unitB, s5.w, s6.x & 0xFFu, win);
-    oPlanes = uvec4(planes, (Is2D(top) || Is2D(second) || Is2D(third)) ? 1u : 0u);
-    oStack = uvec4(na0, na1, na2, win | (uint(at2) << 8) | (uint(at3) << 10));
+    oPlanes = uvec4(planes, ((Is2D(top) || Is2D(second) || Is2D(third)) ? 1u : 0u) | (repeat ? 2u : 0u));
+    oStack = uvec4(na0, na1, na2, win | (uint(at2) << 8) | (uint(at3) << 10) | (repeat ? 0x1000u : 0u));
 }
 #else
 // the composite's output pixel: its PlanesTex row (the lines with no gap between the screens), its
@@ -2612,6 +2643,13 @@ void main()
     uint win = stack.w & 0xFFu;
     int at2 = int((stack.w >> 8) & 0x3u);
     int at3 = int((stack.w >> 10) & 0x3u);
+    // a Wide_Repeat wing pixel: the planes pass's stack is its edge column's, and so is everything else
+    if ((stack.w & 0x1000u) != 0u)
+    {
+        int ex = RepeatColumn(nx);
+        fTexcoord.x += float(ex - nx);
+        nx = ex;
+    }
 
     // the line's latched reference points: the run's first line's plus a line's B and D a line
     ivec4 rot2 = uAffineRot2;
@@ -2689,10 +2727,29 @@ void main()
     // the quads only cover drawn lines, whose pixels the planes pass wrote
     uvec4 planes = texelFetch(PlanesTex, ivec2(nx + SHADOW_OFFSET, row), 0);
 #ifdef WIDE
-    if ((nx < 0 || nx > 255) && planes.w == 0u)
+    // a Wide_Repeat wing pixel: its planes are its edge column's, and so is its 3D
+    if ((planes.w & 2u) != 0u)
+        fTexcoord.x += float(RepeatColumn(nx) - nx);
+    else if (nx < 0 || nx > 255)
     {
-        oColor = ShadowWingColor();
-        return;
+        // a box carried past the edge (Shadow2D::W_CarryLeft and W_CarryRight, Carry_*): the edge
+        // column of the row the line takes its color from, its 3D and brightness included
+        uint carry = nx < 0 ? texelFetch(LineStateTex, ivec2(0, row), 0).y : texelFetch(LineStateTex, ivec2(7, row), 0).w;
+        int d = nx < 0 ? -nx : nx - 255;
+        if ((carry & 0x80000000u) != 0u && d <= int((carry >> 20) & 0xFu))
+        {
+            int src = int(d <= int((carry >> 16) & 0xFu) ? carry & 0xFFu : (carry >> 8) & 0xFFu);
+            int ex = nx < 0 ? 0 : 255;
+            int line = row >= 192 ? row - 192 : row;
+            fTexcoord += vec2(float(ex - nx), float(src - line));
+            row += src - line;
+            planes = texelFetch(PlanesTex, ivec2(ex + SHADOW_OFFSET, row), 0);
+        }
+        else if (planes.w == 0u)
+        {
+            oColor = ShadowWingColor();
+            return;
+        }
     }
 #endif
     oColor = ShadowColor(planes.x, planes.y, planes.z, row);

@@ -118,6 +118,10 @@ void Shadow2DRecorder::Reset() noexcept
     Sprites.clear();
     WindowSprites.clear();
     OldPages.clear();
+    CarryFrame = 0;
+    memset(EdgeSeen, 0, sizeof(EdgeSeen));
+    memset(EdgeHeld, 0, sizeof(EdgeHeld));
+    ObjHeld.clear();
 }
 
 const u8* Shadow2DRecorder::PageSource(const GPU& gpu, u32 page) const noexcept
@@ -351,6 +355,29 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
         wideModes = 0x155;      // Wide_Draw for BG0-3 and OBJ
         wideLeft = 0xFFFFFFFF;
         wideRight = 0xFFFFFFFF;
+    }
+    else if (!num && WideModes)
+    {
+        wideModes = WideModes;
+        wideLeft = WideLeft;
+        wideRight = WideRight;
+        // a BG in Wide_Repeat only counts as a text BG over every BG drawn past the edge (the text box
+        // over a battle's background): one under it would cut the wide layer into strips
+        for (u32 bg = 0; bg < 4; bg++)
+        {
+            if (((wideModes >> (bg * 2)) & 0x3) != Wide_Repeat)
+                continue;
+            bool over = (text & (1 << bg)) != 0;
+            for (u32 d = 0; d < 4 && over; d++)
+            {
+                if (((wideModes >> (d * 2)) & 0x3) != Wide_Draw || !((text | affine | ext) & (1 << d)))
+                    continue;
+                u32 prio = u.BGCnt[bg] & 0x3, under = u.BGCnt[d] & 0x3;
+                over = prio < under || (prio == under && bg < d);
+            }
+            if (!over)
+                wideModes &= ~(0x3u << (bg * 2));
+        }
     }
     bool wide = wideModes && ((text | affine | ext) || (u.LayerEnable & 0x10));
 
@@ -609,42 +636,298 @@ void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
 
         u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
         s32 width = SpriteWidths[size];
-        s32 height = SpriteHeights[size];
         s32 xpos = (s32)((u32)attr1 << 23) >> 23;
         if (xpos <= -width)
             continue;
 
-        // the lines with ((line - y) & 0xFF) < height: [y, y + height) and what wraps past 255
-        u32 y = attr0 & 0xFF;
-        u32 pieces[2][2] = {{y, std::min<u32>(y + height, 256)}, {0, y + height > 256 ? y + height - 256 : 0}};
-        for (auto& piece : pieces)
+        if (!AddInstances(num, start, end, i, attr0, attr1, attr2, xpos, window))
+            return;
+    }
+
+    if (!num && ObjWideMode(0) != Wide_Off)
+        AddOffscreenNeighbors(start, end);
+}
+
+bool Shadow2DRecorder::AddInstances(u32 num, u32 start, u32 end, u32 index, u16 attr0, u16 attr1, u16 attr2, s32 xpos,
+                                    bool window) noexcept
+{
+    Engine& e = Engines[num];
+    u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
+    s32 width = SpriteWidths[size];
+    s32 height = SpriteHeights[size];
+
+    // the lines with ((line - y) & 0xFF) < height: [y, y + height) and what wraps past 255
+    u32 y = attr0 & 0xFF;
+    u32 pieces[2][2] = {{y, std::min<u32>(y + height, 256)}, {0, y + height > 256 ? y + height - 256 : 0}};
+    for (auto& piece : pieces)
+    {
+        u32 first = std::max(piece[0], start);
+        u32 last = std::min(piece[1], end);
+        if (first >= last)
+            continue;
+
+        if (Sprites.size() + WindowSprites.size() >= MaxInstances)
         {
-            u32 first = std::max(piece[0], start);
-            u32 last = std::min(piece[1], end);
-            if (first >= last)
-                continue;
+            for (u32 l = start; l < end; l++)
+                SetLineBit(e.Overflow, l);
+            return false;
+        }
 
-            if (Sprites.size() + WindowSprites.size() >= MaxInstances)
+        Instance inst;
+        inst.X = xpos;
+        inst.Row = (window ? ObjWindowRow : 0) + num * 192 + first;
+        inst.Width = width;
+        inst.Lines = last - first;
+        inst.FirstRow = (first - y) & 0xFF;
+        inst.Attr0 = attr0;
+        inst.Attr1 = attr1;
+        inst.Attr2 = attr2;
+        inst.Index = index;
+        inst.DispCnt = e.RunDispCnt;
+        inst.Flags = num | (window ? 2 : 0);
+        inst.Height = height;
+        (window ? WindowSprites : Sprites).push_back(inst);
+    }
+    return true;
+}
+
+u32 Shadow2DRecorder::ObjWideMode(u32 num) const noexcept
+{
+    if (Wide == 1)
+        return Wide_Draw;
+    return num ? Wide_Off : (WideModes >> 8) & 0x3;
+}
+
+// from PokeDaisy's EXPAND (pk_nds_wide.cpp, GPL-3.0, https://github.com/lidor30/pokedaisy): a game
+// parks the sprites it doesn't use wholly off the screen, where their 9-bit X could put them on either
+// side, so none of those is drawn past the edge, but for the next piece of one that's drawn: flush
+// beside it, on the same line, the same shape, size, priority and palette (a Gen 4 battle's platforms
+// are 64-pixel pieces), either way its X reads, piece by piece. none of them touches columns 0-255,
+// so the screen itself stays the CPU's
+void Shadow2DRecorder::AddOffscreenNeighbors(u32 start, u32 end) noexcept
+{
+    struct Piece { u16 Attr0, Attr1, Attr2; u32 Index; s32 X, Width; };
+    Piece drawn[128], off[128];
+    int numDrawn = 0, numOff = 0;
+    const u16* oam = (const u16*)Engines[0].OAM;
+    for (u32 i = 0; i < 128; i++)
+    {
+        u16 attr0 = oam[i * 4];
+        u16 attr1 = oam[i * 4 + 1];
+        u16 attr2 = oam[i * 4 + 2];
+        // normal and semi-transparent tiled sprites without mosaic, as FlushRun draws them
+        if ((attr0 & 0x0300) || (attr0 & 0x1000) || ((attr0 >> 10) & 0x3) >= 2)
+            continue;
+        u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
+        s32 width = SpriteWidths[size];
+        s32 xpos = (s32)((u32)attr1 << 23) >> 23;
+        Piece p = {attr0, attr1, attr2, i, xpos, width};
+        if (xpos > -width)
+            drawn[numDrawn++] = p;
+        else
+            off[numOff++] = p;
+    }
+
+    for (bool more = numOff > 0; more;)
+    {
+        more = false;
+        for (int i = 0; i < numOff && !more; i++)
+        {
+            Piece o = off[i];
+            for (int j = 0; j < numDrawn && !more; j++)
             {
-                for (u32 l = start; l < end; l++)
-                    SetLineBit(e.Overflow, l);
-                return;
+                const Piece& c = drawn[j];
+                // the same line (Y) and shape, size, priority and palette
+                if ((o.Attr0 & 0xC0FF) != (c.Attr0 & 0xC0FF) || (o.Attr1 & 0xC000) != (c.Attr1 & 0xC000)
+                    || (o.Attr2 & 0xFC00) != (c.Attr2 & 0xFC00))
+                    continue;
+                for (s32 x : {o.X, o.X + 512, o.X - 512})
+                {
+                    if (x + o.Width != c.X && c.X + c.Width != x)
+                        continue;
+                    o.X = x;
+                    if (!AddInstances(0, start, end, o.Index, o.Attr0, o.Attr1, o.Attr2, x, false))
+                        return;
+                    drawn[numDrawn++] = o;
+                    off[i] = off[--numOff];
+                    more = true;
+                    break;
+                }
             }
+        }
+    }
+}
 
-            Instance inst;
-            inst.X = xpos;
-            inst.Row = (window ? ObjWindowRow : 0) + num * 192 + first;
-            inst.Width = width;
-            inst.Lines = last - first;
-            inst.FirstRow = (first - y) & 0xFF;
-            inst.Attr0 = attr0;
-            inst.Attr1 = attr1;
-            inst.Attr2 = attr2;
-            inst.Index = i;
-            inst.DispCnt = e.RunDispCnt;
-            inst.Flags = num | (window ? 2 : 0);
-            inst.Height = height;
-            (window ? WindowSprites : Sprites).push_back(inst);
+// from PokeDaisy's EXPAND (pk_nds_wide.cpp, pk_nds_wide_frame, GPL-3.0, https://github.com/lidor30/pokedaisy):
+// a box at the screen's side (a Gen 4 battle's HP box, flush with it) is carried a few pixels past it
+// and closed there with its outline and stepped corners, instead of stopping in mid-air or running
+// across the whole wing. a row is carried when a sprite that has held its place for a while (not one
+// sliding in) shows at the edge column, and the band of pixels in from the edge is one color that has
+// held too; a row of the same box with a letter or a bar at the edge takes the nearest such row's
+// color, so the letter isn't streaked across the wing. PokeDaisy works on the screen's final colors,
+// this on plane 0 (the top layer's color and flags), and the composite draws the edge column of the
+// row it picks, so the colors come out the same
+void Shadow2DRecorder::WorkOutCarry(const u32* fb, u32* copy) noexcept
+{
+    constexpr int EdgeBand = 5;         // pixels in from the edge that have to be one color
+    constexpr u8 EdgeSteady = 8;        // game frames a sprite and the edge pixel have to hold
+    constexpr int BoxRun = 3;           // how far a box goes past the edge before its end
+    constexpr int BoxCorner[2] = {2, 1};// how much shorter its first and last two rows are
+
+    // the game frames since the last run: 0 for a second compositor run of the same frame, which
+    // holds every count where it is. after a gap (the first run since a reset, a battle after the
+    // last one, frames that drew nothing), what was held then says nothing about now: it starts over
+    u32 step = Frame - CarryFrame;
+    if (CarryFrame == 0 || step > 2)
+    {
+        memset(EdgeSeen, 0, sizeof(EdgeSeen));
+        memset(EdgeHeld, 0, sizeof(EdgeHeld));
+        ObjHeld.clear();
+        step = 1;
+    }
+    CarryFrame = Frame;
+
+    auto plane0 = [&](int y, int x) { return fb[y * GPU2D::AccelLineWords + x]; };
+    auto carrying = [&](int y)
+    {
+        const u32* b = &copy[y * GPU2D::ShadowStateWords];
+        return (b[W_Flags] & F_Drawn) && !(b[W_Flags] & F_UnitB) && !(b[W_Flags] & (0x3u << F_HiresShift))
+            && (b[W_Wide] & Wide_CarryBoxes);
+    };
+
+    // the battle's 3D over its background (BG0 the 3D layer, shown, not under BG3), from the middle
+    // line: a sprite behind it is scenery, drawn past the edge and never carried
+    const u32* mid = &copy[96 * GPU2D::ShadowStateWords];
+    u32 dispcnt = mid[W_DispCnt];
+    u32 bg0Prio = mid[W_BGCnt01] & 0x3, bg3Prio = (mid[W_BGCnt23] >> 16) & 0x3;
+    bool battle3D = (dispcnt & 0x8) && (dispcnt & 0x100) && bg0Prio <= bg3Prio;
+
+    // the rows a held sprite crosses the edge on. sprites are known by what they are (tiles, palette,
+    // shape, size, X, not their Y, which bobs while the game waits for a command, nor their OAM slot,
+    // which the game reshuffles)
+    static constexpr int sizes[3][4][2] = {
+        {{8, 8}, {16, 16}, {32, 32}, {64, 64}}, {{16, 8}, {32, 8}, {32, 16}, {64, 32}}, {{8, 16}, {8, 32}, {16, 32}, {32, 64}},
+    };
+    bool edgeObj[2][192] {};
+    ObjHeldNext.clear();
+    const u16* oam = (const u16*)Engines[0].OAM;
+    for (int i = 0; i < 128; i++)
+    {
+        u16 a0 = oam[i * 4], a1 = oam[i * 4 + 1], a2 = oam[i * 4 + 2];
+        u64 key = (u64)(a0 & 0xC300) | (u64)(a1 & 0xF1FF) << 16 | (u64)a2 << 32;
+        u8 held = 0;
+        for (auto& [k, n] : ObjHeld)
+            if (k == key)
+            {
+                held = (u8)std::min<u32>(255, n + step);
+                break;
+            }
+        ObjHeldNext.emplace_back(key, held);
+        if (!(a0 & 0x100) && (a0 & 0x200))
+            continue;
+        int shape = (a0 >> 14) & 3;
+        if (shape == 3)
+            continue;
+        int w = sizes[shape][(a1 >> 14) & 3][0], h = sizes[shape][(a1 >> 14) & 3][1];
+        if ((a0 & 0x300) == 0x300)
+        {
+            w *= 2;
+            h *= 2;
+        }
+        int x = a1 & 0x1FF, y = a0 & 0xFF;
+        if (x >= 256) x -= 512;
+        if (y >= 192) y -= 256;
+        int prio = (a2 >> 10) & 3;
+        if ((battle3D && prio > (int)bg0Prio) || held < EdgeSteady)
+            continue;
+        bool left = x <= 0 && x + w > 0, right = x < 256 && x + w >= 256;
+        for (int r = std::max(0, y); r < std::min(192, y + h); r++)
+        {
+            edgeObj[0][r] |= left;
+            edgeObj[1][r] |= right;
+        }
+    }
+    ObjHeld.swap(ObjHeldNext);
+
+    for (int side = 0; side < 2; side++)
+    {
+        int ex = side ? 255 : 0;
+        // each row's edge pixel, held give or take a row (a box bobbing a pixel still holds)
+        u32 now[192];
+        for (int y = 0; y < 192; y++)
+            now[y] = plane0(y, ex);
+        for (int y = 0; y < 192; y++)
+        {
+            const u32* was = EdgeSeen[side];
+            bool held = now[y] == was[y] || (y > 0 && now[y] == was[y - 1]) || (y + 1 < 192 && now[y] == was[y + 1]);
+            EdgeHeld[side][y] = held ? (u8)std::min<u32>(255, EdgeHeld[side][y] + step) : 0;
+        }
+        memcpy(EdgeSeen[side], now, sizeof(now));
+
+        // the rows a held sprite shows at the edge on, and the ones of them sure of their color
+        bool covered[192] {}, sure[192] {};
+        for (int y = 0; y < 192; y++)
+        {
+            if (!edgeObj[side][y] || !carrying(y) || !((now[y] >> 24) & 0x90))
+                continue;
+            covered[y] = true;
+            bool band = true;
+            for (int k = 1; k < EdgeBand && band; k++)
+                band = plane0(y, side ? 255 - k : k) == now[y];
+            sure[y] = band && EdgeHeld[side][y] >= EdgeSteady;
+        }
+        // each covered row takes the nearest sure row of its run of covered rows, the one above on a
+        // tie: the nearest sure row at or above each row within its run, then at or below
+        int above[192], below[192], carryRow[192];
+        for (int y = 0, last = -1; y < 192; y++)
+        {
+            if (!covered[y])
+                last = -1;
+            else if (sure[y])
+                last = y;
+            above[y] = last;
+        }
+        for (int y = 191, last = -1; y >= 0; y--)
+        {
+            if (!covered[y])
+                last = -1;
+            else if (sure[y])
+                last = y;
+            below[y] = last;
+        }
+        for (int y = 0; y < 192; y++)
+        {
+            int up = above[y], down = below[y];
+            carryRow[y] = !covered[y] ? -1 : up < 0 ? down : down < 0 || y - up <= down - y ? up : down;
+        }
+        // each run of carried rows (a box, or boxes touching) ends past BoxRun in its outline: its first
+        // row's color, as thick as that line is (up to 3 rows), the corners stepped
+        u32* out = &copy[0];
+        for (int y = 0; y < 192; y++)
+            out[y * GPU2D::ShadowStateWords + (side ? W_CarryRight : W_CarryLeft)] = 0;
+        for (int y = 0; y < 192;)
+        {
+            if (carryRow[y] < 0)
+            {
+                y++;
+                continue;
+            }
+            int r1 = y;
+            while (r1 + 1 < 192 && carryRow[r1 + 1] >= 0)
+                r1++;
+            auto color = [&](int r) { return plane0(carryRow[r], ex); };
+            int t = 1;
+            while (y + t <= r1 && t < 3 && color(y + t) == color(y))
+                t++;
+            for (int r = y; r <= r1; r++)
+            {
+                int k = std::min(r - y, r1 - r);
+                int end = BoxRun + t - (k < 2 ? BoxCorner[k] : 0);
+                out[r * GPU2D::ShadowStateWords + (side ? W_CarryRight : W_CarryLeft)] = Carry_On
+                    | ((u32)carryRow[r] << Carry_RowShift) | ((u32)carryRow[y] << Carry_CapRowShift)
+                    | ((u32)(end - t) << Carry_FillEndShift) | ((u32)end << Carry_CapEndShift);
+            }
+            y = r1 + 1;
         }
     }
 }
@@ -658,23 +941,28 @@ void Shadow2DRecorder::Finalize() noexcept
     }
 }
 
-u32 Shadow2DRecorder::LineReason(const u32* block) const noexcept
+u32 Shadow2DRecorder::LineReason(const u32* block, bool pastMemChange, bool pastRotSprite) const noexcept
 {
     if (block[W_Frame] != Frame || Broken)
         return R_Frame;
 
     u32 flags = block[W_Flags];
     u32 reason = (flags >> F_ReasonShift) & 0x1F;
+    u32 line = (block[W_Lines] >> 16) & 0xFFFF;
+    const Engine& e = Engines[flags & F_UnitB];
+    // an affine sprite's line goes on to the rest, but not one with an affine OBJ window sprite
+    // and the OBJ window on (the windows past the edge would need its shape)
+    if (pastRotSprite && reason == R_RotSprite && line < 192
+        && !((block[W_DispCnt] & 0x8000) && LineBit(e.SpriteWinRot, line)))
+        reason = R_None;
     if (reason != R_None)
         return reason;
 
-    u32 line = (block[W_Lines] >> 16) & 0xFFFF;
     if (line >= 192)
         return R_Frame;
-    const Engine& e = Engines[flags & F_UnitB];
     if (!LineBit(e.BGNoted, line) || !LineBit(e.SpriteNoted, line))
         return R_Frame;
-    if (line < e.LastChangeBG || line < e.LastChangeOBJ)
+    if (!pastMemChange && (line < e.LastChangeBG || line < e.LastChangeOBJ))
         return R_MemChanged;
     if (LineBit(e.Overflow, line))
         return R_InstanceCap;
