@@ -1146,6 +1146,15 @@ public:
     // longer drops polygons the DS would draw (GPU3D::WideListOn). latched with the view width, at a
     // polygon RAM swap. on by default since 11-14 (phones checked); off is as before, for A/Bs
     bool WidePolys = true;
+    // Precise depth (the app's setting, off by default): Z-buffered polygons' vertex depth is
+    // computed at full precision, (Z * 0x800000) / W + 0x7FFE00, instead of the DS's 0x200 steps,
+    // ((Z * 0x4000) / W + 0x3FFF) * 0x200 (GBATEK). W-buffered ones are untouched. it fixes shadows
+    // and decals the game puts closer to the surface under them than one of those steps (the bench
+    // shadows on White 2's Castelia pier); real hardware may not keep more precision, so it's an
+    // enhancement. every renderer gets it through Polygon::FinalZ (OpenGL adds back the bits its
+    // 16-bit vertex depth drops, GLRenderer's PackDepth). latched with the view width, at a polygon
+    // RAM swap (GPU3D::PreciseDepthOn), so a scene never mixes the two
+    bool PreciseDepth = false;
     // WideMelon camera stage 2 (docs/plan-widemelon.md): false treats the renderers' vertical margin
     // (SetViewMargin) as 0, for A/Bs. read where the margin is latched, with the view width
     bool WideY = true;

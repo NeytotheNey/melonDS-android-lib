@@ -1008,16 +1008,20 @@ ivec2 TexWrapAxis(int k, int mode)
 void main()
 {
     int attr = vPolygonAttr.x;
-    int zshift = (attr >> 16) & 0x1F;
 
     vec4 fpos;
     // GPU::GLSeams: positions in 1/(1 << PosFrac) target pixels, uPosScale = 1/(1 << PosFrac)
     fpos.xy = (((vec2(vPosition.xy) * uPosScale) * 2.0) / uScreenSize) - 1.0;
 #ifdef WBuffer
+    int zshift = (attr >> 16) & 0x1F;
     fpos.z = 0.0;
     fZ = (float(vPosition.z << zshift) + uDepthBias) / 16777216.0;
 #else
-    fpos.z = ((float(vPosition.z << zshift) + uDepthBias) / 8388608.0) - 1.0;
+    // the shift is at most 8 here (24-bit depths), and bits 0-3 and 20-23 are the ones it drops,
+    // with GPU::PreciseDepth (0 without it, GLRenderer's PackDepth)
+    int zshift = (attr >> 16) & 0xF;
+    uint zlow = uint((attr & 0xF) | ((attr >> 16) & 0xF0));
+    fpos.z = ((float((vPosition.z << zshift) | zlow) + uDepthBias) / 8388608.0) - 1.0;
 #endif
     fpos.w = float(vPosition.w) / 65536.0f;
     fpos.xyz *= fpos.w;

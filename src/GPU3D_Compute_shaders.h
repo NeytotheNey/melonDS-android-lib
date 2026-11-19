@@ -707,6 +707,60 @@ uint InterpolateZWBuffer(int z0, int z1, int ifactor)
 
 )";
 
+// GPU::PreciseDepth: goes between Common and the source of the Z-buffer InterpSpans and Rasterise
+// programs while the frame's polygons have it (ComputeRenderer::CompileShader), so with it off the
+// sources are what they were. InterpolateZZBuffer is the DS's way: along an edge it keeps the top 10
+// bits of the depth difference, along a span it drops the low 9. that loses nothing while depth
+// comes in 0x200 steps, but with the full depth it's off by up to 0x1FF along a span and more along
+// a long edge, and differently on every line, so decals a little in front of a surface lose to it
+// in stripes. this one is z0 + (z1 - z0) * i / idiff rounded down, exactly, which is what the
+// OpenGL renderer's interpolation gets to within a step or two
+const char* PreciseDepthZ = R"(
+#if defined(InterpSpans) || defined(Rasterise)
+uint InterpolateZPrecise(int z0, int z1, int i, int irecip, int idiff)
+{
+    if (z0 == z1)
+        return uint(z0);
+
+    uint base, disp, factor;
+    if (z0 < z1)
+    {
+        base = uint(z0);
+        disp = uint(z1 - z0);
+        factor = uint(abs(i));
+    }
+    else
+    {
+        base = uint(z1);
+        disp = uint(z0 - z1);
+        factor = uint(abs(idiff - i));
+    }
+    // irecip is (1 << 30) / idiff, rounded down
+    uint diff = uint(abs(idiff));
+    uint recip = uint(abs(irecip));
+
+    // disp * factor has up to 38 bits (a depth difference under 1 << 24, a span or edge under 1 << 14
+    // pixels). times recip >> 30 it's under the quotient by at most product >> 30, plus one
+    uint pHi, pLo, mHi, mLo;
+    umulExtended(disp, factor, pHi, pLo);
+    umulExtended(pLo, recip, mHi, mLo);
+    // the quotient is under disp, so wrapping in the high part's term doesn't change the sum
+    uint q = ((mHi << 2) | (mLo >> 30)) + ((pHi * recip) << 2);
+    // which leaves a remainder under 258 * diff, and the same step on it one under 2 * diff
+    uint r = pLo - q * diff;
+    umulExtended(r, recip, mHi, mLo);
+    uint q2 = (mHi << 2) | (mLo >> 30);
+    q += q2;
+    r -= q2 * diff;
+    if (r >= diff)
+        q++;
+
+    return base + q;
+}
+#define InterpolateZZBuffer InterpolateZPrecise
+#endif
+)";
+
 const std::string InterpSpans = 
     PolygonBuffer +
     XSpanSetupBuffer +

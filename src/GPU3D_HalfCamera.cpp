@@ -1187,6 +1187,7 @@ void HalfCamera::ResetShadow()
     shadow.ViewWidth = Main.ViewWidth;
     shadow.ViewMargin = Main.ViewMargin;
     shadow.WideListOn = Main.WideListOn;
+    shadow.PreciseDepthOn = Main.PreciseDepthOn;
     shadow.ZeroDotWLimit = Main.ZeroDotWLimit;
     shadow.ClipMatrixDirty = true;
     shadow.LastStripPolygon = nullptr;
