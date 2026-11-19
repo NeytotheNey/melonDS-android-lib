@@ -2811,9 +2811,12 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
             // battle's background doesn't blink out past the edge for a frame (the game changes BG
             // memory mid-frame now and then while it prints and animates). only when that change is
             // all that keeps the line on the CPU: its sprites fit (R_InstanceCap, which LineReason
-            // checks after the memory change), it shows no hi-res capture image and isn't held
-            bool wingsOnly = reason == R_MemChanged && wideView && (block[W_Flags] & F_Wide) && !held && !hiresShown
-                && !Shadow.Failed && rec->LineReason(block, true) == R_None;
+            // checks after the memory change), it shows no hi-res capture image and isn't held. the
+            // same for a wide line with an affine sprite (R_RotSprite, a Gen 4 battle's thrown ball and
+            // the trainer throwing it): the CPU draws the sprite in the middle, the wings go on without
+            // it, as PokeDaisy's margins do (they leave affine sprites out), instead of blacking out
+            bool wingsOnly = (reason == R_MemChanged || reason == R_RotSprite) && wideView && (block[W_Flags] & F_Wide)
+                && !held && !hiresShown && !Shadow.Failed && rec->LineReason(block, true, true) == R_None;
             if (wingsOnly)
                 reason = R_None;
             u32 hires = Scale >= 2 && !wingsOnly ? HiresBGs(block) : 0;

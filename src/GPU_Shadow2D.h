@@ -107,7 +107,8 @@ enum : u32
     F_AffineShift = 25,         // BG2 and BG3 (2 bits) drawn as affine BGs (DrawBG_Affine) on this line
     F_ExtShift    = 27,         // and as tiled extended BGs (DrawBG_Extended's 16-bit tilemap mode)
     F_WingsOnly   = 1u << 29,   // only in the compositor's copy: the shadow draws only this line's
-                                // wings (a wide line before a mid-frame memory change)
+                                // wings (a wide line before a mid-frame memory change, or with an
+                                // affine sprite)
     F_Eligible    = 1u << 30,
     F_Drawn       = 1u << 31,   // only in the compositor's copy: the shadow draws this line
 };
@@ -392,8 +393,10 @@ struct Shadow2DRecorder
 
     // whether the line whose block this is can be drawn as far as the recorder knows: R_None, the
     // line's feature reason, or one of the frame's. with [pastMemChange], what it would be if the
-    // line weren't before the frame's last memory change (R_MemChanged's line goes on to the rest)
-    u32 LineReason(const u32* block, bool pastMemChange = false) const noexcept;
+    // line weren't before the frame's last memory change (R_MemChanged's line goes on to the rest),
+    // and with [pastRotSprite], if it showed no affine sprite (R_RotSprite's line goes on to the rest,
+    // unless it's for an affine OBJ window sprite)
+    u32 LineReason(const u32* block, bool pastMemChange = false, bool pastRotSprite = false) const noexcept;
 
     // the source of a MemTex page (the flats, or the palette copy)
     const u8* PageSource(const GPU& gpu, u32 page) const noexcept;

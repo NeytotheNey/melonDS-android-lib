@@ -941,20 +941,25 @@ void Shadow2DRecorder::Finalize() noexcept
     }
 }
 
-u32 Shadow2DRecorder::LineReason(const u32* block, bool pastMemChange) const noexcept
+u32 Shadow2DRecorder::LineReason(const u32* block, bool pastMemChange, bool pastRotSprite) const noexcept
 {
     if (block[W_Frame] != Frame || Broken)
         return R_Frame;
 
     u32 flags = block[W_Flags];
     u32 reason = (flags >> F_ReasonShift) & 0x1F;
+    u32 line = (block[W_Lines] >> 16) & 0xFFFF;
+    const Engine& e = Engines[flags & F_UnitB];
+    // an affine sprite's line goes on to the rest, but not one with an affine OBJ window sprite
+    // and the OBJ window on (the windows past the edge would need its shape)
+    if (pastRotSprite && reason == R_RotSprite && line < 192
+        && !((block[W_DispCnt] & 0x8000) && LineBit(e.SpriteWinRot, line)))
+        reason = R_None;
     if (reason != R_None)
         return reason;
 
-    u32 line = (block[W_Lines] >> 16) & 0xFFFF;
     if (line >= 192)
         return R_Frame;
-    const Engine& e = Engines[flags & F_UnitB];
     if (!LineBit(e.BGNoted, line) || !LineBit(e.SpriteNoted, line))
         return R_Frame;
     if (!pastMemChange && (line < e.LastChangeBG || line < e.LastChangeOBJ))
