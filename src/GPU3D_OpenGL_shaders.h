@@ -152,6 +152,7 @@ layout(std140) uniform uConfig
     float uFogDensity[34];
     int uFogOffset;
     int uFogShift;
+    float uPosScale;
 };
 
 layout(location = 0) out vec4 oColor;
@@ -275,6 +276,7 @@ layout(std140) uniform uConfig
     float uFogDensity[34];
     int uFogOffset;
     int uFogShift;
+    float uPosScale;
 };
 
 layout(location = 0) out vec4 oColor;
@@ -341,6 +343,7 @@ layout(std140) uniform uConfig
     float uFogDensity[34];
     int uFogOffset;
     int uFogShift;
+    float uPosScale;
 };
 
 in uvec4 vPosition;
@@ -394,6 +397,7 @@ layout(std140) uniform uConfig
     float uFogDensity[34];
     int uFogOffset;
     int uFogShift;
+    float uPosScale;
 };
 
 smooth in vec4 fColor;
@@ -1007,7 +1011,8 @@ void main()
     int zshift = (attr >> 16) & 0x1F;
 
     vec4 fpos;
-    fpos.xy = (((vec2(vPosition.xy) ) * 2.0) / uScreenSize) - 1.0;
+    // GPU::GLSeams: positions in 1/(1 << PosFrac) target pixels, uPosScale = 1/(1 << PosFrac)
+    fpos.xy = (((vec2(vPosition.xy) * uPosScale) * 2.0) / uScreenSize) - 1.0;
 #ifdef WBuffer
     fpos.z = 0.0;
     fZ = (float(vPosition.z << zshift) + uDepthBias) / 16777216.0;
