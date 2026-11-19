@@ -484,8 +484,9 @@ void CartRetail::DoSavestate(Savestate* file)
     file->Var32(&SRAMAddr);
     file->Var8(&SRAMStatus);
 
+    // keep the frontend's copy in step, but don't write to disk until the game saves
     if ((!file->Saving) && SRAM)
-        Platform::WriteNDSSave(SRAM.get(), SRAMLength, 0, SRAMLength, UserData);
+        Platform::SyncNDSSave(SRAM.get(), SRAMLength, UserData);
 }
 
 void CartRetail::SetSaveMemory(const u8* savedata, u32 savelen)
