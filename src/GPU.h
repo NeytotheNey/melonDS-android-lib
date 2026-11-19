@@ -1253,12 +1253,18 @@ public:
     // rotated 2D" setting turns on mode 1, and debug.melonade.gpu2d sets any mode over it. the
     // recorder notes each line's state while the jobs are built, and the GL compositor redraws
     // the lines it can at output resolution, for display only. null while it's off, the default, so
-    // that's all it costs. mode 1 draws the lines that gain something, 2 every eligible line; log
+    // that's all it costs. mode 1 draws the lines that gain something, 2 every eligible line, 3 only
+    // the lines with a layer past the edge (the app's Gen 4 battles without the setting); log
     // adds the GPU2D log line, check (with mode 2) the 1x readback; wide 1 lets every layer draw past
     // the edge (debug.melonade.gpu2dwide). set between frames (it waits for the 2D thread and starts
     // the recorder over), or between games before the reset
     std::unique_ptr<Shadow2DRecorder> Shadow2D;
     void SetShadow2D(int mode, bool log, bool check, int wide) noexcept;
+    // unit A's per-layer wide modes (Shadow2D::Wide_*, packed as Shadow2D::WideModes makes them) and
+    // how far each BG may draw past the left and right edges (a byte each), for the frames to come.
+    // the frontend sets them between frames from what the game is doing (the app's Gen 4 battles);
+    // nothing while the shadow is off. 0 is every layer stopping at the edge, the default
+    void SetShadow2DWide(u32 modes, u32 left, u32 right) noexcept;
 
     void SetHiresCapture(bool enable) noexcept;
     // DoCapture, on every capture line it draws with HiresCapture on: the line's record entry

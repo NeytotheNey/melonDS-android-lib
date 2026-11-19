@@ -352,6 +352,29 @@ void Shadow2DRecorder::WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEd
         wideLeft = 0xFFFFFFFF;
         wideRight = 0xFFFFFFFF;
     }
+    else if (!num && WideModes)
+    {
+        wideModes = WideModes;
+        wideLeft = WideLeft;
+        wideRight = WideRight;
+        // a BG in Wide_Repeat only counts as a text BG over every BG drawn past the edge (the text box
+        // over a battle's background): one under it would cut the wide layer into strips
+        for (u32 bg = 0; bg < 4; bg++)
+        {
+            if (((wideModes >> (bg * 2)) & 0x3) != Wide_Repeat)
+                continue;
+            bool over = (text & (1 << bg)) != 0;
+            for (u32 d = 0; d < 4 && over; d++)
+            {
+                if (((wideModes >> (d * 2)) & 0x3) != Wide_Draw || !((text | affine | ext) & (1 << d)))
+                    continue;
+                u32 prio = u.BGCnt[bg] & 0x3, under = u.BGCnt[d] & 0x3;
+                over = prio < under || (prio == under && bg < d);
+            }
+            if (!over)
+                wideModes &= ~(0x3u << (bg * 2));
+        }
+    }
     bool wide = wideModes && ((text | affine | ext) || (u.LayerEnable & 0x10));
 
     u16 backdrop = *(const u16*)&job.Palette[num ? 0x400 : 0];
@@ -609,42 +632,124 @@ void Shadow2DRecorder::FlushRun(u32 num, u32 end) noexcept
 
         u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
         s32 width = SpriteWidths[size];
-        s32 height = SpriteHeights[size];
         s32 xpos = (s32)((u32)attr1 << 23) >> 23;
         if (xpos <= -width)
             continue;
 
-        // the lines with ((line - y) & 0xFF) < height: [y, y + height) and what wraps past 255
-        u32 y = attr0 & 0xFF;
-        u32 pieces[2][2] = {{y, std::min<u32>(y + height, 256)}, {0, y + height > 256 ? y + height - 256 : 0}};
-        for (auto& piece : pieces)
+        if (!AddInstances(num, start, end, i, attr0, attr1, attr2, xpos, window))
+            return;
+    }
+
+    if (!num && ObjWideMode(0) != Wide_Off)
+        AddOffscreenNeighbors(start, end);
+}
+
+bool Shadow2DRecorder::AddInstances(u32 num, u32 start, u32 end, u32 index, u16 attr0, u16 attr1, u16 attr2, s32 xpos,
+                                    bool window) noexcept
+{
+    Engine& e = Engines[num];
+    u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
+    s32 width = SpriteWidths[size];
+    s32 height = SpriteHeights[size];
+
+    // the lines with ((line - y) & 0xFF) < height: [y, y + height) and what wraps past 255
+    u32 y = attr0 & 0xFF;
+    u32 pieces[2][2] = {{y, std::min<u32>(y + height, 256)}, {0, y + height > 256 ? y + height - 256 : 0}};
+    for (auto& piece : pieces)
+    {
+        u32 first = std::max(piece[0], start);
+        u32 last = std::min(piece[1], end);
+        if (first >= last)
+            continue;
+
+        if (Sprites.size() + WindowSprites.size() >= MaxInstances)
         {
-            u32 first = std::max(piece[0], start);
-            u32 last = std::min(piece[1], end);
-            if (first >= last)
-                continue;
+            for (u32 l = start; l < end; l++)
+                SetLineBit(e.Overflow, l);
+            return false;
+        }
 
-            if (Sprites.size() + WindowSprites.size() >= MaxInstances)
+        Instance inst;
+        inst.X = xpos;
+        inst.Row = (window ? ObjWindowRow : 0) + num * 192 + first;
+        inst.Width = width;
+        inst.Lines = last - first;
+        inst.FirstRow = (first - y) & 0xFF;
+        inst.Attr0 = attr0;
+        inst.Attr1 = attr1;
+        inst.Attr2 = attr2;
+        inst.Index = index;
+        inst.DispCnt = e.RunDispCnt;
+        inst.Flags = num | (window ? 2 : 0);
+        inst.Height = height;
+        (window ? WindowSprites : Sprites).push_back(inst);
+    }
+    return true;
+}
+
+u32 Shadow2DRecorder::ObjWideMode(u32 num) const noexcept
+{
+    if (Wide == 1)
+        return Wide_Draw;
+    return num ? Wide_Off : (WideModes >> 8) & 0x3;
+}
+
+// from PokeDaisy's EXPAND (pk_nds_wide.cpp, GPL-3.0, https://github.com/lidor30/pokedaisy): a game
+// parks the sprites it doesn't use wholly off the screen, where their 9-bit X could put them on either
+// side, so none of those is drawn past the edge, but for the next piece of one that's drawn: flush
+// beside it, on the same line, the same shape, size, priority and palette (a Gen 4 battle's platforms
+// are 64-pixel pieces), either way its X reads, piece by piece. none of them touches columns 0-255,
+// so the screen itself stays the CPU's
+void Shadow2DRecorder::AddOffscreenNeighbors(u32 start, u32 end) noexcept
+{
+    struct Piece { u16 Attr0, Attr1, Attr2; u32 Index; s32 X, Width; };
+    Piece drawn[128], off[128];
+    int numDrawn = 0, numOff = 0;
+    const u16* oam = (const u16*)Engines[0].OAM;
+    for (u32 i = 0; i < 128; i++)
+    {
+        u16 attr0 = oam[i * 4];
+        u16 attr1 = oam[i * 4 + 1];
+        u16 attr2 = oam[i * 4 + 2];
+        // normal and semi-transparent tiled sprites without mosaic, as FlushRun draws them
+        if ((attr0 & 0x0300) || (attr0 & 0x1000) || ((attr0 >> 10) & 0x3) >= 2)
+            continue;
+        u32 size = (attr0 >> 14) | ((attr1 & 0xC000) >> 12);
+        s32 width = SpriteWidths[size];
+        s32 xpos = (s32)((u32)attr1 << 23) >> 23;
+        Piece p = {attr0, attr1, attr2, i, xpos, width};
+        if (xpos > -width)
+            drawn[numDrawn++] = p;
+        else
+            off[numOff++] = p;
+    }
+
+    for (bool more = numOff > 0; more;)
+    {
+        more = false;
+        for (int i = 0; i < numOff && !more; i++)
+        {
+            Piece o = off[i];
+            for (int j = 0; j < numDrawn && !more; j++)
             {
-                for (u32 l = start; l < end; l++)
-                    SetLineBit(e.Overflow, l);
-                return;
+                const Piece& c = drawn[j];
+                // the same line (Y) and shape, size, priority and palette
+                if ((o.Attr0 & 0xC0FF) != (c.Attr0 & 0xC0FF) || (o.Attr1 & 0xC000) != (c.Attr1 & 0xC000)
+                    || (o.Attr2 & 0xFC00) != (c.Attr2 & 0xFC00))
+                    continue;
+                for (s32 x : {o.X, o.X + 512, o.X - 512})
+                {
+                    if (x + o.Width != c.X && c.X + c.Width != x)
+                        continue;
+                    o.X = x;
+                    if (!AddInstances(0, start, end, o.Index, o.Attr0, o.Attr1, o.Attr2, x, false))
+                        return;
+                    drawn[numDrawn++] = o;
+                    off[i] = off[--numOff];
+                    more = true;
+                    break;
+                }
             }
-
-            Instance inst;
-            inst.X = xpos;
-            inst.Row = (window ? ObjWindowRow : 0) + num * 192 + first;
-            inst.Width = width;
-            inst.Lines = last - first;
-            inst.FirstRow = (first - y) & 0xFF;
-            inst.Attr0 = attr0;
-            inst.Attr1 = attr1;
-            inst.Attr2 = attr2;
-            inst.Index = i;
-            inst.DispCnt = e.RunDispCnt;
-            inst.Flags = num | (window ? 2 : 0);
-            inst.Height = height;
-            (window ? WindowSprites : Sprites).push_back(inst);
         }
     }
 }

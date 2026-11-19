@@ -2804,7 +2804,11 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
             u32 hires = Scale >= 2 ? HiresBGs(block) : 0;
             if (reason == R_None && rec->Mode == 1 && !hires && !(wideView && (block[W_Flags] & F_Wide)))
                 reason = R_Policy;
-            if (reason != R_None || !sharp)
+            // mode 3 draws just the lines with a layer past the edge, rotated BGs at native pixels as
+            // the CPU has them
+            if (reason == R_None && rec->Mode == 3 && !(wideView && (block[W_Flags] & F_Wide)))
+                reason = R_Policy;
+            if (reason != R_None || !sharp || rec->Mode == 3)
                 hires = 0;
 
             copy[W_Flags] = (copy[W_Flags] & ~(F_Drawn | (0x3u << F_HiresShift)))
@@ -3407,7 +3411,7 @@ void GLCompositor::LogShadow2D(const GPU& gpu) noexcept
 
     Log(LogLevel::Info, "GPU2D mode=%s scale=%d width=%d frames=%u drawn=%u/%u cpu=%s upkb=%.1f inst=%.1f logpages=0 "
         "recus=%.1f checks=%u checklines=%u mismatches=%u failed=%d hires=%llu\n",
-        rec->Check ? "check" : rec->Mode == 2 ? "all" : "1", Scale, ViewWidth, Shadow.LogFrames,
+        rec->Check ? "check" : rec->Mode == 2 ? "all" : rec->Mode == 3 ? "wide" : "1", Scale, ViewWidth, Shadow.LogFrames,
         Shadow.LogReasons[R_None], Shadow.LogFrames * 384, length ? reasons : "-",
         Shadow.LogUploadBytes * perFrame / 1024.0, Shadow.LogInstances * perFrame,
         rec->RecorderNs * perFrame / 1000.0, Shadow.Checks, Shadow.CheckLines, Shadow.Mismatches, Shadow.Failed ? 1 : 0,

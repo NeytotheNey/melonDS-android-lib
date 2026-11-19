@@ -443,11 +443,20 @@ void GPU::SetShadow2D(int mode, bool log, bool check, int wide) noexcept
     }
     if (!Shadow2D)
         Shadow2D = std::make_unique<Shadow2DRecorder>();
-    Shadow2D->Mode = mode >= 2 ? 2 : 1;
+    Shadow2D->Mode = mode >= 3 ? 3 : mode >= 2 ? 2 : 1;
     Shadow2D->Logging = log || check;
     Shadow2D->Check = check;
     Shadow2D->Wide = wide;
     Shadow2D->Reset();
+}
+
+void GPU::SetShadow2DWide(u32 modes, u32 left, u32 right) noexcept
+{
+    if (!Shadow2D)
+        return;
+    Shadow2D->WideModes = modes;
+    Shadow2D->WideLeft = left;
+    Shadow2D->WideRight = right;
 }
 
 // out of line because GPU.h can't see NDS. the CPU doesn't run while an ARM9 DMA holds it stopped

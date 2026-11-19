@@ -110,8 +110,20 @@ enum : u32
 {
     Wide_Off = 0,       // transparent past the edge, the default
     Wide_Draw = 1,      // drawn past the edge as the layer goes on (gpu2dwide 1)
-    Wide_Repeat = 2,    // edge repeat, reserved for WideMelon step 5a
+    // a text BG only: on a line where it shows a pixel at the screen's edge column, the wing on that
+    // side repeats the screen's last two columns, everything in them (a Gen 4 battle's text box rows).
+    // the recorder keeps it only for a BG over every BG in Wide_Draw
+    Wide_Repeat = 2,
+    // the sprites only: past the edge, just the ones behind the 3D layer (a priority number above
+    // BG0's while BG0 shows the 3D): a Gen 4 battle's platforms and trainers, not its HP boxes
+    Wide_Behind3D = 3,
 };
+
+// the modes for unit A's BG0-3 and sprites as W_Wide packs them
+constexpr u32 WideModes(u32 bg0, u32 bg1, u32 bg2, u32 bg3, u32 obj) noexcept
+{
+    return bg0 | (bg1 << 2) | (bg2 << 4) | (bg3 << 6) | (obj << 8);
+}
 
 // why a line stays on the CPU. the feature reasons come from the recorder at the line, the others
 // from the frame (LineReason) or the compositor
@@ -255,11 +267,17 @@ constexpr u32 MaxInstances = 2048;
 
 struct Shadow2DRecorder
 {
-    // set by GPU::SetShadow2D. Mode 1 draws only the lines that gain something, 2 every eligible line
+    // set by GPU::SetShadow2D. Mode 1 draws only the lines that gain something, 2 every eligible line,
+    // 3 only the lines with a layer past the edge (WideMelon's Gen 4 battles without the "Sharper
+    // rotated 2D" setting: every other line stays the CPU's, rotated BGs at native pixels included)
     int Mode = 1;
     bool Logging = false;       // the GPU2D log line (log, check)
     bool Check = false;         // the 1x readback every 30 frames (check)
     int Wide = 0;               // debug.melonade.gpu2dwide: 1 = every layer draws past the edge
+    // unit A's wide modes and extents for the lines to come, as W_Wide, W_WideLeft and W_WideRight
+    // pack them (GPU::SetShadow2DWide); the frontend sets them between frames from what the game is
+    // doing. gpu2dwide 1 wins over them
+    u32 WideModes = 0, WideLeft = 0, WideRight = 0;
     // debug.melonade.gpu2daffine, to tell the affine composite apart from what it needs on a phone:
     // 1 draws the lines with rotated BGs with the plain composite (native BG pixels, as at 1x) while
     // the planes pass still writes StackTex, 2 the same without StackTex. -1 lifts the cap on the
@@ -413,6 +431,12 @@ private:
     void WriteBlock(const GPU2D::LineJob& job, u32 num, bool winEdge) noexcept;
     void ScanRun(Engine& e) noexcept;
     void FlushRun(u32 num, u32 end) noexcept;
+    // the sprites' wide mode for a unit's lines (Wide_*)
+    u32 ObjWideMode(u32 num) const noexcept;
+    // one instance per stretch of [start, end) the sprite covers; false when MaxInstances ran out
+    bool AddInstances(u32 num, u32 start, u32 end, u32 index, u16 attr0, u16 attr1, u16 attr2, s32 xpos, bool window) noexcept;
+    // with unit A's sprites wide: the pieces wholly off the screen that go on flush from a drawn one
+    void AddOffscreenNeighbors(u32 start, u32 end) noexcept;
     void CheckBlock(const u32* block, const GPU2D::UnitState& u, const GPU2D::LineJob& job) noexcept;
 };
 
