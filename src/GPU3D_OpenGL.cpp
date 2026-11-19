@@ -1683,9 +1683,10 @@ static inline s32 RoundToInt(double v)
 // twice the distance for sharp corners (and left where it is for a spike that turns back on itself).
 // the outer corner's depth, W, color and texcoords come from the plane of the corner's triangle with
 // its two neighbors, perspective-correct as GL interpolates them (over 1/W, the Z-buffer's depth
-// linear), so the texture carries on across the skirt. colors stay within the polygon's own range,
-// and texcoords too on an axis that repeats, so a cut-out's border can't wrap round to the texture's
-// other side; depth and W within their range widened by its own span.
+// linear). colors stay within the polygon's own range, and texcoords a 16th of a texel inside it, so
+// the skirt repeats the polygon's edge texels and never shows one the polygon doesn't (a sprite
+// sheet's neighbor, a repeating texture's other side, which the DS never draws there); depth and W
+// within their range widened by its own span.
 // the skirt is new vertices (the outer corners, with the rim vertex's edge info) and two triangles an
 // edge between rim and outer corners, in SkirtIndexBuffer. RenderSceneChunk draws the skirts after the
 // opaque polygons and only over the clear plane (by stencil), so they fill the cracks and the edges'
@@ -1774,9 +1775,22 @@ void GLRenderer::BuildSkirt(RendererPolygon* rp, u32 rim, u32& vidx, u32& sidx)
     hi[Q] = std::min(hi[Q], 65535.0);
     lo[Z] = std::max(lo[Z], 0.0);
     hi[Z] = std::min(hi[Z], (double)0xFFFFFF);
-    // texcoords on an axis that doesn't repeat can go anywhere (the lookup clamps them)
-    if (!(poly->TexParam & (1 << 16))) { lo[S] = -32768; hi[S] = 32767; }
-    if (!(poly->TexParam & (1 << 17))) { lo[T] = -32768; hi[T] = 32767; }
+    // texcoords stay a 16th of a texel inside the polygon's own range on every axis. the range's
+    // ends are texel boundaries (a sprite's 0..80), and the texel just past one isn't the polygon's:
+    // on an axis that clamps it's the next row of a sprite sheet (Gen 4 battle sprites are cut from a
+    // 256x256 one, and their skirts drew a line of the sprite next to it), on one that repeats the
+    // texture's other side. the skirt's fragments lie between the rim's value and this one, so the
+    // lookup truncates them to a texel the polygon has
+    for (int a : {(int)S, (int)T})
+    {
+        if (hi[a] - lo[a] >= 2)
+        {
+            lo[a] += 1;
+            hi[a] -= 1;
+        }
+        else
+            lo[a] = hi[a] = std::floor((lo[a] + hi[a]) / 2);
+    }
 
     const u32 outer = vidx;
     for (u32 j = 0; j < n; j++)
