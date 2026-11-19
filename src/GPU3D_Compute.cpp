@@ -228,6 +228,14 @@ bool ComputeRenderer::CompileShader(GLuint& shader, const std::string& source, c
     }
 
     shaderSource += ComputeRendererShaders::Common;
+    // GPU::PreciseDepth: exact depth interpolation in the programs that interpolate Z-buffer depth.
+    // with it off nothing is added
+    if (PreciseZ && (&source == &ComputeRendererShaders::InterpSpans || &source == &ComputeRendererShaders::Rasterise)
+        && std::find_if(defines.begin(), defines.end(), [](const char* d) { return strcmp(d, "ZBuffer") == 0; }) != defines.end())
+    {
+        shaderSource += ComputeRendererShaders::PreciseDepthZ;
+        shaderName += "PreciseDepth,";
+    }
 #ifdef MELONADE_DEBUG_TOOLS
     // debug only: DepthBlend with the COMPDEPTH counters (GPU::ComputeDepthStats)
     if (DepthStatsOn && &source == &ComputeRendererShaders::DepthBlend)
@@ -273,6 +281,8 @@ void ComputeRenderer::ShaderCompileStep(int& current, int& count)
     {
         ShaderBatch = {};
         ShaderBatchNs = 0;
+        // the whole batch is compiled for one setting
+        PreciseZ = PreciseZWanted;
     }
     s64 start = SteadyNowNs();
     CompileShaderStep(current);
@@ -644,6 +654,7 @@ void ComputeRenderer::Reset(GPU& gpu)
 {
     // set before the first compile, which comes before the first RenderFrame
     UseShaderCache = gpu.ShaderCache;
+    PreciseZWanted = gpu.PreciseDepth;
     // and before the targets' first setup (SetRenderSettings), which starts the rooms. without
     // ComputeGrow the rooms are the most at the first frame, so there's nothing to remember.
     // a cart without a game code (homebrew) or no cart has no rooms. DSiWare is loaded as a cart
@@ -2369,6 +2380,13 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         FlatMode = flatMode;
         optChanged = true;
     }
+    // GPU::PreciseDepth recompiles the same way. it's read here rather than from the polygons (the
+    // scene latches it at its swap), so a loaded state's scene, which has it off, doesn't compile
+    // twice: the frame that scene or a toggle has the other setting in is drawn with exact
+    // interpolation of 0x200 steps, or the DS's of the full depth, which only differs a little
+    PreciseZWanted = gpu.PreciseDepth;
+    if (PreciseZWanted != PreciseZ)
+        optChanged = true;
     // ComputeOpt_SwapSkip: has GPU3D compare each swap's scene with the one before, from the next
     // VBlank on. a swap that changed nothing a render reads then counts like a frame without one
     gpu.GPU3D.SceneRepeatCheck = (OptMask & ComputeOpt_SwapSkip) != 0;

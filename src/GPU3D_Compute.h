@@ -481,6 +481,11 @@ private:
     int CalcMode = 0;
     // GPU::ComputeFlat as compiled: starts at GPU's default, so only the switch compiles twice
     int FlatMode = 1;
+    // GPU::PreciseDepth: PreciseZ is what the programs are compiled for (taken from PreciseZWanted
+    // when a batch starts), PreciseZWanted the setting, from Reset (so the first compile has it)
+    // and every RenderFrame, where a change recompiles like ComputeOpt
+    bool PreciseZ = false;
+    bool PreciseZWanted = false;
     GLint MaxTexBufferSize = 0;
     GLuint ShaderCheckSetup = 0;
     bool CheckSetupFailed = false;
