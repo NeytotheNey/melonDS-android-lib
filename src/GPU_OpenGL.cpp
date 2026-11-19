@@ -670,7 +670,7 @@ void GLCompositor::LogOutputCap(const GPU& gpu, int frontendNeed) noexcept
         line.Reason = "switch off";
     else if (gpu.Filter2D == 3)
         line.Reason = "filtered 2D identity mode";
-    else if (gpu.Shadow2D && !Shadow.Failed)
+    else if (gpu.Shadow2D && !Shadow.Failed && gpu.Shadow2D->MayDraw())
         line.Reason = "GPU 2D shadow";
     else if (line.Need <= 0)
         line.Reason = "need 0";
@@ -762,8 +762,11 @@ bool GLCompositor::OutputAnyRatio(const GPU& gpu, const char** why) noexcept
 // scale, and filtered 2D capped programs (FILTER2D with DOWN3D), with the map at the 3D's scale
 int GLCompositor::OutputNeed(const GPU& gpu, int frontendNeed) const noexcept
 {
-    // a shadow whose programs didn't build (Shadow2DState::Failed) draws nothing, so it doesn't hold the cap off
-    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || (gpu.Shadow2D && !Shadow.Failed))
+    // a shadow whose programs didn't build (Shadow2DState::Failed) draws nothing, so it doesn't hold the
+    // cap off, nor does one in mode 3 with no layer past the edge (Shadow2DRecorder::MayDraw: the app
+    // keeps it on a little past a Gen 4 battle, where the frames are the CPU's as with it off). the
+    // frontend sets the wide modes before it calls SetOutputNeed, so the cap follows the same frame's
+    if ((gpu.OutputCap & 1) == 0 || gpu.Filter2D == 3 || (gpu.Shadow2D && !Shadow.Failed && gpu.Shadow2D->MayDraw()))
         return 0;
     return gpu.OutputCapNeed > 0 ? gpu.OutputCapNeed : frontendNeed;
 }
@@ -2797,16 +2800,20 @@ int GLCompositor::PrepareShadow2D(const GPU& gpu, int backbuf, bool hasFramebuff
 
             u32 ctrl = ctrlCopied ? CtrlWords[outLine] : fb[line * (256*3 + 1) + 256*3];
             u32 reason = Shadow.Failed ? (u32)R_Failed : rec->LineReason(block);
-            if (reason == R_None && hiresDisplay && (ctrl & HiresDisplayFlag))
+            bool hiresShown = hiresDisplay && (ctrl & HiresDisplayFlag);
+            bool held = ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1) != 0;
+            if (reason == R_None && hiresShown)
                 reason = R_Hires;
-            if (reason == R_None && ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1))
+            if (reason == R_None && held)
                 reason = R_Held;
             // a wide line before the frame's last mid-frame change of the unit's memory: the middle
             // stays the CPU's, but the wings are drawn from the memory the compositor has, so a Gen 4
             // battle's background doesn't blink out past the edge for a frame (the game changes BG
-            // memory mid-frame now and then while it prints and animates)
-            bool held = ((WingHoldLines[outLine >> 5] >> (outLine & 31)) & 1) != 0;
-            bool wingsOnly = reason == R_MemChanged && wideView && (block[W_Flags] & F_Wide) && !held && !Shadow.Failed;
+            // memory mid-frame now and then while it prints and animates). only when that change is
+            // all that keeps the line on the CPU: its sprites fit (R_InstanceCap, which LineReason
+            // checks after the memory change), it shows no hi-res capture image and isn't held
+            bool wingsOnly = reason == R_MemChanged && wideView && (block[W_Flags] & F_Wide) && !held && !hiresShown
+                && !Shadow.Failed && rec->LineReason(block, true) == R_None;
             if (wingsOnly)
                 reason = R_None;
             u32 hires = Scale >= 2 && !wingsOnly ? HiresBGs(block) : 0;

@@ -774,8 +774,17 @@ void Shadow2DRecorder::WorkOutCarry(const u32* fb, u32* copy) noexcept
     constexpr int BoxRun = 3;           // how far a box goes past the edge before its end
     constexpr int BoxCorner[2] = {2, 1};// how much shorter its first and last two rows are
 
+    // the game frames since the last run: 0 for a second compositor run of the same frame, which
+    // holds every count where it is. after a gap (the first run since a reset, a battle after the
+    // last one, frames that drew nothing), what was held then says nothing about now: it starts over
     u32 step = Frame - CarryFrame;
-    step = CarryFrame == 0 || step == 0 ? 1 : std::min<u32>(step, 255);
+    if (CarryFrame == 0 || step > 2)
+    {
+        memset(EdgeSeen, 0, sizeof(EdgeSeen));
+        memset(EdgeHeld, 0, sizeof(EdgeHeld));
+        ObjHeld.clear();
+        step = 1;
+    }
     CarryFrame = Frame;
 
     auto plane0 = [&](int y, int x) { return fb[y * GPU2D::AccelLineWords + x]; };
@@ -867,26 +876,29 @@ void Shadow2DRecorder::WorkOutCarry(const u32* fb, u32* copy) noexcept
                 band = plane0(y, side ? 255 - k : k) == now[y];
             sure[y] = band && EdgeHeld[side][y] >= EdgeSteady;
         }
-        // each covered row takes the nearest sure row of its run of covered rows
-        int carryRow[192];
+        // each covered row takes the nearest sure row of its run of covered rows, the one above on a
+        // tie: the nearest sure row at or above each row within its run, then at or below
+        int above[192], below[192], carryRow[192];
+        for (int y = 0, last = -1; y < 192; y++)
+        {
+            if (!covered[y])
+                last = -1;
+            else if (sure[y])
+                last = y;
+            above[y] = last;
+        }
+        for (int y = 191, last = -1; y >= 0; y--)
+        {
+            if (!covered[y])
+                last = -1;
+            else if (sure[y])
+                last = y;
+            below[y] = last;
+        }
         for (int y = 0; y < 192; y++)
         {
-            carryRow[y] = -1;
-            if (!covered[y])
-                continue;
-            for (int d = 0; d < 192 && carryRow[y] < 0; d++)
-            {
-                int up = y - d, down = y + d;
-                bool upIn = up >= 0, downIn = down < 192;
-                for (int k = y; upIn && k > up; k--)
-                    if (!covered[k - 1]) upIn = false;
-                for (int k = y; downIn && k < down; k++)
-                    if (!covered[k + 1]) downIn = false;
-                if (!upIn && !downIn)
-                    break;
-                if (upIn && sure[up]) carryRow[y] = up;
-                else if (downIn && sure[down]) carryRow[y] = down;
-            }
+            int up = above[y], down = below[y];
+            carryRow[y] = !covered[y] ? -1 : up < 0 ? down : down < 0 || y - up <= down - y ? up : down;
         }
         // each run of carried rows (a box, or boxes touching) ends past BoxRun in its outline: its first
         // row's color, as thick as that line is (up to 3 rows), the corners stepped
@@ -929,7 +941,7 @@ void Shadow2DRecorder::Finalize() noexcept
     }
 }
 
-u32 Shadow2DRecorder::LineReason(const u32* block) const noexcept
+u32 Shadow2DRecorder::LineReason(const u32* block, bool pastMemChange) const noexcept
 {
     if (block[W_Frame] != Frame || Broken)
         return R_Frame;
@@ -945,7 +957,7 @@ u32 Shadow2DRecorder::LineReason(const u32* block) const noexcept
     const Engine& e = Engines[flags & F_UnitB];
     if (!LineBit(e.BGNoted, line) || !LineBit(e.SpriteNoted, line))
         return R_Frame;
-    if (line < e.LastChangeBG || line < e.LastChangeOBJ)
+    if (!pastMemChange && (line < e.LastChangeBG || line < e.LastChangeOBJ))
         return R_MemChanged;
     if (LineBit(e.Overflow, line))
         return R_InstanceCap;

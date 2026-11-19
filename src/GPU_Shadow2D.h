@@ -300,6 +300,10 @@ struct Shadow2DRecorder
     // pack them (GPU::SetShadow2DWide); the frontend sets them between frames from what the game is
     // doing. gpu2dwide 1 wins over them
     u32 WideModes = 0, WideLeft = 0, WideRight = 0;
+    // whether the shadow can draw a line in the frames to come, for GLCompositor::OutputNeed: not in
+    // mode 3 with no layer past the edge (no wide modes, gpu2dwide off), where every line is the CPU's,
+    // so the output cap holds there as with the shadow off
+    bool MayDraw() const noexcept { return Mode != 3 || WideModes != 0 || Wide == 1; }
     // debug.melonade.gpu2daffine, to tell the affine composite apart from what it needs on a phone:
     // 1 draws the lines with rotated BGs with the plain composite (native BG pixels, as at 1x) while
     // the planes pass still writes StackTex, 2 the same without StackTex. -1 lifts the cap on the
@@ -387,8 +391,9 @@ struct Shadow2DRecorder
     void Finalize() noexcept;
 
     // whether the line whose block this is can be drawn as far as the recorder knows: R_None, the
-    // line's feature reason, or one of the frame's
-    u32 LineReason(const u32* block) const noexcept;
+    // line's feature reason, or one of the frame's. with [pastMemChange], what it would be if the
+    // line weren't before the frame's last memory change (R_MemChanged's line goes on to the rest)
+    u32 LineReason(const u32* block, bool pastMemChange = false) const noexcept;
 
     // the source of a MemTex page (the flats, or the palette copy)
     const u8* PageSource(const GPU& gpu, u32 page) const noexcept;
