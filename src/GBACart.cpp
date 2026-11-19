@@ -170,8 +170,9 @@ void CartGame::DoSavestate(Savestate* file)
 
     file->Var8((u8*)&SRAMType);
 
+    // keep the frontend's copy in step, but don't write to disk until the game saves
     if ((!file->Saving) && SRAM)
-        Platform::WriteGBASave(SRAM.get(), SRAMLength, 0, SRAMLength, UserData);
+        Platform::SyncGBASave(SRAM.get(), SRAMLength, UserData);
 }
 
 void CartGame::SetupSave(u32 type)

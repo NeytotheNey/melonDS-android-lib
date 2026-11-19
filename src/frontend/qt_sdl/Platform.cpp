@@ -428,6 +428,17 @@ void WriteGBASave(const u8* savedata, u32 savelen, u32 writeoffset, u32 writelen
         inst->gbaSave->RequestFlush(savedata, savelen, writeoffset, writelen);
 }
 
+// this frontend isn't built here; it keeps the old behavior of writing the loaded image like a full save
+void SyncNDSSave(const u8* savedata, u32 savelen, void* userdata)
+{
+    WriteNDSSave(savedata, savelen, 0, savelen, userdata);
+}
+
+void SyncGBASave(const u8* savedata, u32 savelen, void* userdata)
+{
+    WriteGBASave(savedata, savelen, 0, savelen, userdata);
+}
+
 void WriteFirmware(const Firmware& firmware, u32 writeoffset, u32 writelen, void* userdata)
 {
     EmuInstance* inst = (EmuInstance*)userdata;

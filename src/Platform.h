@@ -287,6 +287,13 @@ u64 GetUSCount();
 void WriteNDSSave(const u8* savedata, u32 savelen, u32 writeoffset, u32 writelen, void* userdata);
 void WriteGBASave(const u8* savedata, u32 savelen, u32 writeoffset, u32 writelen, void* userdata);
 
+// called when a savestate load replaces the NDS or GBA save memory.
+// savedata and savelen are the entire save memory buffer and its full length.
+// the frontend should adopt this image as its in-memory copy of the save
+// WITHOUT writing it to disk; the next WriteNDSSave/WriteGBASave will persist it.
+void SyncNDSSave(const u8* savedata, u32 savelen, void* userdata);
+void SyncGBASave(const u8* savedata, u32 savelen, void* userdata);
+
 /// Called when the firmware needs to be written back to storage,
 /// after one of the supported write commands finishes execution.
 /// @param firmware The firmware that was just written.

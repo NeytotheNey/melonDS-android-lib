@@ -377,6 +377,8 @@ u64 GetUSCount()
 // saves are thrown away so both runs start from the same blank save
 void WriteNDSSave(const u8* savedata, u32 savelen, u32 writeoffset, u32 writelen, void* userdata) {}
 void WriteGBASave(const u8* savedata, u32 savelen, u32 writeoffset, u32 writelen, void* userdata) {}
+void SyncNDSSave(const u8* savedata, u32 savelen, void* userdata) {}
+void SyncGBASave(const u8* savedata, u32 savelen, void* userdata) {}
 void WriteFirmware(const Firmware& firmware, u32 writeoffset, u32 writelen, void* userdata) {}
 void WriteDateTime(int year, int month, int day, int hour, int minute, int second, void* userdata) {}
 
