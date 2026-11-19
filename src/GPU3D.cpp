@@ -221,6 +221,7 @@ static void PolygonFieldsSavestate(Polygon* poly, Savestate* file) noexcept
 static void LoadedPolygonDegenerate(Polygon* poly) noexcept
 {
     poly->Degenerate = false;
+    poly->PreciseDepth = false;
 
     for (u32 j = 0; j < poly->NumVertices; j++)
     {
@@ -254,6 +255,7 @@ void GPU3D::LatchViewWidth() noexcept
     ViewWidth = RendererViewWidth();
     ViewMargin = RendererViewMargin();
     WideListOn = ViewWidth != WideMelon::NativeWidth && NDS.GPU.WidePolys;
+    PreciseDepthOn = NDS.GPU.PreciseDepth;
 }
 
 void GPU3D::SetVertexIdLogging(int mode) noexcept
@@ -446,6 +448,7 @@ void GPU3D::Reset() noexcept
         ViewWidth = WideMelon::NativeWidth;
         ViewMargin = 0;
         WideListOn = false;
+        PreciseDepthOn = NDS.GPU.PreciseDepth;
     }
     RenderViewWidth = ViewWidth;
     RenderViewMargin = ViewMargin;
@@ -1985,6 +1988,7 @@ void GPU3D::SubmitPolygon() noexcept
     if (poly->Translucent) poly->SortKey |= 0x10000;
 
     poly->WBuffer = (FlushAttributes & 0x2);
+    poly->PreciseDepth = PreciseDepthOn && !poly->WBuffer;
 
     for (int i = 0; i < nverts; i++)
     {
@@ -2010,6 +2014,12 @@ void GPU3D::SubmitPolygon() noexcept
         s32 z;
         if (FlushAttributes & 0x2)
             z = wshifted;
+        else if (vtx->Position[3] && poly->PreciseDepth)
+        {
+            // GPU::PreciseDepth: the same depth without truncating it to 0x200 steps first
+            s64 pz = (((s64)vtx->Position[2] * 0x800000) / vtx->Position[3]) + 0x7FFE00;
+            z = (s32)std::clamp<s64>(pz, 0, 0xFFFFFF);
+        }
         else if (vtx->Position[3])
             z = ((((s64)vtx->Position[2] * 0x4000) / vtx->Position[3]) + 0x3FFF) * 0x200;
         else

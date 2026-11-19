@@ -1303,16 +1303,34 @@ void GLRenderer::SetupPolygon(GLRenderer::RendererPolygon* rp, Polygon* polygon)
     }
 }
 
+// a vertex's depth as the vertex buffer holds it: 16 bits in [z] and, in [zattr], the shift that
+// brings them back to 24 (bits 16-20 of the attribute word). with GPU::PreciseDepth ([precise], a
+// Z-buffer polygon's Polygon::PreciseDepth) the bits the shift drops, up to 8 as Z-buffer depths
+// have 24 bits, go in bits 0-3 and 20-23 for kRenderVS to add back. the DS's depths are multiples of
+// 0x200 and would never set them, but they're left out without it, so off stays as it was: the
+// BetterPolygons center and the skirts (GPU::GLSeams) interpolate their own
+static inline void PackDepth(u32 depth, bool precise, u32& z, u32& zattr)
+{
+    z = depth;
+    u32 zshift = 0;
+    while (z > 0xFFFF) { z >>= 1; zshift++; }
+    zattr = zshift << 16;
+    if (precise && zshift <= 8)
+    {
+        u32 low = depth & ((1u << zshift) - 1);
+        zattr |= (low & 0xF) | ((low & 0xF0) << 16);
+    }
+}
+
 u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texword, u32* vptr) const
 {
-    u32 z = poly->FinalZ[vid];
     u32 w = poly->FinalW[vid];
 
     u32 alpha = (poly->Attr >> 16) & 0x1F;
 
     // Z should always fit within 16 bits, so it's okay to do this
-    u32 zshift = 0;
-    while (z > 0xFFFF) { z >>= 1; zshift++; }
+    u32 z, zattr;
+    PackDepth(poly->FinalZ[vid], poly->PreciseDepth, z, zattr);
 
     // in 1/(1 << PosFrac) target pixels (GPU::GLSeams), whole target pixels without it
     u32 x, y;
@@ -1365,7 +1383,7 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
 
     // Split TexParam into 2 because some GPUs don't have 32 bit ints. TexPalette only uses 13 bits
     // (texword: TexParam & 0xFFFF, or the heap offset with GPU::GLTexCache, RendererPolygon::TexWord)
-    *vptr++ = vtxattr | (zshift << 16);
+    *vptr++ = vtxattr | zattr;
     *vptr++ = texword;
     *vptr++ = (poly->TexParam >> 16 ) | (poly->TexPalette << 16);
 
@@ -1568,9 +1586,8 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
 
                 u32 w = (u32)cW;
 
-                u32 z = (u32)cZ;
-                u32 zshift = 0;
-                while (z > 0xFFFF) { z >>= 1; zshift++; }
+                u32 z, zattr;
+                PackDepth((u32)cZ, poly->PreciseDepth, z, zattr);
 
                 // build center vertex
                 *vptr++ = cX | (cY << 16);
@@ -1584,7 +1601,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
                 *vptr++ = (u16)cS | ((u16)cT << 16);
 
                 // Split TexParam into 2 because some GPUs don't have 32 bit ints. TexPalette only uses 13 bits
-                *vptr++ = vtxattr | (zshift << 16);
+                *vptr++ = vtxattr | zattr;
                 *vptr++ = rp->TexWord;
                 *vptr++ = (poly->TexParam >> 16 ) | (poly->TexPalette << 16);
 
@@ -1847,13 +1864,12 @@ void GLRenderer::BuildSkirt(RendererPolygon* rp, u32 rim, u32& vidx, u32& sidx)
         for (int a = R; a < NumAttr; a++)
             out[a] = std::clamp(out[a], lo[a], hi[a]);
 
-        u32 z = (u32)RoundToInt(out[Z]);
-        u32 zshift = 0;
-        while (z > 0xFFFF) { z >>= 1; zshift++; }
+        u32 z, zattr;
+        PackDepth((u32)RoundToInt(out[Z]), poly->PreciseDepth, z, zattr);
         v[1] = z | ((u32)RoundToInt(w) << 16);
         v[2] = (v[2] & 0xFF000000) | (u32)RoundToInt(out[R]) | ((u32)RoundToInt(out[G]) << 8) | ((u32)RoundToInt(out[B]) << 16);
         v[3] = (u16)(s16)RoundToInt(out[S]) | ((u32)(u16)(s16)RoundToInt(out[T]) << 16);
-        v[4] = (v[4] & ~(0x1Fu << 16)) | (zshift << 16);
+        v[4] = (v[4] & ~((0xFFu << 16) | 0xFu)) | zattr;
     }
     vidx += n;
 

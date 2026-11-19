@@ -70,6 +70,9 @@ struct Polygon
     s32 FinalZ[10];
     s32 FinalW[10];
     bool WBuffer;
+    // FinalZ is GPU::PreciseDepth's (Z-buffer only), for the OpenGL renderer's vertex packing. not in
+    // savestates: a loaded scene has it off
+    bool PreciseDepth;
 
     u32 Attr;
     u32 TexParam;
@@ -305,6 +308,8 @@ private:
     // keeps get a budget of their own (WingNumPolygons). latched with ViewWidth (LatchViewWidth), but kept
     // through a renderer switch mid-scene, and a state's GP3W brings its scene's. off, everything is as before
     bool WideListOn = false;
+    // GPU::PreciseDepth for the scene being built, latched with ViewWidth (LatchViewWidth)
+    bool PreciseDepthOn = false;
     void LatchViewWidth() noexcept;
 
     // WideMelon: the polygon and vertex RAM counts the native view would have (NumPolygons and NumVertices
