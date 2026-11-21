@@ -4,7 +4,7 @@
 # vs NTR FreeBIOS) and DSi mode (official DSi BIOS vs TWL FreeBIOS).
 #
 # Usage: ./run.sh [OUTDIR]
-#   OUTDIR  default: C:/Dev/melonDS-android/logs/swi/testrom (git-ignored)
+#   OUTDIR  default: D:/Dev/melonadeDS/logs/swi/testrom (git-ignored)
 #           DS:  runs go to OUTDIR/runs/<bios>/<mode>, the report to OUTDIR/report.txt
 #           DSi: runs go to OUTDIR/runs-dsi/<bios>/<mode>, the report to OUTDIR/report-dsi.txt
 #
@@ -37,10 +37,10 @@
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${1:-/c/Dev/melonDS-android/logs/swi/testrom}
-HARNESS=${HARNESS:-/c/Dev/swi-harness-data/build/swi-harness.exe}
-BIOSDIR=${BIOSDIR:-C:/Dev/swi-harness-data/bios}
-DSIDIR=${DSIDIR:-C:/Dev/swi-harness-data/dsi}
+OUT=${1:-/d/Dev/melonadeDS/logs/swi/testrom}
+HARNESS=${HARNESS:-/d/Dev/swi-harness-data/build/swi-harness.exe}
+BIOSDIR=${BIOSDIR:-D:/Dev/swi-harness-data/bios}
+DSIDIR=${DSIDIR:-D:/Dev/swi-harness-data/dsi}
 BUILD=${BUILD:-$HERE/build}
 MODES=${MODES:-ds dsi}
 BIOSES=${BIOSES:-official free}
