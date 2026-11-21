@@ -14,8 +14,8 @@
 # $OUT/states first and only read there.
 
 GAMES=${GAMES:-/c/Users/neyto/OneDrive/Documents/Games}
-OUT=${OUT:-/c/Dev/melonDS-android/logs/wide-check}
-BUILD=${BUILD:-/c/Dev/swi-harness-data/build-widecheck}
+OUT=${OUT:-/d/Dev/melonadeDS/logs/wide-check}
+BUILD=${BUILD:-/d/Dev/swi-harness-data/build-widecheck}
 WIDTH=${WIDTH:-342}
 WIDEPOLYS=${WIDEPOLYS:-0}
 HERE=$(cd "$(dirname "$0")" && pwd)
