@@ -13,7 +13,7 @@
 # flag, the native counts and the count reads have to match too). Savestates are copied into
 # $OUT/states first and only read there.
 
-GAMES=${GAMES:-/c/Users/neyto/OneDrive/Documents/Games}
+GAMES=${GAMES:-/d/Games/Dumps/DS}
 OUT=${OUT:-/d/Dev/melonadeDS/logs/wide-check}
 BUILD=${BUILD:-/d/Dev/swi-harness-data/build-widecheck}
 WIDTH=${WIDTH:-342}
