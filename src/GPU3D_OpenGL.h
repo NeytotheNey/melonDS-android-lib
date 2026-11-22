@@ -102,6 +102,7 @@ public:
     void SetSunShadows(const SunShadows& sun) override { Sun = sun; }
     void SetHiddenTextures(const u32* hashes, u32 count) override;
     void SetLightTextures(const u32* hashes, u32 count) override;
+    void SetUiTextures(const u32* hashes, u32 count) override;
     void SetTextureListing(bool on) override;
     const TextureList* GetTextureList() const override { return TexList.get(); }
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
@@ -140,6 +141,8 @@ private:
         u32 TexWord;
         // the polygon's texture is one of the light textures (VtxAttr_Light)
         bool Light;
+        // or one of the UI textures (VtxAttr_Ui)
+        bool Ui;
     };
 
     GLCompositor CurGLCompositor;
@@ -584,13 +587,20 @@ private:
     u32 NumLightTextures = 0;
     bool LightTexturesChanged = false;
     static constexpr u32 VtxAttr_Light = 1u << 12;
-    // the content hashes the hidden and light textures and the listing (TexList, while SetTextureListing is on) pick textures by,
-    // made when one of them first needs it and dropped while none does, so the texture dirty tracking feeds it only then
+    // and the UI textures (SetUiTextures): RendererPolygon::Ui, VtxAttr_Ui, attr A 0.125 and the depth resolve's flag 64, which the
+    // compositor's depth pass turns into 2D on top (kCompositorDepthFS). bit 10 is another of the attribute word's free bits
+    std::array<u32, MaxUiTextures> UiTextures {};
+    u32 NumUiTextures = 0;
+    bool UiTexturesChanged = false;
+    static constexpr u32 VtxAttr_Ui = 1u << 10;
+    // the content hashes the hidden, light and UI textures and the listing (TexList, while SetTextureListing is on) pick textures
+    // by, made when one of them first needs it and dropped while none does, so the texture dirty tracking feeds it only then
     std::unique_ptr<GLTexHashes> TexHashes;
     std::unique_ptr<TextureList> TexList;
     bool HidesTexture(u32 hash) const;
     bool LightsTexture(u32 hash) const;
-    void ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light);
+    bool UiTexture(u32 hash) const;
+    void ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light, bool ui);
     // per frame, while depth is wanted, the camera is valid (TagCamera) and Sun is on: the sun shadows of the polygons TagCamera tags
     // that write depth, which BuildSunShadows puts after BuildPolygons' vertices and indices and DrawSunShadows draws after the scene,
     // into attr A only (kRenderFS's DepthTag, from VtxAttr_SunShadow, one of the attribute word's bits the render shaders read

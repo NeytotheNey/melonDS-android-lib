@@ -331,9 +331,10 @@ void main()
 // target: the window depth's 24 bits in RGB, high byte in R, and in A the flags, of which these are
 // set here (see kCompositorDepthFS for the others): 4 for a W-buffered frame, 8 for a pixel whose
 // depth a polygon under another camera than the frame's wrote (attr A 1, GLRenderer::TagCamera),
-// 16 for one in such a polygon's sun shadow (attr A 0.5, GLRenderer::DrawSunShadows), and 32 for
-// one a light texture's polygon wrote (attr A 0.25, GLRenderer::VtxAttr_Light). attr A is RGBA8, so
-// the thresholds sit halfway between the steps
+// 16 for one in such a polygon's sun shadow (attr A 0.5, GLRenderer::DrawSunShadows), 32 for one a
+// light texture's polygon wrote (attr A 0.25, GLRenderer::VtxAttr_Light), and 64 for one a UI
+// texture's polygon wrote (attr A 0.125, GLRenderer::VtxAttr_Ui), which the compositor's depth pass
+// hands over as 2D. attr A is RGBA8, so the thresholds sit halfway between the steps
 const char* kDepthResolveFS = kShaderHeader R"(
 
 precision highp float;
@@ -354,7 +355,7 @@ void main()
     // to fp32, times 2^24 (exact) is z again, or z + 0.5 below 2^23, which int() drops
     int value = min(int(depth * 16777216.0), 0xFFFFFF);
     float tag = texelFetch(AttrBuffer, coord, 0).a;
-    int flags = (uWBuffer != 0 ? 4 : 0) | (tag > 0.75 ? 8 : (tag > 0.375 ? 16 : (tag > 0.125 ? 32 : 0)));
+    int flags = (uWBuffer != 0 ? 4 : 0) | (tag > 0.75 ? 8 : (tag > 0.375 ? 16 : (tag > 0.1875 ? 32 : (tag > 0.0625 ? 64 : 0))));
     oColor = vec4(float((value >> 16) & 255), float((value >> 8) & 255), float(value & 255),
                   float(flags)) / 255.0;
 }
@@ -1157,10 +1158,12 @@ float EdgeAttrG()
 // attr A, which the depth resolve turns into a flag (kDepthResolveFS): 1 for a polygon built under another camera than the
 // scene's (GLRenderer::VtxAttr_OtherCamera, bit 30 of the attribute word), and 0.5 for a sun shadow GLRenderer::DrawSunShadows
 // draws (VtxAttr_SunShadow, bit 13), which keeps the larger of the two, so a shadow over a light wins. 0.25 for a light texture's
-// polygon (VtxAttr_Light, bit 12), unless it's under another camera. written where the polygon writes depth
+// polygon (VtxAttr_Light, bit 12), unless it's under another camera. 0.125 for a UI texture's (VtxAttr_Ui, bit 10), whatever its
+// camera, as it's 2D to the effects (no sun shadow is drawn over one in front of the scene). written where the polygon writes depth
 float DepthTag()
 {
     if ((fPolygonAttr.x & 0x2000) != 0) return 0.5;
+    if ((fPolygonAttr.x & 0x400) != 0) return 0.125;
     if (((fPolygonAttr.x >> 30) & 1) != 0) return 1.0;
     return (fPolygonAttr.x & 0x1000) != 0 ? 0.25 : 0.0;
 }
