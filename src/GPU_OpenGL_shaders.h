@@ -3456,8 +3456,98 @@ void main()
 }
 )";
 
+// the frontend's depth of field (GLCompositor::RenderDepth): the top half's depth, drawn over the
+// main draw's half 0 quad into an RG8 target of the output's width by the half's rows, after
+// kCompositorVS (WIDE defined for a wide view). each pixel takes the 3D pixel at its center, so a
+// capped output reads one rather than an average. 16-bit values, high byte in R: the 3D's depth
+// (GLRenderer::ResolveDepth, at least 1) where 3D shows on top, 65535 where its 3D is transparent
+// and what's behind it shows, and 0 where there's nothing to blur: 2D on top (compmode 1 blends 2D
+// over the 3D, 5-7 have none), another display mode, or a hi-res captured line
+const char* kCompositorDepthFS = R"(#version 320 es
 
+precision highp float;
+precision highp int;
+precision mediump usampler2D;
 
+// the 3D target's scale, which a capped output's is below
+uniform uint u3DScale;
+#ifdef WIDE
+uniform int uWideOffset;
+uniform int uWideMargin;
+#endif
+uniform int uHiresCap;
+
+uniform usampler2D ScreenTex;
+uniform sampler2D _3DTex;
+uniform highp sampler2D DepthTex;
+
+smooth in vec2 fTexcoord;
+
+layout(location = 0) out vec4 oColor;
+
+const float NO_DEPTH = 0.0;
+const float BEHIND_3D = 65535.0;
+
+vec4 EncodeDepth(float value)
+{
+    float high = floor(value / 256.0);
+    return vec4(high / 255.0, (value - high * 256.0) / 255.0, 0.0, 1.0);
+}
+
+// the 3D at native position (xpos, row) of the target, with the same maths as Fetch3D: its depth
+// where it's drawn, BEHIND_3D where it's transparent or past the target's sides
+float Depth3D(float xpos, float row)
+{
+#ifdef WIDE
+    ivec2 coord = ivec2(floor(vec2(xpos + float(uWideOffset), row) * float(u3DScale)));
+#else
+    ivec2 coord = ivec2(floor(vec2(xpos, row) * float(u3DScale)));
+#endif
+    ivec2 size = textureSize(_3DTex, 0);
+    if (coord.x < 0 || coord.y < 0 || coord.x >= size.x || coord.y >= size.y)
+        return BEHIND_3D;
+    if (texelFetch(_3DTex, coord, 0).a == 0.0)
+        return BEHIND_3D;
+    vec2 rg = texelFetch(DepthTex, coord, 0).rg;
+    return max(floor(rg.r * 255.0 + 0.5) * 256.0 + floor(rg.g * 255.0 + 0.5), 1.0);
+}
+
+void main()
+{
+    // half 0's texture coordinates run from -margin to 192 + margin (GLCompositor::SetupCompVertices),
+    // and a margin pixel takes its edge line's control word, as the main draw's does (MarginEdge)
+#ifdef WIDE
+    float row3D = fTexcoord.y + float(uWideMargin);
+#else
+    float row3D = fTexcoord.y;
+#endif
+    int line = clamp(int(floor(fTexcoord.y)), 0, 191);
+    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, line), 0));
+    int dispmode = mbright.b & 0x3;
+    float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
+
+    float depth = NO_DEPTH;
+    if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0 || fTexcoord.y < 0.0 || fTexcoord.y >= 192.0)
+    {
+        // a wing or margin pixel: only the 3D goes there, on the lines that show it (WingPixel)
+        if ((mbright.b & 0x20) == 0 && (mbright.b & 0x4) != 0)
+            depth = Depth3D(fTexcoord.x + _3dxpos, row3D);
+    }
+    else if (uHiresCap != 0 && (mbright.r & 0x80) != 0)
+    {
+        // a hi-res image, which shows no live 3D
+    }
+    else if (dispmode == 1)
+    {
+        ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(int(fTexcoord.x) + 512, line), 0));
+        int compmode = val3.a & 0xF;
+        if (compmode == 0 || (compmode >= 2 && compmode <= 4))
+            depth = Depth3D(fTexcoord.x + _3dxpos, row3D);
+    }
+
+    oColor = EncodeDepth(depth);
+}
+)";
 
 
 }

@@ -565,6 +565,9 @@ struct OutputLayout
     // then the bottom screen's 192 * Scale, and the top screen's DS line y is at row
     // (y + TopMargin) * Scale. 0 is the old 386-row layout
     int TopMargin = 0;
+    // whether the depth texture given with Renderer3D::SetOutputDepthTexture holds this draw's
+    // top-half depth (see GLCompositor::RenderDepth)
+    bool HasDepth = false;
 };
 
 class Renderer3D
@@ -614,6 +617,15 @@ public:
     virtual bool TakeEarlyCaptureFrame(bool use) { return false; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
+    // a frontend's post effects (depth of field): an RG8 texture the output's width by its top
+    // half's rows ((192 + 2 * margin) * scale) for output buffer [buffer], which the compositor
+    // fills with the top screen's depth, or 0 for none. given before each frame like the output
+    // texture; while none is given the renderer keeps no depth and nothing costs more. only the
+    // OpenGL renderer has one, the others never set OutputLayout::HasDepth
+    virtual void SetOutputDepthTexture(int buffer, u32 texture) {}
+    // for the compositor's depth pass: binds the 3D depth of the frame SetupAccelFrame binds to the
+    // active texture unit, and returns false when there's none to bind
+    virtual bool SetupAccelDepth() { return false; }
     // GPU::Comp1x (experiment K2c): how the compositor last drew into output buffer [buffer]. true,
     // with [layout], the first time it's asked after a draw into the buffer, false when nothing drew
     // into it since then (or since SetOutputTexture gave it a texture), so the texture still holds

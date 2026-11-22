@@ -282,6 +282,7 @@ GLCompositor::~GLCompositor()
     FreeFilter2D();
     FreeShadow2D();
     FreeComp1xCheck();
+    FreeDepthOut();
 
     glDeleteVertexArrays(1, &CompVertexArrayID);
     glDeleteBuffers(1, &CompVertexBufferID);
@@ -333,6 +334,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     Filter2D(std::move(other.Filter2D)),
     Shadow(std::move(other.Shadow)),
     OneX(other.OneX),
+    DepthOut(other.DepthOut),
     CompVertices(other.CompVertices),
     CompShader(other.CompShader),
     CompVertexBufferID(other.CompVertexBufferID),
@@ -351,6 +353,7 @@ GLCompositor::GLCompositor(GLCompositor&& other) noexcept :
     other.Filter2D = {};
     other.Shadow = {};
     other.OneX = {};
+    other.DepthOut = {};
     other.CompScreenOutputFB = {};
     other.CompScreenInputTex = {};
     other.CompScreenOutputTex = {};
@@ -453,6 +456,10 @@ GLCompositor& GLCompositor::operator=(GLCompositor&& other) noexcept
         FreeComp1xCheck();
         OneX = other.OneX;
 
+        FreeDepthOut();
+        DepthOut = other.DepthOut;
+
+        other.DepthOut = {};
         other.HeldWingsTex = {};
         other.HeldWingsFB = {};
         other.WingPlanesTex = {};
@@ -1350,6 +1357,7 @@ bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
     layout.HalfScale = OneX.HalfScale[buf];
     layout.TopWingLines = OneX.TopWingLines[buf];
     layout.TopMargin = OneX.TopMargin[buf];
+    layout.HasDepth = OneX.HasDepth[buf];
     return true;
 }
 
@@ -1653,6 +1661,8 @@ void GLCompositor::RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept
     // after the draw, which shows the copies as they were before this frame's capture
     if (gpu.HiresCapture)
         RunHiresCapture(gpu, backbuf);
+
+    OneX.HasDepth[backbuf] = DepthOut.Tex[backbuf] != 0 && RenderDepth(renderer, backbuf, hiresDisplay, halvesAt1x);
     if (timers)
         renderer.EndGPUTimer();
     GPUTimers = nullptr;
@@ -3543,6 +3553,113 @@ void GLCompositor::SetOutputTexture(int buf, GLuint texture)
 void GLCompositor::BindOutputTexture(int buf)
 {
     glBindTexture(GL_TEXTURE_2D, CompScreenOutputTex[buf]);
+}
+
+void GLCompositor::SetOutputDepthTexture(int buf, GLuint texture) noexcept
+{
+    DepthOut.Tex[buf] = texture;
+    // a layout's HasDepth is only told for a draw into this texture, as with the output's
+    OneX.HasDepth[buf] = false;
+}
+
+void GLCompositor::FreeDepthOut() noexcept
+{
+    glDeleteFramebuffers(DepthOut.FB.size(), DepthOut.FB.data());
+    for (DepthProgram& program : DepthOut.Programs)
+        glDeleteProgram(program.Program);
+    DepthOut = {};
+}
+
+bool GLCompositor::BuildDepthProgram(bool wide) noexcept
+{
+    std::string vs = kCompositorVS;
+    std::string fs = kCompositorDepthFS;
+    if (wide)
+    {
+        vs.insert(vs.find('\n') + 1, "#define WIDE\n");
+        fs.insert(fs.find('\n') + 1, "#define WIDE\n");
+    }
+    DepthProgram& program = DepthOut.Programs[wide];
+    if (!OpenGL::CompileVertexFragmentProgram(program.Program, vs, fs, wide ? "CompositorDepthWide" : "CompositorDepth",
+                                              {{"vPosition", 0}, {"vTexcoord", 1}}, {{"oColor", 0}}))
+    {
+        DepthOut.Failed[wide] = true;
+        Log(LogLevel::Error, "compositor: the depth program didn't build, so the frontend gets no depth\n");
+        return false;
+    }
+
+    program.ScaleLoc = glGetUniformLocation(program.Program, "u3DScale");
+    program.HiresCapLoc = glGetUniformLocation(program.Program, "uHiresCap");
+    program.WideRatioLoc = glGetUniformLocation(program.Program, "uWideRatio");
+    program.WideOffsetLoc = glGetUniformLocation(program.Program, "uWideOffset");
+    program.WideMarginLoc = glGetUniformLocation(program.Program, "uWideMargin");
+    glUseProgram(program.Program);
+    glUniform1i(glGetUniformLocation(program.Program, "ScreenTex"), 0);
+    glUniform1i(glGetUniformLocation(program.Program, "_3DTex"), 1);
+    glUniform1i(glGetUniformLocation(program.Program, "DepthTex"), DepthUnit);
+    return true;
+}
+
+// the frontend's depth of field: the top half's depth into the buffer's depth texture (see
+// kCompositorDepthFS), after everything else the frame draws, with the planes and control words the
+// main draw read. true when the texture holds this frame's depth: not with no texture, a half 0 at 1x
+// (a plain half has no 3D, GPU::Comp1x) or no depth from the renderer (the first frame after one was
+// asked for, or the compute renderer)
+bool GLCompositor::RenderDepth(Renderer3D& renderer, int backbuf, bool hiresDisplay, int halvesAt1x) noexcept
+{
+    GLuint texture = DepthOut.Tex[backbuf];
+    const bool wide = ViewWidth != 256;
+    if (!texture || (halvesAt1x & 1) || DepthOut.Failed[wide])
+        return false;
+    DepthProgram& program = DepthOut.Programs[wide];
+    if (!program.Program && !BuildDepthProgram(wide))
+        return false;
+
+    if (!DepthOut.FB[backbuf])
+        glGenFramebuffers(1, &DepthOut.FB[backbuf]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DepthOut.FB[backbuf]);
+    if (DepthOut.Attached[backbuf] != texture)
+    {
+        GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture, 0);
+        glDrawBuffers(1, fbassign);
+        DepthOut.Attached[backbuf] = texture;
+        DepthOut.Complete[backbuf] = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (!DepthOut.Complete[backbuf])
+            Log(LogLevel::Error, "compositor: the depth output framebuffer is incomplete\n");
+    }
+
+    bool drawn = false;
+    glActiveTexture(GL_TEXTURE0 + DepthUnit);
+    if (DepthOut.Complete[backbuf] && renderer.SetupAccelDepth())
+    {
+        glActiveTexture(GL_TEXTURE1);
+        renderer.SetupAccelFrame();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, CompScreenInputTex);
+
+        glDisable(GL_BLEND);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        // the main draw's viewport over the whole output: the texture is only its top half's rows,
+        // which is where half 0's quad is
+        glViewport(0, 0, ScreenW, ScreenH);
+        glUseProgram(program.Program);
+        glUniform1ui(program.ScaleLoc, Scale3D);
+        glUniform1i(program.HiresCapLoc, hiresDisplay);
+        if (wide)
+        {
+            glUniform1f(program.WideRatioLoc, ViewWidth / 256.0f);
+            glUniform1i(program.WideOffsetLoc, (ViewWidth - 256) / 2);
+            glUniform1i(program.WideMarginLoc, Margin);
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, CompVertexBufferID);
+        glBindVertexArray(CompVertexArrayID);
+        glDrawArrays(GL_TRIANGLES, 6, 6);
+        drawn = true;
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CompScreenOutputFB[backbuf]);
+    return drawn;
 }
 
 }

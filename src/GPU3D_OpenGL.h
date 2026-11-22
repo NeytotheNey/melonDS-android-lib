@@ -97,6 +97,8 @@ public:
 
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
+    void SetOutputDepthTexture(int buffer, u32 texture) override;
+    bool SetupAccelDepth() override;
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
     void SavestateLoaded() override;
 
@@ -172,6 +174,8 @@ private:
     int FrameTargetWidth(const GPU& gpu) noexcept;
     bool ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept;
     void KeepColorBuffer() noexcept;
+    void ResolveDepth() noexcept;
+    void FreeDepthOut() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
     static bool GrowsSeams(const Polygon* poly);
@@ -531,6 +535,21 @@ private:
     GLuint KeptColorTex {}, SpareColorTex {};
     // set by KeepFrameForBlit for the next RenderFrame, which clears it
     bool KeepRequested = false;
+    // the frontend's depth of field (SetOutputDepthTexture): each render's depth resolved into an
+    // RG8 texture at the end of the frame (kDepthResolveFS), since DepthBufferTex is shared by the
+    // kept and the new color buffer and GPU::GLClearFast drops it after the frame. DepthOutTex goes
+    // with ColorBufferTex and swaps like it, with a kept and a spare one; each is 0 until a render
+    // resolves into it, and DepthOutValid says that one holds ColorBufferTex's frame. all of them
+    // are freed once no depth is wanted, and on a resize
+    bool DepthWanted = false;
+    GLuint DepthOutTex {}, KeptDepthOutTex {}, SpareDepthOutTex {};
+    bool DepthOutValid = false, KeptDepthOutValid = false;
+    // DepthResolveFB's attachment, which follows DepthOutTex as it swaps, and whether it was complete
+    GLuint DepthResolveFB {}, DepthResolveAttached {};
+    bool DepthResolveComplete = false;
+    // built the first time depth is wanted; a failed build leaves the frontend without depth
+    GLuint DepthResolveShader {};
+    bool DepthResolveFailed = false;
     // PrepareEarlyCaptureFrame's readback is in EarlyPixelbufferID and is still what line 0 would
     // read back. cleared by anything that draws into or resizes the 3D frame, or replaces the state
     bool EarlyCapture = false;

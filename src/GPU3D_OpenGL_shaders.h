@@ -326,6 +326,26 @@ void main()
 }
 )";
 
+// the frame's depth for the frontend's depth of field (GLRenderer::ResolveDepth), into an RG8
+// target: the window depth's top 16 bits, high byte in R. Z- and W-buffered frames aren't told apart
+const char* kDepthResolveFS = kShaderHeader R"(
+
+precision highp float;
+precision highp int;
+
+uniform highp sampler2D DepthBuffer;
+
+layout(location = 0) out vec4 oColor;
+
+void main()
+{
+    float depth = texelFetch(DepthBuffer, ivec2(gl_FragCoord.xy), 0).r;
+    float value = min(floor(depth * 65536.0), 65535.0);
+    float high = floor(value / 256.0);
+    oColor = vec4(high / 255.0, (value - high * 256.0) / 255.0, 0.0, 1.0);
+}
+)";
+
 
 
 const char* kRenderVSCommon = R"(
