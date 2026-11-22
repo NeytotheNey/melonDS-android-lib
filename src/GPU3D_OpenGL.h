@@ -101,6 +101,7 @@ public:
     bool SetupAccelDepth(DepthCamera& camera) override;
     void SetSunShadows(const SunShadows& sun) override { Sun = sun; }
     void SetHiddenTextures(const u32* hashes, u32 count) override;
+    void SetLightTextures(const u32* hashes, u32 count) override;
     void SetTextureListing(bool on) override;
     const TextureList* GetTextureList() const override { return TexList.get(); }
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
@@ -137,6 +138,8 @@ private:
         // with GPU::GLTexCache 0x40000000 | the texture's heap offset (below 2^22, AssignTexCache),
         // plus step 4a's TexWord_Color and TexWord_RecAlpha (bits 22 and 23; 24 to 29 are free)
         u32 TexWord;
+        // the polygon's texture is one of the light textures (VtxAttr_Light)
+        bool Light;
     };
 
     GLCompositor CurGLCompositor;
@@ -574,12 +577,20 @@ private:
     std::array<u32, MaxHiddenTextures> HiddenTextures {};
     u32 NumHiddenTextures = 0;
     bool HiddenTexturesChanged = false;
-    // the content hashes the hidden textures and the listing (TexList, while SetTextureListing is on) pick textures by, made when one
-    // of them first needs it and dropped while neither does, so the texture dirty tracking feeds it only then
+    // the frontend's light textures (SetLightTextures), the same way. RenderFrame marks their polygons (RendererPolygon::Light), and
+    // BuildPolygons gives their vertices VtxAttr_Light, which makes the render shaders write attr A 0.25 (kRenderFS's DepthTag) and
+    // the depth resolve flag 32. the bit is one of the attribute word's that kRenderVS and kRenderFS read nothing else from
+    std::array<u32, MaxLightTextures> LightTextures {};
+    u32 NumLightTextures = 0;
+    bool LightTexturesChanged = false;
+    static constexpr u32 VtxAttr_Light = 1u << 12;
+    // the content hashes the hidden and light textures and the listing (TexList, while SetTextureListing is on) pick textures by,
+    // made when one of them first needs it and dropped while none does, so the texture dirty tracking feeds it only then
     std::unique_ptr<GLTexHashes> TexHashes;
     std::unique_ptr<TextureList> TexList;
     bool HidesTexture(u32 hash) const;
-    void ListTexture(const Polygon* polygon, u32 hash, bool hidden);
+    bool LightsTexture(u32 hash) const;
+    void ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light);
     // per frame, while depth is wanted, the camera is valid (TagCamera) and Sun is on: the sun shadows of the polygons TagCamera tags
     // that write depth, which BuildSunShadows puts after BuildPolygons' vertices and indices and DrawSunShadows draws after the scene,
     // into attr A only (kRenderFS's DepthTag, from VtxAttr_SunShadow, one of the attribute word's bits the render shaders read

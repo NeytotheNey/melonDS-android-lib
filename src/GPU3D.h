@@ -651,11 +651,14 @@ struct SunShadows
 
 // a frontend's hidden textures (Renderer3D::SetHiddenTextures) hold at most this many hashes
 constexpr u32 MaxHiddenTextures = 64;
+// and its light textures (Renderer3D::SetLightTextures) as many
+constexpr u32 MaxLightTextures = 64;
 
 // debug: the textures of the last frame the OpenGL renderer drew (Renderer3D::SetTextureListing), one entry per TexParam (but its
 // repeat, flip and transform bits) and TexPalette the frame's textured polygons used, in the order they first came. Hash is the
 // texture's content hash (GLTexHashes), Box the polygons' bounds (left, top, right, bottom, in the frame's 3D pixels, the native top
-// screen's 256 x 192 when it's not wide), Alpha and PolygonId the first polygon's, Hidden whether the hidden textures skipped them
+// screen's 256 x 192 when it's not wide), Alpha and PolygonId the first polygon's, Hidden whether the hidden textures skipped them,
+// Light whether the light textures marked them
 struct TextureListEntry
 {
     u32 Hash;
@@ -667,6 +670,7 @@ struct TextureListEntry
     u8 Alpha;
     u8 PolygonId;
     bool Hidden;
+    bool Light;
 };
 struct TextureList
 {
@@ -768,6 +772,10 @@ public:
     // MaxHiddenTextures are taken), whose polygons the OpenGL renderer doesn't draw at all, as if the game hadn't sent them, while the
     // game's own state stays as it is. 0 shows them all and costs nothing. the other renderers draw everything
     virtual void SetHiddenTextures(const u32* hashes, u32 count) {}
+    // the frontend's light textures, given the same way: [count] content hashes (at most MaxLightTextures are taken), whose
+    // polygons' pixels get flag 32 in the depth's flags (kDepthResolveFS) where they write depth, so effects can make them glow.
+    // they're drawn as they are. 0 marks none and costs nothing. only the OpenGL renderer marks them
+    virtual void SetLightTextures(const u32* hashes, u32 count) {}
     // debug: while on, the OpenGL renderer lists each frame's textures it draws (TextureList), nullptr from the others or while off
     virtual void SetTextureListing(bool on) {}
     [[nodiscard]] virtual const TextureList* GetTextureList() const { return nullptr; }

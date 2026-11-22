@@ -1027,6 +1027,16 @@ void GLRenderer::SetHiddenTextures(const u32* hashes, u32 count)
     HiddenTexturesChanged = true;
 }
 
+void GLRenderer::SetLightTextures(const u32* hashes, u32 count)
+{
+    count = std::min(count, MaxLightTextures);
+    if (count == NumLightTextures && std::equal(hashes, hashes + count, LightTextures.begin()))
+        return;
+    std::copy_n(hashes, count, LightTextures.begin());
+    NumLightTextures = count;
+    LightTexturesChanged = true;
+}
+
 void GLRenderer::SetTextureListing(bool on)
 {
     if (on && !TexList)
@@ -1043,8 +1053,13 @@ bool GLRenderer::HidesTexture(u32 hash) const
     return std::find(HiddenTextures.begin(), HiddenTextures.begin() + NumHiddenTextures, hash) != HiddenTextures.begin() + NumHiddenTextures;
 }
 
+bool GLRenderer::LightsTexture(u32 hash) const
+{
+    return std::find(LightTextures.begin(), LightTextures.begin() + NumLightTextures, hash) != LightTextures.begin() + NumLightTextures;
+}
+
 // TexList: [polygon], whose texture's hash is [hash], counted with the others of its texture this frame
-void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden)
+void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light)
 {
     std::vector<TextureListEntry>& entries = TexList->Entries;
     const u32 texparam = polygon->TexParam & 0x3FF0FFFF;
@@ -1057,7 +1072,7 @@ void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden)
     else if (entries.size() < TextureList::MaxEntries)
     {
         entries.push_back({hash, texparam, polygon->TexPalette, 0, 0, {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN},
-                           (u8)((polygon->Attr >> 16) & 0x1F), (u8)((polygon->Attr >> 24) & 0x3F), hidden});
+                           (u8)((polygon->Attr >> 16) & 0x1F), (u8)((polygon->Attr >> 24) & 0x3F), hidden, light});
         entry = &entries.back();
     }
     else
@@ -1633,6 +1648,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
         if (poly->FacingView) vtxattr |= (1<<8);
         if (poly->WBuffer)    vtxattr |= (1<<9);
         if (TagCamera != GPU3D::NoSceneCamera && poly->Camera != TagCamera) vtxattr |= VtxAttr_OtherCamera;
+        if (rp->Light)        vtxattr |= VtxAttr_Light;
 
         // assemble vertices
         if (poly->Type == 1) // line
@@ -4347,11 +4363,12 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // nothing cached goes stale while it's off. palette RAM doesn't matter (alpha is the texel's)
     // GPU::GLTexCache: the heap's textures were decoded from VRAMFlat_Texture too, and those under a
     // changed chunk get hashed again at their next use. the chunks are counted once for both
-    // the texture hashes are only kept while the hidden textures or the listing want them, so this frame's changes reach them
-    // whenever they're there
-    if ((NumHiddenTextures || TexList) && !TexHashes)
+    // the texture hashes are only kept while the hidden or light textures or the listing want them, so this frame's changes reach
+    // them whenever they're there
+    const bool wantsHashes = NumHiddenTextures || NumLightTextures || TexList;
+    if (wantsHashes && !TexHashes)
         TexHashes = std::make_unique<GLTexHashes>();
-    else if (!NumHiddenTextures && !TexList && TexHashes)
+    else if (!wantsHashes && TexHashes)
         TexHashes.reset();
     if (textureChanged && (NumOpaqueTex || TexHeap || TexHashes))
         TextureDirtyPrefix.Build(textureDirty);
@@ -4395,9 +4412,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     bool needsDepth = DepthWanted && !DepthOutValid && !DepthResolveFailed;
     // and the sun shadows go into the depth's flags, so new ones need the frame drawn again
     bool sunChanged = DepthWanted && Sun != SunDrawn;
-    // and new hidden textures change what's drawn
+    // and new hidden textures change what's drawn, and new light textures the depth's flags
     if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && !sunChanged && !HiddenTexturesChanged
-        && gpu.GPU3D.RenderFrameIdentical)
+        && !LightTexturesChanged && gpu.GPU3D.RenderFrameIdentical)
     {
 #ifdef MELONADE_DEBUG_TOOLS
         if (Timers)
@@ -4408,6 +4425,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
     TargetsChanged = false;
     SunDrawn = Sun;
     HiddenTexturesChanged = false;
+    LightTexturesChanged = false;
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Timers)
@@ -4731,18 +4749,22 @@ void GLRenderer::RenderFrame(GPU& gpu)
         {
             const Polygon* polygon = gpu.GPU3D.RenderPolygonRAM[i];
             if (polygon->Degenerate) continue;
-            // the hidden textures' polygons are left out of everything below. an untextured frame has no textures to hide
+            // the hidden textures' polygons are left out of everything below, and the light textures' marked. an untextured frame
+            // has no textures to hide or mark
+            bool light = false;
             if (TexHashes) [[unlikely]]
             {
                 u32 hash = texturing ? TexHashes->Hash(gpu.VRAMFlat_Texture, gpu.VRAMFlat_TexPal, polygon->TexParam, polygon->TexPalette) : 0;
                 bool hidden = hash && HidesTexture(hash);
+                light = hash && !hidden && LightsTexture(hash);
                 if (TexList && hash)
-                    ListTexture(polygon, hash, hidden);
+                    ListTexture(polygon, hash, hidden, light);
                 if (hidden)
                     continue;
             }
 
             SetupPolygon(&PolygonList[npolys], gpu.GPU3D.RenderPolygonRAM[i]);
+            PolygonList[npolys].Light = light;
             if (NoDiscard && NoDiscardClass(polygon, texturing) == NoDiscard_Yes)
                 PolygonList[npolys].RenderKey |= RenderKey_NoDiscard;
             if (firsttrans < 0 && polygon->Translucent)
