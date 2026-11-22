@@ -263,6 +263,55 @@ void GPU3D::SetVertexIdLogging(int mode) noexcept
     VertexIdLog = mode > 0 ? std::make_unique<VertexIdLogger>(mode) : nullptr;
 }
 
+void GPU3D::CameraLog::Note(const s32* proj, const u32* viewport, const Vertex* vertices, int count) noexcept
+{
+    u32 hash = 2166136261u;
+    for (int i = 0; i < 16; i++)
+        hash = (hash ^ (u32)proj[i]) * 16777619u;
+    for (int i = 0; i < 6; i++)
+        hash = (hash ^ viewport[i]) * 16777619u;
+
+    CameraUse* use = nullptr;
+    for (u32 i = 0; i < BuildingCount && !use; i++)
+    {
+        CameraUse& known = Building[i];
+        if (known.Hash == hash && !memcmp(known.Proj, proj, sizeof(known.Proj)) && !memcmp(known.Viewport, viewport, sizeof(known.Viewport)))
+            use = &known;
+    }
+    if (!use)
+    {
+        if (BuildingCount == MaxUses)
+        {
+            BuildingOther++;
+            return;
+        }
+        use = &Building[BuildingCount++];
+        memcpy(use->Proj, proj, sizeof(use->Proj));
+        memcpy(use->Viewport, viewport, sizeof(use->Viewport));
+        use->Hash = hash;
+        use->Polygons = 0;
+        use->XMin = use->YMin = INT32_MAX;
+        use->XMax = use->YMax = INT32_MIN;
+    }
+    use->Polygons++;
+    for (int i = 0; i < count; i++)
+    {
+        use->XMin = std::min(use->XMin, vertices[i].FinalPosition[0]);
+        use->XMax = std::max(use->XMax, vertices[i].FinalPosition[0]);
+        use->YMin = std::min(use->YMin, vertices[i].FinalPosition[1]);
+        use->YMax = std::max(use->YMax, vertices[i].FinalPosition[1]);
+    }
+}
+
+void GPU3D::CameraLog::OnSwap() noexcept
+{
+    Last = Building;
+    LastCount = BuildingCount;
+    LastOther = BuildingOther;
+    Swaps++;
+    Invalidate();
+}
+
 void GPU3D::SetHalfCamera(int mode) noexcept
 {
     // set again by a new game's start only, with no 3D frame in progress
@@ -307,6 +356,7 @@ void GPU3D::MarkRenderStateReplaced() noexcept
 void GPU3D::Reset() noexcept
 {
     if (VertexIdLog) VertexIdLog->Invalidate();
+    if (CameraLogData) CameraLogData->Invalidate();
     if (HalfCam) HalfCam->Invalidate();
 
     CmdFIFO.Clear();
@@ -675,6 +725,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         UpdateClipMatrix();
 
         if (VertexIdLog) VertexIdLog->Invalidate();
+        if (CameraLogData) CameraLogData->Invalidate();
 
         CurVertexRAM = &VertexRAM[CurRAMBank ? VertexRAMSize : 0];
         CurPolygonRAM = &PolygonRAM[CurRAMBank ? PolygonRAMSize : 0];
@@ -1877,6 +1928,7 @@ void GPU3D::SubmitPolygon() noexcept
     const u32 vertsbefore = NumVertices;
     Polygon* poly = &CurPolygonRAM[NumPolygons++];
     if (VertexIdLog) VertexIdLog->OnPolygon(NumPolygons - 1, *this);
+    if (CameraLogData) CameraLogData->Note(ProjMatrix, Viewport, clippedvertices, nverts);
     poly->NumVertices = 0;
 
     poly->Attr = CurPolygonAttr;
@@ -3542,6 +3594,7 @@ void GPU3D::VBlank() noexcept
         if (FlushRequest)
         {
             if (VertexIdLog) VertexIdLog->OnSwap(*this);
+            if (CameraLogData) CameraLogData->OnSwap();
             if (HalfCam) HalfCam->OnSwap();
             if (WideDrops.Enabled) WideDropsOnSwap();
 

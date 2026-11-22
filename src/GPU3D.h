@@ -187,6 +187,36 @@ public:
     void SetVertexIdLogging(int mode) noexcept;
     [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
 
+    // debug only: per 3D scene, the projection matrices and viewports its polygons were built under, for
+    // working out a game's camera (the desktop's --camera-dump). costs a null check per polygon while off
+    struct CameraUse
+    {
+        s32 Proj[16];
+        u32 Viewport[6];
+        u32 Hash;
+        u32 Polygons;
+        // the screen box its polygons cover, in DS pixels
+        s32 XMin, YMin, XMax, YMax;
+    };
+    struct CameraLog
+    {
+        static constexpr u32 MaxUses = 16;
+        // the scene being built, and the last one swapped in, which the renderer draws next
+        std::array<CameraUse, MaxUses> Building {}, Last {};
+        u32 BuildingCount = 0, LastCount = 0;
+        // polygons whose camera didn't fit in MaxUses
+        u32 BuildingOther = 0, LastOther = 0;
+        // swaps since the logging went on, so a reader can tell a new Last
+        u32 Swaps = 0;
+
+        void Note(const s32* proj, const u32* viewport, const Vertex* vertices, int count) noexcept;
+        void OnSwap() noexcept;
+        void Invalidate() noexcept { BuildingCount = 0; BuildingOther = 0; }
+    };
+    // set before the game runs
+    void SetCameraLogging(bool enable) noexcept { CameraLogData = enable ? std::make_unique<CameraLog>() : nullptr; }
+    [[nodiscard]] const CameraLog* GetCameraLog() const noexcept { return CameraLogData.get(); }
+
     // polygons dropped because the polygon or vertex RAM was full, since the last reset, and of those,
     // with WideMelon on, the ones the native view would still have had room for, so the wide view cost
     // them (an estimate, see SubmitPolygon), and the ones only the wide view kept (wing). not serialized
@@ -354,6 +384,7 @@ private:
 
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;
+    std::unique_ptr<CameraLog> CameraLogData;
     std::unique_ptr<HalfCamera> HalfCam;
 
 public:
