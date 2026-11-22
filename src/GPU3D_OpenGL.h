@@ -98,7 +98,7 @@ public:
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
     void SetOutputDepthTexture(int buffer, u32 texture) override;
-    bool SetupAccelDepth() override;
+    bool SetupAccelDepth(DepthCamera& camera) override;
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
     void SavestateLoaded() override;
 
@@ -174,7 +174,7 @@ private:
     int FrameTargetWidth(const GPU& gpu) noexcept;
     bool ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept;
     void KeepColorBuffer() noexcept;
-    void ResolveDepth(bool wbuffer) noexcept;
+    void ResolveDepth(const GPU3D& gpu3d) noexcept;
     void FreeDepthOut() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
@@ -544,6 +544,13 @@ private:
     bool DepthWanted = false;
     GLuint DepthOutTex {}, KeptDepthOutTex {}, SpareDepthOutTex {};
     bool DepthOutValid = false, KeptDepthOutValid = false;
+    // the camera each of those frames was drawn with (GPU3D::RenderCamera as SetupAccelDepth hands it over), swapped with them
+    DepthCamera DepthOutCamera {}, KeptDepthOutCamera {};
+    // while depth is wanted and the render's camera is valid, its index (GPU3D::SceneCamera::Index): BuildPolygons tags the
+    // polygons built under another one (VtxAttr_OtherCamera), whose pixels get flag 8 in the depth (attr A, kDepthResolveFS).
+    // NoSceneCamera tags none. the bit is one of the vertex attribute word's that kRenderVS and kRenderFS read nothing else from
+    u8 TagCamera = GPU3D::NoSceneCamera;
+    static constexpr u32 VtxAttr_OtherCamera = 1u << 30;
     // DepthResolveFB's attachment, which follows DepthOutTex as it swaps, and whether it was complete
     GLuint DepthResolveFB {}, DepthResolveAttached {};
     bool DepthResolveComplete = false;
@@ -551,6 +558,7 @@ private:
     GLuint DepthResolveShader {};
     GLint DepthResolveWBufferLoc = -1;
     bool DepthResolveFailed = false;
+    static DepthCamera ToDepthCamera(const GPU3D::SceneCamera& camera) noexcept;
     // PrepareEarlyCaptureFrame's readback is in EarlyPixelbufferID and is still what line 0 would
     // read back. cleared by anything that draws into or resizes the 3D frame, or replaces the state
     bool EarlyCapture = false;

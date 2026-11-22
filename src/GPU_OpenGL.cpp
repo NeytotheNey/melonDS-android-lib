@@ -1358,6 +1358,7 @@ bool GLCompositor::TakeOutputLayout(int buf, OutputLayout& layout) noexcept
     layout.TopWingLines = OneX.TopWingLines[buf];
     layout.TopMargin = OneX.TopMargin[buf];
     layout.HasDepth = OneX.HasDepth[buf];
+    layout.Camera = OneX.HasDepth[buf] ? OneX.Camera[buf] : DepthCamera {};
     return true;
 }
 
@@ -3630,8 +3631,10 @@ bool GLCompositor::RenderDepth(Renderer3D& renderer, int backbuf, bool hiresDisp
     }
 
     bool drawn = false;
+    DepthCamera& camera = OneX.Camera[backbuf];
+    camera = {};
     glActiveTexture(GL_TEXTURE0 + DepthUnit);
-    if (DepthOut.Complete[backbuf] && renderer.SetupAccelDepth())
+    if (DepthOut.Complete[backbuf] && renderer.SetupAccelDepth(camera))
     {
         glActiveTexture(GL_TEXTURE1);
         renderer.SetupAccelFrame();

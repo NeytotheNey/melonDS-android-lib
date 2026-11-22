@@ -1178,8 +1178,9 @@ bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth, 
 
     glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, ScreenW, ScreenH, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    // RGB as the edge and fog passes read it, A the other-camera tag for the frontend's depth (TagCamera)
     glBindTexture(GL_TEXTURE_2D, AttrBufferTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, ScreenW, ScreenH, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
     glBindFramebuffer(GL_FRAMEBUFFER, DownscaleFramebuffer);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, DownScaleBufferTex, 0);
@@ -1264,8 +1265,10 @@ void GLRenderer::KeepColorBuffer() noexcept
     {
         KeptDepthOutTex = DepthOutTex;
         KeptDepthOutValid = DepthOutValid;
+        KeptDepthOutCamera = DepthOutCamera;
         DepthOutTex = SpareDepthOutTex;
         DepthOutValid = false;
+        DepthOutCamera = {};
         SpareDepthOutTex = 0;
     }
 }
@@ -1277,16 +1280,34 @@ void GLRenderer::FreeDepthOut() noexcept
     glDeleteTextures(1, &SpareDepthOutTex);
     DepthOutTex = KeptDepthOutTex = SpareDepthOutTex = 0;
     DepthOutValid = KeptDepthOutValid = false;
+    DepthOutCamera = KeptDepthOutCamera = {};
     DepthResolveAttached = 0;
+}
+
+// a scene's camera as the frontend gets it: 20.12 to real numbers (exact, as every 20.12 value below 2^24 is a float), and
+// the viewport as left, top, width and height, top being the row clip y = 1 lands on (GPU3D::SubmitPolygon's Viewport[3]). an
+// invalid pick still shows what it was, for logs
+DepthCamera GLRenderer::ToDepthCamera(const GPU3D::SceneCamera& camera) noexcept
+{
+    DepthCamera out;
+    if (camera.Index == GPU3D::NoSceneCamera)
+        return out;
+    for (int i = 0; i < 16; i++)
+        out.Proj[i] = (float)camera.Proj[i] / 4096.0f;
+    out.Viewport = {(float)camera.Viewport[0], (float)camera.Viewport[3], (float)camera.Viewport[4], (float)camera.Viewport[5]};
+    out.Valid = camera.Valid;
+    return out;
 }
 
 // the frontend's depth (DepthWanted), right after the render while DepthBufferTex still holds it:
 // one pass over the whole target into DepthOutTex, made here the first time. a shader or target that
-// fails leaves the frontend without depth (DepthOutValid false), never the frame. [wbuffer]: the frame
-// is W-buffered, which goes in the texture's flags
-void GLRenderer::ResolveDepth(bool wbuffer) noexcept
+// fails leaves the frontend without depth (DepthOutValid false), never the frame. the flags get
+// whether the frame is W-buffered and, from attr A, the pixels of polygons under another camera
+// than the render's (TagCamera), whose camera goes with the texture
+void GLRenderer::ResolveDepth(const GPU3D& gpu3d) noexcept
 {
     DepthOutValid = false;
+    DepthOutCamera = {};
     if (DepthResolveFailed)
         return;
     if (!DepthResolveShader)
@@ -1300,6 +1321,7 @@ void GLRenderer::ResolveDepth(bool wbuffer) noexcept
         }
         glUseProgram(DepthResolveShader);
         glUniform1i(glGetUniformLocation(DepthResolveShader, "DepthBuffer"), 0);
+        glUniform1i(glGetUniformLocation(DepthResolveShader, "AttrBuffer"), 1);
         DepthResolveWBufferLoc = glGetUniformLocation(DepthResolveShader, "uWBuffer");
         glGenFramebuffers(1, &DepthResolveFB);
     }
@@ -1332,14 +1354,21 @@ void GLRenderer::ResolveDepth(bool wbuffer) noexcept
         glDisable(GL_SCISSOR_TEST);
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glViewport(0, 0, ScreenW, ScreenH);
+        // every polygon of a scene shares its W-buffer setting
+        const bool wbuffer = gpu3d.RenderNumPolygons && gpu3d.RenderPolygonRAM[0]->WBuffer;
         glUseProgram(DepthResolveShader);
         glUniform1i(DepthResolveWBufferLoc, wbuffer ? 1 : 0);
+        // units 0 and 1 are bound again before the next render (RenderFrame) and the compositor's draws
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, AttrBufferTex);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
         glBindVertexArray(ClearVertexArrayID);
         glDrawArrays(GL_TRIANGLES, 0, 2*3);
         DepthOutValid = true;
+        // a scene without polygons has nothing to rebuild
+        DepthOutCamera = gpu3d.RenderNumPolygons ? ToDepthCamera(gpu3d.RenderCamera) : DepthCamera {};
     }
     // what the rest of RenderFrame expects bound
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
@@ -1541,6 +1570,7 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
         u32 vtxattr = polyattr & 0x1F00C8F0;
         if (poly->FacingView) vtxattr |= (1<<8);
         if (poly->WBuffer)    vtxattr |= (1<<9);
+        if (TagCamera != GPU3D::NoSceneCamera && poly->Camera != TagCamera) vtxattr |= VtxAttr_OtherCamera;
 
         // assemble vertices
         if (poly->Type == 1) // line
@@ -3017,6 +3047,11 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     if (h != 192) glScissor(0, y*ScaleFactor, ScreenW, h*ScaleFactor);
 
     GLboolean fogenable = (gpu3d.RenderDispCnt & (1<<7)) ? GL_TRUE : GL_FALSE;
+    // attr A, the other-camera tag (TagCamera), follows the depth: written by every draw that writes depth, while the frontend
+    // wants the depth. opaque draws have blending off, and the translucent ones get no blending on the attr target (below), so
+    // what's written is the polygon's own tag
+    const GLboolean tagmask = DepthWanted ? GL_TRUE : GL_FALSE;
+    auto transtagmask = [tagmask](u32 polyattr) { return (polyattr & (1<<11)) ? tagmask : GL_FALSE; };
 
     // TODO: proper 'equal' depth test!
     // (has margin of +-0x200 in Z-buffer mode, +-0xFF in W-buffer mode)
@@ -3029,7 +3064,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     UseRenderShader(wbuffer, RenderMode_Opaque);
     glLineWidth(1.0);
 
-    glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, tagmask);
 
     glDepthFunc(GL_LESS);
     glDepthMask(GL_TRUE);
@@ -3107,6 +3142,11 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
     else
         glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ONE);
+    // the attr target takes its source as it is. that's what the blend above gave it while every attr output had alpha 1, and
+    // with alpha the tag (kRenderFS) it keeps the fog bit right where the tag is 0, and makes A the tag rather than its max
+    // with the one under it
+    glBlendEquationSeparatei(1, GL_FUNC_ADD, GL_FUNC_ADD);
+    glBlendFuncSeparatei(1, GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
 
     glLineWidth(1.0);
 
@@ -3215,7 +3255,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                         glDisable(GL_BLEND);
                         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                        glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
+                        glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, tagmask);
 
                         glStencilFunc(GL_ALWAYS, polyid, 0xFF);
                         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
@@ -3251,7 +3291,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                         glEnable(GL_BLEND);
                         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                        glColorMaski(1, GL_FALSE, GL_FALSE, transfog, GL_FALSE);
+                        glColorMaski(1, GL_FALSE, GL_FALSE, transfog, transtagmask(polyattr));
 
                         glStencilFunc(GL_EQUAL, 0xFE, 0xFF);
                         glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
@@ -3266,7 +3306,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     else
                     {
                         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                        glColorMaski(1, GL_FALSE, GL_FALSE, transfog, GL_FALSE);
+                        glColorMaski(1, GL_FALSE, GL_FALSE, transfog, transtagmask(polyattr));
 
                         glStencilFunc(GL_EQUAL, 0xFF, 0xFE);
                         glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
@@ -3415,7 +3455,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                    glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
+                    glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, tagmask);
 
                     glStencilFunc(GL_ALWAYS, polyid, 0xFF);
                     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
@@ -3464,7 +3504,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     glEnable(GL_BLEND);
                     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                    glColorMaski(1, GL_FALSE, GL_FALSE, transfog, GL_FALSE);
+                    glColorMaski(1, GL_FALSE, GL_FALSE, transfog, transtagmask(polyattr));
 
                     glStencilFunc(GL_EQUAL, 0xC0|polyid, 0x80);
                     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
@@ -3486,7 +3526,7 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
                     if (fetch) glDisable(GL_BLEND);
                     else       glEnable(GL_BLEND);
                     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                    glColorMaski(1, GL_FALSE, GL_FALSE, transfog, GL_FALSE);
+                    glColorMaski(1, GL_FALSE, GL_FALSE, transfog, transtagmask(polyattr));
 
                     glStencilFunc(GL_NOTEQUAL, 0x40|polyid, 0x7F);
                     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
@@ -4000,7 +4040,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
             // every write mask is open (above) and the scissor test is off, so the clears cover what
             // the quad does, all of MainFramebuffer. same float values as the shader's outputs, which
             // the GL turns into the targets' formats the same way: color (RGBA8, the DS's BGR order
-            // swizzled into RGB) and attr (RGB8: poly ID/63, edge flag 0, fog flag) round to the
+            // swizzled into RGB) and attr (RGBA8: poly ID/63, edge flag 0, fog flag, no tag) round to the
             // same bytes (k*255/31 and k*255/63 are never near a half), depth is the window z the
             // quad's NDC z gives, z/2^24 (both exact in float), stencil the reference above
             u32 r = gpu.GPU3D.RenderClearAttr1 & 0x1F;
@@ -4011,7 +4051,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
             u32 z = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
 
             const GLfloat color[4] = {(float)b / 31.0f, (float)g / 31.0f, (float)r / 31.0f, (float)a / 31.0f};
-            const GLfloat attr[4] = {(float)polyid / 63.0f, 0.0f, (float)fog, 1.0f};
+            const GLfloat attr[4] = {(float)polyid / 63.0f, 0.0f, (float)fog, 0.0f};
             glClearBufferfv(GL_COLOR, 0, color);
             glClearBufferfv(GL_COLOR, 1, attr);
             glClearBufferfi(GL_DEPTH_STENCIL, 0, (float)z / 16777216.0f, clearstencil);
@@ -4087,6 +4127,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
         if (!anyOpaqueDraw || (EdgeMark != 0 && !PrepareEdgeShaders()))
             EdgeMark = 0;
 
+        TagCamera = DepthWanted && gpu.GPU3D.RenderCamera.Valid ? gpu.GPU3D.RenderCamera.Index : GPU3D::NoSceneCamera;
         BuildPolygons(&PolygonList[0], npolys);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
@@ -4162,7 +4203,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
         NumFinalPolys = 0;
 
     if (DepthWanted)
-        ResolveDepth(gpu.GPU3D.RenderNumPolygons && gpu.GPU3D.RenderPolygonRAM[0]->WBuffer);
+        ResolveDepth(gpu.GPU3D);
 
     if (ClearFast & 2)
     {
@@ -4381,6 +4422,7 @@ void GLRenderer::Blit(const GPU& gpu)
         KeptDepthOutTex = 0;
     }
     KeptDepthOutValid = false;
+    KeptDepthOutCamera = {};
 }
 
 // GPU::BlitAfterReadback: line 0's readback, made right after the render at line 215, into the
@@ -4422,13 +4464,14 @@ void GLRenderer::SetOutputDepthTexture(int buffer, u32 texture)
     CurGLCompositor.SetOutputDepthTexture(buffer, (GLuint) texture);
 }
 
-bool GLRenderer::SetupAccelDepth()
+bool GLRenderer::SetupAccelDepth(DepthCamera& camera)
 {
     // the depth of the frame SetupAccelFrame binds
     GLuint texture = KeptColorTex ? (KeptDepthOutValid ? KeptDepthOutTex : 0) : (DepthOutValid ? DepthOutTex : 0);
     if (!texture)
         return false;
     glBindTexture(GL_TEXTURE_2D, texture);
+    camera = KeptColorTex ? KeptDepthOutCamera : DepthOutCamera;
     return true;
 }
 

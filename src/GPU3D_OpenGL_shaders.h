@@ -53,7 +53,8 @@ void main()
     oAttr.r = float(uOpaquePolyID) / 63.0;
     oAttr.g = 0.0;
     oAttr.b = float(uFogFlag);
-    oAttr.a = 1.0;
+    // no other-camera tag (kRenderFS's OtherCameraTag)
+    oAttr.a = 0.0;
 }
 )";
 
@@ -116,7 +117,7 @@ void main()
     oAttr.r = float(uOpaquePolyID) / 63.0;
     oAttr.g = 0.0;
     oAttr.b = float((depth >> 15) & 1u);
-    oAttr.a = 1.0;
+    oAttr.a = 0.0;
     gl_FragDepth = float(z) / 16777216.0;
 }
 )";
@@ -327,27 +328,31 @@ void main()
 )";
 
 // the frame's depth for the frontend's depth of field (GLRenderer::ResolveDepth), into an RGBA8
-// target: the window depth's 24 bits in RGB, high byte in R, and in A the flags, of which only 4 (a
-// W-buffered frame) is set here (see kCompositorDepthFS for the others)
+// target: the window depth's 24 bits in RGB, high byte in R, and in A the flags, of which these are
+// set here (see kCompositorDepthFS for the others): 4 for a W-buffered frame, 8 for a pixel whose
+// depth a polygon under another camera than the frame's wrote (attr A, GLRenderer::TagCamera)
 const char* kDepthResolveFS = kShaderHeader R"(
 
 precision highp float;
 precision highp int;
 
 uniform highp sampler2D DepthBuffer;
+uniform sampler2D AttrBuffer;
 uniform int uWBuffer;
 
 layout(location = 0) out vec4 oColor;
 
 void main()
 {
-    float depth = texelFetch(DepthBuffer, ivec2(gl_FragCoord.xy), 0).r;
+    ivec2 coord = ivec2(gl_FragCoord.xy);
+    float depth = texelFetch(DepthBuffer, coord, 0).r;
     // the DS's 24-bit depth z: the render shaders write z / 2^24, which the depth buffer stores as
     // round(z * (2^24 - 1) / 2^24), one below z from 2^23 up. sampled as that over 2^24 - 1 and rounded
     // to fp32, times 2^24 (exact) is z again, or z + 0.5 below 2^23, which int() drops
     int value = min(int(depth * 16777216.0), 0xFFFFFF);
+    int flags = (uWBuffer != 0 ? 4 : 0) | (texelFetch(AttrBuffer, coord, 0).a > 0.5 ? 8 : 0);
     oColor = vec4(float((value >> 16) & 255), float((value >> 8) & 255), float(value & 255),
-                  uWBuffer != 0 ? 4.0 : 0.0) / 255.0;
+                  float(flags)) / 255.0;
 }
 )";
 
@@ -1145,6 +1150,13 @@ float EdgeAttrG()
 #define EDGE_ATTR_G 0.0
 #endif
 
+// attr A: 1 for a polygon built under another camera than the scene's (GLRenderer::VtxAttr_OtherCamera, bit 30 of the
+// attribute word), which the depth resolve turns into a flag (kDepthResolveFS). written where the polygon writes depth
+float OtherCameraTag()
+{
+    return float((fPolygonAttr.x >> 30) & 1);
+}
+
 #ifdef NoDiscard
 // GPU::GLNoDiscard (R1 step 1, GLRenderer::BuildRenderShader's nodiscard build, Z-buffer only): the
 // opaque pass of polygons whose fragments always come out at alpha 31, so it's the opaque branch
@@ -1157,7 +1169,7 @@ void main()
     oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
     oAttr.g = EDGE_ATTR_G;
     oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-    oAttr.a = 1.0;
+    oAttr.a = OtherCameraTag();
 
     oColor = col;
 }
@@ -1181,7 +1193,7 @@ void main()
             oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
             oAttr.g = EDGE_ATTR_G;
             oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-            oAttr.a = 1.0;
+            oAttr.a = OtherCameraTag();
         }
         else
         {
@@ -1190,7 +1202,7 @@ void main()
             if (col.a >= 30.5/31.0) discard;
 
             oAttr.b = 0.0;
-            oAttr.a = 1.0;
+            oAttr.a = OtherCameraTag();
 
 #ifdef FramebufferFetch
             // the blend GLRenderer's fixed-function state does (GL_FUNC_ADD with SRC_ALPHA,

@@ -1212,6 +1212,7 @@ void HalfCamera::ResetShadow()
     shadow.WingNumPolygons = 0;
     shadow.WingNumVertices = 0;
     shadow.WideListOverflow = false;
+    shadow.ResetSceneCameras();
 }
 
 bool HalfCamera::Replay(const SceneInfo& current, const SceneInfo& previous)
@@ -1312,6 +1313,7 @@ bool HalfCamera::ShowReplayedScene()
 
     RealList = Main.RenderPolygonRAM;
     RealNumPolygons = Main.RenderNumPolygons;
+    Main.RealRenderCamera = Main.RenderCamera;
 
     // the same steps as GPU3D::VBlank: translucent polygons after the opaque ones, then Y-sorting
     auto& list = Main.RenderPolygonRAM;
@@ -1328,6 +1330,8 @@ bool HalfCamera::ShowReplayedScene()
         [](const Polygon* a, const Polygon* b) { return a->SortKey < b->SortKey; });
 
     Main.RenderNumPolygons = shadow.NumPolygons;
+    // its polygons' Camera are the shadow's
+    Main.RenderCamera = shadow.PickSceneCamera();
 
     // GPU::ComputeOpt bit 5: when this swap's scene was copied (GPU3D::VBlank just did, or the
     // copy isn't valid), the in-between scene is compared with it. the same list by value draws
@@ -1340,6 +1344,7 @@ bool HalfCamera::ShowReplayedScene()
         Main.MidScenesSame++;
         Main.RenderPolygonRAM = RealList;
         Main.RenderNumPolygons = RealNumPolygons;
+        Main.RenderCamera = Main.RealRenderCamera;
         return false;
     }
 
@@ -1353,9 +1358,12 @@ bool HalfCamera::ShowReplayedScene()
 void HalfCamera::RestoreRealScene()
 {
     Main.RenderPolygonRAM = RealList;
-    // unless something else set the count since (SetEnabled turning rendering off clears it)
+    // unless something else set the count since (SetEnabled turning rendering off clears it, and the camera)
     if (Main.RenderNumPolygons == MidNumPolygons)
+    {
         Main.RenderNumPolygons = RealNumPolygons;
+        Main.RenderCamera = Main.RealRenderCamera;
+    }
     IsMidActive = false;
 }
 

@@ -19,6 +19,8 @@
 #pragma once
 
 #include "OpenGLSupport.h"
+// DepthCamera, which the depth pass keeps with each buffer
+#include "GPU3D.h"
 
 #include <array>
 #include <optional>
@@ -192,8 +194,9 @@ private:
         std::array<u32, Comp1xOff_Count> LogOff {};
         u32 LogFiltered = 0;                // of those, frames whose halves were filtered, at the map's scale
         u32 Checks = 0, CheckPixels = 0, Mismatches = 0, MismatchNative = 0;
-        // whether the buffer's depth texture got this draw's depth (OutputLayout::HasDepth)
+        // whether the buffer's depth texture got this draw's depth (OutputLayout::HasDepth), and the camera it was drawn with
         std::array<bool, 2> HasDepth {};
+        std::array<DepthCamera, 2> Camera {};
     };
     Comp1xState OneX {};
 

@@ -94,6 +94,10 @@ struct Polygon
 
     u32 SortKey;
 
+    // which of its scene's cameras it was built under (GPU3D::SceneCameras), GPU3D::NoSceneCamera when the table was full or the
+    // polygon came from a savestate, which doesn't hold it
+    u8 Camera;
+
     void DoSavestate(Savestate* file) noexcept;
 };
 
@@ -187,31 +191,43 @@ public:
     void SetVertexIdLogging(int mode) noexcept;
     [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
 
-    // debug only: per 3D scene, the projection matrices and viewports its polygons were built under, for
-    // working out a game's camera (the desktop's --camera-dump). costs a null check per polygon while off
-    struct CameraUse
+    // a scene's cameras: each projection and viewport its polygons were built under, with how many of them, counted as they're built
+    // (SubmitPolygon) so the camera a frontend's effects get with the depth is the one most of the scene used, whatever is current at
+    // the swap. a polygon's Camera is its index here
+    static constexpr u32 MaxSceneCameras = 16;
+    static constexpr u8 NoSceneCamera = 0xFF;
+    struct CameraCount
     {
         s32 Proj[16];
         u32 Viewport[6];
-        u32 Hash;
         u32 Polygons;
-        // the screen box its polygons cover, in DS pixels
-        s32 XMin, YMin, XMax, YMax;
     };
+    // the camera picked for a scene at the swap (PickSceneCamera): the one with the most polygons, raw as the DS has it
+    struct SceneCamera
+    {
+        s32 Proj[16] {};
+        u32 Viewport[6] {};
+        // its index in the scene's cameras (Polygon::Camera), NoSceneCamera for a scene with none
+        u8 Index = NoSceneCamera;
+        // whether positions can be rebuilt from the depth with it: the scene is Z-buffered, the projection is a perspective one, at
+        // least half the scene's polygons use it, and every polygon was counted (not after a savestate load mid-scene)
+        bool Valid = false;
+    };
+    // the render list's (RenderPolygonRAM), picked when the list was latched, or HalfCamera's in-between scene's while that's shown.
+    // cleared with the rendering state
+    SceneCamera RenderCamera {};
+
+    // debug only: each scene's cameras as they were counted, for the desktop's --camera-dump. costs a null check per swap while off
     struct CameraLog
     {
-        static constexpr u32 MaxUses = 16;
-        // the scene being built, and the last one swapped in, which the renderer draws next
-        std::array<CameraUse, MaxUses> Building {}, Last {};
-        u32 BuildingCount = 0, LastCount = 0;
-        // polygons whose camera didn't fit in MaxUses
-        u32 BuildingOther = 0, LastOther = 0;
-        // swaps since the logging went on, so a reader can tell a new Last
+        std::array<CameraCount, MaxSceneCameras> Cameras {};
+        u32 NumCameras = 0;
+        // polygons built while the table was full, and the scene's polygons
+        u32 Other = 0, Polygons = 0;
+        // what the swap picked from them (RenderCamera then)
+        SceneCamera Pick {};
+        // swaps latched since the logging went on, so a reader can tell a new scene
         u32 Swaps = 0;
-
-        void Note(const s32* proj, const u32* viewport, const Vertex* vertices, int count) noexcept;
-        void OnSwap() noexcept;
-        void Invalidate() noexcept { BuildingCount = 0; BuildingOther = 0; }
     };
     // set before the game runs
     void SetCameraLogging(bool enable) noexcept { CameraLogData = enable ? std::make_unique<CameraLog>() : nullptr; }
@@ -381,6 +397,20 @@ private:
     // the SCENESTATS line (GPU::SceneStats), at each line 215 and once a second
     SceneStatsCounters SceneStatsSec {};
     void NoteSceneStats(const GPU& gpu) noexcept;
+
+    // the scene being built's cameras (see CameraCount), not serialized: a state load starts them again, and the pick at its swap then
+    // sees polygons it didn't count. CurSceneCamera is the one the next polygon gets, looked up again once SceneCameraDirty says the
+    // projection or the viewport may have changed (UpdateClipMatrix, VIEWPORT). OtherCameraPolygons were built with the table full
+    std::array<CameraCount, MaxSceneCameras> SceneCameras {};
+    u32 NumSceneCameras = 0;
+    u32 OtherCameraPolygons = 0;
+    u8 CurSceneCamera = NoSceneCamera;
+    bool SceneCameraDirty = true;
+    void NoteSceneCamera() noexcept;
+    void ResetSceneCameras() noexcept;
+    [[nodiscard]] SceneCamera PickSceneCamera() const noexcept;
+    // HalfCamera's: the real scene's RenderCamera while the in-between scene's own is there (it keeps the real list the same way)
+    SceneCamera RealRenderCamera {};
 
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;
@@ -573,6 +603,24 @@ public:
     u32 ScrolledLine[256]; // not part of the hardware state, don't serialize
 };
 
+// the camera the top screen's depth (Renderer3D::SetOutputDepthTexture) was drawn with, for a frontend that rebuilds view-space
+// positions from it. a pixel at (x, y) in DS pixels from the native top screen's top-left corner, rows going down (a pixel's center is
+// at +0.5; the wings and the margin rows are outside 0..256 and 0..192) with a Z-buffered 24-bit depth d is at NDC
+// x = (x - Viewport[0]) * 2 / Viewport[2] - 1, y = 1 - (y - Viewport[1]) * 2 / Viewport[3], z = (d - 0x7FFE00) / 2^23, and its
+// view-space position is inverse(Proj) times (x, y, z, 1), divided by its w. a game that puts its camera in the projection gets
+// world space instead
+struct DepthCamera
+{
+    // the projection most of the scene's polygons were built under, as real numbers in the DS's order, which is OpenGL's column-major
+    // one: GLSL's mat4 of these 16 floats times (view x, y, z, 1) is the clip position, as the DS's row vector times its matrix is
+    std::array<float, 16> Proj {};
+    // its viewport: left, top, width and height in DS pixels
+    std::array<float, 4> Viewport {};
+    // false when the scene is W-buffered, the projection is orthographic, it covers under half the scene's polygons, or the frame
+    // has no depth. Proj and Viewport still hold the scene's pick then, for logs (0 for a scene without polygons)
+    bool Valid = false;
+};
+
 // GPU::Comp1x (experiment K2c): what the compositor drew into an output texture. HalvesAt1x bit h
 // (0 the top screen, 1 the bottom one) is a half drawn at 1x: its image is the first ViewWidth x 192
 // texels from the half's first row (h * 194 * Scale, the rows the full draw starts it at), and the
@@ -597,8 +645,9 @@ struct OutputLayout
     // (y + TopMargin) * Scale. 0 is the old 386-row layout
     int TopMargin = 0;
     // whether the depth texture given with Renderer3D::SetOutputDepthTexture holds this draw's
-    // top-half depth (see GLCompositor::RenderDepth)
+    // top-half depth (see GLCompositor::RenderDepth), and the camera it was drawn with
     bool HasDepth = false;
+    DepthCamera Camera {};
 };
 
 class Renderer3D
@@ -655,8 +704,8 @@ public:
     // OpenGL renderer has one, the others never set OutputLayout::HasDepth
     virtual void SetOutputDepthTexture(int buffer, u32 texture) {}
     // for the compositor's depth pass: binds the 3D depth of the frame SetupAccelFrame binds to the
-    // active texture unit, and returns false when there's none to bind
-    virtual bool SetupAccelDepth() { return false; }
+    // active texture unit, with the camera it was drawn with in [camera], and returns false when there's none to bind
+    virtual bool SetupAccelDepth(DepthCamera& camera) { return false; }
     // GPU::Comp1x (experiment K2c): how the compositor last drew into output buffer [buffer]. true,
     // with [layout], the first time it's asked after a draw into the buffer, false when nothing drew
     // into it since then (or since SetOutputTexture gave it a texture), so the texture still holds
