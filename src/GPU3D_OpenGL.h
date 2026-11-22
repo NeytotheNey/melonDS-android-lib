@@ -99,6 +99,7 @@ public:
     void BindOutputTexture(int buffer) override;
     void SetOutputDepthTexture(int buffer, u32 texture) override;
     bool SetupAccelDepth(DepthCamera& camera) override;
+    void SetSunShadows(const SunShadows& sun) override { Sun = sun; }
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
     void SavestateLoaded() override;
 
@@ -178,6 +179,15 @@ private:
     void FreeDepthOut() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
+    struct SunFrame;
+    struct SunClipVertex;
+    bool PrepareSunFrame(const GPU3D& gpu3d, SunFrame& frame) const;
+    static int ClipSunShadow(const SunFrame& frame, const SunClipVertex* in, int n, SunClipVertex* out);
+    static int SunShadowPolygon(const SunFrame& frame, const GPU& gpu, const Polygon* poly, const std::array<double, 16>& inverse,
+                                SunClipVertex* out);
+    u32* SetupSunVertices(const SunFrame& frame, const RendererPolygon* rp, const SunClipVertex* shadow, int n, u32* vptr) const;
+    void BuildSunShadows(const GPU& gpu, int npolys);
+    void DrawSunShadows();
     static bool GrowsSeams(const Polygon* poly);
     void BuildSkirt(RendererPolygon* rp, u32 rim, u32& vidx, u32& sidx);
     int RenderSkirtBatch(int i) const;
@@ -551,6 +561,30 @@ private:
     // NoSceneCamera tags none. the bit is one of the vertex attribute word's that kRenderVS and kRenderFS read nothing else from
     u8 TagCamera = GPU3D::NoSceneCamera;
     static constexpr u32 VtxAttr_OtherCamera = 1u << 30;
+    // the frontend's sun shadows (SetSunShadows), and what the last frame drawn had of them, so a change draws a frame RenderFrame
+    // would skip as identical again
+    SunShadows Sun {};
+    SunShadows SunDrawn {};
+    // per frame, while depth is wanted, the camera is valid (TagCamera) and Sun is on: the sun shadows of the polygons TagCamera tags
+    // that write depth, which BuildSunShadows puts after BuildPolygons' vertices and indices and DrawSunShadows draws after the scene,
+    // into attr A only (kRenderFS's DepthTag, from VtxAttr_SunShadow, one of the attribute word's bits the render shaders read
+    // nothing else from). each is drawn in the passes its polygon writes depth in: opaque for opaque and need-opaque polygons,
+    // translucent for translucent ones with depth write (attr bit 11). Full is PolyFull's program
+    struct SunShadow
+    {
+        u32 IndicesOffset;
+        u32 NumIndices;
+        bool Full;
+        bool Opaque;
+        bool Trans;
+    };
+    SunShadow SunShadowList[PolygonRAMSize] {};
+    int NumSunShadows = 0;
+    static constexpr u32 VtxAttr_SunShadow = 1u << 13;
+    // how much nearer than the scene a shadow is tested, in 24-bit depth (uDepthBias): three of the DS's 0x200 steps, as a floor's
+    // depth can round up to one step nearer than the shadow's own and the feet can sit a little off it, while a character drawn
+    // under its own projection (Pokemon White's) is several steps nearer than its true place, so it still hides its own shadow
+    static constexpr float SunShadowDepthBias = 3.0f * 512.0f;
     // DepthResolveFB's attachment, which follows DepthOutTex as it swaps, and whether it was complete
     GLuint DepthResolveFB {}, DepthResolveAttached {};
     bool DepthResolveComplete = false;

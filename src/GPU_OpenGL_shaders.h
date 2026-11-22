@@ -3463,9 +3463,9 @@ void main()
 // depth (GLRenderer::ResolveDepth, at least 1) where 3D shows on top, 0xFFFFFF where its 3D is
 // transparent and what's behind it shows, and 0 where there's nothing to blur: 2D on top (compmode 1
 // blends 2D over the 3D, 5-7 have none), another display mode, or a hi-res captured line. A holds
-// flags: 1 for those 0 pixels, 2 for the transparent ones, 4 where the 3D read is W-buffered, and 8
-// where a polygon under another camera than the frame's (DepthCamera) drew the 3D that shows. 16 and
-// up are kept for later
+// flags: 1 for those 0 pixels, 2 for the transparent ones, 4 where the 3D read is W-buffered, 8
+// where a polygon under another camera than the frame's (DepthCamera) drew the 3D that shows, and 16
+// where such a polygon's sun shadow falls on it (SunShadows). 32 and up are kept for later
 const char* kCompositorDepthFS = R"(#version 320 es
 
 precision highp float;
@@ -3494,6 +3494,7 @@ const int FLAG_2D = 1;
 const int FLAG_BEHIND_3D = 2;
 const int FLAG_WBUFFER = 4;
 const int FLAG_OTHER_CAMERA = 8;
+const int FLAG_SUN_SHADOW = 16;
 
 // (depth, flags)
 vec4 EncodeDepth(ivec2 value)
@@ -3518,7 +3519,7 @@ ivec2 Depth3D(float xpos, float row)
     int wbuffer = bytes.a & FLAG_WBUFFER;
     if (texelFetch(_3DTex, coord, 0).a == 0.0)
         return ivec2(BEHIND_3D, FLAG_BEHIND_3D | wbuffer);
-    return ivec2(max((bytes.r << 16) | (bytes.g << 8) | bytes.b, 1), bytes.a & (FLAG_WBUFFER | FLAG_OTHER_CAMERA));
+    return ivec2(max((bytes.r << 16) | (bytes.g << 8) | bytes.b, 1), bytes.a & (FLAG_WBUFFER | FLAG_OTHER_CAMERA | FLAG_SUN_SHADOW));
 }
 
 void main()

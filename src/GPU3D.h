@@ -216,6 +216,14 @@ public:
     // the render list's (RenderPolygonRAM), picked when the list was latched, or HalfCamera's in-between scene's while that's shown.
     // cleared with the rendering state
     SceneCamera RenderCamera {};
+    // a scene's cameras as they were counted, so a renderer can look up a polygon's own projection by its Camera (the OpenGL
+    // renderer's sun shadows). RenderCameras is the render list's, latched, replaced and cleared with RenderCamera
+    struct CameraTable
+    {
+        std::array<CameraCount, MaxSceneCameras> Cameras {};
+        u32 Count = 0;
+    };
+    CameraTable RenderCameras {};
 
     // debug only: each scene's cameras as they were counted, for the desktop's --camera-dump. costs a null check per swap while off
     struct CameraLog
@@ -409,8 +417,11 @@ private:
     void NoteSceneCamera() noexcept;
     void ResetSceneCameras() noexcept;
     [[nodiscard]] SceneCamera PickSceneCamera() const noexcept;
-    // HalfCamera's: the real scene's RenderCamera while the in-between scene's own is there (it keeps the real list the same way)
+    [[nodiscard]] CameraTable SceneCameraTable() const noexcept;
+    // HalfCamera's: the real scene's RenderCamera and RenderCameras while the in-between scene's own are there (it keeps the real
+    // list the same way)
     SceneCamera RealRenderCamera {};
+    CameraTable RealRenderCameras {};
 
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;
@@ -621,6 +632,23 @@ struct DepthCamera
     bool Valid = false;
 };
 
+// a frontend's sun shadows (Renderer3D::SetSunShadows), for the characters' own: while On, the frontend wants the depth and the scene's
+// camera is valid, the OpenGL renderer draws each polygon under another camera that writes depth (the depth's flag 8) a second time,
+// stood upright about its bottom edge and flattened onto the ground away from the sun, and sets flag 16 where it lands. Direction
+// (towards the sun) and Up (the world's up) are unit vectors in the view space of DepthCamera's projection
+struct SunShadows
+{
+    bool On = false;
+    std::array<float, 3> Direction {};
+    std::array<float, 3> Up {};
+
+    bool operator==(const SunShadows& other) const noexcept
+    {
+        return On == other.On && Direction == other.Direction && Up == other.Up;
+    }
+    bool operator!=(const SunShadows& other) const noexcept { return !(*this == other); }
+};
+
 // GPU::Comp1x (experiment K2c): what the compositor drew into an output texture. HalvesAt1x bit h
 // (0 the top screen, 1 the bottom one) is a half drawn at 1x: its image is the first ViewWidth x 192
 // texels from the half's first row (h * 194 * Scale, the rows the full draw starts it at), and the
@@ -706,6 +734,8 @@ public:
     // for the compositor's depth pass: binds the 3D depth of the frame SetupAccelFrame binds to the
     // active texture unit, with the camera it was drawn with in [camera], and returns false when there's none to bind
     virtual bool SetupAccelDepth(DepthCamera& camera) { return false; }
+    // the frontend's sun shadows (see SunShadows), given before each frame like the depth texture. only the OpenGL renderer draws them
+    virtual void SetSunShadows(const SunShadows& sun) {}
     // GPU::Comp1x (experiment K2c): how the compositor last drew into output buffer [buffer]. true,
     // with [layout], the first time it's asked after a draw into the buffer, false when nothing drew
     // into it since then (or since SetOutputTexture gave it a texture), so the texture still holds

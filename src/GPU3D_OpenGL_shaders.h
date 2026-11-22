@@ -53,7 +53,7 @@ void main()
     oAttr.r = float(uOpaquePolyID) / 63.0;
     oAttr.g = 0.0;
     oAttr.b = float(uFogFlag);
-    // no other-camera tag (kRenderFS's OtherCameraTag)
+    // no other-camera tag (kRenderFS's DepthTag)
     oAttr.a = 0.0;
 }
 )";
@@ -330,7 +330,8 @@ void main()
 // the frame's depth for the frontend's depth of field (GLRenderer::ResolveDepth), into an RGBA8
 // target: the window depth's 24 bits in RGB, high byte in R, and in A the flags, of which these are
 // set here (see kCompositorDepthFS for the others): 4 for a W-buffered frame, 8 for a pixel whose
-// depth a polygon under another camera than the frame's wrote (attr A, GLRenderer::TagCamera)
+// depth a polygon under another camera than the frame's wrote (attr A 1, GLRenderer::TagCamera),
+// and 16 for one in such a polygon's sun shadow (attr A 0.5, GLRenderer::DrawSunShadows)
 const char* kDepthResolveFS = kShaderHeader R"(
 
 precision highp float;
@@ -350,7 +351,8 @@ void main()
     // round(z * (2^24 - 1) / 2^24), one below z from 2^23 up. sampled as that over 2^24 - 1 and rounded
     // to fp32, times 2^24 (exact) is z again, or z + 0.5 below 2^23, which int() drops
     int value = min(int(depth * 16777216.0), 0xFFFFFF);
-    int flags = (uWBuffer != 0 ? 4 : 0) | (texelFetch(AttrBuffer, coord, 0).a > 0.5 ? 8 : 0);
+    float tag = texelFetch(AttrBuffer, coord, 0).a;
+    int flags = (uWBuffer != 0 ? 4 : 0) | (tag > 0.75 ? 8 : (tag > 0.25 ? 16 : 0));
     oColor = vec4(float((value >> 16) & 255), float((value >> 8) & 255), float(value & 255),
                   float(flags)) / 255.0;
 }
@@ -1150,10 +1152,12 @@ float EdgeAttrG()
 #define EDGE_ATTR_G 0.0
 #endif
 
-// attr A: 1 for a polygon built under another camera than the scene's (GLRenderer::VtxAttr_OtherCamera, bit 30 of the
-// attribute word), which the depth resolve turns into a flag (kDepthResolveFS). written where the polygon writes depth
-float OtherCameraTag()
+// attr A, which the depth resolve turns into a flag (kDepthResolveFS): 1 for a polygon built under another camera than the
+// scene's (GLRenderer::VtxAttr_OtherCamera, bit 30 of the attribute word), and 0.5 for a sun shadow GLRenderer::DrawSunShadows
+// draws (VtxAttr_SunShadow, bit 13), which keeps the larger of the two. written where the polygon writes depth
+float DepthTag()
 {
+    if ((fPolygonAttr.x & 0x2000) != 0) return 0.5;
     return float((fPolygonAttr.x >> 30) & 1);
 }
 
@@ -1169,7 +1173,7 @@ void main()
     oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
     oAttr.g = EDGE_ATTR_G;
     oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-    oAttr.a = OtherCameraTag();
+    oAttr.a = DepthTag();
 
     oColor = col;
 }
@@ -1193,7 +1197,7 @@ void main()
             oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
             oAttr.g = EDGE_ATTR_G;
             oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-            oAttr.a = OtherCameraTag();
+            oAttr.a = DepthTag();
         }
         else
         {
@@ -1202,7 +1206,7 @@ void main()
             if (col.a >= 30.5/31.0) discard;
 
             oAttr.b = 0.0;
-            oAttr.a = OtherCameraTag();
+            oAttr.a = DepthTag();
 
 #ifdef FramebufferFetch
             // the blend GLRenderer's fixed-function state does (GL_FUNC_ADD with SRC_ALPHA,

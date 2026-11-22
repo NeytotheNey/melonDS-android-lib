@@ -1776,6 +1776,560 @@ void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys
     NumIndices = iidx;
 }
 
+// the sun shadows' math (BuildSunShadows), in doubles. a matrix is in the DS's order: a row vector v times it is the sum over i
+// of v[i] * m[i * 4 + j], as GPU3D::SubmitVertex multiplies
+namespace
+{
+using SunMatrix = std::array<double, 16>;
+using SunVector = std::array<double, 4>;
+
+struct SunPoint
+{
+    double x, y, z;
+};
+
+SunPoint operator+(SunPoint a, SunPoint b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+SunPoint operator-(SunPoint a, SunPoint b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+SunPoint operator*(SunPoint a, double k) { return {a.x * k, a.y * k, a.z * k}; }
+double Dot(SunPoint a, SunPoint b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+double Length(SunPoint a) { return std::sqrt(Dot(a, a)); }
+
+// [v] scaled to unit length into [out], false when it's too short or not finite
+bool Normalize(const std::array<float, 3>& v, std::array<double, 3>& out)
+{
+    SunPoint p = {v[0], v[1], v[2]};
+    double length = Length(p);
+    if (!(length > 1e-6) || !std::isfinite(length))
+        return false;
+    out = {p.x / length, p.y / length, p.z / length};
+    return true;
+}
+
+SunVector Transform(const SunVector& v, const SunMatrix& m)
+{
+    SunVector out;
+    for (int j = 0; j < 4; j++)
+        out[j] = v[0] * m[j] + v[1] * m[4 + j] + v[2] * m[8 + j] + v[3] * m[12 + j];
+    return out;
+}
+
+// [m]'s inverse by cofactors (the same in either order, as transposing commutes with inverting), false when it has none
+bool Invert(const SunMatrix& m, SunMatrix& inv)
+{
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (!(std::abs(det) > 1e-12) || !std::isfinite(det))
+        return false;
+    for (double& v : inv)
+        v /= det;
+    return true;
+}
+
+SunMatrix ToSunMatrix(const s32* proj)
+{
+    SunMatrix m;
+    for (int i = 0; i < 16; i++)
+        m[i] = proj[i] / 4096.0;
+    return m;
+}
+
+// a polygon's 10 vertices, and one more for each of the 5 planes ClipSunShadow cuts it with
+constexpr int MaxSunClipVertices = 16;
+// the nearest clip w a shadow keeps, in view-space units, which keeps the divisions off 0
+constexpr double SunNearW = 0.25;
+}
+
+// a shadow vertex on its way: the scene camera's clip position (before WideMelon's squeeze) and the texture coordinates
+struct GLRenderer::SunClipVertex
+{
+    std::array<double, 4> Clip;
+    double S, T;
+};
+
+// what BuildSunShadows works from for a frame: the scene camera's projection and viewport, the target's extent in its NDC, the sun,
+// and each of the scene's cameras' inverse, made as it's first needed
+struct GLRenderer::SunFrame
+{
+    std::array<double, 16> Proj;
+    // left, top, width and height in DS pixels (GPU3D's Viewport 0, 3, 4 and 5), and the raw one
+    double Viewport[4];
+    const u32* RawViewport;
+    // x from and to, y from and to
+    double Bounds[4];
+    // what undoes WideMelon's squeeze of the polygons' clip x and y (GPU3D::SubmitVertex), and the frame's wings in DS pixels
+    double ViewScaleX, ViewScaleY, Wing;
+    std::array<double, 3> Direction, Up;
+    std::array<std::array<double, 16>, GPU3D::MaxSceneCameras> Inverse;
+    std::array<bool, GPU3D::MaxSceneCameras> Tried {}, Usable {};
+
+    // camera [index]'s projection inverted, nullptr when it isn't a perspective one with the scene camera's viewport, so its view
+    // space isn't known to be the scene camera's
+    const std::array<double, 16>* InverseOf(const GPU3D& gpu3d, u8 index)
+    {
+        if (index >= gpu3d.RenderCameras.Count)
+            return nullptr;
+        if (!Tried[index])
+        {
+            Tried[index] = true;
+            const GPU3D::CameraCount& camera = gpu3d.RenderCameras.Cameras[index];
+            const bool perspective = camera.Proj[3] != 0 || camera.Proj[7] != 0 || camera.Proj[11] != 0;
+            Usable[index] = perspective && !memcmp(camera.Viewport, RawViewport, sizeof(camera.Viewport))
+                && Invert(ToSunMatrix(camera.Proj), Inverse[index]);
+        }
+        return Usable[index] ? &Inverse[index] : nullptr;
+    }
+};
+
+// false when the frame draws no sun shadows: they're off, there's no valid camera to tag by (TagCamera, so no depth wanted either),
+// the frontend gets no depth, or the sun's vectors or the viewport make no sense
+bool GLRenderer::PrepareSunFrame(const GPU3D& gpu3d, SunFrame& frame) const
+{
+    if (!Sun.On || TagCamera == GPU3D::NoSceneCamera || DepthResolveFailed)
+        return false;
+    if (!Normalize(Sun.Direction, frame.Direction) || !Normalize(Sun.Up, frame.Up))
+        return false;
+    const GPU3D::SceneCamera& camera = gpu3d.RenderCamera;
+    const double x0 = camera.Viewport[0], y0 = camera.Viewport[3], width = camera.Viewport[4], height = camera.Viewport[5];
+    if (width <= 0.0 || height <= 0.0)
+        return false;
+    frame.Proj = ToSunMatrix(camera.Proj);
+    frame.Viewport[0] = x0;
+    frame.Viewport[1] = y0;
+    frame.Viewport[2] = width;
+    frame.Viewport[3] = height;
+    frame.RawViewport = camera.Viewport;
+    // the target in DS pixels, its wings and margin rows outside 0..256 and 0..192
+    const double wing = (TargetWidth - WideMelon::NativeWidth) * 0.5;
+    frame.Bounds[0] = (-wing - x0) * 2.0 / width - 1.0;
+    frame.Bounds[1] = (WideMelon::NativeWidth + wing - x0) * 2.0 / width - 1.0;
+    frame.Bounds[2] = 1.0 - (WideMelon::NativeHeight + TargetMargin - y0) * 2.0 / height;
+    frame.Bounds[3] = 1.0 - (-TargetMargin - y0) * 2.0 / height;
+    frame.ViewScaleX = gpu3d.RenderViewWidth / (double)WideMelon::NativeWidth;
+    frame.ViewScaleY = (WideMelon::NativeHeight + 2 * gpu3d.RenderViewMargin) / (double)WideMelon::NativeHeight;
+    frame.Wing = (gpu3d.RenderViewWidth - WideMelon::NativeWidth) * 0.5;
+    return true;
+}
+
+// Sutherland-Hodgman against a near plane and the target's sides, in clip space, where the texture coordinates go linearly
+int GLRenderer::ClipSunShadow(const SunFrame& frame, const SunClipVertex* in, int n, SunClipVertex* out)
+{
+    const double* bounds = frame.Bounds;
+    // a plane's value at a clip position, inside from 0 up
+    auto side = [bounds](int plane, const std::array<double, 4>& c)
+    {
+        switch (plane)
+        {
+        case 0: return c[3] - SunNearW;
+        case 1: return c[0] - bounds[0] * c[3];
+        case 2: return bounds[1] * c[3] - c[0];
+        case 3: return c[1] - bounds[2] * c[3];
+        default: return bounds[3] * c[3] - c[1];
+        }
+    };
+    auto lerp = [](const SunClipVertex& a, const SunClipVertex& b, double t)
+    {
+        SunClipVertex v;
+        for (int i = 0; i < 4; i++)
+            v.Clip[i] = a.Clip[i] + (b.Clip[i] - a.Clip[i]) * t;
+        v.S = a.S + (b.S - a.S) * t;
+        v.T = a.T + (b.T - a.T) * t;
+        return v;
+    };
+    SunClipVertex work[2][MaxSunClipVertices];
+    std::copy_n(in, n, work[0]);
+    int cur = 0;
+    for (int plane = 0; plane < 5 && n > 0; plane++)
+    {
+        const SunClipVertex* src = work[cur];
+        SunClipVertex* dst = work[cur ^ 1];
+        int kept = 0;
+        for (int i = 0; i < n; i++)
+        {
+            const SunClipVertex& p = src[(i + n - 1) % n];
+            const SunClipVertex& q = src[i];
+            const double fp = side(plane, p.Clip), fq = side(plane, q.Clip);
+            if ((fp >= 0.0) != (fq >= 0.0) && kept < MaxSunClipVertices)
+                dst[kept++] = lerp(p, q, fp / (fp - fq));
+            if (fq >= 0.0 && kept < MaxSunClipVertices)
+                dst[kept++] = q;
+        }
+        n = kept;
+        cur ^= 1;
+    }
+    std::copy_n(work[cur], n, out);
+    return n;
+}
+
+// whether the texel at [s], [t] (whole texels) of the texture [texparam] describes comes out with an alpha above 0, its coordinates
+// wrapped, mirrored or clamped as the DS does them (SoftRenderer::TextureLookup's alpha)
+static bool SunTexelShows(const GPU& gpu, u32 texparam, s32 s, s32 t)
+{
+    const s32 width = 8 << ((texparam >> 20) & 0x7), height = 8 << ((texparam >> 23) & 0x7);
+    auto wrap = [](s32 c, s32 size, bool repeat, bool flip)
+    {
+        if (!repeat)
+            return std::clamp(c, 0, size - 1);
+        if (flip && (c & size))
+            return (size - 1) - (c & (size - 1));
+        return c & (size - 1);
+    };
+    s = wrap(s, width, texparam & (1 << 16), texparam & (1 << 18));
+    t = wrap(t, height, texparam & (1 << 17), texparam & (1 << 19));
+    const u32 base = (texparam & 0xFFFF) << 3;
+    const u32 texel = (u32)(t * width + s);
+    // palette index 0 is transparent with bit 29
+    const bool color0 = !(texparam & (1 << 29));
+    switch ((texparam >> 26) & 0x7)
+    {
+    case 1: return (gpu.ReadVRAMFlat_Texture<u8>(base + texel) >> 5) != 0;
+    case 2: return color0 || ((gpu.ReadVRAMFlat_Texture<u8>(base + (texel >> 2)) >> ((s & 0x3) << 1)) & 0x3) != 0;
+    case 3: return color0 || ((gpu.ReadVRAMFlat_Texture<u8>(base + (texel >> 1)) >> ((s & 0x1) << 2)) & 0xF) != 0;
+    case 4: return color0 || gpu.ReadVRAMFlat_Texture<u8>(base + texel) != 0;
+    case 5:
+    {
+        // 4x4 blocks: index 3 is transparent in the block modes 0 and 1, and slot 1 reads as index 0
+        const u32 addr = (base + (t & 0x3FC) * (width >> 2) + (s & 0x3FC) + (t & 0x3)) & 0x7FFFF;
+        if (addr >= 0x20000 && addr < 0x40000)
+            return true;
+        const u32 slot1 = 0x20000 + ((addr & 0x1FFFC) >> 1) + (addr >= 0x40000 ? 0x10000 : 0);
+        const u32 index = (gpu.ReadVRAMFlat_Texture<u8>(addr) >> ((s & 0x3) << 1)) & 0x3;
+        return index != 3 || (gpu.ReadVRAMFlat_Texture<u16>(slot1) >> 14) >= 2;
+    }
+    case 6: return (gpu.ReadVRAMFlat_Texture<u8>(base + texel) >> 3) != 0;
+    case 7: return (gpu.ReadVRAMFlat_Texture<u16>(base + (texel << 1)) & 0x8000) != 0;
+    default: return true;
+    }
+}
+
+// how far up from its bottom edge (vertex [a] to the next) [poly]'s lowest row of texels that show is, in its plane, from its
+// vertices' places there: [along] the edge and [height] up from it. 0 when the texture doesn't decide that (none, a decal, a
+// texture stretched past the rows scanned, or one where nothing shows)
+static double SunFeetHeight(const GPU& gpu, const Polygon* poly, const double* along, const double* height, int a, int n)
+{
+    const u32 texparam = poly->TexParam;
+    if (!(gpu.GPU3D.RenderDispCnt & 1) || ((texparam >> 26) & 0x7) == 0 || ((poly->Attr >> 4) & 0x3) == 1)
+        return 0.0;
+    // the texture coordinates (1/16 texel) as an affine function of a place in the plane: tex[a] + along * u + height * v, from the
+    // edge's two vertices and the highest one
+    const int b = (a + 1) % n;
+    int c = a;
+    for (int i = 0; i < n; i++)
+        if (height[i] > height[c])
+            c = i;
+    if (!(height[c] > 1e-6) || !(along[b] > 1e-6))
+        return 0.0;
+    const s16* t0 = poly->Vertices[a]->TexCoords;
+    const s16* tb = poly->Vertices[b]->TexCoords;
+    const s16* tc = poly->Vertices[c]->TexCoords;
+    const double us = (tb[0] - t0[0]) / along[b], ut = (tb[1] - t0[1]) / along[b];
+    const double vs = (tc[0] - t0[0] - along[c] * us) / height[c], vt = (tc[1] - t0[1] - along[c] * ut) / height[c];
+    // a texel's size up and along the plane
+    const double rowHeight = 16.0 / std::hypot(vs, vt), texelWidth = 16.0 / std::hypot(us, ut);
+    if (!std::isfinite(rowHeight) || !std::isfinite(texelWidth) || height[c] / rowHeight > 256.0)
+        return 0.0;
+    // a polygon the DS clipped (at the screen's side, say) shows only part of its sprite, maybe not the feet, so its rows are looked
+    // at across the whole texture instead
+    bool clipped = false;
+    for (int i = 0; i < n; i++)
+        clipped = clipped || poly->Vertices[i]->Clipped;
+    const double size[2] = {(double)(8 << ((texparam >> 20) & 0x7)) * 16.0, (double)(8 << ((texparam >> 23) & 0x7)) * 16.0};
+    int budget = 2 * 64 * 64;
+    for (int row = 0; (row + 0.5) * rowHeight < height[c]; row++)
+    {
+        const double h = (row + 0.5) * rowHeight;
+        // the polygon's extent along the edge at this height, or the texture's
+        double from = INFINITY, to = -INFINITY;
+        if (clipped)
+        {
+            from = -INFINITY;
+            to = INFINITY;
+            const double at[2] = {t0[0] + h * vs, t0[1] + h * vt}, slope[2] = {us, ut};
+            for (int k = 0; k < 2; k++)
+            {
+                if (std::abs(slope[k]) > 1e-9)
+                {
+                    const double x0 = -at[k] / slope[k], x1 = (size[k] - at[k]) / slope[k];
+                    from = std::max(from, std::min(x0, x1));
+                    to = std::min(to, std::max(x0, x1));
+                }
+                else if (at[k] < 0.0 || at[k] >= size[k])
+                    to = -INFINITY;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                const int j = (i + 1) % n;
+                if ((height[i] - h) * (height[j] - h) > 0.0 || height[i] == height[j])
+                    continue;
+                const double x = along[i] + (along[j] - along[i]) * (h - height[i]) / (height[j] - height[i]);
+                from = std::min(from, x);
+                to = std::max(to, x);
+            }
+        }
+        // two looks a texel across it, so none is skipped, up to a budget for the whole scan (a 64 x 64 sprite's worth)
+        const double span = to - from;
+        const int samples = span > 0.0 && span < texelWidth * 1024.0 ? std::max((int)std::ceil(span / texelWidth * 2.0), 1) : 0;
+        budget -= samples;
+        if (budget < 0)
+            return 0.0;
+        for (int k = 0; k < samples; k++)
+        {
+            const double x = from + (k + 0.5) * span / samples;
+            const double s = t0[0] + x * us + h * vs, t = t0[1] + x * ut + h * vt;
+            if (SunTexelShows(gpu, texparam, (s32)std::floor(s / 16.0), (s32)std::floor(t / 16.0)))
+                return row * rowHeight;
+        }
+    }
+    return 0.0;
+}
+
+// [poly]'s sun shadow in [out], clipped to the target, and its vertex count (under 3 for none): its vertices back in view space
+// through [inverse], its own projection's, stood upright on its feet (its bottom edge, the lowest on screen, or its texture's lowest
+// row that shows above it) by turning it about them until it holds the world's up, flattened along the sun onto the ground through
+// them, and projected with the scene's camera
+int GLRenderer::SunShadowPolygon(const SunFrame& frame, const GPU& gpu, const Polygon* poly, const std::array<double, 16>& inverse,
+                                 SunClipVertex* out)
+{
+    const int n = (int)poly->NumVertices;
+    SunPoint view[10];
+    // how far down the screen each is, -y / w
+    double down[10];
+    for (int i = 0; i < n; i++)
+    {
+        const Vertex* vtx = poly->Vertices[i];
+        if (vtx->Position[3] <= 0)
+            return 0;
+        const SunVector clip = {vtx->Position[0] * frame.ViewScaleX, vtx->Position[1] * frame.ViewScaleY, (double)vtx->Position[2],
+                                (double)vtx->Position[3]};
+        const SunVector v = Transform(clip, inverse);
+        if (!(std::abs(v[3]) > 1e-9))
+            return 0;
+        view[i] = {v[0] / v[3], v[1] / v[3], v[2] / v[3]};
+        down[i] = -clip[1] / clip[3];
+    }
+    int a = 0;
+    for (int i = 1; i < n; i++)
+        if (down[i] + down[(i + 1) % n] > down[a] + down[(a + 1) % n])
+            a = i;
+    const SunPoint base = view[a];
+    SunPoint edge = view[(a + 1) % n] - base;
+    const double edgeLength = Length(edge);
+    if (!(edgeLength > 1e-6))
+        return 0;
+    edge = edge * (1.0 / edgeLength);
+    // the polygon's own up: square to the edge in its plane, towards the vertex farthest from it, and each vertex's place in its
+    // plane, along the edge from the base and up from the edge
+    SunPoint across = {0.0, 0.0, 0.0};
+    double farthest = 0.0;
+    for (int i = 0; i < n; i++)
+    {
+        const SunPoint rel = view[i] - base;
+        const SunPoint perpendicular = rel - edge * Dot(rel, edge);
+        const double distance = Length(perpendicular);
+        if (distance > farthest)
+        {
+            farthest = distance;
+            across = perpendicular * (1.0 / distance);
+        }
+    }
+    if (!(farthest > 1e-6))
+        return 0;
+    double along[10], height[10];
+    for (int i = 0; i < n; i++)
+    {
+        along[i] = Dot(view[i] - base, edge);
+        height[i] = Dot(view[i] - base, across);
+    }
+    // it turns about its feet, the lowest row of its texture that shows, which a sprite can have transparent rows below
+    const double feet = SunFeetHeight(gpu, poly, along, height, a, n);
+    const SunPoint pivot = base + across * feet;
+    // upright: up made square to the edge, which is the ground's normal too, so the ground holds the feet
+    const SunPoint up = {frame.Up[0], frame.Up[1], frame.Up[2]};
+    SunPoint upright = up - edge * Dot(up, edge);
+    const double uprightLength = Length(upright);
+    if (!(uprightLength > 1e-3))
+        return 0;
+    upright = upright * (1.0 / uprightLength);
+    // a sun this low would throw a shadow over 20 times as long as what casts it
+    const SunPoint direction = {frame.Direction[0], frame.Direction[1], frame.Direction[2]};
+    const double rise = Dot(direction, upright);
+    if (!(rise > 0.05))
+        return 0;
+    // where the shadow of a point stood upright this high above the ground falls, per unit of height
+    const SunPoint fall = upright - direction * (1.0 / rise);
+    SunClipVertex shadow[10];
+    for (int i = 0; i < n; i++)
+    {
+        const SunPoint ground = pivot + edge * along[i] + fall * (height[i] - feet);
+        shadow[i].Clip = Transform({ground.x, ground.y, ground.z, 1.0}, frame.Proj);
+        shadow[i].S = poly->Vertices[i]->TexCoords[0];
+        shadow[i].T = poly->Vertices[i]->TexCoords[1];
+    }
+    return ClipSunShadow(frame, shadow, n, out);
+}
+
+// the vertices of a polygon's clipped sun shadow into [vptr], as SetupVertex packs a vertex, with the polygon's texture and
+// VtxAttr_SunShadow, which makes the render shaders write attr A 0.5 (kRenderFS's DepthTag)
+u32* GLRenderer::SetupSunVertices(const SunFrame& frame, const RendererPolygon* rp, const SunClipVertex* shadow, int n, u32* vptr) const
+{
+    const Polygon* poly = rp->PolyData;
+    // w only steers the perspective-correct interpolation, so it's scaled to fill the 16 bits the vertex has for it
+    double maxw = 0.0;
+    for (int i = 0; i < n; i++)
+        maxw = std::max(maxw, shadow[i].Clip[3]);
+    const u32 vtxattr = (poly->Attr & 0x1F00C8F0) | (poly->FacingView ? (1 << 8) : 0) | VtxAttr_SunShadow;
+    const Vertex* first = poly->Vertices[0];
+    const u32 color = (first->FinalColor[0] >> 1) | ((first->FinalColor[1] >> 1) << 8) | ((first->FinalColor[2] >> 1) << 16)
+                      | (((poly->Attr >> 16) & 0x1F) << 24);
+    for (int i = 0; i < n; i++)
+    {
+        const SunClipVertex& v = shadow[i];
+        const double w = v.Clip[3];
+        // DS pixels, then the hi-res position GPU3D::SubmitPolygon would give them, on a frame built for a wide view or a margin too
+        const double dsx = frame.Viewport[0] + (v.Clip[0] / w + 1.0) * 0.5 * frame.Viewport[2];
+        const double dsy = frame.Viewport[1] + (1.0 - v.Clip[1] / w) * 0.5 * frame.Viewport[3];
+        const s32 hiresx = std::max((s32)std::lround((dsx + frame.Wing) * 16.0), 0);
+        const s32 hiresy = std::max((s32)std::lround((dsy + FrameMargin) * 16.0), 0);
+        const u32 x = WideFrame ? WideVertexX(hiresx) : HiresToPos(hiresx * ScaleFactor);
+        const u32 y = WideFrameY ? WideVertexY(hiresy) : HiresToPos(hiresy * ScaleFactor);
+        const u32 depth = (u32)std::clamp(std::round(v.Clip[2] / w * 8388608.0 + 0x7FFE00), 0.0, (double)0xFFFFFF);
+        u32 z, zattr;
+        PackDepth(depth, true, z, zattr);
+        const u32 w16 = (u32)std::clamp(std::round(w / maxw * 65535.0), 1.0, 65535.0);
+        const s16 s = (s16)std::clamp(std::round(v.S), -32768.0, 32767.0);
+        const s16 t = (s16)std::clamp(std::round(v.T), -32768.0, 32767.0);
+
+        *vptr++ = std::min(x, 0xFFFFu) | (std::min(y, 0xFFFFu) << 16);
+        *vptr++ = z | (w16 << 16);
+        *vptr++ = color;
+        *vptr++ = (u16)s | ((u32)(u16)t << 16);
+        *vptr++ = vtxattr | zattr;
+        *vptr++ = rp->TexWord;
+        *vptr++ = (poly->TexParam >> 16) | (poly->TexPalette << 16);
+    }
+    return vptr;
+}
+
+// the sun shadows of the frame's polygons (SunShadow), after BuildPolygons' vertices and indices, while there's room for them
+void GLRenderer::BuildSunShadows(const GPU& gpu, int npolys)
+{
+    const GPU3D& gpu3d = gpu.GPU3D;
+    NumSunShadows = 0;
+    SunFrame frame;
+    if (!PrepareSunFrame(gpu3d, frame))
+        return;
+
+    u32* vptr = &VertexBuffer[NumVertices * 7];
+    u32 vidx = NumVertices, iidx = NumIndices;
+    for (int i = 0; i < npolys; i++)
+    {
+        const RendererPolygon* rp = &PolygonList[i];
+        const Polygon* poly = rp->PolyData;
+        // the ones TagCamera tags, where they write depth
+        if (poly->Camera == TagCamera || poly->IsShadowMask || poly->IsShadow || poly->Type == 1)
+            continue;
+        const bool opaque = !poly->Translucent || (poly->Attr & 0x001F0000) == 0x001F0000;
+        const bool trans = poly->Translucent && (poly->Attr & (1 << 11));
+        if (!opaque && !trans)
+            continue;
+        const std::array<double, 16>* inverse = frame.InverseOf(gpu3d, poly->Camera);
+        if (!inverse)
+            continue;
+        SunClipVertex shadow[MaxSunClipVertices];
+        const int n = SunShadowPolygon(frame, gpu, poly, *inverse, shadow);
+        const u32 indices = n >= 3 ? (u32)(n - 2) * 3 : 0;
+        if (!indices || vidx + n > MaxGLVertices || iidx + indices > std::size(IndexBuffer))
+            continue;
+
+        vptr = SetupSunVertices(frame, rp, shadow, n, vptr);
+        SunShadowList[NumSunShadows++] = {iidx, indices, PolyFull(rp), opaque, trans};
+        for (int j = 1; j + 1 < n; j++)
+        {
+            IndexBuffer[iidx++] = vidx;
+            IndexBuffer[iidx++] = vidx + j;
+            IndexBuffer[iidx++] = vidx + j + 1;
+        }
+        vidx += n;
+    }
+    NumVertices = vidx;
+    NumIndices = iidx;
+}
+
+// BuildSunShadows' shadows, after the scene and before the depth resolve: into attr A only, with the program and pass their polygon
+// writes depth with (not the edge-marking builds, as attr G isn't written), tested against the scene a little nearer
+// (SunShadowDepthBias), and blended to the larger of attr A's values, so an other-camera tag stays. it leaves the state
+// RenderSceneChunk's final passes leave, with the depth test on as the frame has it
+void GLRenderer::DrawSunShadows()
+{
+    glBindVertexArray(VertexArrayID);
+    glDisable(GL_STENCIL_TEST);
+    glEnable(GL_BLEND);
+    glBlendEquationSeparatei(1, GL_FUNC_ADD, GL_MAX);
+    glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    // the edge and fog passes used their own programs without telling UseRenderShader's cache
+    CurShaderID = -1;
+    CurRenderMode = -1;
+
+    for (int mode : {(int)RenderMode_Opaque, (int)RenderMode_Translucent})
+    {
+        auto drawn = [this, mode](int i)
+        {
+            return mode == RenderMode_Opaque ? SunShadowList[i].Opaque : SunShadowList[i].Trans;
+        };
+        for (int i = 0; i < NumSunShadows; )
+        {
+            if (!drawn(i)) { i++; continue; }
+            // a run of shadows with the same program, whose indices follow one another
+            const SunShadow& first = SunShadowList[i];
+            u32 count = 0;
+            for (; i < NumSunShadows && drawn(i) && SunShadowList[i].Full == first.Full; i++)
+                count += SunShadowList[i].NumIndices;
+
+            const int id = first.Full ? FullShader : 0;
+            if (!RenderShader[id])
+                continue;
+            if (CurShaderID != id)
+            {
+                glUseProgram(RenderShader[id]);
+                CurShaderID = id;
+                CurRenderMode = -1;
+            }
+            if (CurRenderMode != mode)
+            {
+                glUniform1i(RenderModeULoc[id], mode);
+                CurRenderMode = mode;
+            }
+            SetDepthBias(-SunShadowDepthBias);
+            glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(first.IndicesOffset * 2));
+        }
+    }
+
+    glBlendEquationSeparatei(1, GL_FUNC_ADD, GL_FUNC_ADD);
+    glEnable(GL_STENCIL_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+}
+
 // GPU::GLSeams bit 1: the polygons that get a skirt (BuildSkirt), the ones the opaque pass fills as
 // solid area: not translucent (alpha below 31 or a translucent texture format), not wireframe
 // (alpha 0), not shadows or shadow masks, not depth-equal (decals sit on a surface already drawn),
@@ -3768,7 +4322,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // its depth, which GPU::GLClearFast drops, so a frame the frontend wants depth for and has none
     // for yet is drawn again
     bool needsDepth = DepthWanted && !DepthOutValid && !DepthResolveFailed;
-    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && gpu.GPU3D.RenderFrameIdentical)
+    // and the sun shadows go into the depth's flags, so new ones need the frame drawn again
+    bool sunChanged = DepthWanted && Sun != SunDrawn;
+    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && !sunChanged && gpu.GPU3D.RenderFrameIdentical)
     {
 #ifdef MELONADE_DEBUG_TOOLS
         if (Timers)
@@ -3777,6 +4333,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
         return;
     }
     TargetsChanged = false;
+    SunDrawn = Sun;
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Timers)
@@ -4129,6 +4686,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
         TagCamera = DepthWanted && gpu.GPU3D.RenderCamera.Valid ? gpu.GPU3D.RenderCamera.Index : GPU3D::NoSceneCamera;
         BuildPolygons(&PolygonList[0], npolys);
+        BuildSunShadows(gpu, npolys);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
         if (EdgeMark != 0)
@@ -4189,6 +4747,8 @@ void GLRenderer::RenderFrame(GPU& gpu)
             FragCounter->Ring.BeginFrame(GLFragCounter::Binding, ScreenW * ScreenH);
 #endif
         RenderSceneChunk(gpu.GPU3D, 0, 192);
+        if (NumSunShadows)
+            DrawSunShadows();
 #ifdef MELONADE_DEBUG_TOOLS
         if (FragCounter)
         {

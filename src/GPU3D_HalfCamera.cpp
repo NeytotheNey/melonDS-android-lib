@@ -1314,6 +1314,7 @@ bool HalfCamera::ShowReplayedScene()
     RealList = Main.RenderPolygonRAM;
     RealNumPolygons = Main.RenderNumPolygons;
     Main.RealRenderCamera = Main.RenderCamera;
+    Main.RealRenderCameras = Main.RenderCameras;
 
     // the same steps as GPU3D::VBlank: translucent polygons after the opaque ones, then Y-sorting
     auto& list = Main.RenderPolygonRAM;
@@ -1330,8 +1331,9 @@ bool HalfCamera::ShowReplayedScene()
         [](const Polygon* a, const Polygon* b) { return a->SortKey < b->SortKey; });
 
     Main.RenderNumPolygons = shadow.NumPolygons;
-    // its polygons' Camera are the shadow's
+    // its polygons' Camera are the shadow's, and index its cameras
     Main.RenderCamera = shadow.PickSceneCamera();
+    Main.RenderCameras = shadow.SceneCameraTable();
 
     // GPU::ComputeOpt bit 5: when this swap's scene was copied (GPU3D::VBlank just did, or the
     // copy isn't valid), the in-between scene is compared with it. the same list by value draws
@@ -1345,6 +1347,7 @@ bool HalfCamera::ShowReplayedScene()
         Main.RenderPolygonRAM = RealList;
         Main.RenderNumPolygons = RealNumPolygons;
         Main.RenderCamera = Main.RealRenderCamera;
+        Main.RenderCameras = Main.RealRenderCameras;
         return false;
     }
 
@@ -1363,6 +1366,7 @@ void HalfCamera::RestoreRealScene()
     {
         Main.RenderNumPolygons = RealNumPolygons;
         Main.RenderCamera = Main.RealRenderCamera;
+        Main.RenderCameras = Main.RealRenderCameras;
     }
     IsMidActive = false;
 }

@@ -331,6 +331,15 @@ GPU3D::SceneCamera GPU3D::PickSceneCamera() const noexcept
     return pick;
 }
 
+// the scene being built's cameras, for RenderCameras at its swap
+GPU3D::CameraTable GPU3D::SceneCameraTable() const noexcept
+{
+    CameraTable table;
+    std::copy_n(SceneCameras.begin(), NumSceneCameras, table.Cameras.begin());
+    table.Count = NumSceneCameras;
+    return table;
+}
+
 void GPU3D::SetHalfCamera(int mode) noexcept
 {
     // set again by a new game's start only, with no 3D frame in progress
@@ -350,6 +359,7 @@ void GPU3D::ResetRenderingState() noexcept
 {
     RenderNumPolygons = 0;
     RenderCamera = {};
+    RenderCameras = {};
 
     RenderDispCnt = 0;
     RenderAlphaRef = 0;
@@ -769,6 +779,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         RenderNumPolygons = savedNumPolygons;
         // not in the state. after HalfCam's Invalidate above, which puts the real scene's back
         RenderCamera = {};
+        RenderCameras = {};
     }
     if (file->Saving)
     {
@@ -3580,6 +3591,7 @@ void GPU3D::VBlank() noexcept
                 RenderFrameIdentical = false;
                 // with the list, so a scene drawn twice has its camera both times. the bank swap below starts the next one's
                 RenderCamera = PickSceneCamera();
+                RenderCameras = SceneCameraTable();
                 if (CameraLogData)
                 {
                     CameraLogData->Cameras = SceneCameras;
