@@ -1282,8 +1282,9 @@ void GLRenderer::FreeDepthOut() noexcept
 
 // the frontend's depth (DepthWanted), right after the render while DepthBufferTex still holds it:
 // one pass over the whole target into DepthOutTex, made here the first time. a shader or target that
-// fails leaves the frontend without depth (DepthOutValid false), never the frame
-void GLRenderer::ResolveDepth() noexcept
+// fails leaves the frontend without depth (DepthOutValid false), never the frame. [wbuffer]: the frame
+// is W-buffered, which goes in the texture's flags
+void GLRenderer::ResolveDepth(bool wbuffer) noexcept
 {
     DepthOutValid = false;
     if (DepthResolveFailed)
@@ -1299,6 +1300,7 @@ void GLRenderer::ResolveDepth() noexcept
         }
         glUseProgram(DepthResolveShader);
         glUniform1i(glGetUniformLocation(DepthResolveShader, "DepthBuffer"), 0);
+        DepthResolveWBufferLoc = glGetUniformLocation(DepthResolveShader, "uWBuffer");
         glGenFramebuffers(1, &DepthResolveFB);
     }
 
@@ -1306,7 +1308,7 @@ void GLRenderer::ResolveDepth() noexcept
     {
         glGenTextures(1, &DepthOutTex);
         SetupDefaultTexParams(DepthOutTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, ScreenW, ScreenH, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     }
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DepthResolveFB);
     if (DepthResolveAttached != DepthOutTex)
@@ -1331,6 +1333,7 @@ void GLRenderer::ResolveDepth() noexcept
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glViewport(0, 0, ScreenW, ScreenH);
         glUseProgram(DepthResolveShader);
+        glUniform1i(DepthResolveWBufferLoc, wbuffer ? 1 : 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
@@ -4159,7 +4162,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
         NumFinalPolys = 0;
 
     if (DepthWanted)
-        ResolveDepth();
+        ResolveDepth(gpu.GPU3D.RenderNumPolygons && gpu.GPU3D.RenderPolygonRAM[0]->WBuffer);
 
     if (ClearFast & 2)
     {

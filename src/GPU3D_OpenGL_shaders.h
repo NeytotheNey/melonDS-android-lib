@@ -326,23 +326,28 @@ void main()
 }
 )";
 
-// the frame's depth for the frontend's depth of field (GLRenderer::ResolveDepth), into an RG8
-// target: the window depth's top 16 bits, high byte in R. Z- and W-buffered frames aren't told apart
+// the frame's depth for the frontend's depth of field (GLRenderer::ResolveDepth), into an RGBA8
+// target: the window depth's 24 bits in RGB, high byte in R, and in A the flags, of which only 4 (a
+// W-buffered frame) is set here (see kCompositorDepthFS for the others)
 const char* kDepthResolveFS = kShaderHeader R"(
 
 precision highp float;
 precision highp int;
 
 uniform highp sampler2D DepthBuffer;
+uniform int uWBuffer;
 
 layout(location = 0) out vec4 oColor;
 
 void main()
 {
     float depth = texelFetch(DepthBuffer, ivec2(gl_FragCoord.xy), 0).r;
-    float value = min(floor(depth * 65536.0), 65535.0);
-    float high = floor(value / 256.0);
-    oColor = vec4(high / 255.0, (value - high * 256.0) / 255.0, 0.0, 1.0);
+    // the DS's 24-bit depth z: the render shaders write z / 2^24, which the depth buffer stores as
+    // round(z * (2^24 - 1) / 2^24), one below z from 2^23 up. sampled as that over 2^24 - 1 and rounded
+    // to fp32, times 2^24 (exact) is z again, or z + 0.5 below 2^23, which int() drops
+    int value = min(int(depth * 16777216.0), 0xFFFFFF);
+    oColor = vec4(float((value >> 16) & 255), float((value >> 8) & 255), float(value & 255),
+                  uWBuffer != 0 ? 4.0 : 0.0) / 255.0;
 }
 )";
 

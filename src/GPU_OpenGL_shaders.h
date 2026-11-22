@@ -3457,12 +3457,14 @@ void main()
 )";
 
 // the frontend's depth of field (GLCompositor::RenderDepth): the top half's depth, drawn over the
-// main draw's half 0 quad into an RG8 target of the output's width by the half's rows, after
+// main draw's half 0 quad into an RGBA8 target of the output's width by the half's rows, after
 // kCompositorVS (WIDE defined for a wide view). each pixel takes the 3D pixel at its center, so a
-// capped output reads one rather than an average. 16-bit values, high byte in R: the 3D's depth
-// (GLRenderer::ResolveDepth, at least 1) where 3D shows on top, 65535 where its 3D is transparent
-// and what's behind it shows, and 0 where there's nothing to blur: 2D on top (compmode 1 blends 2D
-// over the 3D, 5-7 have none), another display mode, or a hi-res captured line
+// capped output reads one rather than an average. 24-bit values in RGB, high byte in R: the 3D's
+// depth (GLRenderer::ResolveDepth, at least 1) where 3D shows on top, 0xFFFFFF where its 3D is
+// transparent and what's behind it shows, and 0 where there's nothing to blur: 2D on top (compmode 1
+// blends 2D over the 3D, 5-7 have none), another display mode, or a hi-res captured line. A holds
+// flags: 1 for those 0 pixels, 2 for the transparent ones, and 4 where the 3D read is W-buffered.
+// the rest are kept for later (docs/HD2D-Plan.md in the app, phase 3)
 const char* kCompositorDepthFS = R"(#version 320 es
 
 precision highp float;
@@ -3485,18 +3487,22 @@ smooth in vec2 fTexcoord;
 
 layout(location = 0) out vec4 oColor;
 
-const float NO_DEPTH = 0.0;
-const float BEHIND_3D = 65535.0;
+const int NO_DEPTH = 0;
+const int BEHIND_3D = 0xFFFFFF;
+const int FLAG_2D = 1;
+const int FLAG_BEHIND_3D = 2;
+const int FLAG_WBUFFER = 4;
 
-vec4 EncodeDepth(float value)
+// (depth, flags)
+vec4 EncodeDepth(ivec2 value)
 {
-    float high = floor(value / 256.0);
-    return vec4(high / 255.0, (value - high * 256.0) / 255.0, 0.0, 1.0);
+    return vec4(float((value.x >> 16) & 255), float((value.x >> 8) & 255), float(value.x & 255),
+                float(value.y)) / 255.0;
 }
 
 // the 3D at native position (xpos, row) of the target, with the same maths as Fetch3D: its depth
-// where it's drawn, BEHIND_3D where it's transparent or past the target's sides
-float Depth3D(float xpos, float row)
+// and its flags where it's drawn, BEHIND_3D where it's transparent or past the target's sides
+ivec2 Depth3D(float xpos, float row)
 {
 #ifdef WIDE
     ivec2 coord = ivec2(floor(vec2(xpos + float(uWideOffset), row) * float(u3DScale)));
@@ -3505,11 +3511,12 @@ float Depth3D(float xpos, float row)
 #endif
     ivec2 size = textureSize(_3DTex, 0);
     if (coord.x < 0 || coord.y < 0 || coord.x >= size.x || coord.y >= size.y)
-        return BEHIND_3D;
+        return ivec2(BEHIND_3D, FLAG_BEHIND_3D);
+    ivec4 bytes = ivec4(floor(texelFetch(DepthTex, coord, 0) * 255.0 + 0.5));
+    int wbuffer = bytes.a & FLAG_WBUFFER;
     if (texelFetch(_3DTex, coord, 0).a == 0.0)
-        return BEHIND_3D;
-    vec2 rg = texelFetch(DepthTex, coord, 0).rg;
-    return max(floor(rg.r * 255.0 + 0.5) * 256.0 + floor(rg.g * 255.0 + 0.5), 1.0);
+        return ivec2(BEHIND_3D, FLAG_BEHIND_3D | wbuffer);
+    return ivec2(max((bytes.r << 16) | (bytes.g << 8) | bytes.b, 1), wbuffer);
 }
 
 void main()
@@ -3526,7 +3533,7 @@ void main()
     int dispmode = mbright.b & 0x3;
     float _3dxpos = float(mbright.a - ((mbright.b & 0x80) * 2));
 
-    float depth = NO_DEPTH;
+    ivec2 depth = ivec2(NO_DEPTH, FLAG_2D);
     if (fTexcoord.x < 0.0 || fTexcoord.x >= 256.0 || fTexcoord.y < 0.0 || fTexcoord.y >= 192.0)
     {
         // a wing or margin pixel: only the 3D goes there, on the lines that show it (WingPixel)
