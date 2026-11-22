@@ -649,6 +649,34 @@ struct SunShadows
     bool operator!=(const SunShadows& other) const noexcept { return !(*this == other); }
 };
 
+// a frontend's hidden textures (Renderer3D::SetHiddenTextures) hold at most this many hashes
+constexpr u32 MaxHiddenTextures = 64;
+
+// debug: the textures of the last frame the OpenGL renderer drew (Renderer3D::SetTextureListing), one entry per TexParam (but its
+// repeat, flip and transform bits) and TexPalette the frame's textured polygons used, in the order they first came. Hash is the
+// texture's content hash (GLTexHashes), Box the polygons' bounds (left, top, right, bottom, in the frame's 3D pixels, the native top
+// screen's 256 x 192 when it's not wide), Alpha and PolygonId the first polygon's, Hidden whether the hidden textures skipped them
+struct TextureListEntry
+{
+    u32 Hash;
+    u32 TexParam;
+    u32 TexPalette;
+    u32 Polygons;
+    u32 Translucent;
+    s32 Box[4];
+    u8 Alpha;
+    u8 PolygonId;
+    bool Hidden;
+};
+struct TextureList
+{
+    // the frames listed so far, so a frontend can tell a new listing
+    u32 Frames = 0;
+    std::vector<TextureListEntry> Entries;
+    // the textures past this many in a frame aren't listed
+    static constexpr size_t MaxEntries = 1024;
+};
+
 // GPU::Comp1x (experiment K2c): what the compositor drew into an output texture. HalvesAt1x bit h
 // (0 the top screen, 1 the bottom one) is a half drawn at 1x: its image is the first ViewWidth x 192
 // texels from the half's first row (h * 194 * Scale, the rows the full draw starts it at), and the
@@ -736,6 +764,13 @@ public:
     virtual bool SetupAccelDepth(DepthCamera& camera) { return false; }
     // the frontend's sun shadows (see SunShadows), given before each frame like the depth texture. only the OpenGL renderer draws them
     virtual void SetSunShadows(const SunShadows& sun) {}
+    // the frontend's hidden textures, given before each frame like the sun shadows: [count] content hashes (GLTexHashes, at most
+    // MaxHiddenTextures are taken), whose polygons the OpenGL renderer doesn't draw at all, as if the game hadn't sent them, while the
+    // game's own state stays as it is. 0 shows them all and costs nothing. the other renderers draw everything
+    virtual void SetHiddenTextures(const u32* hashes, u32 count) {}
+    // debug: while on, the OpenGL renderer lists each frame's textures it draws (TextureList), nullptr from the others or while off
+    virtual void SetTextureListing(bool on) {}
+    [[nodiscard]] virtual const TextureList* GetTextureList() const { return nullptr; }
     // GPU::Comp1x (experiment K2c): how the compositor last drew into output buffer [buffer]. true,
     // with [layout], the first time it's asked after a draw into the buffer, false when nothing drew
     // into it since then (or since SetOutputTexture gave it a texture), so the texture still holds

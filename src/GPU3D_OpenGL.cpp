@@ -1008,10 +1008,72 @@ void GLRenderer::Reset(GPU& gpu)
     // GPU::GLTexCache: the same, the heap would only rehash everything at its next use
     if (TexHeap)
         TexHeap->Clear();
+    // and the texture hashes
+    if (TexHashes)
+        TexHashes->Clear();
     TargetsChanged = true;
     EarlyCapture = false;
     // pacing starts over with the new console
     DropPaceFences();
+}
+
+void GLRenderer::SetHiddenTextures(const u32* hashes, u32 count)
+{
+    count = std::min(count, MaxHiddenTextures);
+    if (count == NumHiddenTextures && std::equal(hashes, hashes + count, HiddenTextures.begin()))
+        return;
+    std::copy_n(hashes, count, HiddenTextures.begin());
+    NumHiddenTextures = count;
+    HiddenTexturesChanged = true;
+}
+
+void GLRenderer::SetTextureListing(bool on)
+{
+    if (on && !TexList)
+    {
+        TexList = std::make_unique<TextureList>();
+        TexList->Entries.reserve(TextureList::MaxEntries);
+    }
+    else if (!on)
+        TexList.reset();
+}
+
+bool GLRenderer::HidesTexture(u32 hash) const
+{
+    return std::find(HiddenTextures.begin(), HiddenTextures.begin() + NumHiddenTextures, hash) != HiddenTextures.begin() + NumHiddenTextures;
+}
+
+// TexList: [polygon], whose texture's hash is [hash], counted with the others of its texture this frame
+void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden)
+{
+    std::vector<TextureListEntry>& entries = TexList->Entries;
+    const u32 texparam = polygon->TexParam & 0x3FF0FFFF;
+    // polygons in a row mostly share a texture, so the search starts from the newest
+    auto it = std::find_if(entries.rbegin(), entries.rend(),
+                           [&](const TextureListEntry& e) { return e.TexParam == texparam && e.TexPalette == polygon->TexPalette; });
+    TextureListEntry* entry;
+    if (it != entries.rend())
+        entry = &*it;
+    else if (entries.size() < TextureList::MaxEntries)
+    {
+        entries.push_back({hash, texparam, polygon->TexPalette, 0, 0, {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN},
+                           (u8)((polygon->Attr >> 16) & 0x1F), (u8)((polygon->Attr >> 24) & 0x3F), hidden});
+        entry = &entries.back();
+    }
+    else
+        return;
+
+    entry->Polygons++;
+    if (polygon->Translucent)
+        entry->Translucent++;
+    for (u32 v = 0; v < polygon->NumVertices; v++)
+    {
+        const s32* position = polygon->Vertices[v]->FinalPosition;
+        entry->Box[0] = std::min(entry->Box[0], position[0]);
+        entry->Box[1] = std::min(entry->Box[1], position[1]);
+        entry->Box[2] = std::max(entry->Box[2], position[0]);
+        entry->Box[3] = std::max(entry->Box[3], position[1]);
+    }
 }
 
 void GLRenderer::SetBetterPolygons(bool betterpolygons) noexcept
@@ -4285,7 +4347,13 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // nothing cached goes stale while it's off. palette RAM doesn't matter (alpha is the texel's)
     // GPU::GLTexCache: the heap's textures were decoded from VRAMFlat_Texture too, and those under a
     // changed chunk get hashed again at their next use. the chunks are counted once for both
-    if (textureChanged && (NumOpaqueTex || TexHeap))
+    // the texture hashes are only kept while the hidden textures or the listing want them, so this frame's changes reach them
+    // whenever they're there
+    if ((NumHiddenTextures || TexList) && !TexHashes)
+        TexHashes = std::make_unique<GLTexHashes>();
+    else if (!NumHiddenTextures && !TexList && TexHashes)
+        TexHashes.reset();
+    if (textureChanged && (NumOpaqueTex || TexHeap || TexHashes))
         TextureDirtyPrefix.Build(textureDirty);
     if (gpu.GLNoDiscard & 4)
         ClearOpaqueTex();
@@ -4299,11 +4367,14 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // returns every chunk; bank remaps the same way). the planes over a changed chunk get their
     // words hashed again at their next use, which runs after that upload, so it sees the palette
     // TexPalLinear and the record path see in this frame
-    if (texPalChanged && TexHeap && TexHeap->ColorPlane())
-    {
+    const bool colorPlanes = TexHeap && TexHeap->ColorPlane();
+    if (texPalChanged && (colorPlanes || TexHashes))
         TexPalettePrefix.Build(texPalDirty);
+    if (texPalChanged && colorPlanes)
         TexHeap->InvalidatePalette(TexPalettePrefix);
-    }
+    // the texture hashes read VRAMFlat_Texture and VRAMFlat_TexPal, which just changed in these chunks
+    if (TexHashes && (textureChanged || texPalChanged))
+        TexHashes->Invalidate(textureChanged ? &TextureDirtyPrefix : nullptr, texPalChanged ? &TexPalettePrefix : nullptr);
 
     // the targets match the polygons drawn here (see FrameTargetWidth). this runs after the
     // frame's Blit, so the compositor's width only changes between frames as well. with a Blit
@@ -4324,7 +4395,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     bool needsDepth = DepthWanted && !DepthOutValid && !DepthResolveFailed;
     // and the sun shadows go into the depth's flags, so new ones need the frame drawn again
     bool sunChanged = DepthWanted && Sun != SunDrawn;
-    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && !sunChanged && gpu.GPU3D.RenderFrameIdentical)
+    // and new hidden textures change what's drawn
+    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && !sunChanged && !HiddenTexturesChanged
+        && gpu.GPU3D.RenderFrameIdentical)
     {
 #ifdef MELONADE_DEBUG_TOOLS
         if (Timers)
@@ -4334,6 +4407,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
     }
     TargetsChanged = false;
     SunDrawn = Sun;
+    HiddenTexturesChanged = false;
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Timers)
@@ -4651,10 +4725,22 @@ void GLRenderer::RenderFrame(GPU& gpu)
         int firsttrans = -1;
         bool texturing = (gpu.GPU3D.RenderDispCnt & (1<<0)) != 0;
         bool anyOpaqueDraw = false;
+        if (TexList)
+            TexList->Entries.clear();
         for (u32 i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
         {
             const Polygon* polygon = gpu.GPU3D.RenderPolygonRAM[i];
             if (polygon->Degenerate) continue;
+            // the hidden textures' polygons are left out of everything below. an untextured frame has no textures to hide
+            if (TexHashes) [[unlikely]]
+            {
+                u32 hash = texturing ? TexHashes->Hash(gpu.VRAMFlat_Texture, gpu.VRAMFlat_TexPal, polygon->TexParam, polygon->TexPalette) : 0;
+                bool hidden = hash && HidesTexture(hash);
+                if (TexList && hash)
+                    ListTexture(polygon, hash, hidden);
+                if (hidden)
+                    continue;
+            }
 
             SetupPolygon(&PolygonList[npolys], gpu.GPU3D.RenderPolygonRAM[i]);
             if (NoDiscard && NoDiscardClass(polygon, texturing) == NoDiscard_Yes)
@@ -4760,7 +4846,13 @@ void GLRenderer::RenderFrame(GPU& gpu)
 #endif
     }
     else
+    {
         NumFinalPolys = 0;
+        if (TexList)
+            TexList->Entries.clear();
+    }
+    if (TexList)
+        TexList->Frames++;
 
     if (DepthWanted)
         ResolveDepth(gpu.GPU3D);

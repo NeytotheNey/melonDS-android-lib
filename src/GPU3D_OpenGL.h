@@ -100,6 +100,9 @@ public:
     void SetOutputDepthTexture(int buffer, u32 texture) override;
     bool SetupAccelDepth(DepthCamera& camera) override;
     void SetSunShadows(const SunShadows& sun) override { Sun = sun; }
+    void SetHiddenTextures(const u32* hashes, u32 count) override;
+    void SetTextureListing(bool on) override;
+    const TextureList* GetTextureList() const override { return TexList.get(); }
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
     void SavestateLoaded() override;
 
@@ -565,6 +568,18 @@ private:
     // would skip as identical again
     SunShadows Sun {};
     SunShadows SunDrawn {};
+    // the frontend's hidden textures (SetHiddenTextures), and whether they changed since the last frame drawn, which draws a frame
+    // RenderFrame would skip as identical again. RenderFrame leaves their polygons out of PolygonList, so nothing of theirs is drawn,
+    // edge-marked, fogged, depth-written or sun-shadowed
+    std::array<u32, MaxHiddenTextures> HiddenTextures {};
+    u32 NumHiddenTextures = 0;
+    bool HiddenTexturesChanged = false;
+    // the content hashes the hidden textures and the listing (TexList, while SetTextureListing is on) pick textures by, made when one
+    // of them first needs it and dropped while neither does, so the texture dirty tracking feeds it only then
+    std::unique_ptr<GLTexHashes> TexHashes;
+    std::unique_ptr<TextureList> TexList;
+    bool HidesTexture(u32 hash) const;
+    void ListTexture(const Polygon* polygon, u32 hash, bool hidden);
     // per frame, while depth is wanted, the camera is valid (TagCamera) and Sun is on: the sun shadows of the polygons TagCamera tags
     // that write depth, which BuildSunShadows puts after BuildPolygons' vertices and indices and DrawSunShadows draws after the scene,
     // into attr A only (kRenderFS's DepthTag, from VtxAttr_SunShadow, one of the attribute word's bits the render shaders read

@@ -230,6 +230,45 @@ private:
     Plane UsePlane(const u8* vram, Entry& e, UploadSink& sink, bool limits);
 };
 
+// a texture's content hash, the same wherever it sits in VRAM: TexParam's size, format and color 0 bits (20 to 29), the texel bytes
+// the DS reads for that size and format, for 4x4 their slot 1 palette indices too, and for the paletted formats the palette words
+// it can use (a 4x4 texture's, from the lowest to the highest its blocks point at). not its address, its repeat and flip bits or its
+// texture coordinate transform. 0 for none (format 0), never for a texture. the renderer's hidden textures and texture listing pick
+// textures by it (Renderer3D::SetHiddenTextures); the hashes are kept between frames and hashed again only after texture or palette
+// VRAM under them changed, so each texture costs one hash the first frame it's used and a table lookup after that. emulator thread
+// only
+class GLTexHashes
+{
+public:
+    // the hash of a polygon's texture (texparam, texpal its TexParam and TexPalette), for the texture and palette VRAM as
+    // GPU::VRAMFlat_Texture and VRAMFlat_TexPal have them (512 KB and 128 KB)
+    u32 Hash(const u8* texVram, const u8* palVram, u32 texparam, u32 texpal);
+    // texture or palette VRAM changed in these chunks this frame (pal nullptr: it didn't): what was hashed from them is hashed again
+    // at its next use
+    void Invalidate(const TexDirtyPrefix* tex, const TexPalDirtyPrefix* pal);
+    void Clear();
+
+    // the table's room: past it everything is dropped and hashed again, which a frame needs more distinct textures than this for
+    static constexpr int MaxEntries = 2048;
+
+private:
+    static constexpr int IndexSlots = 4096;
+    struct Entry
+    {
+        u64 Key;
+        u32 Hash;
+        // the 512 byte chunks it was hashed from, first to last (inclusive): texels, 4x4 slot 1 indices (First1 > Last1 for none),
+        // palette (PalFirst > PalLast for none)
+        u16 First0, Last0, First1, Last1, PalFirst, PalLast;
+        bool Stale;
+    };
+    std::vector<Entry> Entries;
+    std::vector<s16> Index;
+
+    static u32 HashSlot(u64 key) { return (u32)((key * 0x9E3779B97F4A7C15ull) >> 52); } // IndexSlots = 4096
+    static void Compute(const u8* texVram, const u8* palVram, u32 texparam, u32 texpal, Entry& e);
+};
+
 }
 
 #endif
