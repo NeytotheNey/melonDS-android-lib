@@ -103,6 +103,7 @@ public:
     void SetHiddenTextures(const u32* hashes, u32 count) override;
     void SetLightTextures(const u32* hashes, u32 count) override;
     void SetUiTextures(const u32* hashes, u32 count) override;
+    void SetFocusTextures(const u32* hashes, u32 count) override;
     void SetTextureListing(bool on) override;
     const TextureList* GetTextureList() const override { return TexList.get(); }
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
@@ -563,7 +564,8 @@ private:
     bool DepthWanted = false;
     GLuint DepthOutTex {}, KeptDepthOutTex {}, SpareDepthOutTex {};
     bool DepthOutValid = false, KeptDepthOutValid = false;
-    // the camera each of those frames was drawn with (GPU3D::RenderCamera as SetupAccelDepth hands it over), swapped with them
+    // the camera each of those frames was drawn with (GPU3D::RenderCamera as SetupAccelDepth hands it over) and its scene's focus
+    // (SceneFocus), swapped with them
     DepthCamera DepthOutCamera {}, KeptDepthOutCamera {};
     // while depth is wanted and the render's camera is valid, its index (GPU3D::SceneCamera::Index): BuildPolygons tags the
     // polygons built under another one (VtxAttr_OtherCamera), whose pixels get flag 8 in the depth (attr A, kDepthResolveFS).
@@ -593,14 +595,25 @@ private:
     u32 NumUiTextures = 0;
     bool UiTexturesChanged = false;
     static constexpr u32 VtxAttr_Ui = 1u << 10;
-    // the content hashes the hidden, light and UI textures and the listing (TexList, while SetTextureListing is on) pick textures
-    // by, made when one of them first needs it and dropped while none does, so the texture dirty tracking feeds it only then
+    // and the focus textures (SetFocusTextures): RenderFrame keeps the scene's biggest polygon of theirs in SceneFocus (NoteFocus, with
+    // its box's area in SceneFocusArea), which ResolveDepth hands out with the depth's camera
+    std::array<u32, MaxFocusTextures> FocusTextures {};
+    u32 NumFocusTextures = 0;
+    bool FocusTexturesChanged = false;
+    DepthFocus SceneFocus {};
+    s64 SceneFocusArea = -1;
+    // the renders ResolveDepth has resolved, for DepthFocus::Scene
+    u32 DepthScenes = 0;
+    // the content hashes the hidden, light, UI and focus textures and the listing (TexList, while SetTextureListing is on) pick
+    // textures by, made when one of them first needs it and dropped while none does, so the texture dirty tracking feeds it only then
     std::unique_ptr<GLTexHashes> TexHashes;
     std::unique_ptr<TextureList> TexList;
     bool HidesTexture(u32 hash) const;
     bool LightsTexture(u32 hash) const;
     bool UiTexture(u32 hash) const;
-    void ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light, bool ui);
+    bool FocusTexture(u32 hash) const;
+    void NoteFocus(const Polygon* polygon);
+    void ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light, bool ui, bool focus);
     // per frame, while depth is wanted, the camera is valid (TagCamera) and Sun is on: the sun shadows of the polygons TagCamera tags
     // that write depth, which BuildSunShadows puts after BuildPolygons' vertices and indices and DrawSunShadows draws after the scene,
     // into attr A only (kRenderFS's DepthTag, from VtxAttr_SunShadow, one of the attribute word's bits the render shaders read

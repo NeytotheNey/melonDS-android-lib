@@ -1047,6 +1047,16 @@ void GLRenderer::SetUiTextures(const u32* hashes, u32 count)
     UiTexturesChanged = true;
 }
 
+void GLRenderer::SetFocusTextures(const u32* hashes, u32 count)
+{
+    count = std::min(count, MaxFocusTextures);
+    if (count == NumFocusTextures && std::equal(hashes, hashes + count, FocusTextures.begin()))
+        return;
+    std::copy_n(hashes, count, FocusTextures.begin());
+    NumFocusTextures = count;
+    FocusTexturesChanged = true;
+}
+
 void GLRenderer::SetTextureListing(bool on)
 {
     if (on && !TexList)
@@ -1073,8 +1083,36 @@ bool GLRenderer::UiTexture(u32 hash) const
     return std::find(UiTextures.begin(), UiTextures.begin() + NumUiTextures, hash) != UiTextures.begin() + NumUiTextures;
 }
 
+bool GLRenderer::FocusTexture(u32 hash) const
+{
+    return std::find(FocusTextures.begin(), FocusTextures.begin() + NumFocusTextures, hash) != FocusTextures.begin() + NumFocusTextures;
+}
+
+// SceneFocus: [polygon], drawn with a focus texture, if its box on screen is bigger than the scene's focus so far, so a sliver or a
+// reflection of the same texture doesn't take it
+void GLRenderer::NoteFocus(const Polygon* polygon)
+{
+    if (polygon->NumVertices == 0)
+        return;
+    s32 box[4] = {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN};
+    for (u32 v = 0; v < polygon->NumVertices; v++)
+    {
+        const s32* position = polygon->Vertices[v]->FinalPosition;
+        box[0] = std::min(box[0], position[0]);
+        box[1] = std::min(box[1], position[1]);
+        box[2] = std::max(box[2], position[0]);
+        box[3] = std::max(box[3], position[1]);
+    }
+    const s64 area = (s64)(box[2] - box[0]) * (box[3] - box[1]);
+    if (area <= SceneFocusArea)
+        return;
+    SceneFocusArea = area;
+    SceneFocus.Found = true;
+    SceneFocus.Depth = (u32)polygon->FinalZ[0];
+}
+
 // TexList: [polygon], whose texture's hash is [hash], counted with the others of its texture this frame
-void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light, bool ui)
+void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light, bool ui, bool focus)
 {
     std::vector<TextureListEntry>& entries = TexList->Entries;
     const u32 texparam = polygon->TexParam & 0x3FF0FFFF;
@@ -1087,7 +1125,7 @@ void GLRenderer::ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool
     else if (entries.size() < TextureList::MaxEntries)
     {
         entries.push_back({hash, texparam, polygon->TexPalette, 0, 0, {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN},
-                           (u8)((polygon->Attr >> 16) & 0x1F), (u8)((polygon->Attr >> 24) & 0x3F), hidden, light, ui});
+                           (u8)((polygon->Attr >> 16) & 0x1F), (u8)((polygon->Attr >> 24) & 0x3F), hidden, light, ui, focus});
         entry = &entries.back();
     }
     else
@@ -1459,8 +1497,11 @@ void GLRenderer::ResolveDepth(const GPU3D& gpu3d) noexcept
         glBindVertexArray(ClearVertexArrayID);
         glDrawArrays(GL_TRIANGLES, 0, 2*3);
         DepthOutValid = true;
-        // a scene without polygons has nothing to rebuild
+        // a scene without polygons has nothing to rebuild, and no focus
         DepthOutCamera = gpu3d.RenderNumPolygons ? ToDepthCamera(gpu3d.RenderCamera) : DepthCamera {};
+        DepthOutCamera.Focus = gpu3d.RenderNumPolygons ? SceneFocus : DepthFocus {};
+        DepthOutCamera.Focus.WBuffer = wbuffer;
+        DepthOutCamera.Focus.Scene = ++DepthScenes;
     }
     // what the rest of RenderFrame expects bound
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
@@ -4379,9 +4420,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     // nothing cached goes stale while it's off. palette RAM doesn't matter (alpha is the texel's)
     // GPU::GLTexCache: the heap's textures were decoded from VRAMFlat_Texture too, and those under a
     // changed chunk get hashed again at their next use. the chunks are counted once for both
-    // the texture hashes are only kept while the hidden, light or UI textures or the listing want them, so this frame's changes
+    // the texture hashes are only kept while the hidden, light, UI or focus textures or the listing want them, so this frame's changes
     // reach them whenever they're there
-    const bool wantsHashes = NumHiddenTextures || NumLightTextures || NumUiTextures || TexList;
+    const bool wantsHashes = NumHiddenTextures || NumLightTextures || NumUiTextures || NumFocusTextures || TexList;
     if (wantsHashes && !TexHashes)
         TexHashes = std::make_unique<GLTexHashes>();
     else if (!wantsHashes && TexHashes)
@@ -4428,9 +4469,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     bool needsDepth = DepthWanted && !DepthOutValid && !DepthResolveFailed;
     // and the sun shadows go into the depth's flags, so new ones need the frame drawn again
     bool sunChanged = DepthWanted && Sun != SunDrawn;
-    // and new hidden textures change what's drawn, and new light and UI textures the depth's flags
+    // and new hidden textures change what's drawn, new light and UI textures the depth's flags, and new focus textures its focus
     if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && !sunChanged && !HiddenTexturesChanged
-        && !LightTexturesChanged && !UiTexturesChanged && gpu.GPU3D.RenderFrameIdentical)
+        && !LightTexturesChanged && !UiTexturesChanged && !FocusTexturesChanged && gpu.GPU3D.RenderFrameIdentical)
     {
 #ifdef MELONADE_DEBUG_TOOLS
         if (Timers)
@@ -4443,6 +4484,10 @@ void GLRenderer::RenderFrame(GPU& gpu)
     HiddenTexturesChanged = false;
     LightTexturesChanged = false;
     UiTexturesChanged = false;
+    FocusTexturesChanged = false;
+    // what this render's polygons find of the focus textures
+    SceneFocus = {};
+    SceneFocusArea = -1;
 
 #ifdef MELONADE_DEBUG_TOOLS
     if (Timers)
@@ -4767,7 +4812,8 @@ void GLRenderer::RenderFrame(GPU& gpu)
             const Polygon* polygon = gpu.GPU3D.RenderPolygonRAM[i];
             if (polygon->Degenerate) continue;
             // the hidden textures' polygons are left out of everything below, and the light and UI textures' marked (a UI texture
-            // isn't a light too, as it's 2D to the effects). an untextured frame has no textures to hide or mark
+            // isn't a light too, as it's 2D to the effects), and the focus textures' biggest one kept. an untextured frame has no
+            // textures to hide or mark
             bool light = false, ui = false;
             if (TexHashes) [[unlikely]]
             {
@@ -4775,8 +4821,11 @@ void GLRenderer::RenderFrame(GPU& gpu)
                 bool hidden = hash && HidesTexture(hash);
                 ui = hash && !hidden && UiTexture(hash);
                 light = hash && !hidden && !ui && LightsTexture(hash);
+                bool focus = hash && !hidden && !ui && FocusTexture(hash);
+                if (focus)
+                    NoteFocus(polygon);
                 if (TexList && hash)
-                    ListTexture(polygon, hash, hidden, light, ui);
+                    ListTexture(polygon, hash, hidden, light, ui, focus);
                 if (hidden)
                     continue;
             }

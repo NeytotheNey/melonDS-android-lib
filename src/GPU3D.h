@@ -620,6 +620,18 @@ public:
 // x = (x - Viewport[0]) * 2 / Viewport[2] - 1, y = 1 - (y - Viewport[1]) * 2 / Viewport[3], z = (d - 0x7FFE00) / 2^23, and its
 // view-space position is inverse(Proj) times (x, y, z, 1), divided by its w. a game that puts its camera in the projection gets
 // world space instead
+// the scene's focus for a frontend's depth of field (Renderer3D::SetFocusTextures): of the polygons drawn with a focus texture (Pokemon
+// White's player), the one covering the biggest box on screen. Depth is its depth as the depth buffer holds it (its first vertex's FinalZ:
+// the 24-bit Z-buffer value, or W-buffered w in 20.12); Found is false when the scene drew none. WBuffer is whether the scene is W-buffered,
+// with or without one, and Scene counts the renders whose depth went out, so a frontend can tell a new scene from one it was handed before
+struct DepthFocus
+{
+    bool Found = false;
+    bool WBuffer = false;
+    u32 Depth = 0;
+    u32 Scene = 0;
+};
+
 struct DepthCamera
 {
     // the projection most of the scene's polygons were built under, as real numbers in the DS's order, which is OpenGL's column-major
@@ -630,6 +642,8 @@ struct DepthCamera
     // false when the scene is W-buffered, the projection is orthographic, it covers under half the scene's polygons, or the frame
     // has no depth. Proj and Viewport still hold the scene's pick then, for logs (0 for a scene without polygons)
     bool Valid = false;
+    // the scene's focus, which goes with its camera whether or not that's Valid (only the OpenGL renderer finds one)
+    DepthFocus Focus {};
 };
 
 // a frontend's sun shadows (Renderer3D::SetSunShadows), for the characters' own: while On, the frontend wants the depth and the scene's
@@ -655,12 +669,14 @@ constexpr u32 MaxHiddenTextures = 64;
 constexpr u32 MaxLightTextures = 64;
 // and its UI textures (Renderer3D::SetUiTextures) as many
 constexpr u32 MaxUiTextures = 64;
+// and its focus textures (Renderer3D::SetFocusTextures) as many
+constexpr u32 MaxFocusTextures = 64;
 
 // debug: the textures of the last frame the OpenGL renderer drew (Renderer3D::SetTextureListing), one entry per TexParam (but its
 // repeat, flip and transform bits) and TexPalette the frame's textured polygons used, in the order they first came. Hash is the
 // texture's content hash (GLTexHashes), Box the polygons' bounds (left, top, right, bottom, in the frame's 3D pixels, the native top
 // screen's 256 x 192 when it's not wide), Alpha and PolygonId the first polygon's, Hidden whether the hidden textures skipped them,
-// Light whether the light textures marked them, Ui whether the UI textures did
+// Light whether the light textures marked them, Ui whether the UI textures did, Focus whether the focus textures did
 struct TextureListEntry
 {
     u32 Hash;
@@ -674,6 +690,7 @@ struct TextureListEntry
     bool Hidden;
     bool Light;
     bool Ui;
+    bool Focus;
 };
 struct TextureList
 {
@@ -784,6 +801,11 @@ public:
     // kCompositorDepthFS) where they write depth, so effects leave them and take nothing from them. they're drawn as they are. 0
     // marks none and costs nothing. only the OpenGL renderer marks them
     virtual void SetUiTextures(const u32* hashes, u32 count) {}
+    // the frontend's focus textures, given the same way: [count] content hashes (at most MaxFocusTextures are taken) of what a depth of
+    // field should focus on (Pokemon White's player), whose biggest polygon in each scene goes out with the depth's camera
+    // (DepthCamera::Focus) while depth is wanted. they're drawn as they are; a hidden or UI texture is never the focus. 0 finds none and
+    // costs nothing. only the OpenGL renderer finds one
+    virtual void SetFocusTextures(const u32* hashes, u32 count) {}
     // debug: while on, the OpenGL renderer lists each frame's textures it draws (TextureList), nullptr from the others or while off
     virtual void SetTextureListing(bool on) {}
     [[nodiscard]] virtual const TextureList* GetTextureList() const { return nullptr; }
