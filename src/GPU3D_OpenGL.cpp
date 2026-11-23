@@ -951,6 +951,9 @@ GLRenderer::~GLRenderer()
     glDeleteTextures(1, &ColorBufferTex);
     glDeleteTextures(1, &KeptColorTex);
     glDeleteTextures(1, &SpareColorTex);
+    FreeDepthOut();
+    glDeleteFramebuffers(1, &DepthResolveFB);
+    glDeleteProgram(DepthResolveShader);
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
     glDeleteTextures(1, &DownScaleBufferTex);
@@ -1167,6 +1170,8 @@ bool GLRenderer::ResizeTargets(bool betterpolygons, int scale, int targetWidth, 
     glDeleteTextures(1, &SpareColorTex);
     glDeleteTextures(1, &KeptColorTex);
     SpareColorTex = KeptColorTex = 0;
+    // the same for the frontend's depth, which the next render resolves again at the new size
+    FreeDepthOut();
 
     glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -1253,6 +1258,88 @@ void GLRenderer::KeepColorBuffer() noexcept
 
     glBindFramebuffer(GL_FRAMEBUFFER, MainFramebuffer);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex, 0);
+
+    // the frontend's depth goes with its color buffer
+    if (DepthWanted)
+    {
+        KeptDepthOutTex = DepthOutTex;
+        KeptDepthOutValid = DepthOutValid;
+        DepthOutTex = SpareDepthOutTex;
+        DepthOutValid = false;
+        SpareDepthOutTex = 0;
+    }
+}
+
+void GLRenderer::FreeDepthOut() noexcept
+{
+    glDeleteTextures(1, &DepthOutTex);
+    glDeleteTextures(1, &KeptDepthOutTex);
+    glDeleteTextures(1, &SpareDepthOutTex);
+    DepthOutTex = KeptDepthOutTex = SpareDepthOutTex = 0;
+    DepthOutValid = KeptDepthOutValid = false;
+    DepthResolveAttached = 0;
+}
+
+// the frontend's depth (DepthWanted), right after the render while DepthBufferTex still holds it:
+// one pass over the whole target into DepthOutTex, made here the first time. a shader or target that
+// fails leaves the frontend without depth (DepthOutValid false), never the frame
+void GLRenderer::ResolveDepth() noexcept
+{
+    DepthOutValid = false;
+    if (DepthResolveFailed)
+        return;
+    if (!DepthResolveShader)
+    {
+        if (!OpenGL::CompileVertexFragmentProgram(DepthResolveShader, kFinalPassVS, kDepthResolveFS, "DepthResolveShader",
+                                                  {{"vPosition", 0}}, {{"oColor", 0}}))
+        {
+            DepthResolveFailed = true;
+            Platform::Log(Platform::LogLevel::Error, "the depth resolve program didn't build, so the frontend gets no depth\n");
+            return;
+        }
+        glUseProgram(DepthResolveShader);
+        glUniform1i(glGetUniformLocation(DepthResolveShader, "DepthBuffer"), 0);
+        glGenFramebuffers(1, &DepthResolveFB);
+    }
+
+    if (!DepthOutTex)
+    {
+        glGenTextures(1, &DepthOutTex);
+        SetupDefaultTexParams(DepthOutTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, ScreenW, ScreenH, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+    }
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DepthResolveFB);
+    if (DepthResolveAttached != DepthOutTex)
+    {
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, DepthOutTex, 0);
+        DepthResolveAttached = DepthOutTex;
+        DepthResolveComplete = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (!DepthResolveComplete)
+        {
+            // given up on, so RenderFrame doesn't draw every skipped frame again for depth it never gets
+            DepthResolveFailed = true;
+            Platform::Log(Platform::LogLevel::Error, "the depth resolve target is incomplete (%dx%d), so the frontend gets no depth\n", ScreenW, ScreenH);
+        }
+    }
+
+    if (DepthResolveComplete)
+    {
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glViewport(0, 0, ScreenW, ScreenH);
+        glUseProgram(DepthResolveShader);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
+        glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
+        glBindVertexArray(ClearVertexArrayID);
+        glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        DepthOutValid = true;
+    }
+    // what the rest of RenderFrame expects bound
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
 }
 
 
@@ -3574,6 +3661,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     KeepRequested = false;
     // an earlier readback is of the frame this replaces (a skipped one too, to keep it simple)
     EarlyCapture = false;
+    // the frontend no longer asks for depth (a kept one is gone, as the Blit after its render ran)
+    if (!DepthWanted && (DepthOutTex || SpareDepthOutTex))
+        FreeDepthOut();
 
     // same path as the software and compute renderers: DeriveState gathers the dirty 512 byte
     // chunks of the texture and palette mappings (clearing the bank dirty bits they came from,
@@ -3631,8 +3721,11 @@ void GLRenderer::RenderFrame(GPU& gpu)
     SeamsDrawn = gpu.GLSeams;
 
     // nothing changed since the last frame: MainFramebuffer still holds it, so Blit and the
-    // capture readback keep working from it (upstream's GL renderer skips the same way)
-    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && gpu.GPU3D.RenderFrameIdentical)
+    // capture readback keep working from it (upstream's GL renderer skips the same way). but not
+    // its depth, which GPU::GLClearFast drops, so a frame the frontend wants depth for and has none
+    // for yet is drawn again
+    bool needsDepth = DepthWanted && !DepthOutValid && !DepthResolveFailed;
+    if (!textureChanged && !texPalChanged && !TargetsChanged && !seamsChanged && !needsDepth && gpu.GPU3D.RenderFrameIdentical)
     {
 #ifdef MELONADE_DEBUG_TOOLS
         if (Timers)
@@ -4065,6 +4158,9 @@ void GLRenderer::RenderFrame(GPU& gpu)
     else
         NumFinalPolys = 0;
 
+    if (DepthWanted)
+        ResolveDepth();
+
     if (ClearFast & 2)
     {
         // GPU::GLClearFast bit 1 (D1): attr, depth and stencil are only read during the frame (the
@@ -4276,6 +4372,12 @@ void GLRenderer::Blit(const GPU& gpu)
         SpareColorTex = KeptColorTex;
         KeptColorTex = 0;
     }
+    if (KeptDepthOutTex)
+    {
+        SpareDepthOutTex = KeptDepthOutTex;
+        KeptDepthOutTex = 0;
+    }
+    KeptDepthOutValid = false;
 }
 
 // GPU::BlitAfterReadback: line 0's readback, made right after the render at line 215, into the
@@ -4309,6 +4411,22 @@ void GLRenderer::SetOutputTexture(int buffer, u32 texture)
 void GLRenderer::BindOutputTexture(int buffer)
 {
     CurGLCompositor.BindOutputTexture(buffer);
+}
+
+void GLRenderer::SetOutputDepthTexture(int buffer, u32 texture)
+{
+    DepthWanted = texture != 0;
+    CurGLCompositor.SetOutputDepthTexture(buffer, (GLuint) texture);
+}
+
+bool GLRenderer::SetupAccelDepth()
+{
+    // the depth of the frame SetupAccelFrame binds
+    GLuint texture = KeptColorTex ? (KeptDepthOutValid ? KeptDepthOutTex : 0) : (DepthOutValid ? DepthOutTex : 0);
+    if (!texture)
+        return false;
+    glBindTexture(GL_TEXTURE_2D, texture);
+    return true;
 }
 
 void GLRenderer::SavestateLoaded()

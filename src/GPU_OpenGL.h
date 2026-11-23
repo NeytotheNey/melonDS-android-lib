@@ -98,6 +98,8 @@ public:
     void RenderFrame(const GPU& gpu, Renderer3D& renderer) noexcept;
     void SetOutputTexture(int buf, GLuint texture);
     void BindOutputTexture(int buf);
+    // see Renderer3D::SetOutputDepthTexture
+    void SetOutputDepthTexture(int buf, GLuint texture) noexcept;
     // GPU::Comp1x: see Renderer3D::TakeOutputLayout
     bool TakeOutputLayout(int buf, OutputLayout& layout) noexcept;
     // drops the held WideMelon wings (see WingHold), for a reset or a savestate load.
@@ -190,8 +192,34 @@ private:
         std::array<u32, Comp1xOff_Count> LogOff {};
         u32 LogFiltered = 0;                // of those, frames whose halves were filtered, at the map's scale
         u32 Checks = 0, CheckPixels = 0, Mismatches = 0, MismatchNative = 0;
+        // whether the buffer's depth texture got this draw's depth (OutputLayout::HasDepth)
+        std::array<bool, 2> HasDepth {};
     };
     Comp1xState OneX {};
+
+    // the frontend's depth of field (Renderer3D::SetOutputDepthTexture): its texture for each buffer
+    // and the framebuffer that draws into it, and the depth pass's program for each view (kCompositorDepthFS,
+    // [1] wide), built the first time a buffer has a texture. a program or target that fails leaves the
+    // frame without depth, never the frame. the textures are the frontend's
+    struct DepthProgram
+    {
+        GLuint Program = 0;
+        GLint ScaleLoc = -1, HiresCapLoc = -1, WideRatioLoc = -1, WideOffsetLoc = -1, WideMarginLoc = -1;
+    };
+    struct DepthOutState
+    {
+        std::array<GLuint, 2> Tex {};
+        std::array<GLuint, 2> FB {};
+        std::array<GLuint, 2> Attached {};
+        std::array<bool, 2> Complete {};
+        std::array<DepthProgram, 2> Programs {};
+        std::array<bool, 2> Failed {};
+    };
+    DepthOutState DepthOut {};
+    static constexpr int DepthUnit = 4;
+    bool BuildDepthProgram(bool wide) noexcept;
+    bool RenderDepth(Renderer3D& renderer, int backbuf, bool hiresDisplay, int halvesAt1x) noexcept;
+    void FreeDepthOut() noexcept;
 
     // how a frame's halves at 1x are drawn: with the main draw's program, at DrawScale (1, or the
     // filter map's with filtered 2D), whose u3DScale is at ScaleLoc and, for the filter's program,
