@@ -249,12 +249,16 @@ void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
     // native view is the view, so the native counts a bank past the DS's limits relies on stay right
     ViewWidth = RendererViewWidth();
     ViewMargin = RendererViewMargin();
+    ViewShiftX = RendererViewShiftX();
+    ViewShiftY = RendererViewShiftY();
 }
 
 void GPU3D::LatchViewWidth() noexcept
 {
     ViewWidth = RendererViewWidth();
     ViewMargin = RendererViewMargin();
+    ViewShiftX = RendererViewShiftX();
+    ViewShiftY = RendererViewShiftY();
     WideListOn = ViewWidth != WideMelon::NativeWidth && NDS.GPU.WidePolys;
     PreciseDepthOn = NDS.GPU.PreciseDepth;
 }
@@ -527,11 +531,14 @@ void GPU3D::Reset() noexcept
     {
         ViewWidth = WideMelon::NativeWidth;
         ViewMargin = 0;
+        ViewShiftX = ViewShiftY = 0;
         WideListOn = false;
         PreciseDepthOn = NDS.GPU.PreciseDepth;
     }
     RenderViewWidth = ViewWidth;
     RenderViewMargin = ViewMargin;
+    RenderViewShiftX = ViewShiftX;
+    RenderViewShiftY = ViewShiftY;
     RenderWideList = WideListOn;
 
     if (CurrentRenderer)
@@ -1852,9 +1859,12 @@ void GPU3D::SubmitPolygon() noexcept
             if (ViewWidth != WideMelon::NativeWidth)
             {
                 // X was squeezed by 256/W around clip X = 0, which is the viewport's centre, so it's
-                // stretched back by W/256 around that same point, on a target (W-256)/2 wider each side
-                s64 centre = ((s64)Viewport[0] << 4) + ((s64)Viewport[4] << 3) + ((ViewWidth - WideMelon::NativeWidth) << 3);
-                s64 num = (s64)vtx->Position[0] * Viewport[4] * ViewWidth;
+                // stretched back by W/256 around that same point, on a target (W-256)/2 wider each side.
+                // a shifted view (ViewShiftX) moved that point too: the shift is taken out of X and the
+                // centre moved by it, which cancels for a full-screen viewport
+                s64 centre = ((s64)Viewport[0] << 4) + ((s64)Viewport[4] << 3) + ((ViewWidth - WideMelon::NativeWidth) << 3)
+                             + (s64)ViewShiftX * 16;
+                s64 num = ((s64)vtx->Position[0] * ViewWidth - (s64)2 * ViewShiftX * (s64)w) * Viewport[4];
                 s64 den = (s64)w << 5;
                 s64 wideX = centre + (num >= 0 ? num / den : -((den - 1 - num) / den));
 
@@ -1865,9 +1875,10 @@ void GPU3D::SubmitPolygon() noexcept
             {
                 // the same for Y (camera stage 2): squeezed by 192/H around clip Y = 0, the viewport's
                 // centre, so stretched back by H/192 around it, on a target ViewMargin rows taller
-                // each side. clip Y points up and the rows down, as in the native formula
-                s64 centre = ((s64)Viewport[3] << 4) + ((s64)Viewport[5] << 3) + ((s64)ViewMargin << 4);
-                s64 num = -(s64)vtx->Position[1] * Viewport[5] * ViewHeight();
+                // each side. clip Y points up and the rows down, as in the native formula, and the shift
+                // (ViewShiftY) goes as in X
+                s64 centre = ((s64)Viewport[3] << 4) + ((s64)Viewport[5] << 3) + ((s64)ViewMargin << 4) + (s64)ViewShiftY * 16;
+                s64 num = -((s64)vtx->Position[1] * ViewHeight() + (s64)2 * ViewShiftY * (s64)w) * Viewport[5];
                 s64 den = (s64)w * 24;
                 s64 wideY = centre + (num >= 0 ? num / den : -((den - 1 - num) / den));
 
@@ -2237,9 +2248,9 @@ void GPU3D::SubmitVertex() noexcept
     TempVertexNativeX[VertexNumInPoly] = vertextrans->Position[0];
     TempVertexNativeY[VertexNumInPoly] = vertextrans->Position[1];
     if (ViewWidth != WideMelon::NativeWidth)
-        vertextrans->Position[0] = WideMelon::ProjectX(vertextrans->Position[0], ViewWidth);
+        vertextrans->Position[0] = WideMelon::ProjectX(vertextrans->Position[0], vertextrans->Position[3], ViewWidth, ViewShiftX);
     if (ViewMargin != 0)
-        vertextrans->Position[1] = WideMelon::ProjectY(vertextrans->Position[1], ViewHeight());
+        vertextrans->Position[1] = WideMelon::ProjectY(vertextrans->Position[1], vertextrans->Position[3], ViewHeight(), ViewShiftY);
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -2503,9 +2514,10 @@ void GPU3D::BoxTest(const u32* params) noexcept
     {
         for (int i = 0; i < 8; i++)
         {
-            cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], ViewWidth + 8);
+            // with the view's shift, so the 4 px go on each side of a shifted view too
+            cube[i].Position[0] = WideMelon::ProjectX(cube[i].Position[0], cube[i].Position[3], ViewWidth + 8, ViewShiftX);
             if (ViewMargin != 0)
-                cube[i].Position[1] = WideMelon::ProjectY(cube[i].Position[1], ViewHeight() + 8);
+                cube[i].Position[1] = WideMelon::ProjectY(cube[i].Position[1], cube[i].Position[3], ViewHeight() + 8, ViewShiftY);
         }
         hit = BoxTestHits(*this, cube);
         if (WideCheck) WideCheckBoxRetryHits += hit;
@@ -3410,6 +3422,7 @@ bool GPU3D::MatchRenderScene(bool save) noexcept
         pos += count;
     };
 
+    // no view shift in the key: the compute renderer never shifts, and a shift moves the vertices compared below
     item[0] = (u32)RenderViewWidth | ((u32)RenderViewMargin << 16);
     item[1] = RenderNumPolygons;
     put(2);
@@ -3485,6 +3498,7 @@ u64 GPU3D::HashRenderScene() const noexcept
         s32 Position[10][2], HiresPosition[10][2], Color[10][3], TexCoords[10][2];
     } item;
 
+    // without the view shift, as in MatchRenderScene's key (the vertices hashed below carry it)
     u64 hash = XXH64(&RenderNumPolygons, sizeof(RenderNumPolygons),
         (u64)((u32)RenderViewWidth | ((u32)RenderViewMargin << 16)) ^ ((u64)FlushAttributes << 32));
     for (u32 i = 0; i < RenderNumPolygons; i++)
@@ -3587,6 +3601,8 @@ void GPU3D::VBlank() noexcept
                 RenderNumPolygons = NumPolygons;
                 RenderViewWidth = ViewWidth;
                 RenderViewMargin = ViewMargin;
+                RenderViewShiftX = ViewShiftX;
+                RenderViewShiftY = ViewShiftY;
                 RenderWideList = WideListOn;
                 RenderFrameIdentical = false;
                 // with the list, so a scene drawn twice has its camera both times. the bank swap below starts the next one's
@@ -3919,6 +3935,22 @@ int GPU3D::RendererViewMargin() const noexcept
     if (WideCheck || !NDS.GPU.WideY)
         return 0;
     return WideMelon::SanitizeMargin(CurrentRenderer->GetViewMargin(), ViewWidth);
+}
+
+// and the shift, within the width and margin just latched (ViewWidth, ViewMargin): 0 at width 256 or margin 0, and
+// with the wide check
+int GPU3D::RendererViewShiftX() const noexcept
+{
+    if (WideCheck)
+        return 0;
+    return WideMelon::ClampShift(CurrentRenderer->GetViewShiftX(), (ViewWidth - WideMelon::NativeWidth) / 2);
+}
+
+int GPU3D::RendererViewShiftY() const noexcept
+{
+    if (WideCheck)
+        return 0;
+    return WideMelon::ClampShift(CurrentRenderer->GetViewShiftY(), ViewMargin);
 }
 
 bool GPU3D::IsRendererAccelerated() const noexcept
