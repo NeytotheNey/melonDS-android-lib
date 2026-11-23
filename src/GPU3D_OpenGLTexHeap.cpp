@@ -820,4 +820,120 @@ void GLTexHeap::InvalidatePalette(const TexPalDirtyPrefix& dirty)
     }
 }
 
+// [len] bytes from [lo] of a memory of [size] bytes (a power of two) into the hash after [seed], wrapping at its end as the DS's reads
+// do, and the 512 byte chunks that covers in [first] and [last]: all of them when it wraps
+static u64 HashWrapped(const u8* mem, u32 size, u32 lo, u32 len, u64 seed, u16& first, u16& last)
+{
+    lo &= size - 1;
+    len = std::min(len, size);
+    if (lo + len <= size)
+    {
+        first = (u16)(lo / 512);
+        last = (u16)((lo + len - 1) / 512);
+        return XXH3_64bits_withSeed(mem + lo, len, seed);
+    }
+    first = 0;
+    last = (u16)(size / 512 - 1);
+    u64 hash = XXH3_64bits_withSeed(mem + lo, size - lo, seed);
+    return XXH3_64bits_withSeed(mem, len - (size - lo), hash);
+}
+
+void GLTexHashes::Compute(const u8* texVram, const u8* palVram, u32 texparam, u32 texpal, Entry& e)
+{
+    constexpr u32 texSize = 512 * 1024, palSize = 128 * 1024;
+    // bits a texel, and the palette's bytes (4x4's comes from its blocks), by format
+    static constexpr u32 bitsPerTexel[8] = {0, 8, 2, 4, 8, 2, 8, 16};
+    static constexpr u32 paletteBytes[8] = {0, 32 * 2, 4 * 2, 16 * 2, 256 * 2, 0, 8 * 2, 0};
+
+    const u32 format = (texparam >> 26) & 0x7;
+    const u32 addr = (texparam & 0xFFFF) << 3;
+    const u32 texels = (8u << ((texparam >> 20) & 0x7)) * (8u << ((texparam >> 23) & 0x7));
+    u64 hash = HashWrapped(texVram, texSize, addr, texels * bitsPerTexel[format] / 8, (texparam >> 20) & 0x3FF, e.First0,
+                           e.Last0);
+    e.First1 = e.PalFirst = 1;
+    e.Last1 = e.PalLast = 0;
+
+    u32 palLo = texpal << (format == 2 ? 3 : 4);
+    u32 palLen = paletteBytes[format];
+    if (format == 5)
+    {
+        // each 4x4 block's palette index, in slot 1 (as SoftRenderer::TextureLookup finds it), points at its four colors
+        const u32 slot1 = 0x20000 + ((addr & 0x1FFFC) >> 1) + (addr >= 0x40000 ? 0x10000 : 0);
+        const u32 blocks = texels / 16;
+        hash = HashWrapped(texVram, texSize, slot1, blocks * 2, hash, e.First1, e.Last1);
+        u32 lowest = UINT32_MAX, highest = 0;
+        for (u32 b = 0; b < blocks; b++)
+        {
+            u16 info;
+            memcpy(&info, texVram + ((slot1 + b * 2) & (texSize - 2)), 2);
+            const u32 offset = (info & 0x3FFF) << 2;
+            lowest = std::min(lowest, offset);
+            highest = std::max(highest, offset);
+        }
+        palLo += lowest;
+        palLen = highest - lowest + 4 * 2;
+    }
+    if (palLen)
+        hash = HashWrapped(palVram, palSize, palLo, palLen, hash, e.PalFirst, e.PalLast);
+
+    // 0 is no texture
+    const u32 folded = (u32)(hash ^ (hash >> 32));
+    e.Hash = folded ? folded : 1;
+}
+
+u32 GLTexHashes::Hash(const u8* texVram, const u8* palVram, u32 texparam, u32 texpal)
+{
+    if (((texparam >> 26) & 0x7) == 0)
+        return 0;
+    if (Index.empty())
+    {
+        Index.assign(IndexSlots, -1);
+        Entries.reserve(MaxEntries);
+    }
+
+    // the address, size, format and color 0 bits, and the palette: what the hash reads from
+    const u64 key = (u64)(texparam & 0x3FF0FFFF) | ((u64)(texpal & 0x1FFF) << 32);
+    u32 slot = HashSlot(key);
+    while (Index[slot] >= 0 && Entries[Index[slot]].Key != key)
+        slot = (slot + 1) & (IndexSlots - 1);
+    if (Index[slot] < 0)
+    {
+        if ((int)Entries.size() == MaxEntries)
+        {
+            Clear();
+            slot = HashSlot(key);
+        }
+        Index[slot] = (s16)Entries.size();
+        Entries.push_back({key, 0, 0, 0, 0, 0, 0, 0, true});
+    }
+
+    Entry& e = Entries[Index[slot]];
+    if (e.Stale)
+    {
+        Compute(texVram, palVram, texparam, texpal, e);
+        e.Stale = false;
+    }
+    return e.Hash;
+}
+
+void GLTexHashes::Invalidate(const TexDirtyPrefix* tex, const TexPalDirtyPrefix* pal)
+{
+    constexpr u32 lastPalChunk = TexPalDirtyPrefix::NumChunks - 1;
+    for (Entry& e : Entries)
+    {
+        if (e.Stale)
+            continue;
+        // palette chunks past the 96 KB TexPalDirtyPrefix covers are never mapped, so they never change
+        if ((tex && (tex->Changed(e.First0, e.Last0) || tex->Changed(e.First1, e.Last1)))
+            || (pal && e.PalFirst <= lastPalChunk && pal->Changed(e.PalFirst, std::min<u32>(e.PalLast, lastPalChunk))))
+            e.Stale = true;
+    }
+}
+
+void GLTexHashes::Clear()
+{
+    Entries.clear();
+    std::fill(Index.begin(), Index.end(), -1);
+}
+
 }

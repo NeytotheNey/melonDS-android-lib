@@ -98,7 +98,14 @@ public:
     void SetOutputTexture(int buffer, u32 texture) override;
     void BindOutputTexture(int buffer) override;
     void SetOutputDepthTexture(int buffer, u32 texture) override;
-    bool SetupAccelDepth() override;
+    bool SetupAccelDepth(DepthCamera& camera) override;
+    void SetSunShadows(const SunShadows& sun) override { Sun = sun; }
+    void SetHiddenTextures(const u32* hashes, u32 count) override;
+    void SetLightTextures(const u32* hashes, u32 count) override;
+    void SetUiTextures(const u32* hashes, u32 count) override;
+    void SetFocusTextures(const u32* hashes, u32 count) override;
+    void SetTextureListing(bool on) override;
+    const TextureList* GetTextureList() const override { return TexList.get(); }
     bool TakeOutputLayout(int buffer, OutputLayout& layout) override { return CurGLCompositor.TakeOutputLayout(buffer, layout); }
     void SavestateLoaded() override;
 
@@ -133,6 +140,10 @@ private:
         // with GPU::GLTexCache 0x40000000 | the texture's heap offset (below 2^22, AssignTexCache),
         // plus step 4a's TexWord_Color and TexWord_RecAlpha (bits 22 and 23; 24 to 29 are free)
         u32 TexWord;
+        // the polygon's texture is one of the light textures (VtxAttr_Light)
+        bool Light;
+        // or one of the UI textures (VtxAttr_Ui)
+        bool Ui;
     };
 
     GLCompositor CurGLCompositor;
@@ -174,10 +185,19 @@ private:
     int FrameTargetWidth(const GPU& gpu) noexcept;
     bool ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept;
     void KeepColorBuffer() noexcept;
-    void ResolveDepth(bool wbuffer) noexcept;
+    void ResolveDepth(const GPU3D& gpu3d) noexcept;
     void FreeDepthOut() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
+    struct SunFrame;
+    struct SunClipVertex;
+    bool PrepareSunFrame(const GPU3D& gpu3d, SunFrame& frame) const;
+    static int ClipSunShadow(const SunFrame& frame, const SunClipVertex* in, int n, SunClipVertex* out);
+    static int SunShadowPolygon(const SunFrame& frame, const GPU& gpu, const Polygon* poly, const std::array<double, 16>& inverse,
+                                SunClipVertex* out);
+    u32* SetupSunVertices(const SunFrame& frame, const RendererPolygon* rp, const SunClipVertex* shadow, int n, u32* vptr) const;
+    void BuildSunShadows(const GPU& gpu, int npolys);
+    void DrawSunShadows();
     static bool GrowsSeams(const Polygon* poly);
     void BuildSkirt(RendererPolygon* rp, u32 rim, u32& vidx, u32& sidx);
     int RenderSkirtBatch(int i) const;
@@ -544,6 +564,76 @@ private:
     bool DepthWanted = false;
     GLuint DepthOutTex {}, KeptDepthOutTex {}, SpareDepthOutTex {};
     bool DepthOutValid = false, KeptDepthOutValid = false;
+    // the camera each of those frames was drawn with (GPU3D::RenderCamera as SetupAccelDepth hands it over) and its scene's focus
+    // (SceneFocus), swapped with them
+    DepthCamera DepthOutCamera {}, KeptDepthOutCamera {};
+    // while depth is wanted and the render's camera is valid, its index (GPU3D::SceneCamera::Index): BuildPolygons tags the
+    // polygons built under another one (VtxAttr_OtherCamera), whose pixels get flag 8 in the depth (attr A, kDepthResolveFS).
+    // NoSceneCamera tags none. the bit is one of the vertex attribute word's that kRenderVS and kRenderFS read nothing else from
+    u8 TagCamera = GPU3D::NoSceneCamera;
+    static constexpr u32 VtxAttr_OtherCamera = 1u << 30;
+    // the frontend's sun shadows (SetSunShadows), and what the last frame drawn had of them, so a change draws a frame RenderFrame
+    // would skip as identical again
+    SunShadows Sun {};
+    SunShadows SunDrawn {};
+    // the frontend's hidden textures (SetHiddenTextures), and whether they changed since the last frame drawn, which draws a frame
+    // RenderFrame would skip as identical again. RenderFrame leaves their polygons out of PolygonList, so nothing of theirs is drawn,
+    // edge-marked, fogged, depth-written or sun-shadowed
+    std::array<u32, MaxHiddenTextures> HiddenTextures {};
+    u32 NumHiddenTextures = 0;
+    bool HiddenTexturesChanged = false;
+    // the frontend's light textures (SetLightTextures), the same way. RenderFrame marks their polygons (RendererPolygon::Light), and
+    // BuildPolygons gives their vertices VtxAttr_Light, which makes the render shaders write attr A 0.25 (kRenderFS's DepthTag) and
+    // the depth resolve flag 32. the bit is one of the attribute word's that kRenderVS and kRenderFS read nothing else from
+    std::array<u32, MaxLightTextures> LightTextures {};
+    u32 NumLightTextures = 0;
+    bool LightTexturesChanged = false;
+    static constexpr u32 VtxAttr_Light = 1u << 12;
+    // and the UI textures (SetUiTextures): RendererPolygon::Ui, VtxAttr_Ui, attr A 0.125 and the depth resolve's flag 64, which the
+    // compositor's depth pass turns into 2D on top (kCompositorDepthFS). bit 10 is another of the attribute word's free bits
+    std::array<u32, MaxUiTextures> UiTextures {};
+    u32 NumUiTextures = 0;
+    bool UiTexturesChanged = false;
+    static constexpr u32 VtxAttr_Ui = 1u << 10;
+    // and the focus textures (SetFocusTextures): RenderFrame keeps the scene's biggest polygon of theirs in SceneFocus (NoteFocus, with
+    // its box's area in SceneFocusArea), which ResolveDepth hands out with the depth's camera
+    std::array<u32, MaxFocusTextures> FocusTextures {};
+    u32 NumFocusTextures = 0;
+    bool FocusTexturesChanged = false;
+    DepthFocus SceneFocus {};
+    s64 SceneFocusArea = -1;
+    // the renders ResolveDepth has resolved, for DepthFocus::Scene
+    u32 DepthScenes = 0;
+    // the content hashes the hidden, light, UI and focus textures and the listing (TexList, while SetTextureListing is on) pick
+    // textures by, made when one of them first needs it and dropped while none does, so the texture dirty tracking feeds it only then
+    std::unique_ptr<GLTexHashes> TexHashes;
+    std::unique_ptr<TextureList> TexList;
+    bool HidesTexture(u32 hash) const;
+    bool LightsTexture(u32 hash) const;
+    bool UiTexture(u32 hash) const;
+    bool FocusTexture(u32 hash) const;
+    void NoteFocus(const Polygon* polygon);
+    void ListTexture(const Polygon* polygon, u32 hash, bool hidden, bool light, bool ui, bool focus);
+    // per frame, while depth is wanted, the camera is valid (TagCamera) and Sun is on: the sun shadows of the polygons TagCamera tags
+    // that write depth, which BuildSunShadows puts after BuildPolygons' vertices and indices and DrawSunShadows draws after the scene,
+    // into attr A only (kRenderFS's DepthTag, from VtxAttr_SunShadow, one of the attribute word's bits the render shaders read
+    // nothing else from). each is drawn in the passes its polygon writes depth in: opaque for opaque and need-opaque polygons,
+    // translucent for translucent ones with depth write (attr bit 11). Full is PolyFull's program
+    struct SunShadow
+    {
+        u32 IndicesOffset;
+        u32 NumIndices;
+        bool Full;
+        bool Opaque;
+        bool Trans;
+    };
+    SunShadow SunShadowList[PolygonRAMSize] {};
+    int NumSunShadows = 0;
+    static constexpr u32 VtxAttr_SunShadow = 1u << 13;
+    // how much nearer than the scene a shadow is tested, in 24-bit depth (uDepthBias): three of the DS's 0x200 steps, as a floor's
+    // depth can round up to one step nearer than the shadow's own and the feet can sit a little off it, while a character drawn
+    // under its own projection (Pokemon White's) is several steps nearer than its true place, so it still hides its own shadow
+    static constexpr float SunShadowDepthBias = 3.0f * 512.0f;
     // DepthResolveFB's attachment, which follows DepthOutTex as it swaps, and whether it was complete
     GLuint DepthResolveFB {}, DepthResolveAttached {};
     bool DepthResolveComplete = false;
@@ -551,6 +641,7 @@ private:
     GLuint DepthResolveShader {};
     GLint DepthResolveWBufferLoc = -1;
     bool DepthResolveFailed = false;
+    static DepthCamera ToDepthCamera(const GPU3D::SceneCamera& camera) noexcept;
     // PrepareEarlyCaptureFrame's readback is in EarlyPixelbufferID and is still what line 0 would
     // read back. cleared by anything that draws into or resizes the 3D frame, or replaces the state
     bool EarlyCapture = false;

@@ -3463,8 +3463,11 @@ void main()
 // depth (GLRenderer::ResolveDepth, at least 1) where 3D shows on top, 0xFFFFFF where its 3D is
 // transparent and what's behind it shows, and 0 where there's nothing to blur: 2D on top (compmode 1
 // blends 2D over the 3D, 5-7 have none), another display mode, or a hi-res captured line. A holds
-// flags: 1 for those 0 pixels, 2 for the transparent ones, and 4 where the 3D read is W-buffered.
-// the rest are kept for later (docs/HD2D-Plan.md in the app, phase 3)
+// flags: 1 for those 0 pixels, 2 for the transparent ones, 4 where the 3D read is W-buffered, 8
+// where a polygon under another camera than the frame's (DepthCamera) drew the 3D that shows, 16
+// where such a polygon's sun shadow falls on it (SunShadows), and 32 where a light texture's polygon
+// (Renderer3D::SetLightTextures) drew it. where a UI texture's polygon (Renderer3D::SetUiTextures)
+// drew it, the 3D counts as 2D on top: 0 with flags 1 and 64. 128 is kept for later
 const char* kCompositorDepthFS = R"(#version 320 es
 
 precision highp float;
@@ -3492,6 +3495,10 @@ const int BEHIND_3D = 0xFFFFFF;
 const int FLAG_2D = 1;
 const int FLAG_BEHIND_3D = 2;
 const int FLAG_WBUFFER = 4;
+const int FLAG_OTHER_CAMERA = 8;
+const int FLAG_SUN_SHADOW = 16;
+const int FLAG_LIGHT = 32;
+const int FLAG_UI = 64;
 
 // (depth, flags)
 vec4 EncodeDepth(ivec2 value)
@@ -3501,7 +3508,8 @@ vec4 EncodeDepth(ivec2 value)
 }
 
 // the 3D at native position (xpos, row) of the target, with the same maths as Fetch3D: its depth
-// and its flags where it's drawn, BEHIND_3D where it's transparent or past the target's sides
+// and its flags where it's drawn, BEHIND_3D where it's transparent or past the target's sides, and
+// NO_DEPTH as 2D on top where a UI texture drew it
 ivec2 Depth3D(float xpos, float row)
 {
 #ifdef WIDE
@@ -3516,7 +3524,9 @@ ivec2 Depth3D(float xpos, float row)
     int wbuffer = bytes.a & FLAG_WBUFFER;
     if (texelFetch(_3DTex, coord, 0).a == 0.0)
         return ivec2(BEHIND_3D, FLAG_BEHIND_3D | wbuffer);
-    return ivec2(max((bytes.r << 16) | (bytes.g << 8) | bytes.b, 1), wbuffer);
+    if ((bytes.a & FLAG_UI) != 0)
+        return ivec2(NO_DEPTH, FLAG_2D | FLAG_UI);
+    return ivec2(max((bytes.r << 16) | (bytes.g << 8) | bytes.b, 1), bytes.a & (FLAG_WBUFFER | FLAG_OTHER_CAMERA | FLAG_SUN_SHADOW | FLAG_LIGHT));
 }
 
 void main()

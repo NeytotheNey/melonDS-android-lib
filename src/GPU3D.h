@@ -94,6 +94,10 @@ struct Polygon
 
     u32 SortKey;
 
+    // which of its scene's cameras it was built under (GPU3D::SceneCameras), GPU3D::NoSceneCamera when the table was full or the
+    // polygon came from a savestate, which doesn't hold it
+    u8 Camera;
+
     void DoSavestate(Savestate* file) noexcept;
 };
 
@@ -186,6 +190,56 @@ public:
     // per scene as well. set before the game runs
     void SetVertexIdLogging(int mode) noexcept;
     [[nodiscard]] int GetVertexIdLogging() const noexcept { return VertexIdLog ? VertexIdLog->GetMode() : 0; }
+
+    // a scene's cameras: each projection and viewport its polygons were built under, with how many of them, counted as they're built
+    // (SubmitPolygon) so the camera a frontend's effects get with the depth is the one most of the scene used, whatever is current at
+    // the swap. a polygon's Camera is its index here
+    static constexpr u32 MaxSceneCameras = 16;
+    static constexpr u8 NoSceneCamera = 0xFF;
+    struct CameraCount
+    {
+        s32 Proj[16];
+        u32 Viewport[6];
+        u32 Polygons;
+    };
+    // the camera picked for a scene at the swap (PickSceneCamera): the one with the most polygons, raw as the DS has it
+    struct SceneCamera
+    {
+        s32 Proj[16] {};
+        u32 Viewport[6] {};
+        // its index in the scene's cameras (Polygon::Camera), NoSceneCamera for a scene with none
+        u8 Index = NoSceneCamera;
+        // whether positions can be rebuilt from the depth with it: the scene is Z-buffered, the projection is a perspective one, at
+        // least half the scene's polygons use it, and every polygon was counted (not after a savestate load mid-scene)
+        bool Valid = false;
+    };
+    // the render list's (RenderPolygonRAM), picked when the list was latched, or HalfCamera's in-between scene's while that's shown.
+    // cleared with the rendering state
+    SceneCamera RenderCamera {};
+    // a scene's cameras as they were counted, so a renderer can look up a polygon's own projection by its Camera (the OpenGL
+    // renderer's sun shadows). RenderCameras is the render list's, latched, replaced and cleared with RenderCamera
+    struct CameraTable
+    {
+        std::array<CameraCount, MaxSceneCameras> Cameras {};
+        u32 Count = 0;
+    };
+    CameraTable RenderCameras {};
+
+    // debug only: each scene's cameras as they were counted, for the desktop's --camera-dump. costs a null check per swap while off
+    struct CameraLog
+    {
+        std::array<CameraCount, MaxSceneCameras> Cameras {};
+        u32 NumCameras = 0;
+        // polygons built while the table was full, and the scene's polygons
+        u32 Other = 0, Polygons = 0;
+        // what the swap picked from them (RenderCamera then)
+        SceneCamera Pick {};
+        // swaps latched since the logging went on, so a reader can tell a new scene
+        u32 Swaps = 0;
+    };
+    // set before the game runs
+    void SetCameraLogging(bool enable) noexcept { CameraLogData = enable ? std::make_unique<CameraLog>() : nullptr; }
+    [[nodiscard]] const CameraLog* GetCameraLog() const noexcept { return CameraLogData.get(); }
 
     // polygons dropped because the polygon or vertex RAM was full, since the last reset, and of those,
     // with WideMelon on, the ones the native view would still have had room for, so the wide view cost
@@ -352,8 +406,26 @@ private:
     SceneStatsCounters SceneStatsSec {};
     void NoteSceneStats(const GPU& gpu) noexcept;
 
+    // the scene being built's cameras (see CameraCount), not serialized: a state load starts them again, and the pick at its swap then
+    // sees polygons it didn't count. CurSceneCamera is the one the next polygon gets, looked up again once SceneCameraDirty says the
+    // projection or the viewport may have changed (UpdateClipMatrix, VIEWPORT). OtherCameraPolygons were built with the table full
+    std::array<CameraCount, MaxSceneCameras> SceneCameras {};
+    u32 NumSceneCameras = 0;
+    u32 OtherCameraPolygons = 0;
+    u8 CurSceneCamera = NoSceneCamera;
+    bool SceneCameraDirty = true;
+    void NoteSceneCamera() noexcept;
+    void ResetSceneCameras() noexcept;
+    [[nodiscard]] SceneCamera PickSceneCamera() const noexcept;
+    [[nodiscard]] CameraTable SceneCameraTable() const noexcept;
+    // HalfCamera's: the real scene's RenderCamera and RenderCameras while the in-between scene's own are there (it keeps the real
+    // list the same way)
+    SceneCamera RealRenderCamera {};
+    CameraTable RealRenderCameras {};
+
     // only allocated while the logging is on, not serialized
     std::unique_ptr<VertexIdLogger> VertexIdLog;
+    std::unique_ptr<CameraLog> CameraLogData;
     std::unique_ptr<HalfCamera> HalfCam;
 
 public:
@@ -542,6 +614,93 @@ public:
     u32 ScrolledLine[256]; // not part of the hardware state, don't serialize
 };
 
+// the camera the top screen's depth (Renderer3D::SetOutputDepthTexture) was drawn with, for a frontend that rebuilds view-space
+// positions from it. a pixel at (x, y) in DS pixels from the native top screen's top-left corner, rows going down (a pixel's center is
+// at +0.5; the wings and the margin rows are outside 0..256 and 0..192) with a Z-buffered 24-bit depth d is at NDC
+// x = (x - Viewport[0]) * 2 / Viewport[2] - 1, y = 1 - (y - Viewport[1]) * 2 / Viewport[3], z = (d - 0x7FFE00) / 2^23, and its
+// view-space position is inverse(Proj) times (x, y, z, 1), divided by its w. a game that puts its camera in the projection gets
+// world space instead
+// the scene's focus for a frontend's depth of field (Renderer3D::SetFocusTextures): of the polygons drawn with a focus texture (Pokemon
+// White's player), the one covering the biggest box on screen. Depth is its depth as the depth buffer holds it (its first vertex's FinalZ:
+// the 24-bit Z-buffer value, or W-buffered w in 20.12); Found is false when the scene drew none. WBuffer is whether the scene is W-buffered,
+// with or without one, and Scene counts the renders whose depth went out, so a frontend can tell a new scene from one it was handed before
+struct DepthFocus
+{
+    bool Found = false;
+    bool WBuffer = false;
+    u32 Depth = 0;
+    u32 Scene = 0;
+};
+
+struct DepthCamera
+{
+    // the projection most of the scene's polygons were built under, as real numbers in the DS's order, which is OpenGL's column-major
+    // one: GLSL's mat4 of these 16 floats times (view x, y, z, 1) is the clip position, as the DS's row vector times its matrix is
+    std::array<float, 16> Proj {};
+    // its viewport: left, top, width and height in DS pixels
+    std::array<float, 4> Viewport {};
+    // false when the scene is W-buffered, the projection is orthographic, it covers under half the scene's polygons, or the frame
+    // has no depth. Proj and Viewport still hold the scene's pick then, for logs (0 for a scene without polygons)
+    bool Valid = false;
+    // the scene's focus, which goes with its camera whether or not that's Valid (only the OpenGL renderer finds one)
+    DepthFocus Focus {};
+};
+
+// a frontend's sun shadows (Renderer3D::SetSunShadows), for the characters' own: while On, the frontend wants the depth and the scene's
+// camera is valid, the OpenGL renderer draws each polygon under another camera that writes depth (the depth's flag 8) a second time,
+// stood upright about its bottom edge and flattened onto the ground away from the sun, and sets flag 16 where it lands. Direction
+// (towards the sun) and Up (the world's up) are unit vectors in the view space of DepthCamera's projection
+struct SunShadows
+{
+    bool On = false;
+    std::array<float, 3> Direction {};
+    std::array<float, 3> Up {};
+
+    bool operator==(const SunShadows& other) const noexcept
+    {
+        return On == other.On && Direction == other.Direction && Up == other.Up;
+    }
+    bool operator!=(const SunShadows& other) const noexcept { return !(*this == other); }
+};
+
+// a frontend's hidden textures (Renderer3D::SetHiddenTextures) hold at most this many hashes
+constexpr u32 MaxHiddenTextures = 64;
+// and its light textures (Renderer3D::SetLightTextures) as many
+constexpr u32 MaxLightTextures = 64;
+// and its UI textures (Renderer3D::SetUiTextures) as many
+constexpr u32 MaxUiTextures = 64;
+// and its focus textures (Renderer3D::SetFocusTextures) as many
+constexpr u32 MaxFocusTextures = 64;
+
+// debug: the textures of the last frame the OpenGL renderer drew (Renderer3D::SetTextureListing), one entry per TexParam (but its
+// repeat, flip and transform bits) and TexPalette the frame's textured polygons used, in the order they first came. Hash is the
+// texture's content hash (GLTexHashes), Box the polygons' bounds (left, top, right, bottom, in the frame's 3D pixels, the native top
+// screen's 256 x 192 when it's not wide), Alpha and PolygonId the first polygon's, Hidden whether the hidden textures skipped them,
+// Light whether the light textures marked them, Ui whether the UI textures did, Focus whether the focus textures did
+struct TextureListEntry
+{
+    u32 Hash;
+    u32 TexParam;
+    u32 TexPalette;
+    u32 Polygons;
+    u32 Translucent;
+    s32 Box[4];
+    u8 Alpha;
+    u8 PolygonId;
+    bool Hidden;
+    bool Light;
+    bool Ui;
+    bool Focus;
+};
+struct TextureList
+{
+    // the frames listed so far, so a frontend can tell a new listing
+    u32 Frames = 0;
+    std::vector<TextureListEntry> Entries;
+    // the textures past this many in a frame aren't listed
+    static constexpr size_t MaxEntries = 1024;
+};
+
 // GPU::Comp1x (experiment K2c): what the compositor drew into an output texture. HalvesAt1x bit h
 // (0 the top screen, 1 the bottom one) is a half drawn at 1x: its image is the first ViewWidth x 192
 // texels from the half's first row (h * 194 * Scale, the rows the full draw starts it at), and the
@@ -566,8 +725,9 @@ struct OutputLayout
     // (y + TopMargin) * Scale. 0 is the old 386-row layout
     int TopMargin = 0;
     // whether the depth texture given with Renderer3D::SetOutputDepthTexture holds this draw's
-    // top-half depth (see GLCompositor::RenderDepth)
+    // top-half depth (see GLCompositor::RenderDepth), and the camera it was drawn with
     bool HasDepth = false;
+    DepthCamera Camera {};
 };
 
 class Renderer3D
@@ -624,8 +784,31 @@ public:
     // OpenGL renderer has one, the others never set OutputLayout::HasDepth
     virtual void SetOutputDepthTexture(int buffer, u32 texture) {}
     // for the compositor's depth pass: binds the 3D depth of the frame SetupAccelFrame binds to the
-    // active texture unit, and returns false when there's none to bind
-    virtual bool SetupAccelDepth() { return false; }
+    // active texture unit, with the camera it was drawn with in [camera], and returns false when there's none to bind
+    virtual bool SetupAccelDepth(DepthCamera& camera) { return false; }
+    // the frontend's sun shadows (see SunShadows), given before each frame like the depth texture. only the OpenGL renderer draws them
+    virtual void SetSunShadows(const SunShadows& sun) {}
+    // the frontend's hidden textures, given before each frame like the sun shadows: [count] content hashes (GLTexHashes, at most
+    // MaxHiddenTextures are taken), whose polygons the OpenGL renderer doesn't draw at all, as if the game hadn't sent them, while the
+    // game's own state stays as it is. 0 shows them all and costs nothing. the other renderers draw everything
+    virtual void SetHiddenTextures(const u32* hashes, u32 count) {}
+    // the frontend's light textures, given the same way: [count] content hashes (at most MaxLightTextures are taken), whose
+    // polygons' pixels get flag 32 in the depth's flags (kDepthResolveFS) where they write depth, so effects can make them glow.
+    // they're drawn as they are. 0 marks none and costs nothing. only the OpenGL renderer marks them
+    virtual void SetLightTextures(const u32* hashes, u32 count) {}
+    // the frontend's UI textures, given the same way: [count] content hashes (at most MaxUiTextures are taken) of the game's UI drawn
+    // in 3D (Pokemon White's speech bubble tails), whose polygons' pixels the depth hands over as 2D on top (depth 0, flags 1 and 64,
+    // kCompositorDepthFS) where they write depth, so effects leave them and take nothing from them. they're drawn as they are. 0
+    // marks none and costs nothing. only the OpenGL renderer marks them
+    virtual void SetUiTextures(const u32* hashes, u32 count) {}
+    // the frontend's focus textures, given the same way: [count] content hashes (at most MaxFocusTextures are taken) of what a depth of
+    // field should focus on (Pokemon White's player), whose biggest polygon in each scene goes out with the depth's camera
+    // (DepthCamera::Focus) while depth is wanted. they're drawn as they are; a hidden or UI texture is never the focus. 0 finds none and
+    // costs nothing. only the OpenGL renderer finds one
+    virtual void SetFocusTextures(const u32* hashes, u32 count) {}
+    // debug: while on, the OpenGL renderer lists each frame's textures it draws (TextureList), nullptr from the others or while off
+    virtual void SetTextureListing(bool on) {}
+    [[nodiscard]] virtual const TextureList* GetTextureList() const { return nullptr; }
     // GPU::Comp1x (experiment K2c): how the compositor last drew into output buffer [buffer]. true,
     // with [layout], the first time it's asked after a draw into the buffer, false when nothing drew
     // into it since then (or since SetOutputTexture gave it a texture), so the texture still holds

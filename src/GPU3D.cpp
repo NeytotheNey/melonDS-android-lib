@@ -222,6 +222,7 @@ static void LoadedPolygonDegenerate(Polygon* poly) noexcept
 {
     poly->Degenerate = false;
     poly->PreciseDepth = false;
+    poly->Camera = GPU3D::NoSceneCamera;
 
     for (u32 j = 0; j < poly->NumVertices; j++)
     {
@@ -263,6 +264,82 @@ void GPU3D::SetVertexIdLogging(int mode) noexcept
     VertexIdLog = mode > 0 ? std::make_unique<VertexIdLogger>(mode) : nullptr;
 }
 
+// CurSceneCamera for the projection and viewport now: the one it was if they're the same, else the table's entry for them, made
+// if there's room
+void GPU3D::NoteSceneCamera() noexcept
+{
+    SceneCameraDirty = false;
+    auto isCurrent = [this](const CameraCount& camera)
+    {
+        return !memcmp(camera.Proj, ProjMatrix, sizeof(camera.Proj)) && !memcmp(camera.Viewport, Viewport, sizeof(camera.Viewport));
+    };
+    if (CurSceneCamera != NoSceneCamera && isCurrent(SceneCameras[CurSceneCamera]))
+        return;
+    for (u32 i = 0; i < NumSceneCameras; i++)
+    {
+        if (isCurrent(SceneCameras[i]))
+        {
+            CurSceneCamera = (u8)i;
+            return;
+        }
+    }
+    if (NumSceneCameras == MaxSceneCameras)
+    {
+        CurSceneCamera = NoSceneCamera;
+        return;
+    }
+    CameraCount& camera = SceneCameras[NumSceneCameras];
+    memcpy(camera.Proj, ProjMatrix, sizeof(camera.Proj));
+    memcpy(camera.Viewport, Viewport, sizeof(camera.Viewport));
+    camera.Polygons = 0;
+    CurSceneCamera = (u8)NumSceneCameras++;
+}
+
+void GPU3D::ResetSceneCameras() noexcept
+{
+    NumSceneCameras = 0;
+    OtherCameraPolygons = 0;
+    CurSceneCamera = NoSceneCamera;
+    SceneCameraDirty = true;
+}
+
+// the scene being built's camera, at its swap (or HalfCamera's replay's end): the most polygons' (the first of a tie)
+GPU3D::SceneCamera GPU3D::PickSceneCamera() const noexcept
+{
+    SceneCamera pick;
+    u32 most = 0, counted = OtherCameraPolygons;
+    for (u32 i = 0; i < NumSceneCameras; i++)
+    {
+        counted += SceneCameras[i].Polygons;
+        if (SceneCameras[i].Polygons > most)
+        {
+            most = SceneCameras[i].Polygons;
+            pick.Index = (u8)i;
+        }
+    }
+    if (pick.Index == NoSceneCamera)
+        return pick;
+
+    const CameraCount& camera = SceneCameras[pick.Index];
+    memcpy(pick.Proj, camera.Proj, sizeof(pick.Proj));
+    memcpy(pick.Viewport, camera.Viewport, sizeof(pick.Viewport));
+    // clip w is (v x, y, z, 1) dotted with the matrix's fourth column, which a perspective projection makes depend on the
+    // position; an orthographic one leaves it at Proj[15]. every polygon of a scene shares its W-buffer setting
+    const bool perspective = camera.Proj[3] != 0 || camera.Proj[7] != 0 || camera.Proj[11] != 0;
+    const bool wbuffer = NumPolygons != 0 && CurPolygonRAM[0].WBuffer;
+    pick.Valid = perspective && !wbuffer && (u64)most * 2 >= NumPolygons && counted == NumPolygons;
+    return pick;
+}
+
+// the scene being built's cameras, for RenderCameras at its swap
+GPU3D::CameraTable GPU3D::SceneCameraTable() const noexcept
+{
+    CameraTable table;
+    std::copy_n(SceneCameras.begin(), NumSceneCameras, table.Cameras.begin());
+    table.Count = NumSceneCameras;
+    return table;
+}
+
 void GPU3D::SetHalfCamera(int mode) noexcept
 {
     // set again by a new game's start only, with no 3D frame in progress
@@ -281,6 +358,8 @@ void GPU3D::SetHalfCameraSmoothing(bool isEnabled) noexcept
 void GPU3D::ResetRenderingState() noexcept
 {
     RenderNumPolygons = 0;
+    RenderCamera = {};
+    RenderCameras = {};
 
     RenderDispCnt = 0;
     RenderAlphaRef = 0;
@@ -308,6 +387,7 @@ void GPU3D::Reset() noexcept
 {
     if (VertexIdLog) VertexIdLog->Invalidate();
     if (HalfCam) HalfCam->Invalidate();
+    ResetSceneCameras();
 
     CmdFIFO.Clear();
     CmdPIPE.Clear();
@@ -675,6 +755,8 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         UpdateClipMatrix();
 
         if (VertexIdLog) VertexIdLog->Invalidate();
+        // the scene's polygons so far aren't counted, which leaves its pick invalid
+        ResetSceneCameras();
 
         CurVertexRAM = &VertexRAM[CurRAMBank ? VertexRAMSize : 0];
         CurPolygonRAM = &PolygonRAM[CurRAMBank ? PolygonRAMSize : 0];
@@ -693,7 +775,12 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     u32 savedNumPolygons = std::min(renderNumPolygons, NativePolygonRAMSize);
     file->Var32(&savedNumPolygons);
     if (!file->Saving)
+    {
         RenderNumPolygons = savedNumPolygons;
+        // not in the state. after HalfCam's Invalidate above, which puts the real scene's back
+        RenderCamera = {};
+        RenderCameras = {};
+    }
     if (file->Saving)
     {
         for (u32 i = 0; i < NativePolygonRAMSize; i++)
@@ -1178,6 +1265,8 @@ void GPU3D::UpdateClipMatrix() noexcept
 {
     if (!ClipMatrixDirty) return;
     ClipMatrixDirty = false;
+    // the projection may be another one now, which the next polygon looks up
+    SceneCameraDirty = true;
 
     memcpy(ClipMatrix, ProjMatrix, 16*4);
     MatrixMult4x4(ClipMatrix, PosMatrix);
@@ -1877,6 +1966,10 @@ void GPU3D::SubmitPolygon() noexcept
     const u32 vertsbefore = NumVertices;
     Polygon* poly = &CurPolygonRAM[NumPolygons++];
     if (VertexIdLog) VertexIdLog->OnPolygon(NumPolygons - 1, *this);
+    if (SceneCameraDirty) NoteSceneCamera();
+    poly->Camera = CurSceneCamera;
+    if (CurSceneCamera != NoSceneCamera) SceneCameras[CurSceneCamera].Polygons++;
+    else                                 OtherCameraPolygons++;
     poly->NumVertices = 0;
 
     poly->Attr = CurPolygonAttr;
@@ -2883,6 +2976,7 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
             Viewport[3] = (191 - (entry.Param >> 24)) & 0xFF;             // y1
             Viewport[4] = (Viewport[2] - Viewport[0] + 1) & 0x1FF;          // width
             Viewport[5] = (Viewport[1] - Viewport[3] + 1) & 0xFF;           // height
+            SceneCameraDirty = true;
             break;
 
         case 0x72: // vec test
@@ -3495,6 +3589,18 @@ void GPU3D::VBlank() noexcept
                 RenderViewMargin = ViewMargin;
                 RenderWideList = WideListOn;
                 RenderFrameIdentical = false;
+                // with the list, so a scene drawn twice has its camera both times. the bank swap below starts the next one's
+                RenderCamera = PickSceneCamera();
+                RenderCameras = SceneCameraTable();
+                if (CameraLogData)
+                {
+                    CameraLogData->Cameras = SceneCameras;
+                    CameraLogData->NumCameras = NumSceneCameras;
+                    CameraLogData->Other = OtherCameraPolygons;
+                    CameraLogData->Polygons = NumPolygons;
+                    CameraLogData->Pick = RenderCamera;
+                    CameraLogData->Swaps++;
+                }
 
                 // SceneRepeatCheck: the swap is the only thing in the way of an identical frame
                 // when the registers are the last latch's and the scene is the last swap's again.
@@ -3544,6 +3650,7 @@ void GPU3D::VBlank() noexcept
             if (VertexIdLog) VertexIdLog->OnSwap(*this);
             if (HalfCam) HalfCam->OnSwap();
             if (WideDrops.Enabled) WideDropsOnSwap();
+            ResetSceneCameras();
 
             CurRAMBank = CurRAMBank?0:1;
             CurVertexRAM = &VertexRAM[CurRAMBank ? VertexRAMSize : 0];
