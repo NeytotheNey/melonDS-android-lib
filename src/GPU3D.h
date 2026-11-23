@@ -142,6 +142,9 @@ public:
     // and the vertical margin, the 3D rows above and below the 192 (0 unless the width is wide),
     // latched with it from the renderer's GetViewMargin() (0 with GPU::WideY off)
     [[nodiscard]] int GetViewMargin() const noexcept { return ViewMargin; }
+    // and the view shift, latched with them (see ViewShiftX)
+    [[nodiscard]] int GetViewShiftX() const noexcept { return ViewShiftX; }
+    [[nodiscard]] int GetViewShiftY() const noexcept { return ViewShiftY; }
     u32* GetLine(int line) noexcept { return GetLine(line, RenderXPos, AbortFrame); }
     // with the X scroll and abort state a line had when it was built, for a display capture
     // line that is drawn later (see GPU::Begin2DJob)
@@ -356,6 +359,13 @@ private:
     int ViewMargin = 0;
     int RendererViewMargin() const noexcept;
     [[nodiscard]] int ViewHeight() const noexcept { return 192 + 2 * ViewMargin; }
+    // the view shift: native column 0 sits (ViewWidth - 256) / 2 + ViewShiftX columns in from the view's left, and DS line 0
+    // ViewMargin + ViewShiftY rows down, so a guard band can go on some sides only. 0 at width 256 (X) or margin 0 (Y), and
+    // within the view; latched with the width
+    int ViewShiftX = 0;
+    int ViewShiftY = 0;
+    int RendererViewShiftX() const noexcept;
+    int RendererViewShiftY() const noexcept;
     // WideMelon's wide list (GPU::WidePolys): with the view wider than 256, a bank holds up to
     // PolygonRAMSize polygons and VertexRAMSize vertices, the native view's counts take the DS's limits
     // and only they set DISP3DCNT bit 13 and feed the count registers, and the polygons only the wide view
@@ -549,6 +559,8 @@ public:
     bool MatchRenderScene(bool save) noexcept;
     int RenderViewWidth = 256; // the view width RenderPolygonRAM was built for, not serialized either
     int RenderViewMargin = 0;  // and its margin
+    int RenderViewShiftX = 0;  // and its shift
+    int RenderViewShiftY = 0;
     // and whether it was built into WideMelon's wide list (WideListOn at the swap), for the renderers'
     // list sizes. derived on a state load
     bool RenderWideList = false;
@@ -827,6 +839,12 @@ public:
     // 0 unless the width is wide
     [[nodiscard]] virtual int GetViewMargin() const noexcept { return 0; }
     [[nodiscard]] virtual int GetOutputMargin() const noexcept { return 0; }
+    // and the view shift (GPU3D::ViewShiftX), new geometry's and the output's, which lags the same way. only the GL renderer
+    // shifts
+    [[nodiscard]] virtual int GetViewShiftX() const noexcept { return 0; }
+    [[nodiscard]] virtual int GetViewShiftY() const noexcept { return 0; }
+    [[nodiscard]] virtual int GetOutputShiftX() const noexcept { return 0; }
+    [[nodiscard]] virtual int GetOutputShiftY() const noexcept { return 0; }
 
     // hi-res display capture (GPU::HiresCapture): whether the GL compositor's capture pass would
     // run with this frame's capture (GLCompositor::RunsHiresCapture). off without a compositor

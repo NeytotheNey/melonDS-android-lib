@@ -64,8 +64,10 @@ public:
     // target is 192 + 2 x margin rows tall, all shown in the top half, which the output's layout
     // follows (OutputLayout::TopMargin): (192 + 2 x margin) x scale rows, the 2 x scale padding rows,
     // then the bottom screen's 192 x scale. a margin row has no 2D line, so it's drawn as a wing
-    // pixel of the nearest DS line (0 or 191), with the 3D at its own row and column (MarginEdge)
-    void SetRenderSettings(int scale, int scale3D, int viewWidth, int margin) noexcept;
+    // pixel of the nearest DS line (0 or 191), with the 3D at its own row and column (MarginEdge).
+    // [shiftX] and [shiftY] are the 3D's view shift (GPU3D::ViewShiftX, only the GL renderer's): the
+    // native 256 x 192 starts WingLeft() columns and RowsAbove() rows into the top half
+    void SetRenderSettings(int scale, int scale3D, int viewWidth, int margin, int shiftX = 0, int shiftY = 0) noexcept;
     // GPU::OutputCap: the output scale for 3D at [scale] when what shows the output needs [need]x:
     // the smallest s >= need that divides scale with scale / s up to 4 or, with [anyRatio] (GPU::OutputCap
     // bit 2), is also above scale / 2 (8x gives 5x-7x, 12x 7x-11x, 16x 9x-15x), so an output pixel
@@ -207,7 +209,7 @@ private:
     struct DepthProgram
     {
         GLuint Program = 0;
-        GLint ScaleLoc = -1, HiresCapLoc = -1, WideRatioLoc = -1, WideOffsetLoc = -1, WideMarginLoc = -1;
+        GLint ScaleLoc = -1, HiresCapLoc = -1, WideRatioLoc = -1, WideOffsetLoc = -1, WideShiftLoc = -1, WideTopLoc = -1;
     };
     struct DepthOutState
     {
@@ -251,8 +253,14 @@ private:
     // the vertical margin (see SetRenderSettings), and the output rows the top half's DS line 0 and the
     // bottom half start at, in native rows (0 and 194 without a margin)
     int Margin = 0;
+    // the view shift (see SetRenderSettings): the columns left and right of the native 256, and the
+    // top half's rows above DS line 0
+    int ShiftX = 0, ShiftY = 0;
+    [[nodiscard]] int WingLeft() const noexcept { return (ViewWidth - 256) / 2 + ShiftX; }
+    [[nodiscard]] int WingRight() const noexcept { return (ViewWidth - 256) / 2 - ShiftX; }
+    [[nodiscard]] int RowsAbove() const noexcept { return Margin + ShiftY; }
     [[nodiscard]] int TopRows() const noexcept { return 192 + 2 * Margin; }
-    [[nodiscard]] int HalfLineRow(int half) const noexcept { return half ? TopRows() + 2 : Margin; }
+    [[nodiscard]] int HalfLineRow(int half) const noexcept { return half ? TopRows() + 2 : RowsAbove(); }
     int ScreenH = 0, ScreenW = 0;
 
     GLuint CompShader {};
@@ -282,6 +290,8 @@ private:
         GLuint WideRatioLoc = 0;
         GLuint WideOffsetLoc = 0;
         GLint WideMarginLoc = -1;
+        GLint WideShiftLoc = -1;
+        GLint WideTopLoc = -1;
         // filtered 2D's (FILTER2D, in Filter2DState::Down3D) only: uFilterMapScale and uFilterRowOffset
         GLint MapScaleLoc = -1;
         GLint RowOffsetLoc = -1;
@@ -346,6 +356,8 @@ private:
     GLuint CompWideOffsetLoc = 0;
     GLuint CompWideHiresCapLoc = 0;
     GLint CompWideMarginLoc = -1;
+    GLint CompWideShiftLoc = -1;
+    GLint CompWideTopLoc = -1;
 
     // the wide programs' wing planes (see GPU2D::AccelWingPlanesStart), GL_RGBA8UI, 6 texels per
     // line, both screens' 192 lines like the screen texture. made with the wide program and
@@ -434,7 +446,7 @@ private:
         GLuint Shader = 0;
         bool ShaderFailed = false;
         GLuint ScaleLoc = 0, WideOffsetLoc = 0, DstRowLoc = 0;
-        GLint WideMarginLoc = -1;
+        GLint WideTopLoc = -1;
         // GPU::OutputCap: the pass's programs for a capped output, one per GPU::OutputCap3D mode
         // (HiresCaptureDown3DFS), which read the 3D at its own scale. made alongside the compositor's
         // (PrepareCapped) while hi-res capture is on, or by the first capped pass that needs one
@@ -443,7 +455,7 @@ private:
             GLuint Program = 0;
             bool Failed = false;
             GLuint ScaleLoc = 0, WideOffsetLoc = 0, DstRowLoc = 0, RatioLoc = 0;
-            GLint WideMarginLoc = -1;
+            GLint WideTopLoc = -1;
         };
         std::array<Down3DShader, 4> Down3D {};
 
@@ -495,6 +507,8 @@ private:
         GLuint ScaleLoc = 0, RatioLoc = 0, OffsetLoc = 0, HiresCapLoc = 0, MapScaleLoc = 0, IdentityLoc = 0;
         GLint RowOffsetLoc = -1;
         GLint MarginLoc = -1;
+        GLint ShiftLoc = -1;
+        GLint TopLoc = -1;
     };
     struct Filter2DState
     {
@@ -569,7 +583,7 @@ private:
     struct Shadow2DProgram
     {
         GLuint Program = 0;
-        GLint ScaleLoc = -1, WideOffsetLoc = -1, ObjOffsetLoc = -1, WideMarginLoc = -1;
+        GLint ScaleLoc = -1, WideOffsetLoc = -1, ObjOffsetLoc = -1, WideMarginLoc = -1, WideTopLoc = -1;
         // the affine composite's run constants (Shadow2D::PackAffineLine)
         GLint AffineRefLoc = -1, AffineRot2Loc = -1, AffineRot3Loc = -1, AffineLineLoc = -1, AffineRowLoc = -1;
         GLint AffinePerLineLoc = -1;
@@ -645,9 +659,9 @@ private:
     // 0-5 half 1's quad (output rows from 194 * Scale, the bottom screen: the top of clip space, as
     // the frontend reads the output upside down) and 6-11 half 0's. GPU::Comp1x: 12-17 half 0 over a
     // whole viewport, 18-23 half 1 (see DrawHalfAt1x). with a margin, half 0's texture coordinates
-    // run from -margin to 192 + margin over its 192 + 2 x margin rows (SetupCompVertices)
+    // run from -(margin + shiftY) to 192 + margin - shiftY over its 192 + 2 x margin rows (SetupCompVertices)
     std::array<CompVertex, 2*3*2*2> CompVertices {};
-    void SetupCompVertices(int margin) noexcept;
+    void SetupCompVertices(int margin, int shiftY) noexcept;
 
     GLuint CompScreenInputTex = 0;
     // the compositor's own output textures only exist while a buffer is drawn into without a

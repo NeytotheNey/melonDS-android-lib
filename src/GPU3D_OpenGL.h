@@ -26,6 +26,7 @@
 #include "GPU3D_GLStats.h"
 #include "GPU3D_Hash3D.h"
 #include "GPU3D_OpenGLTexHeap.h"
+#include "WideMelon.h"
 
 namespace melonDS
 {
@@ -75,6 +76,16 @@ public:
     void SetViewMargin(int margin) noexcept;
     [[nodiscard]] int GetViewMargin() const noexcept override { return ViewMargin; }
     [[nodiscard]] int GetOutputMargin() const noexcept override { return TargetMargin; }
+    // the view shift (GPU3D::ViewShiftX): native column 0 sits (width - 256) / 2 + x columns in from the view's left and DS line 0
+    // margin + y rows down, so the extra columns and rows can be more on one side than the other. kept like the margin, and
+    // clamped to the view: within +-(width - 256) / 2 and +-margin, so 0 while the width or the margin falls back. the output's
+    // (GetOutputShiftX) lags like its width, and a frontend finds the native 256 x 192 at column (GetOutputWidth() - 256) / 2 +
+    // GetOutputShiftX() and row GetOutputMargin() + GetOutputShiftY() of the top half
+    void SetViewShift(int x, int y) noexcept;
+    [[nodiscard]] int GetViewShiftX() const noexcept override { return ViewShiftX; }
+    [[nodiscard]] int GetViewShiftY() const noexcept override { return ViewShiftY; }
+    [[nodiscard]] int GetOutputShiftX() const noexcept override { return TargetShiftX; }
+    [[nodiscard]] int GetOutputShiftY() const noexcept override { return TargetShiftY; }
     [[nodiscard]] bool RunsHiresCapture(int debug) const noexcept override { return CurGLCompositor.RunsHiresCapture(debug); }
 
     void VCount144(GPU& gpu) override {};
@@ -178,12 +189,26 @@ private:
     bool TargetFits(int width, int scale) const noexcept;
     bool MarginFits(int margin, int scale) const noexcept;
     int ResolveViewMargin(int margin, int width, int scale) noexcept;
-    int FrameTargetMargin(const GPU& gpu, int targetWidth) const noexcept;
+    void ResolveViewShift() noexcept;
     bool ScaleFits(int scale) const noexcept;
     int FitScale(int scale) const noexcept;
     int ResolveViewWidth(int width, int scale) noexcept;
-    int FrameTargetWidth(const GPU& gpu) noexcept;
-    bool ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept;
+    // the targets' width, margin and shift (TargetWidth and the rest)
+    struct TargetView
+    {
+        int Width = 256;
+        int Margin = 0;
+        int ShiftX = 0;
+        int ShiftY = 0;
+        bool operator==(const TargetView& other) const noexcept
+        {
+            return Width == other.Width && Margin == other.Margin && ShiftX == other.ShiftX && ShiftY == other.ShiftY;
+        }
+        bool operator!=(const TargetView& other) const noexcept { return !(*this == other); }
+    };
+    [[nodiscard]] TargetView CurrentTarget() const noexcept { return {TargetWidth, TargetMargin, TargetShiftX, TargetShiftY}; }
+    TargetView FrameTarget(const GPU& gpu) noexcept;
+    bool ResizeTargets(bool betterpolygons, int scale, const TargetView& target) noexcept;
     void KeepColorBuffer() noexcept;
     void ResolveDepth(const GPU3D& gpu3d) noexcept;
     void FreeDepthOut() noexcept;
@@ -442,10 +467,17 @@ private:
     int RequestedViewMargin = 0;
     int ViewMargin = 0;
     int TargetMargin = 0;
+    // the shift asked for (SetViewShift), the one new geometry gets (clamped to ViewWidth and ViewMargin) and the targets'
+    int RequestedViewShiftX = 0, RequestedViewShiftY = 0;
+    int ViewShiftX = 0, ViewShiftY = 0;
+    int TargetShiftX = 0, TargetShiftY = 0;
+    // the targets' columns left of native column 0 and rows above DS line 0
+    [[nodiscard]] int TargetLeft() const noexcept { return (TargetWidth - WideMelon::NativeWidth) / 2 + TargetShiftX; }
+    [[nodiscard]] int TargetTop() const noexcept { return TargetMargin + TargetShiftY; }
 
     // set per frame: the polygons were built for a wide view, or are drawn into one. when the
-    // two widths differ (right after a change), WideXAdjust keeps them centred. the same for the
-    // margin (WideFrameY and WideYAdjust, in hi-res rows)
+    // two views differ (right after a change), WideXAdjust keeps their native columns lined up. the
+    // same for the margin (WideFrameY and WideYAdjust, in hi-res rows)
     bool WideFrame {};
     s32 WideXAdjust {};
     bool WideFrameY {};
@@ -458,8 +490,10 @@ private:
     // GPU::GLSeams as the last frame drawn had it, so a change draws an identical frame again
     int SeamsDrawn = 0;
     s32 WideYAdjust {};
-    // the margin the frame's polygons were built for (GPU3D::RenderViewMargin), for TargetRow
+    // the margin the frame's polygons were built for (GPU3D::RenderViewMargin), for TargetRow, and their rows above
+    // DS line 0 (with GPU3D::RenderViewShiftY)
     int FrameMargin = 0;
+    int FrameTop = 0;
 
     // set per frame from GPU::ShadowMaskLineClear, GPU::ShadowMaskDepthTest and GPU::EqualDepthMargin
     bool ShadowMaskLineClear = true;

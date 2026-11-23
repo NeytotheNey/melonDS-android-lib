@@ -22,13 +22,20 @@ inline int SanitizeWidth(int width)
     return width;
 }
 
-// Squeezes clip-space X so the native frustum only covers the centre 256/width
-// of the screen. Everything the game would have clipped at the sides now lands
-// in the extra space instead. Rounds to nearest, symmetrically around 0.
-inline int32_t ProjectX(int32_t x, int width)
+// n / d rounded to nearest, symmetrically around 0, kept within int32 (a shifted view's terms can add up past it)
+inline int32_t RoundedRatio(int64_t n, int d)
 {
-    int64_t n = (int64_t)x * NativeWidth;
-    return (int32_t)((n + (n < 0 ? -(width / 2) : (width / 2))) / width);
+    int64_t q = (n + (n < 0 ? -(d / 2) : (d / 2))) / d;
+    return (int32_t)(q < INT32_MIN ? INT32_MIN : q > INT32_MAX ? INT32_MAX : q);
+}
+
+// Squeezes clip-space X so the native frustum only covers 256 of the screen's
+// [width] columns, starting (width - 256) / 2 + shiftX in from the left (shiftX
+// positive moves it right). Everything the game would have clipped at the sides
+// now lands in the extra space instead. [w] is the vertex's clip W.
+inline int32_t ProjectX(int32_t x, int32_t w, int width, int shiftX)
+{
+    return RoundedRatio((int64_t)x * NativeWidth + (int64_t)2 * shiftX * w, width);
 }
 
 // the margin only applies to a wide view, and is clamped to 0..MaxMargin
@@ -39,12 +46,19 @@ inline int SanitizeMargin(int margin, int viewWidth)
     return margin > MaxMargin ? MaxMargin : margin;
 }
 
-// ProjectX for clip-space Y: squeezes the native frustum into the middle 192 rows of a view
-// [height] rows tall (192 + 2 * margin), rounded the same way
-inline int32_t ProjectY(int32_t y, int height)
+// ProjectX for clip-space Y: squeezes the native frustum into 192 rows of a view [height] rows
+// tall (192 + 2 * margin), starting margin + shiftY rows down (shiftY positive moves it down, and
+// clip Y points up), rounded the same way
+inline int32_t ProjectY(int32_t y, int32_t w, int height, int shiftY)
 {
-    int64_t n = (int64_t)y * NativeHeight;
-    return (int32_t)((n + (n < 0 ? -(height / 2) : (height / 2))) / height);
+    return RoundedRatio((int64_t)y * NativeHeight - (int64_t)2 * shiftY * w, height);
+}
+
+// the view shift that fits a view: native column 0 at (width - 256) / 2 + shiftX and row 0 at margin + shiftY,
+// so each side keeps 0 or more columns and rows
+inline int ClampShift(int shift, int room)
+{
+    return shift < -room ? -room : shift > room ? room : shift;
 }
 
 }

@@ -1186,6 +1186,8 @@ void HalfCamera::ResetShadow()
     // what the scene was built for: it's only updated after this, at the swap
     shadow.ViewWidth = Main.ViewWidth;
     shadow.ViewMargin = Main.ViewMargin;
+    shadow.ViewShiftX = Main.ViewShiftX;
+    shadow.ViewShiftY = Main.ViewShiftY;
     shadow.WideListOn = Main.WideListOn;
     shadow.PreciseDepthOn = Main.PreciseDepthOn;
     shadow.ZeroDotWLimit = Main.ZeroDotWLimit;

@@ -103,6 +103,8 @@ in vec2 vTexcoord;
 
 #ifdef WIDE
 uniform float uWideRatio;
+// the view shift (GLCompositor::ShiftX): the native 256 starts this many columns right of the output's centred spot
+uniform int uWideShiftX;
 #endif
 
 smooth out vec2 fTexcoord;
@@ -117,7 +119,7 @@ void main()
     gl_Position = fpos;
 #ifdef WIDE
     // spread the native 0..256 over the wide output, what ends up below 0 or past 256 is a wing
-    fTexcoord = vec2((vTexcoord.x - 128.0) * uWideRatio + 128.0, vTexcoord.y);
+    fTexcoord = vec2((vTexcoord.x - 128.0) * uWideRatio + 128.0 - float(uWideShiftX), vTexcoord.y);
 #else
     fTexcoord = vTexcoord;
 #endif
@@ -151,12 +153,17 @@ uniform int uWideOffset;
 // rows below them. 0 is the old layout. the 256 view never has one (WIDE_MARGIN)
 uniform int uWideMargin;
 #define WIDE_MARGIN uWideMargin
+// and the rows above DS line 0: uWideMargin, plus the view shift (GLCompositor::RowsAbove). the
+// sizes go by uWideMargin, the offsets by this
+uniform int uWideTop;
+#define WIDE_TOP uWideTop
 uniform mediump sampler2D HeldWingsTex;
 // each line's wing planes (GPU2D::AccelWingPlanesStart): planes 0-2 of the left wing's pixel in
 // texels 0-2, the right one's in 3-5, at the screen texture's rows
 uniform usampler2D WingPlanesTex;
 #else
 #define WIDE_MARGIN 0
+#define WIDE_TOP 0
 #endif
 
 uniform usampler2D ScreenTex;
@@ -222,15 +229,15 @@ ivec4 Fetch3D(float xpos, float ypos)
 
 #ifdef WIDE
 // the 3D target's row, in native rows, for this pixel: the top half's rows are the target's, its
-// margins included (fTexcoord.y runs from -uWideMargin there), and the bottom half shows the target's
-// middle 192. without a margin it's as before
+// margins included (fTexcoord.y runs from -uWideTop there), and the bottom half shows the target's
+// native 192. without a margin it's as before
 float Row3D()
 {
     if (uWideMargin == 0)
         return mod(fTexcoord.y, 192.0);
     if (gl_FragCoord.y < float((192 + 2 * uWideMargin) * int(u3DScale)))
-        return fTexcoord.y + float(uWideMargin);
-    return fTexcoord.y - 192.0 + float(uWideMargin);
+        return fTexcoord.y + float(uWideTop);
+    return fTexcoord.y - 192.0 + float(uWideTop);
 }
 #define ROW3D Row3D()
 
@@ -325,11 +332,11 @@ highp ivec2 FilterSubPixel()
     highp ivec2 coord = ivec2(gl_FragCoord.xy);
     coord.y -= uFilterRowOffset;
     highp int scale = int(u3DScale);
-    // the top screen's DS lines start WIDE_MARGIN rows down (only DS lines get here, see main)
+    // the top screen's DS lines start WIDE_TOP rows down (only DS lines get here, see main)
     if (coord.y >= (194 + 2 * WIDE_MARGIN) * scale)
         coord.y -= (2 + 2 * WIDE_MARGIN) * scale;
     else
-        coord.y -= WIDE_MARGIN * scale;
+        coord.y -= WIDE_TOP * scale;
 #ifdef WIDE
     coord.x -= uWideOffset * scale;
 #endif
@@ -453,7 +460,7 @@ void main()
         if (coord.y >= (194 + 2 * WIDE_MARGIN) * scale)
             coord.y -= (194 + 2 * WIDE_MARGIN) * scale;
         else
-            coord.y -= WIDE_MARGIN * scale;
+            coord.y -= WIDE_TOP * scale;
 #ifdef WIDE
         coord.x -= uWideOffset * scale;
 #endif
@@ -829,13 +836,13 @@ ivec4 FinishPixel(ivec4 pixel, ivec4 mbright, int dispmode)
 
 // the output pixel in its half's rows, which are the 3D's: the output has 2 padding lines between the
 // halves, so the second half's rows start at 194 lines. with a margin (WIDE_MARGIN) the top half has
-// the 3D's 192 + 2 * margin rows, and the bottom one shows its middle 192, from row margin
+// the 3D's 192 + 2 * margin rows, and the bottom one shows its native 192, from row WIDE_TOP
 highp ivec2 OutputPixel()
 {
     highp int scale = int(u3DScale);
     highp ivec2 base = ivec2(gl_FragCoord.xy);
     if (base.y >= (194 + 2 * WIDE_MARGIN) * scale)
-        base.y -= (194 + WIDE_MARGIN) * scale;
+        base.y -= (194 + 2 * WIDE_MARGIN - WIDE_TOP) * scale;
     return base;
 }
 
@@ -1107,7 +1114,7 @@ void main()
         if (coord.y >= (194 + 2 * WIDE_MARGIN) * scale)
             coord.y -= (194 + 2 * WIDE_MARGIN) * scale;
         else
-            coord.y -= WIDE_MARGIN * scale;
+            coord.y -= WIDE_TOP * scale;
 #ifdef WIDE
         coord.x -= uWideOffset * scale;
 #endif
@@ -1204,7 +1211,7 @@ precision highp usampler2D;
 
 uniform int uScale;
 uniform int uWideOffset;    // native columns the 3D target has on each side of the middle 256
-uniform int uWideMargin;    // and the rows above DS line 0 (camera stage 2), 0 without a margin
+uniform int uWideTop;       // and the rows above DS line 0 (camera stage 2, with the view shift), 0 without a margin
 uniform int uDstRow;        // the bank row the capture starts at
 
 // per capture line: the 3 planes (columns 0-767) as GPU::HiresCapRecord has them, then 2 control
@@ -1228,7 +1235,7 @@ ivec4 Fetch3DCapture(int x, int y)
     if (x < 0 || x >= 256 * uScale)
         return ivec4(0);
 
-    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * uScale, y + uWideMargin * uScale), 0);
+    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * uScale, y + uWideTop * uScale), 0);
     return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
 }
 
@@ -1251,7 +1258,7 @@ ivec4 Fetch3DCaptureAt(int x, int y, int scale3D)
     if (x < 0 || x >= 256 * scale3D)
         return ivec4(0);
 
-    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * scale3D, y + uWideMargin * scale3D), 0);
+    vec4 texel = texelFetch(_3DTex, ivec2(x + uWideOffset * scale3D, y + uWideTop * scale3D), 0);
     return ivec4(round(texel.bgra * 255.0)) >> ivec4(2, 2, 2, 3);
 }
 
@@ -1269,7 +1276,7 @@ ivec4 Average3DCapture(int x, int y, Block3D block, int scale3D)
         return ivec4(0);
 
 #if DOWN3D_MODE == 1 || DOWN3D_MODE == 3
-    block.first = ivec2(x + uWideOffset * scale3D, y + uWideMargin * scale3D);
+    block.first = ivec2(x + uWideOffset * scale3D, y + uWideTop * scale3D);
     vec4 average = Bilinear3DBlock(block);
     return ivec4(average.bgra * 255.0 + 0.5) >> ivec4(2, 2, 2, 3);
 #else
@@ -1328,7 +1335,7 @@ void SourceADown3D(ivec2 frag, int row, int x, int line, uint capcnt, int xscrol
     if (x3d >= 0 && x3d < 256 * scale3D)
     {
         Block3D texels = block;
-        texels.first = ivec2(x3d + uWideOffset * scale3D, y3d + uWideMargin * scale3D);
+        texels.first = ivec2(x3d + uWideOffset * scale3D, y3d + uWideTop * scale3D);
         int alphas = Block3DAlphas(texels);
         exact = alphas == 2 || (alphas == 1 && BlendSaturates(val3));
     }
@@ -2540,10 +2547,10 @@ void OutputPixel(out int row, out int nx, out ivec2 sub)
 {
     highp ivec2 frag = ivec2(gl_FragCoord.xy);
     int scale = int(u3DScale);
-    // the output has 2 padding lines between the screens, and the top screen's lines start WIDE_MARGIN
+    // the output has 2 padding lines between the screens, and the top screen's lines start WIDE_TOP
     // rows down (the margins are never drawn here, see GLCompositor::BuildShadow2DQuads)
     int screen = frag.y >= (194 + 2 * WIDE_MARGIN) * scale ? 1 : 0;
-    int subY = frag.y - (screen != 0 ? 194 + 2 * WIDE_MARGIN : WIDE_MARGIN) * scale;
+    int subY = frag.y - (screen != 0 ? 194 + 2 * WIDE_MARGIN : WIDE_TOP) * scale;
     row = screen * 192 + subY / scale;
 
     int subX = frag.x - SHADOW_OFFSET * scale;
@@ -3478,7 +3485,8 @@ precision mediump usampler2D;
 uniform uint u3DScale;
 #ifdef WIDE
 uniform int uWideOffset;
-uniform int uWideMargin;
+// the target's rows above DS line 0 (GLCompositor::RowsAbove)
+uniform int uWideTop;
 #endif
 uniform int uHiresCap;
 
@@ -3531,10 +3539,10 @@ ivec2 Depth3D(float xpos, float row)
 
 void main()
 {
-    // half 0's texture coordinates run from -margin to 192 + margin (GLCompositor::SetupCompVertices),
+    // half 0's texture coordinates run from -top to 192 + bottom (GLCompositor::SetupCompVertices),
     // and a margin pixel takes its edge line's control word, as the main draw's does (MarginEdge)
 #ifdef WIDE
-    float row3D = fTexcoord.y + float(uWideMargin);
+    float row3D = fTexcoord.y + float(uWideTop);
 #else
     float row3D = fTexcoord.y;
 #endif
