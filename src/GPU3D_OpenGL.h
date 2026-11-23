@@ -174,7 +174,7 @@ private:
     int FrameTargetWidth(const GPU& gpu) noexcept;
     bool ResizeTargets(bool betterpolygons, int scale, int targetWidth, int targetMargin) noexcept;
     void KeepColorBuffer() noexcept;
-    void ResolveDepth() noexcept;
+    void ResolveDepth(bool wbuffer) noexcept;
     void FreeDepthOut() noexcept;
     void ReadBackCaptureFrame(GLuint pixelBuffer) noexcept;
     void BuildPolygons(RendererPolygon* polygons, int npolys);
@@ -536,7 +536,7 @@ private:
     // set by KeepFrameForBlit for the next RenderFrame, which clears it
     bool KeepRequested = false;
     // the frontend's depth of field (SetOutputDepthTexture): each render's depth resolved into an
-    // RG8 texture at the end of the frame (kDepthResolveFS), since DepthBufferTex is shared by the
+    // RGBA8 texture at the end of the frame (kDepthResolveFS), since DepthBufferTex is shared by the
     // kept and the new color buffer and GPU::GLClearFast drops it after the frame. DepthOutTex goes
     // with ColorBufferTex and swaps like it, with a kept and a spare one; each is 0 until a render
     // resolves into it, and DepthOutValid says that one holds ColorBufferTex's frame. all of them
@@ -549,6 +549,7 @@ private:
     bool DepthResolveComplete = false;
     // built the first time depth is wanted; a failed build leaves the frontend without depth
     GLuint DepthResolveShader {};
+    GLint DepthResolveWBufferLoc = -1;
     bool DepthResolveFailed = false;
     // PrepareEarlyCaptureFrame's readback is in EarlyPixelbufferID and is still what line 0 would
     // read back. cleared by anything that draws into or resizes the 3D frame, or replaces the state

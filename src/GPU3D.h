@@ -617,9 +617,9 @@ public:
     virtual bool TakeEarlyCaptureFrame(bool use) { return false; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
-    // a frontend's post effects (depth of field): an RG8 texture the output's width by its top
+    // a frontend's post effects (depth of field): an RGBA8 texture the output's width by its top
     // half's rows ((192 + 2 * margin) * scale) for output buffer [buffer], which the compositor
-    // fills with the top screen's depth, or 0 for none. given before each frame like the output
+    // fills with the top screen's 24-bit depth and flags (kCompositorDepthFS), or 0 for none. given before each frame like the output
     // texture; while none is given the renderer keeps no depth and nothing costs more. only the
     // OpenGL renderer has one, the others never set OutputLayout::HasDepth
     virtual void SetOutputDepthTexture(int buffer, u32 texture) {}
